@@ -4,9 +4,9 @@
 #
 # install.sh — the aterm install: the released aterm.app AND the `aterm`
 # command (ONE name on PATH; it fronts every verb — aterm help / ctl / pkg /
-# fleet / drive), in one command. Every release is ONE lean app: aterm opens
-# immediately, and the ALab toolchain installs itself on first launch with live
-# progress. Flags only EXCLUDE.
+# fleet / drive), in one command. Current macOS releases are lean apps; Linux
+# releases provide one executable. The ALab toolchain installs separately, on a
+# lean app's first launch with live progress unless excluded.
 #
 # The download source is the PUBLIC release repo (alabsystems/aterm; a run
 # from a checkout derives the slug from its Cargo.toml, ATERM_REPO_SLUG names
@@ -55,30 +55,21 @@
 #         fallback. The installed runtime then independently verifies the proof
 #         and enrolls this managed binary for signed updates. A source fallback
 #         is NOT automatically enrolled.
-#   cli — the `aterm` command (transparent PTY passthrough + the front door
-#         for every verb). ONE name lands on PATH — the [workspace.metadata.
-#         atpkg] expose declaration; the verb siblings (aterm-ctl, atpkg,
-#         aterm-fleet, aterm-drive) ride CO-LOCATED and `aterm ctl/pkg/fleet/
-#         drive` resolve them via current_exe, never PATH. Preferred source:
-#         the installed app bundle — newer releases ship the whole toolset
-#         inside Contents/MacOS (the CLI terminal under the name `aterm-cli`;
-#         the bundle's `aterm` is the GUI) — so this half is ONE SYMLINK into
-#         the bundle: no cargo, works from a piped script, and the link tracks
-#         in-place app updates. Fallback: the toolset is built from THIS
-#         checkout's source (run `git pull --ff-only` first for the latest
-#         main; needs a checkout + the pinned CUSTOM `trust` toolchain —
-#         rust-toolchain.toml — which arrives EITHER the product's way, `aterm
-#         pkg install trust` (the atpkg store's targo, taken FIRST, no rustup
-#         needed), OR as rustup's `trust` link, built through rustup's proxy,
-#         the one cargo that honours the pin; rustup cannot download it, so
-#         with neither in reach the lane is a loud pre-flight skip naming
-#         `aterm pkg install trust` (rustup and the Trust tarballs where no
-#         `aterm` can run it), never a mid-build abort — see
-#         find_cargo_and_rustup)
-#         into a private store
-#         (~/.local/lib/aterm/bin, override ATERM_STORE_DIR) with the one
-#         `aterm` symlink in ~/.local/bin — non-macOS, older bundles, or no
-#         installed app. A PATH hint prints if ~/.local/bin isn't on PATH.
+#   cli — the `aterm` command: one executable serves the terminal modes and
+#         dispatches product commands in-process. ONE name lands on PATH, per
+#         [workspace.metadata.atpkg]; compatibility argv0 aliases name the same
+#         executable. Preferred macOS source: Contents/MacOS/aterm in the
+#         installed app. find_bundle_cli also accepts the previous bundle
+#         layout, whose aterm-cli front door needs its four verb executables.
+#         The symlink tracks app updates and needs no compiler or checkout.
+#         A released Linux binary already installed in the private store is
+#         reused. Otherwise the fallback builds this checkout's ONE executable
+#         into ~/.local/lib/aterm/bin (override ATERM_STORE_DIR), with the
+#         `aterm` symlink in ~/.local/bin. It needs the pinned `trust`
+#         toolchain: the managed store's targo is preferred, else rustup's
+#         proxy and a custom `trust` link (find_cargo_and_rustup). An unavailable
+#         toolchain skips that fallback with a remedy. A PATH hint prints if
+#         ~/.local/bin isn't on PATH.
 #   toolset — `aterm pkg seed` + `pkg update` (a fresh lean install defers it
 #         to the app's first launch); PATH — one marker-fenced block in your
 #         shell profile. Each has its --no-… flag.
@@ -127,8 +118,8 @@
 #   ATERM_NO_PATH=1 tools/install.sh                  # as --no-path
 #
 # One-liner, no clone needed (the cli half symlinks from the just-installed
-# app when its bundle ships the tools; against older releases the cli half is
-# skipped with a note, since building from source needs a checkout):
+# app when its bundle has the current executable or a supported legacy CLI
+# toolset; otherwise the cli half is skipped, since building needs a checkout):
 #   curl -fsSL https://raw.githubusercontent.com/alabsystems/aterm/HEAD/tools/install.sh | bash
 set -euo pipefail
 
@@ -631,21 +622,21 @@ OFFICIAL_REPO_SLUG="alabsystems/aterm"
 OFFICIAL_TEAM_ID="A66A9P66Z7"
 
 # One bare GitHub name segment (an owner OR a repo): the alphabet and bounds of
-# crates/aterm-update-core/build.rs `valid_segment`.
+# crates/aterm-update-core/src/source.rs `is_valid_slug`.
 valid_slug_segment() {
 	[[ "$1" =~ ^[A-Za-z0-9._-]{1,100}$ && "$1" != . && "$1" != .. ]]
 }
 
-# The update channel a workspace manifest declares, as OWNER/REPO on stdout —
-# EXACTLY the derivation of the shipped binary's compiled-in channel
-# (crates/aterm-update-core/build.rs): `[workspace.metadata.aterm]
-# update_channel` when it is a valid slug inside that table, else the
-# `[workspace.package] repository` URL. A run from a checkout installs from
-# where that checkout's binaries update from — the public channel every release
-# is published to — and never from `repository` alone: in the development
-# checkout that is the private repository the source lives in, which carries
-# no release a tokenless machine can read. Status 1 when neither rung yields a
-# valid slug (the caller then keeps its default).
+# The update channel a workspace manifest declares, as OWNER/REPO on stdout:
+# `[workspace.metadata.aterm] update_channel` when it is a valid slug inside
+# that table, else the `[workspace.package] repository` URL. The shipped
+# binary's compiled-in channel (aterm_update_core::DEFAULT_OWNER/DEFAULT_REPO)
+# is held equal to that key by aterm-release's channel tests. A run from a
+# checkout installs from where that checkout's binaries update from — the
+# public channel every release is published to — and never from `repository`
+# alone: in the development checkout that is the private repository the source
+# lives in, which carries no release a tokenless machine can read. Status 1
+# when neither rung yields a valid slug (the caller then keeps its default).
 channel_slug_from_manifest() { # <Cargo.toml>
 	local manifest="$1" slug
 	[[ -r "$manifest" ]] || return 1
@@ -665,9 +656,10 @@ valid_slug() {
 }
 
 # One `key = "value"` string out of one `[table]` of a TOML file, on stdout (empty
-# when absent): the line-oriented shape build.rs `table_string` reads, line for
-# line — the exact header, then `key = "value"` with the value the first
-# double-quoted run (a trailing `# comment` falls outside it), whitespace trimmed.
+# when absent): the line-oriented shape the release cutter's `table_string`
+# (crates/aterm-release/src/channel.rs) reads, line for line — the exact
+# header, then `key = "value"` with the value the first double-quoted run (a
+# trailing `# comment` falls outside it), whitespace trimmed.
 manifest_table_string() { # <file> <table> <key>
 	awk -v header="[$2]" -v key="$3" '
 		{ line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
@@ -737,9 +729,9 @@ app_already_current() { # <elected_tag> <tag_explicit> <bundle_id> <installed_ve
 }
 
 # `bounded SECS CMD [ARG...]`: CMD's own status, or 124 when it has not
-# finished within SECS (its process group SIGKILLed). A copy of
-# tools/lib-bounded.sh's, which has the measurements; this script runs alone
-# through curl | bash and cannot source it. codesign waits on trustd and spctl
+# finished within SECS (its process group SIGKILLed): the shell twin of
+# aterm_uds::deadline, since this script runs alone through curl | bash and can
+# source nothing. codesign waits on trustd and spctl
 # also on a network lookup; while either does not answer it never returns. Every call below is
 # bounded at VERIFY_WAIT_SECS — a hang detector: the in-app updater measured
 # codesign at 0.09 s on 851 MB and spctl under half a second
@@ -925,8 +917,8 @@ desktop_exec_path_ok() {
 }
 
 # Defined in the library half (above the ATERM_INSTALL_LIBRARY_ONLY return) so
-# tools/test-install-channel.sh can drive it; it reads BIN_DIR and ROOT, which
-# the install half sets before calling it.
+# its tests (crates/aterm-update/tests/install_sh) can drive it; it reads
+# BIN_DIR and ROOT, which the install half sets before calling it.
 install_linux_desktop_entry() {
 	# Desktop identity (best-effort, NON-FATAL, Linux only): GNOME/KDE identify
 	# an aterm window by the Wayland app_id / X11 WM_CLASS the GUI sets
@@ -992,8 +984,8 @@ install_linux_desktop_entry() {
 	# (assets/linux/icons/hicolor). A piped install has no checkout — Linux
 	# delivery is one signed binary, no tarball — so it gets the generic icon;
 	# the entry above still buys window grouping + the launcher row, so that
-	# is a NOTE, not a rollback. tools/test-install-channel.sh pins the clone
-	# run installing all five sizes.
+	# is a NOTE, not a rollback. crates/aterm-update/tests/install_sh pins the
+	# clone run installing all five sizes.
 	local icon_n=0 src size dest
 	if [[ -n "$ROOT" && -d "$ROOT/assets/linux/icons/hicolor" ]]; then
 		for src in "$ROOT"/assets/linux/icons/hicolor/*/apps/aterm.png; do
@@ -1047,8 +1039,8 @@ random_suffix() {
 # exactly as before.
 #
 # Pure decision logic, extracted from install_app so the whole election matrix
-# is pinned by tools/test-install-channel.sh without a network. The election
-# is CPU-independent (the universal app rides every container), so no
+# is pinned by crates/aterm-update/tests/install_sh without a network. The
+# election is CPU-independent (the universal app rides every container), so no
 # hardware probe feeds it. Inputs are positional; outputs are globals:
 #   CONTAINER_KIND      dmg | zip
 #   ASSET_NAME/ASSET_SHA  the elected asset and its manifest digest
@@ -1142,20 +1134,11 @@ elect_container() { # <toolchain01> <version> <dmg> <dmg_sha> <zip> <zip_sha>
 # THE RUSTUP LANE. rust-toolchain.toml pins the toolchain, and of the cargos
 # rustup knows ONLY its proxy honours it: a
 # plain cargo — Homebrew's `rust` formula, a distro package — compiles with
-# PATH's rustc. On the trust-pinned dev tree that build does not get far.
-# crates/aterm depends on crates/trust-gate, whose build script refuses any
-# non-Trust rustc among the build's first units. Its refusal names this very
-# case ("this cargo is not rustup's and ignores the pin") and the fix
-# ("targo --unverified build"), and it stays the
-# backstop. What this pre-flight adds beyond it:
-#   * it FINDS the proxy when ~/.cargo/bin is not on PATH at all, where the
+# PATH's rustc instead of the pinned Trust. This pre-flight:
+#   * FINDS the proxy when ~/.cargo/bin is not on PATH at all, where the
 #     `command -v cargo` pre-flight skipped the lane as "needs cargo";
-#   * it refuses BEFORE any compile. trust-gate's refusal is a mid-build
-#     abort, and FAILSAFE POLICY (the header) makes a condition a pre-flight
-#     can detect a skip, never that;
-#   * until 2026-09-29 a tree whose committed pin named a stock channel (the
-#     PUBLIC snapshot's then) stood trust-gate down, and there a Homebrew cargo
-#     built silently with whatever rustc PATH held; that stand-down is gone.
+#   * refuses BEFORE any compile: FAILSAFE POLICY (the header) makes a
+#     condition a pre-flight can detect a skip, never a mid-build abort.
 # On a Mac the proxy is the one that loses:
 # path_helper puts the system dirs FIRST in every login shell's INHERITED PATH,
 # so a terminal spawned from a terminal finds /usr/local/bin/cargo before
@@ -1223,10 +1206,7 @@ elect_container() { # <toolchain01> <version> <dmg> <dmg_sha> <zip> <zip_sha>
 #     so that proxy resolves to the pin.
 #
 # FAILSAFE POLICY applies: every outcome here is a pre-flight skip reason,
-# never a mid-build abort. tools/dev-app.sh loads the functions between the
-# markers from this file (this script stays self-contained for the piped
-# lane, so the one copy lives here); tools/test-cargo-pin.sh pins their
-# behaviour.
+# never a mid-build abort. crates/aterm-update/tests/install_sh pins their behaviour.
 #
 # RUSTUP_AUTO_INSTALL=0 on every probe: rustup 1.29.0 otherwise treats a
 # pinned-but-absent toolchain as an order to DOWNLOAD it (`rustup which cargo`
@@ -1235,7 +1215,6 @@ elect_container() { # <toolchain01> <version> <dmg> <dmg_sha> <zip> <zip_sha>
 # fetch.
 #
 # Read-only: no file is created, so the --dry-run zero-mutation contract holds.
-# >>> cargo-pin gate: tools/dev-app.sh loads everything to the closing marker
 # One file's PHYSICAL path: symlinks followed hop by hop with readlink (the
 # installer's floor is macOS's stock bash 3.2, and `realpath` is not on every
 # Mac), the directory spelled as getcwd() spells it. Empty, exit 1, when the
@@ -1265,7 +1244,7 @@ gate_pinned_channel() { # <root>
 # product's own way — `aterm pkg install trust` — has NO rustup: atpkg holds the
 # Trust toolchain at <prefix>/store/trust/<build>/bin/ (targo, trustc, and their
 # siblings), <prefix>/store/trust/current selects the build, and
-# <prefix>/bin/targo is the shim on PATH (its body is
+# <prefix>/bin/targo is the shim on PATH (its last line is
 # `exec '<prefix>/store/trust/<build>/bin/targo' "$@"`), with `alab-targo`
 # beside it — atpkg's ALIAS shim, the same body, laid so the managed copy can
 # be typed when a foreign `targo` sits ahead of the managed bin/ on PATH
@@ -1309,23 +1288,58 @@ gate_pinned_channel() { # <root>
 # Anything short of that is "no managed store": the reason is kept in
 # MANAGED_DECLINE for the refusal, and the rustup lane runs unchanged.
 
-# The exec target of an atpkg shim — a script whose body is `exec '<path>'
-# "$@"` (the `alab-<tool>` alias has the same body) — else the file itself. A
+# The exec target of an atpkg launcher shim, else the file itself. A shim is a
+# `#!/bin/sh` file of at most GATE_SHIM_MAX_BYTES whose LAST command (blank and
+# comment lines aside) is `exec '<absolute path>' "$@"`, on a line no earlier
+# line continues into (a trailing `\`, `|` or `&&`), in a file with no
+# here-document and no other `exec`: the word anywhere on a command line before
+# it refuses the file. Most shims are that one command (the `alab-<tool>` alias
+# has the same body); on macOS atpkg's `targo` and `targo-tippy` shims first run
+# a block of shell builtins that may put `--config build.build-dir=…` in front
+# of "$@" (crates/atpkg/src/build_cache.rs), so their exec is the last of about
+# seventy lines. Following such a shim is sound: it is read here, never run,
+# only to LOCATE the store file, which gate_store_targo must then prove and every
+# build runs by its physical path; a prelude runs only when the shim itself is
+# executed, so it cannot change what is selected. A second `exec` (atpkg's
+# compat route guard among them: that shim may run another file than the one
+# its last line names) or any shape not recognised here is not followed. A
 # Mach-O targo on PATH is not read past its magic (`head -c 2`).
+GATE_SHIM_MAX_BYTES=16384
 gate_shim_target() { # <file>
-	local line="" cand=""
-	if [[ "$(head -c 2 "$1" 2>/dev/null)" == '#!' ]]; then
-		while IFS= read -r line || [[ -n "$line" ]]; do
-			case "$line" in
-			"exec '"*"' \"\$@\"")
-				cand="${line#exec \'}"
-				cand="${cand%\' \"\$@\"}"
-				break
-				;;
-			esac
-		done < <(head -n 8 "$1" 2>/dev/null)
+	local line="" cmd="" last="" prev="" target="" size="" first=1 bad=""
+	local word='(^|[^[:alnum:]_])exec([^[:alnum:]_]|$)'
+	if [[ -f "$1" && "$(head -c 2 "$1" 2>/dev/null)" == '#!' ]]; then
+		size="$(wc -c <"$1" 2>/dev/null)" || size=""
+		size="${size//[!0-9]/}"
+		[[ -n "$size" && "$size" -le "$GATE_SHIM_MAX_BYTES" ]] || bad=1
+		while [[ -z "$bad" ]] && { IFS= read -r line || [[ -n "$line" ]]; }; do
+			if [[ -n "$first" ]]; then
+				first=""
+				[[ "$line" == '#!/bin/sh' ]] || bad=1
+				continue
+			fi
+			cmd="${line#"${line%%[![:space:]]*}"}"
+			cmd="${cmd%"${cmd##*[![:space:]]}"}"
+			[[ -z "$cmd" || "$cmd" == '#'* ]] && continue
+			# The previous command line was not the last one: it is prelude.
+			if [[ -n "$last" ]]; then
+				if [[ "$last" =~ $word || "$last" == *'<<'* ]]; then
+					bad=1
+				fi
+				prev="$last"
+			fi
+			last="$cmd"
+		done <"$1"
+		case "$prev" in *'\' | *'|' | *'&&') bad=1 ;; esac
+		case "$last" in
+		"exec '"*"' \"\$@\"")
+			target="${last#exec \'}"
+			target="${target%\' \"\$@\"}"
+			;;
+		esac
+		[[ -z "$bad" && "$target" == /* && "$target" != *"'"* ]] || target=""
 	fi
-	printf '%s\n' "${cand:-$1}"
+	printf '%s\n' "${target:-$1}"
 }
 
 # The shape proof: <candidate> resolves, physically, to
@@ -1603,8 +1617,7 @@ cargo_honours_pin() {
 	# proxy was invoked from. cargo, with RUSTC and build.rustc unset
 	# (.cargo/config.toml sets neither), then runs PATH's `rustc`. Measured
 	# 2026-09-10 with rustup 1.29.1 and a fake toolchain, linked into a scratch
-	# RUSTUP_HOME, whose cargo reports `command -v rustc` (nothing compiled;
-	# on the trust-pinned tree trust-gate would refuse that compile): with a
+	# RUSTUP_HOME, whose cargo reports `command -v rustc` (nothing compiled): with a
 	# Homebrew-style rustc in a dir ahead of $CARGO_HOME/bin on PATH, the
 	# toolchain's cargo saw PATH unchanged and resolved that rustc. So
 	# cargo_build_pinned itself puts $CARGO_HOME/bin and then this cargo's own
@@ -1684,12 +1697,11 @@ cargo_build_pinned() { # <root>
 		(cd "$1" && env -u CARGO_BUILD_TARGET -u RUSTUP_TOOLCHAIN PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$(dirname "$CARGO_BIN"):$PATH" "$CARGO_BIN" build --release -p aterm --target-dir "$1/target" --config "$CARGO_UNVERIFIED_LANE")
 	fi
 }
-# <<< cargo-pin gate
 # The rustup lane in the block above serves a tree whose pin names a stock channel,
 # or a `trust` link rustup resolves with no aterm-managed store in reach. The public
 # snapshot pins `trust` like the dev tree (2026-09-29), so on a machine with aterm
-# both take the store lane. The dev tree builds with the aterm-managed Trust targo
-# only — tools/dev-app.sh refuses the rustup lane.
+# both take the store lane. A dev build of the tree is `targo --unverified ship
+# dev-app`, on the Trust toolchain the release cutter resolves.
 
 # Does <name> parse as a rustup DIST toolchain, one `rustup toolchain install`
 # can fetch? rustup's grammar (`rustup help toolchain`, 1.29.1):
@@ -1770,16 +1782,17 @@ linux_target_preflight() { # <tag> <head-tag> <asset>
 # machine -> appcast chain as update-core before interpreting an artifact claim.
 # Kept inside the one-file installer so the curl|bash path never fetches an
 # unverified executable helper. Python parses TOML; OpenSSL performs Ed25519.
-# tools/test-linux-bootstrap.py pins this interpreter to the committed root and
-# exercises signed synthetic fixtures without adding any production key override.
+# crates/aterm-update/tests/install_sh runs this interpreter over Rust-signed
+# synthetic releases (swapping only the pin, never through a production
+# override) and holds it to the updater's chain and to the committed root pin.
 linux_release_verify() {
 	python3 - "$@" <<'ATERM_LINUX_VERIFY_PY'
 # Copyright 2026 Andrew Yates
 # SPDX-License-Identifier: Apache-2.0
-"""Read-only signed release verification shared by bootstrap and website sync.
+"""Read-only signed release verification for the Linux bootstrap.
 
-The installer embeds this exact module for its one-file curl|bash delivery.
-tools/test-linux-bootstrap.py checks the copy and the committed root pin.
+The installer embeds this module for its one-file curl|bash delivery.
+crates/aterm-update/tests/install_sh holds it to the updater's chain and root pin.
 """
 
 import base64
@@ -2121,8 +2134,8 @@ ATERM_LINUX_VERIFY_PY
 # sat at $BIN_DIR/aterm without looking. These are the uninstaller's own tests,
 # hoisted so the install path asks the same questions and prints the same
 # SKIPPED line (docs/AUDIT-distribution-channel-2026-08-31.md, "ownership
-# asymmetry"). Defined above the library guard so tools/test-install-channel.sh
-# pins them.
+# asymmetry"). Defined above the library guard so
+# crates/aterm-update/tests/install_sh pins them.
 
 # The one SKIPPED line both directions print for an entry that is not ours.
 ownership_skip() { # <path> <reason>
@@ -2259,7 +2272,7 @@ bin_aterm_plan() { # <path> <store-dir>
 
 # The argv0 aliases the store lanes link beside the store's `aterm`
 # (expose_store_binary), each a symlink whose target is exactly `aterm`.
-STORE_ALIASES="aterm-cli aterm-ctl atpkg aterm-fleet aterm-drive aterm-link aterm-gui"
+STORE_ALIASES="aterm-cli aterm-ctl atpkg aterm-fleet aterm-drive aterm-askpass aterm-link aterm-gui"
 
 # Whether an entry of the store directory is one the store lanes place, judged
 # by what it is, not where it sits: the `aterm` binary (a regular file that
@@ -3163,8 +3176,8 @@ print_install_plan() {
 # body is a parse error (bash executes none of an unterminated compound), and
 # a cut that keeps the body but loses the last line defines everything and
 # runs nothing. No side effect can happen unless the final byte arrived — the
-# same tail-call guard rustup and uv ship. Tested by
-# tools/test-install-guard.sh.
+# same tail-call guard rustup and uv ship. Tested at every top-level cut point
+# by crates/aterm-update/tests/install_sh.
 # The body below keeps its pre-wrap indentation ON PURPOSE: re-indenting
 # ~1,600 lines would bury the guard's real diff in mechanical churn and risk
 # pushing literal tabs into multi-line strings.
@@ -3293,10 +3306,9 @@ REPO_SLUG="${ATERM_REPO_SLUG:-$(checkout_channel_slug)}"
 
 # --- pre-flight: decide what each half CAN do here (fail fast, skip loud) ------
 BIN_DIR="${ATERM_BIN_DIR:-$HOME/.local/bin}"
-# The private store for toolset binaries — filled by the cli source build OR by
-# the Linux release lane: ONE name (`aterm`) is exposed on PATH as a symlink
-# into here; the verb siblings ride alongside, resolved via current_exe — the
-# same expose/bundle split as [workspace.metadata.atpkg] and the app bundle.
+# The private store for the ONE executable, from a source build or Linux
+# release, plus compatibility argv0 symlinks. Only `aterm` is exposed on PATH,
+# as a symlink into this store, like the app-backed command on macOS.
 # Defined before the app pre-flight because on Linux the store IS the app
 # half's destination.
 STORE_DIR="${ATERM_STORE_DIR:-$HOME/.local/lib/aterm/bin}"
@@ -3639,8 +3651,9 @@ install_app() {
 
 	# --- pick the container: the LEAN zip; a pinned pre-lean release, its DMG --
 	# The decision lives in elect_container (with the election rationale and
-	# every manifest-identity bind), extracted so tools/test-install-channel.sh
-	# pins the whole matrix without a network. It sets CONTAINER_KIND/
+	# every manifest-identity bind), extracted so
+	# crates/aterm-update/tests/install_sh pins the whole matrix without a
+	# network. It sets CONTAINER_KIND/
 	# ASSET_NAME/ASSET_SHA/LEAN_REASON/TOOLCHAIN_DEFERRED; a refusal already
 	# named its cause.
 	elect_container "$DO_TOOLCHAIN" "$VERSION" \
@@ -3948,11 +3961,10 @@ install_linux_app() {
 }
 
 # --- the cli half: the one `aterm` command, preferring the installed bundle ----
-# Newer releases ship the CLI terminal inside the bundle as `aterm-cli` (its
-# cargo binary is `aterm`; that name belongs to the GUI in Contents/MacOS)
-# next to the verb siblings — so the preferred install is ONE symlink into the
-# bundle: no cargo, piped-script friendly, and the link tracks in-place app
-# updates (the updater swaps aterm.app at the same path).
+# Current releases use Contents/MacOS/aterm for the session, window and product
+# commands. The preferred install symlinks that executable; the previous separate
+# CLI toolset is accepted below for compatibility. Neither bundle lane builds
+# source, and the link tracks app updates at the same path.
 
 # The first installed bundle whose toolset can back the `aterm` symlink,
 # echoed as the exact TARGET to link. Two generations qualify:
@@ -4029,9 +4041,8 @@ install_cli_from_source() {
 	# cargo withholds [target.*] rustflags from HOST units (build scripts, proc
 	# macros, and their dependencies) whenever an explicit target is set — the
 	# flag, CARGO_BUILD_TARGET, or [build] target — and this repo compiles with
-	# Trust, whose Trust-lane flags live in exactly those rustflags
-	# (.cargo/config.toml's `--cfg clean_islands`, plus rustup's lane's
-	# CARGO_UNVERIFIED_LANE off-switch). Under a pinned triple the host units
+	# Trust, whose rustup lane carries its off-switch in exactly those rustflags
+	# (CARGO_UNVERIFIED_LANE). Under a pinned triple the host units
 	# lose them, and on rustup's lane verify strictly and fail closed (first
 	# casualty: shlex, under cc). A plain host build applies them to every unit
 	# and lands the binary
@@ -4044,8 +4055,9 @@ install_cli_from_source() {
 	# deleted output, so a redirected build can never leave a previous build's
 	# binary here to be silently installed.
 	rm -f "$rel/aterm"
-	# ONE binary carries everything: the session, the window, and every verb
-	# in-process (`-p aterm` pulls the whole library graph). cargo_build_pinned
+	# ONE shipped binary carries the session, window and product commands
+	# in-process (`-p aterm` pulls their library graph). Development-only tools
+	# retain separate executables. cargo_build_pinned
 	# runs the pre-flighted $CARGO_BIN (find_cargo_and_rustup +
 	# cargo_honours_pin) on the lane the pre-flight took: the aterm-managed
 	# store's targo on its explicit `--unverified` lane, the store's bin dir
@@ -4093,9 +4105,9 @@ place_store_binary() {
 }
 
 expose_store_binary() {
-	# argv0 compat aliases beside it (matching the bundle's symlinks), so
-	# in-session \`aterm-ctl …\` scripts and the drive/fleet sibling lookup keep
-	# resolving.
+	# argv0 compatibility aliases point to the same executable, as in the app
+	# bundle, so older scripts invoking aterm-ctl, atpkg, aterm-fleet or
+	# aterm-drive still reach their in-process entry points.
 	local alias
 	for alias in $STORE_ALIASES; do
 		ln -sfn aterm "$STORE_DIR/$alias"
@@ -4249,8 +4261,8 @@ install_cli_completions() {
 	*"#compdef aterm"*) front_door=1 ;;
 	esac
 
-	# shell:kind:destination triples — the aterm-ctl verb sibling (always), and
-	# the `aterm` front door itself (only when the bundle can generate it).
+	# shell:kind:destination triples — the aterm-ctl compatibility command
+	# (always), and `aterm` itself (only when the bundle can generate it).
 	local entry shell rest kind dest dir
 	local wrote_bash=0 wrote_zsh=0 wrote_fish=0
 	for entry in \
