@@ -1,88 +1,59 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Procedural box-drawing / block-element / braille glyphs.
+//! Procedural box-drawing, block-element and braille glyphs.
 //!
-//! Fonts draw U+2500–257F (box drawing), U+2580–259F (block elements) and
-//! U+2800–28FF (braille) with glyph metrics that rarely fill the cell exactly,
-//! leaving hairline gaps or overlaps where strokes should meet across cell
-//! boundaries — the classic tmux pane-border / powerline seam artifact. This
-//! module synthesizes those glyphs from the cell geometry instead: every
-//! bitmap is exactly `cell_w x cell_h` and strokes always reach the cell edge.
+//! Font glyphs for these ranges rarely fill the cell exactly and leave hairline seams
+//! where strokes should meet across cells (tmux pane borders, powerline). This module
+//! draws them from the cell geometry instead: every bitmap is exactly `cell_w x cell_h`
+//! and strokes reach the cell edge.
 //!
-//! Coverage comes in two regimes, split by family:
+//! * Orthogonal families (lines, junctions, dashes, doubles, blocks, shades, quadrants,
+//!   sextants, octants, braille, the legacy eighth blocks U+1FB70–1FB8B) are hard 0/255,
+//!   so the CPU coverage blend and the GPU alpha blend produce identical pixels.
+//! * Diagonal and curved families ([`antialiased`]: diagonals, rounded arcs, Powerline
+//!   separators, legacy wedges) are rasterized at 4×4 subsamples per pixel and
+//!   box-filtered, with stroke thickness measured perpendicular to the edge. Their
+//!   cell-edge texels are then forced back to 0/255 ([`Canvas::harden_edges`]) so
+//!   adjacent cells still tile bit-exactly: the seam-tiling law,
+//!   `tests/procedural_aa_edges.rs`.
 //!
-//! * ORTHOGONAL families (axis-aligned strokes and fills: lines, junctions,
-//!   dashes, doubles, blocks, shades, quadrants, sextants, octants, braille,
-//!   the legacy eighth blocks U+1FB70–1FB8B) are HARD 0/255 — no antialiasing —
-//!   so the CPU coverage blend and the GPU alpha blend produce EXACTLY the
-//!   same pixels on these cells (coverage 255 -> pure foreground, coverage 0
-//!   -> untouched background).
-//! * DIAGONAL/CURVED families ([`antialiased`]: the diagonals U+2571–2573,
-//!   rounded arcs U+256D–2570, Powerline separators U+E0B0–E0BF and the
-//!   legacy wedges/triangles U+1FB3C–1FB6F) are rasterized at 4×4 subsamples
-//!   per pixel and box-filtered down to 8-bit coverage, with stroke thickness
-//!   measured PERPENDICULAR to the edge (a slanted stroke no longer thins
-//!   into a beaded chain of per-row horizontal fills). Their CELL-EDGE texels
-//!   are then forced back to hard 0/255 ([`Canvas::harden_edges`]) so
-//!   adjacent cells still tile bit-exactly at the seam — the seam-tiling law,
-//!   machine-checked by `tests/procedural_aa_edges.rs`.
-//!
-//! Dispatch lives in [`crate::Renderer::glyph_key`], which routes these ranges
-//! to [`crate::FaceId::Procedural`] BEFORE any font lookup. The escape hatch
-//! `ATERM_NO_PROCEDURAL_GLYPHS=1` (read at renderer construction, documented
-//! with the other font env vars in `lib.rs`) restores font glyphs.
+//! [`crate::Renderer::glyph_key`] routes these ranges to [`crate::FaceId::Procedural`]
+//! before any font lookup; the dev seam `ATERM_NO_PROCEDURAL_GLYPHS=1` restores fonts.
 //!
 //! ## The shared rounding rule
 //!
-//! Every stroke is sized and placed by ONE rule, so glyphs in adjacent cells
-//! always meet exactly:
+//! Every stroke is sized and placed by one rule, so glyphs in adjacent cells meet:
 //!
-//! * `light = max(1, round(min(w, h) / 8))` — in integers, `(min(w, h) + 4) / 8`.
-//! * `heavy = 3 * light` — the same parity as `light`, so the heavy span
-//!   exactly contains the light span on both axes (a heavy stroke widens a
-//!   light one by `light` on each side, never shifting its centre).
-//! * a stroke of thickness `t` across an extent `e` covers the half-open span
-//!   `[(e - t) / 2, (e - t) / 2 + t)` (integer division: when `e - t` is odd
-//!   the extra pixel goes to the right/bottom).
-//! * a double line is the heavy span split into rails: its first and last
-//!   `light` pixels, leaving a gap that is exactly the light span — so a
-//!   single line threading a double junction passes through the gap.
-//! * block-element fractions use `eighth(k, e) = (k * e + 4) / 8` (round half
-//!   up), each block anchored to its defining edge — complementary halves
-//!   (▀/▄, ▌/▐, the quadrants) overlap by one pixel on odd extents rather
-//!   than leaving a seam.
+//! * `light = max(1, round(min(w, h) / 8))`, in integers `(min(w, h) + 4) / 8`.
+//! * `heavy = 3 * light`: the same parity as `light`, so the heavy span contains the
+//!   light span on both axes, widening it by `light` on each side.
+//! * a stroke of thickness `t` across extent `e` covers `[(e - t) / 2, (e - t) / 2 + t)`;
+//!   when `e - t` is odd the extra pixel goes right/bottom.
+//! * a double line is the heavy span's first and last `light` pixels; the gap between is
+//!   exactly the light span, so a single line threading a double junction passes through.
+//! * block fractions use `eighth(k, e) = (k * e + 4) / 8` (round half up), each block
+//!   anchored to its defining edge; complementary halves (▀/▄, ▌/▐, quadrants) overlap
+//!   by one pixel on odd extents rather than leaving a seam.
 //!
-//! Within those rules, full coverage of the drawn blocks: solid, dashed
-//! (double/triple/quadruple), rounded arcs (U+256D–2570), diagonals
-//! (U+2571–2573), every light/heavy/double junction, eighth blocks, quadrants,
-//! braille, sextants, the Unicode 16 octants and the legacy wedge/eighth
-//! ranges. The shade characters
-//! ░▒▓ (U+2591–2593) are necessarily rendered as 0/255 ordered dithers (25% /
-//! 50% checkerboard / 75%) instead of translucent grey, keeping the CPU==GPU
-//! exactness guarantee — keyed by the cell's ABSOLUTE pixel-position parity
-//! ([`coverage_phased`]) so any odd cell width still tiles the dither with a
-//! uniform period at every seam (no doubled line, machine-checked by
-//! `tests/shade_phase.rs`).
+//! The shades ░▒▓ are 0/255 ordered dithers (25%, 50% checkerboard, 75%), not
+//! translucent grey, to keep CPU and GPU exact. They key on the cell's absolute pixel
+//! parity ([`coverage_phased`]) so odd cell widths tile the dither uniformly
+//! (`tests/shade_phase.rs`).
 
 mod icons;
 mod symbols;
 
 pub use icons::{IconMetrics, band_icon_coverage, band_icon_width};
 
-/// Whether `ch` is a LAST-RESORT symbol this module can draw without a font:
-/// the media controls (⏩⏪⏫⏬⏭⏮⏯ ⏴⏵⏶⏷ ⏸⏹⏺), the common Geometric Shapes
-/// (■□▪▫ ▲△▶▷▼▽◀◁ ►◄ ◆◇ ●○◐◑◒◓ ◢◣◤◥ …), the check marks and crosses
-/// (✓✔✕✖✗✘), and ⚪⚫ ⬤ ⭘. (Claude Code's `⎿` connector is NOT here: it
-/// must join a `│` above it, so it is in the pre-emptive [`covers`] family.)
+/// Whether `ch` is a last-resort symbol this module can draw without a font: media
+/// controls (⏩⏪⏫⏬⏭⏮⏯ ⏴⏵⏶⏷ ⏸⏹⏺), common Geometric Shapes (■□▪▫ ▲△▶▷▼▽◀◁ ►◄ ◆◇
+/// ●○◐◑◒◓ ◢◣◤◥ …), check marks and crosses (✓✔✕✖✗✘), and ⚪⚫ ⬤ ⭘.
 ///
-/// DISJOINT from [`covers`] and deliberately NOT a pre-emptive family: these
-/// are consulted only as the LAST tier of the resolution chain
-/// ([`crate::font_chain::Tier::Synthetic`]), after every real face has missed,
-/// so a font that has the glyph always draws it and only `.notdef` tofu is
-/// replaced. See `procedural/symbols.rs` for the measured miss that motivated
-/// it (U+23F5 in the Claude Code / Codex footer, covered by no face on a bare
-/// Linux host).
+/// Disjoint from [`covers`] and not pre-emptive: consulted only as the last tier of the
+/// resolution chain ([`crate::font_chain::Tier::Synthetic`]) after every real face
+/// missed, so it replaces only `.notdef` tofu. (`⎿` must join a `│` above it, so it is
+/// in [`covers`] instead.)
 pub fn covers_symbol(ch: char) -> bool {
     symbols::covers(ch)
 }
@@ -96,13 +67,11 @@ pub fn symbol_coverage(ch: char, cell_w: usize, cell_h: usize, span: usize) -> O
     symbols::coverage(ch, cell_w, cell_h, span)
 }
 
-/// Whether `ch` is in a range this module draws (box drawing U+2500–257F,
-/// block elements U+2580–259F, braille U+2800–28FF, legacy sextants /
-/// wedges / eighth blocks U+1FB00–1FB8B, Unicode 16 block octants
-/// U+1CD00–1CDE5, Powerline separators U+E0B0–E0BF —
-/// centred solid/outline triangles, rounded half-circles, and the four corner
-/// ("angled") triangles + outlines), and the `⎿` tree connector U+23BF, which
-/// is a box-drawing stroke in all but block name and must tile with `│`.
+/// Whether `ch` is in a range this module draws: box drawing U+2500–257F, block elements
+/// U+2580–259F, braille U+2800–28FF, legacy sextants / wedges / eighth blocks
+/// U+1FB00–1FB8B, Unicode 16 octants U+1CD00–1CDE5, Powerline separators U+E0B0–E0BF,
+/// and the `⎿` connector U+23BF, a box-drawing stroke in all but block name that must
+/// tile with `│`.
 pub fn covers(ch: char) -> bool {
     matches!(
         u32::from(ch),
@@ -115,11 +84,10 @@ pub fn covers(ch: char) -> bool {
     )
 }
 
-/// Whether `ch` is in an ANTI-ALIASED (diagonal/curved) procedural family:
-/// rounded arcs U+256D–2570, diagonals U+2571–2573, legacy wedges/triangles
-/// U+1FB3C–1FB6F, Powerline U+E0B0–E0BF. Interior texels of these glyphs may
-/// take any 0..=255 coverage; their cell-edge texels are still hard 0/255
-/// (the seam-tiling law). Everything else `covers()` is hard 0/255 throughout.
+/// Whether `ch` is in an anti-aliased (diagonal or curved) family: rounded arcs
+/// U+256D–2570, diagonals U+2571–2573, legacy wedges U+1FB3C–1FB6F, Powerline
+/// U+E0B0–E0BF. Their interior may take any coverage, their cell-edge texels are hard
+/// 0/255; everything else [`covers`] accepts is hard 0/255 throughout.
 pub fn antialiased(ch: char) -> bool {
     matches!(
         u32::from(ch),
@@ -137,16 +105,11 @@ pub fn coverage(ch: char, cell_w: usize, cell_h: usize) -> Option<Vec<u8>> {
     coverage_phased(ch, cell_w, cell_h, false, false)
 }
 
-/// [`coverage`] with the shade-dither phase made explicit. `phase_x`/`phase_y`
-/// are the PARITY of the destination cell's top-left pixel (`(pad + col *
-/// cell_w) & 1` and the row twin): the ░▒▓ dithers are functions of ABSOLUTE
-/// framebuffer parity, so two horizontally-adjacent cells of odd width get
-/// opposite `phase_x` and the composed pattern keeps its uniform 2-pixel
-/// period across the seam (cell-local parity doubled a dither line at EVERY
-/// seam when `cell_w` was odd). At most 4 variants exist per shade; every
-/// non-shade glyph ignores the phase. Both the CPU blit and the GPU quad
-/// emission key their glyph lookups with this same phase
-/// ([`crate::shade_phase_key`]), so the two backends stay byte-identical.
+/// [`coverage`] with the shade-dither phase explicit. `phase_x`/`phase_y` are the parity
+/// of the destination cell's top-left pixel (`(pad + col * cell_w) & 1` and the row
+/// twin): the ░▒▓ dithers follow absolute framebuffer parity, so cells of odd width keep
+/// a uniform 2-pixel period across the seam. Non-shade glyphs ignore the phase. The CPU
+/// blit and GPU quads key their lookups with the same phase ([`crate::shade_phase_key`]).
 pub fn coverage_phased(
     ch: char,
     cell_w: usize,
@@ -179,21 +142,16 @@ pub fn coverage_phased(
         _ => unreachable!("covers() gates the ranges"),
     }
     if antialiased(ch) {
-        // THE seam-tiling law: AA families still tile bit-exactly across cells.
+        // The seam-tiling law: AA families still tile bit-exactly across cells.
         c.harden_edges();
     }
     Some(c.buf)
 }
 
-/// The anti-aliased coverage sprite for a [`crate::DecoGlyph`] "sparkle word"
-/// decoration at a `cell_w x cell_h` cell: row-major `cell_w * cell_h` bytes,
-/// each a coverage value `0..=255`.
-///
-/// Unlike the box-drawing glyphs (hard 0/255), these are soft-edged so the
-/// sparkle reads cleanly at small cell sizes. The GPU path rasterizes the SAME
-/// mask into its atlas, so CPU and GPU stay byte-parity-exact: the host bakes
-/// colour + per-decoration alpha at composite time, and the mask is the single
-/// shared source of shape.
+/// The anti-aliased coverage sprite (`0..=255` per byte, row-major `cell_w * cell_h`) for
+/// a [`crate::DecoGlyph`] sparkle-word decoration. Soft-edged so it reads at small cell
+/// sizes; the GPU rasterizes this same mask and the host applies colour and alpha at
+/// composite time, so CPU and GPU match.
 #[must_use]
 pub fn deco_coverage(glyph: crate::DecoGlyph, cell_w: usize, cell_h: usize) -> Vec<u8> {
     use crate::DecoGlyph;
@@ -302,29 +260,19 @@ fn paw(px: f32, py: f32, fw: f32, fh: f32) -> f32 {
     cov
 }
 
-/// The Singularity nova's per-cell Over darkening mask (Sparkle Words v2
-/// §6.1): a SOFT radial shadow — coverage `1` at the cell centre falling
-/// quadratically to `0` at radius `r`. Centred in the cell and parameterized
-/// only by the cell geometry, like every other deco glyph; the host builds
-/// the visible collapse shadow by stamping one tinted decoration per covered
-/// cell along the contracting ring, and the soft blobs fuse into a dark band.
-/// (The original v2 mask was a hollow annulus per cell, which rendered as a
-/// grid of faint "ghost rings" around the collapse — the v2.1 polish audit;
-/// the glyph name stays for stream/parity stability.)
+/// The Singularity nova's per-cell Over darkening mask (Sparkle Words v2 §6.1): a soft
+/// radial shadow, coverage `1` at the cell centre falling quadratically to `0` at `r`.
+/// The host stamps one tinted decoration per cell along the contracting ring and the
+/// blobs fuse into a dark band. The `RingArc` name stays for stream stability.
 fn ring_arc(px: f32, py: f32, cx: f32, cy: f32, r: f32) -> f32 {
     let d2 = ((px - cx).powi(2) + (py - cy).powi(2)) / (r * r).max(1e-6);
     (1.0 - d2).clamp(0.0, 1.0)
 }
 
-/// The SUPER NOVA's light-background eclipse veil (Sparkle Words v3 §3.3): a
-/// full-cell soft-edged square — coverage `1` across the cell interior,
-/// ramping to ~half at the border texels over a ~1 px anti-aliased fringe on
-/// all four edges. Coverage is the pixel centre's distance to the nearest
-/// cell border, clamped to `0..=1`, so the square spans the WHOLE cell (no
-/// inset, the shape's edge sits exactly on the cell border) with the same
-/// ~1 px AA regime as the sibling soft masks ([`disc`]'s edge ramp).
-/// (Named for the shape, not the glyph: `shade` is taken by the ░▒▓ shade
-/// block-character painter.)
+/// The super nova's light-background eclipse veil (Sparkle Words v3 §3.3): a full-cell
+/// square whose coverage is the pixel centre's distance to the nearest cell border,
+/// clamped to `0..=1`, so it fills the cell with a ~1 px fringe like [`disc`]'s. (Not
+/// named `shade`: that is the ░▒▓ painter.)
 fn soft_square(px: f32, py: f32, fw: f32, fh: f32) -> f32 {
     px.min(fw - px).min(py.min(fh - py)).clamp(0.0, 1.0)
 }
@@ -395,11 +343,9 @@ impl Canvas {
         }
     }
 
-    /// Force the border rows/columns to hard 0/255 (majority coverage wins):
-    /// the seam-tiling law. An AA glyph's interior may hold any coverage, but
-    /// the texels ON the cell boundary — the only ones a neighbouring cell's
-    /// glyph must meet — quantize so adjacent cells compose with no
-    /// half-covered seam line (and so the CPU/GPU blends stay exact there).
+    /// Force the border rows and columns to hard 0/255 (majority wins): the seam-tiling
+    /// law. Only boundary texels meet a neighbouring cell's glyph, so quantizing them
+    /// leaves no half-covered seam line and keeps the CPU/GPU blends exact there.
     fn harden_edges(&mut self) {
         let (w, h) = (self.w, self.h);
         let mut harden = |i: usize| {
@@ -417,7 +363,7 @@ impl Canvas {
 }
 
 /// A centred stroke of thickness `t` across extent `e`: the half-open span
-/// `[(e - t) / 2, (e - t) / 2 + t)`. THE placement rule (see module docs).
+/// `[(e - t) / 2, (e - t) / 2 + t)`, the module's placement rule.
 fn span(e: usize, t: usize) -> (usize, usize) {
     let t = t.min(e);
     let s = (e - t) / 2;
@@ -991,14 +937,10 @@ fn draw_block(c: &mut Canvas, cp: u32) {
     }
 }
 
-/// The shade dithers: 1 = ░ 25% (even x AND even y), 2 = ▒ 50% checkerboard,
-/// 3 = ▓ 75% (the complement of the 25% pattern's odd/odd holes). The pattern
-/// is keyed by ABSOLUTE framebuffer parity: `phase_x`/`phase_y` (each 0 or 1)
-/// are the parity of the destination cell's top-left pixel, so `x + phase_x ≡
-/// absolute x (mod 2)` and the dither is one uniform lattice across the whole
-/// grid — an odd cell width no longer doubles a dither line at every seam
-/// (cell-local parity restarted the pattern per cell). Phase `(0, 0)`
-/// reproduces the old pattern byte-for-byte.
+/// The shade dithers: 1 = ░ 25% (even x and even y), 2 = ▒ 50% checkerboard, 3 = ▓ 75%
+/// (all but odd/odd). `phase_x`/`phase_y` are the parity of the destination cell's
+/// top-left pixel, so the pattern is one lattice in absolute framebuffer coordinates and
+/// odd cell widths do not double a dither line at the seams.
 fn shade(c: &mut Canvas, level: u8, phase_x: usize, phase_y: usize) {
     for y in 0..c.h {
         for x in 0..c.w {
@@ -1049,11 +991,9 @@ fn quadrants(c: &mut Canvas, cp: u32) {
     }
 }
 
-/// Distance from `(px, py)` to the SEGMENT `(ax, ay)..(bx, by)` — the
-/// perpendicular distance to the line, clamped to the endpoints. The stroke
-/// primitive for the Powerline chevrons: a band `dist <= t/2` has thickness
-/// `t` PERPENDICULAR to the edge at every slope (a per-row horizontal fill of
-/// width `t` degenerates to `t / sqrt(1 + slope²)` — a beaded chain at 45°).
+/// Distance from `(px, py)` to the segment `(ax, ay)..(bx, by)`. The Powerline chevron
+/// stroke: a band `dist <= t/2` is `t` thick perpendicular to the edge at every slope,
+/// where a per-row fill of width `t` thins to `t / sqrt(1 + slope²)` (beads at 45°).
 fn seg_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     let (dx, dy) = (bx - ax, by - ay);
     let len2 = dx * dx + dy * dy;
@@ -1066,16 +1006,12 @@ fn seg_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
 }
 
-/// Powerline separators U+E0B0–E0BF, synthesized full-bleed so they tile
-/// seamlessly with the adjacent segment's background (the glyph paints the
-/// segment colour; the rest of the cell shows the next segment's bg):
-/// E0B0/E0B2 solid right/left triangles, E0B1/E0B3 their chevron outlines,
-/// E0B4/E0B6 solid right/left rounded (half-ellipse) caps, E0B5/E0B7
-/// outlines, E0B8–E0BF the corner ("angled") triangles + their hypotenuse
-/// outlines. All are supersampled ([`Canvas::paint_aa`]); outline strokes
-/// measure their thickness PERPENDICULAR to the edge ([`seg_dist`] / radial),
-/// so a 45° chevron keeps a constant-width stroke instead of thinning into a
-/// beaded chain of per-row fills. Cell-edge texels are hardened by the caller.
+/// Powerline separators U+E0B0–E0BF, full-bleed so they tile with the adjacent
+/// segment's background: E0B0/E0B2 solid right/left triangles, E0B1/E0B3 their chevron
+/// outlines, E0B4/E0B6 solid rounded (half-ellipse) caps, E0B5/E0B7 their outlines,
+/// E0B8–E0BF the corner triangles and their hypotenuse outlines. All are supersampled;
+/// outline thickness is perpendicular to the edge ([`seg_dist`] or radial). The caller
+/// hardens the cell-edge texels.
 fn draw_powerline(c: &mut Canvas, cp: u32) {
     let (w, h) = (c.w, c.h);
     let (wf, hf) = (w as f32, h as f32);
@@ -1138,12 +1074,11 @@ fn draw_powerline(c: &mut Canvas, cp: u32) {
     });
 }
 
-/// Block sextants U+1FB00–1FB3B: a 2×3 grid of filled sub-cells. The 60 code
-/// points map to the 6-bit fill masks 1..=62 EXCLUDING 21 (left column) and 42
-/// (right column) — those, plus 0 (space) and 63 (full block), have their own
-/// characters. Bits: 1=upper-left 2=upper-right 4=mid-left 8=mid-right
-/// 16=lower-left 32=lower-right. Sub-cells fully tile the cell (no AA) so the
-/// CPU==GPU exactness holds and adjacent sextants seam perfectly.
+/// Block sextants U+1FB00–1FB3B: a 2×3 grid of filled sub-cells. The 60 code points map
+/// to the 6-bit masks 1..=62 except 21 (left column) and 42 (right column), which, like 0
+/// (space) and 63 (full block), have their own characters. Bits: 1=upper-left
+/// 2=upper-right 4=mid-left 8=mid-right 16=lower-left 32=lower-right. Hard 0/255, so
+/// adjacent sextants seam exactly.
 fn draw_sextant(c: &mut Canvas, cp: u32) {
     let k = cp - 0x1FB00;
     // The k-th mask in 1..=62 skipping the two whole-column masks.
@@ -1328,12 +1263,10 @@ fn draw_wedge(c: &mut Canvas, cp: u32) {
     c.paint_aa(|px, py| side(px, py) * corner >= 0.0);
 }
 
-/// Legacy eighth blocks U+1FB70–1FB8B (Symbols for Legacy Computing) —
-/// ORTHOGONAL (hard 0/255) fills on the same `eighth` rounding rule as
-/// U+2580–259F, so they seam exactly with the classic eighth blocks:
-/// vertical/horizontal one-eighth bars 2..7 (1 and 8 live at U+258F/2595 and
-/// U+2594/2581), the edge-pair combinations, the 1-3-5-8 scanline set, and
-/// the upper/right k-eighths fills.
+/// Legacy eighth blocks U+1FB70–1FB8B (Symbols for Legacy Computing): hard 0/255 fills
+/// on the same `eighth` rule as U+2580–259F, so they seam with the classic eighth
+/// blocks: one-eighth bars 2..7 (1 and 8 live at U+258F/2595 and U+2594/2581), the
+/// edge pairs, the 1-3-5-8 scanline set, and the upper/right k-eighths fills.
 fn draw_legacy_block(c: &mut Canvas, cp: u32) {
     let (w, h) = (c.w, c.h);
     match cp {
@@ -1429,11 +1362,9 @@ fn draw_braille(c: &mut Canvas, cp: u32) {
 mod tests {
     use super::*;
 
-    /// The Singularity darkening mask is a SOFT radial shadow (v2.1 polish —
-    /// the earlier hollow-annulus mask stamped visible "ghost rings" per
-    /// cell): full coverage at the cell centre, monotone quadratic falloff
-    /// outward, symmetric about the centre, and empty in the corners so
-    /// neighbouring stamps fuse without box seams.
+    /// The Singularity darkening mask is a soft radial shadow: full at the centre,
+    /// monotone falloff, centre-symmetric, and empty corners so neighbouring stamps
+    /// fuse without box seams.
     #[test]
     fn ring_arc_is_a_soft_radial_shadow() {
         let (w, h) = (16usize, 18usize);
@@ -1461,11 +1392,8 @@ mod tests {
         assert_eq!(at(w - 1, h - 1), 0, "all corners are empty");
     }
 
-    /// The SUPER NOVA eclipse veil (v3 §3.3) is a full-cell soft-edged
-    /// square: every interior texel (a full pixel in from the border)
-    /// saturates at 255, and the one-texel border ring on all four edges is a
-    /// soft — partial but non-zero — AA fringe, so the veil covers the whole
-    /// cell without reading as a hard box.
+    /// The super nova veil is a full-cell soft square: interior texels saturate and
+    /// the one-texel border ring is a partial, non-zero fringe.
     #[test]
     fn shade_is_a_full_cell_soft_square() {
         let (w, h) = (16usize, 18usize);
@@ -1512,12 +1440,9 @@ mod tests {
             .map(|cp| char::from_u32(cp).unwrap())
     }
 
-    /// THE coverage contract, per family: every glyph, at every size, is
-    /// exactly cell-sized; the ORTHOGONAL families contain only hard 0/255
-    /// coverage (the property that makes CPU and GPU blending bit-identical
-    /// on those cells); the [`antialiased`] families are hard 0/255 on their
-    /// CELL-EDGE texels (the seam-tiling law — proven over the exhaustive
-    /// size lattice in `tests/procedural_aa_edges.rs`).
+    /// Every glyph at every size is cell-sized; orthogonal families are hard 0/255
+    /// throughout, [`antialiased`] ones on their cell-edge texels
+    /// (`tests/procedural_aa_edges.rs` covers the whole size lattice).
     #[test]
     fn every_glyph_is_cell_sized_and_hard_where_required() {
         for &(w, h) in SIZES {
@@ -1683,9 +1608,8 @@ mod tests {
         assert_eq!(count('▓'), 3 * w * h / 4);
     }
 
-    /// Sextants are covered, hard 0/255, and laid out on the 2×3 grid: U+1FB00
-    /// fills ONLY the upper-left sub-cell; the next-to-last (mask 62) fills all
-    /// but the upper-left. Every one of the 60 draws ink and they are distinct.
+    /// Sextants are covered, hard 0/255, inked and distinct; U+1FB00 fills only the
+    /// upper-left sub-cell.
     #[test]
     fn sextants_fill_the_2x3_grid() {
         let (w, h) = (12, 24);
@@ -1836,12 +1760,9 @@ mod tests {
         );
     }
 
-    /// The chevron outline keeps a CONSTANT PERPENDICULAR stroke width: at a
-    /// squat cell (steep ~45°+ edges) every interior row of E0B1 carries at
-    /// least a full stroke's worth of ink and consecutive rows' ink intervals
-    /// overlap (a connected band). The pre-fix per-row horizontal fill of
-    /// width `t` degenerated at these slopes into a beaded chain — rows held
-    /// only `t` ink and the band broke between rows.
+    /// The chevron outline's stroke width is perpendicular, not horizontal: on squat
+    /// cells every interior row carries a full stroke of ink and consecutive rows
+    /// overlap (no beading).
     #[test]
     fn chevron_outline_width_is_perpendicular_not_horizontal() {
         for (w, h) in [(20usize, 8usize), (16, 10), (12, 24), (9, 19)] {
@@ -1850,9 +1771,7 @@ mod tests {
                 let cov = coverage(ch, w, h).unwrap();
                 // slope of the chevron edge in x-per-y: w / (h/2).
                 let slope = w as f32 / (h as f32 / 2.0);
-                // 0.55: headroom for apex/edge clipping (the band near the
-                // apex extends past the cell and is cut) — still far above
-                // the pre-fix per-row ink of `t * 255` at these slopes.
+                // 0.55 leaves headroom for the band clipped at the apex and edges.
                 let want = (t as f32 * (1.0 + slope * slope).sqrt() * 255.0 * 0.55) as usize;
                 let mut prev: Option<(usize, usize)> = None;
                 for y in 1..h - 1 {
@@ -1878,12 +1797,9 @@ mod tests {
         }
     }
 
-    /// Wedges (U+1FB3C–1FB67) obey the complementary-pair tiling law: each
-    /// diagonal appears in exactly two glyphs filling opposite sides, and the
-    /// pair composes to full coverage — per-pixel coverage sums to ≥ 254
-    /// (± one rounding LSB in the interior), with the shared cell-edge texels
-    /// hardened so at least one side owns each edge texel fully. Also spot
-    /// checks orientation and the quarter/three-quarter triangles.
+    /// Each wedge and its complement (same diagonal, opposite corner) sum to full
+    /// coverage (≥ 254: one rounding LSB); also spot-checks orientation and the quarter
+    /// triangles.
     #[test]
     fn wedge_pairs_tile_and_orient() {
         // (glyph, complement) — same diagonal, opposite corner.
@@ -1925,11 +1841,8 @@ mod tests {
         }
     }
 
-    /// Legacy eighth blocks (U+1FB70–1FB8B) are ORTHOGONAL: hard 0/255, on
-    /// the same `eighth` boundaries as U+2580–259F. Spot checks: vertical
-    /// block-2 occupies exactly the second eighth column band; the 1358
-    /// scanline set lights exactly rows {1,3,5,8}; UPPER ONE QUARTER aligns
-    /// to `eighth(2, h)`; RIGHT ONE QUARTER anchors to the right edge.
+    /// Legacy eighth blocks (U+1FB70–1FB8B) are hard 0/255 on the same `eighth`
+    /// boundaries as U+2580–259F.
     #[test]
     fn legacy_eighth_blocks_are_hard_and_aligned() {
         let (w, h) = (16, 32);

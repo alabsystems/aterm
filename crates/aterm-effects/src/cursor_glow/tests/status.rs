@@ -18,8 +18,8 @@ fn type_one_key(glow: &mut CursorGlow, cfg: &GlowConfig, g: Geom, at: Instant, r
     glow.tick(Some((row, col + 1)), at, cfg, g, &mut typed_scratch());
 }
 
-/// The status verb reports the same classic geometry as the renderer:
-/// four licensed cells span half the arc (3 / 6) and occupy four bands.
+/// Four typed keys earn four licensed spawns and a ribbon of at least four cells across at least
+/// two status bands.
 #[test]
 fn a_typed_burst_earns_a_rainbow_ribbon_the_status_verb_reports() {
     let g = geom();
@@ -58,9 +58,8 @@ fn a_typed_burst_earns_a_rainbow_ribbon_the_status_verb_reports() {
     );
 }
 
-/// A whole word at fast, average, and slow human cadence retains one
-/// classic rainbow. Status span and band counts are derived from the live
-/// cell count, with no phase, fold, or endpoint-dwell allowance.
+/// A twelve-key word at fast, average and slow human cadence earns a multi-cell ribbon across at
+/// least two status bands.
 #[test]
 fn a_word_typed_at_human_cadence_earns_the_full_rainbow_ribbon() {
     for ms in [100u64, 150, 250] {
@@ -256,7 +255,7 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
         line.contains(r#"style="rainbow kitty pet""#),
         "the raw config string is reported verbatim: {line}"
     );
-    // ONE LINE — a status the caller can grep without reassembly.
+    // One line: a status the caller can grep without reassembly.
     assert!(!line.contains('\n'), "the status row is one line: {line}");
     // Never a fabricated reason.
     let quiet = TrailStatus {
@@ -291,10 +290,9 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
         .ribbon_active(),
         "four cells in one hue is a bar, not a rainbow"
     );
-    // A falling curtain is still a ribbon: `ribbon_segments` is floored at
-    // the arc's dimmest stop, so late in every 0.24 s curtain the claim is
-    // zero while the band is still drawn. The row carries what is drawn and
-    // why the claim is under its floor, and the verdict reads both.
+    // A falling curtain is still a ribbon: `ribbon_segments` is floored at the arc's dimmest
+    // stop, so late in a curtain the claim is zero while the band is still drawn. The row
+    // carries what is drawn and why the claim is under its floor; the verdict reads both.
     let curtain = TrailStatus {
         ribbon_segments: 0,
         ribbon_hue_bands: 0,
@@ -367,8 +365,7 @@ fn row_for(flow: rk::Flow) -> TrailStatus<'static> {
         momentum_glow: 0.0,
         glow_active: false,
         pet_active: false,
-        // The resident's own four columns (another round's, landed in the
-        // same merge): a flow row says nothing about the cat.
+        // A flow row says nothing about the pet.
         pet_action: "none",
         pet_content: 0.0,
         pet_pending: 0,
@@ -400,7 +397,7 @@ fn the_trail_row_reports_the_flow_the_engine_is_in() {
     glow.tick(Some((2, 1)), t0, &c, g, &mut out);
     assert!(glow.v2.engaged(), "flow is priced by v2's spine");
 
-    // COLD: no keys, no flow. The row says so in its own words.
+    // Cold: no keys, no flow.
     let cold = glow.flow_status();
     assert_eq!(
         (cold.heat, cold.combo, cold.best),
@@ -431,7 +428,7 @@ fn the_trail_row_reports_the_flow_the_engine_is_in() {
     assert_eq!(hot.best, hot.combo, "the run IS the best so far");
     assert_eq!(entries, 1, "one ENTRY latch for one crossing, ever");
 
-    // The ROW, in the bytes the socket prints.
+    // The row, in the bytes the socket prints.
     let row = row_for(hot).line();
     assert!(
         row.contains(" flow=1.00")
@@ -464,8 +461,7 @@ fn the_trail_row_reports_the_flow_the_engine_is_in() {
         "an EXIT latches nothing — the pet hears only entries"
     );
 
-    // A KILL ends it too (exit no. 2), and a key under the floor is the
-    // third: a cold hand's first key can never open the theme.
+    // A cold hand's first key is under the spine floor and opens nothing.
     let mut cold = CursorGlow::default();
     cold.tick(Some((2, 1)), t0, &c, g, &mut out);
     cold.note_typed(t0 + Duration::from_millis(83));
@@ -603,7 +599,7 @@ fn the_status_row_names_who_owns_the_block_cursor() {
     let broken = TrailStatus {
         block_fill: Some(BlockFill {
             owner: BlockFillOwner::Phaser,
-            fill: 0x00F8_E1E1, // measured on the glass
+            fill: 0x00F8_E1E1,
             base: Some(0x00FF_0000),
         }),
         ..quiet
@@ -651,8 +647,7 @@ fn the_status_row_names_who_owns_the_block_cursor() {
             block_fill: Some(BlockFill {
                 owner,
                 fill: 0x0012_3456,
-                // The host hands a base to everyone EXCEPT the styles that
-                // own their colour outright.
+                // The host hands a base to every style except those that own their colour.
                 base: (!identity).then_some(0x00AB_CDEF),
             }),
             ..quiet
@@ -679,4 +674,28 @@ fn the_status_row_names_who_owns_the_block_cursor() {
     }
     // One line, still — the whole row stays greppable without reassembly.
     assert!(!owned.line().contains('\n'));
+}
+
+/// The classic wake lights every observed move without the licensed spawn
+/// path, so it reports its spawns itself: `trail status` counts them and the
+/// diagnosis ring names them `motion`. A frame with no move adds nothing.
+#[test]
+fn classic_spawns_reach_the_count_and_the_ring() {
+    let g = geom();
+    let c = cfg(GlowStyle::Classic, true);
+    let mut glow = CursorGlow::default();
+    let mut out = Vec::new();
+    let t = Instant::now();
+    glow.tick(Some((2, 4)), t, &c, g, &mut out);
+    let (spawns, licensed) = (glow.spawns(), glow.admission_tally().licensed);
+    glow.tick(Some((2, 5)), t + Duration::from_millis(40), &c, g, &mut out);
+    assert_eq!(glow.spawns(), spawns + 1);
+    assert_eq!(glow.admission_tally().licensed, licensed + 1);
+    let last = glow.admission_log().last().expect("a ring row");
+    assert_eq!(last.licence, AdmissionRecord::LICENCE_MOTION);
+    assert_eq!((last.origin, last.target), ((2, 4), (2, 5)));
+    // Negative control: the cursor stays put, nothing more is counted.
+    glow.tick(Some((2, 5)), t + Duration::from_millis(80), &c, g, &mut out);
+    assert_eq!(glow.spawns(), spawns + 1);
+    assert_eq!(glow.admission_tally().licensed, licensed + 1);
 }

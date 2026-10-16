@@ -153,6 +153,19 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.103.0", "shell-integration"),
     ("v0.103.0", "stalled-sequence"),
     ("v0.103.0", "twelve-panes"),
+    ("v0.104.0", "claude-code-1049"),
+    ("v0.104.0", "colour-and-shell"),
+    ("v0.104.0", "held-pane"),
+    ("v0.104.0", "history"),
+    ("v0.104.0", "history-carry"),
+    ("v0.104.0", "incident-55x149"),
+    ("v0.104.0", "link-dense"),
+    ("v0.104.0", "link-dense-history"),
+    ("v0.104.0", "policy-repaint"),
+    ("v0.104.0", "policy-visible"),
+    ("v0.104.0", "shell-integration"),
+    ("v0.104.0", "stalled-sequence"),
+    ("v0.104.0", "twelve-panes"),
 ];
 
 /// THE DESK SET, one `("vX.Y.0", "<desk>")` row per desk: from that release on,
@@ -2612,11 +2625,11 @@ fn every_shipped_producers_rendezvous_grants_this_successor() {
                 record.env_parent_birth.as_str(),
             ),
             (
-                crate::handoff_rendezvous::ENV_RENDEZVOUS,
-                crate::handoff_rendezvous::ENV_CLAIM,
-                crate::handoff_rendezvous::ENV_PROOF_TERM,
-                ENV_TARGET,
-                ENV_PARENT_BIRTH,
+                crate::handoff_rendezvous::ENV_RENDEZVOUS.name(),
+                crate::handoff_rendezvous::ENV_CLAIM.name(),
+                crate::handoff_rendezvous::ENV_PROOF_TERM.name(),
+                ENV_TARGET.name(),
+                ENV_PARENT_BIRTH.name(),
             ),
             "{label}: the launch environment's names"
         );

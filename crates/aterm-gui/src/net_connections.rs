@@ -688,8 +688,7 @@ mod tests {
         // broke on — the stand-in config it used to fall back to has no `[net]`.
         let broken = "[[net.connections]]\nname = \"work\"\nhost = \n";
         let reason = crate::app_config::net_config_from_text(broken)
-            .err()
-            .expect("a broken file does not parse");
+            .expect_err("a broken file does not parse");
         assert!(reason.starts_with("line 3: "), "{reason}");
         assert!(!reason.contains('\n'), "{reason}");
         let whole = "[[net.connections]]\nname = \"work\"\nhost = \"h:1\"\nfingerprint = \"x\"\n";

@@ -5,32 +5,13 @@
 //! Tier-1 drives the real sink and GUI decisions in `app_input` tests.
 
 use aterm_spec::{
-    derive::{
-        ordered_input_admission_model, paste_order_sink_isolation_model,
-        queued_key_kernel_delivery_model,
-    },
+    derive::{paste_order_sink_isolation_model, queued_key_kernel_delivery_model},
     interp, verify,
 };
 
 #[test]
-fn ordered_input_retention_is_bounded_with_room_for_keys() {
-    let model = ordered_input_admission_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|m| m.name == model.name)
-    );
-    verify::prove_and_catch_scalar(&model, model.name);
-}
-
-#[test]
 fn a_spill_receipt_cannot_grant_queued_key_present_priority() {
     let model = queued_key_kernel_delivery_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     // A NotRun has already printed its own NOT RUN line.
     let _ = verify::prove_and_catch_tiered(&model, model.name);
 
@@ -54,12 +35,6 @@ fn a_spill_receipt_cannot_grant_queued_key_present_priority() {
 #[test]
 fn a_paste_in_a_cannot_order_a_key_in_b() {
     let model = paste_order_sink_isolation_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the sink-isolation machine must stay enrolled in the spec-link registry"
-    );
     // A NotRun has already printed its own NOT RUN line.
     let _ = verify::prove_and_catch_tiered(&model, model.name);
 

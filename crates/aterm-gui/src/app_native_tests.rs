@@ -4,6 +4,9 @@
 use super::*;
 use crate::update_words::LiveHealth as _;
 
+#[path = "app_native_settings_keep_tests.rs"]
+mod settings_keep_tests;
+
 #[test]
 fn messages_quiet_gap_folds_mixed_split_feedback_and_visibility() {
     use crate::native_app::AppViewState;
@@ -138,12 +141,9 @@ fn child_still_ours(pid: libc::pid_t, within: std::time::Duration) -> bool {
     }
 }
 
-/// A timed-out read reaps the child it owns, and the next read recovers.
-///
-/// A take proves the reap only if the fixture ran inside the budget (the
-/// shell writes the pid file); a take whose spawn was starved past the
-/// budget is repeated with a larger one, as in the inherited-pipe test
-/// below. The child sleeps `JOB`, far past every budget, so a read that
+/// A timed-out read reaps the child it owns, and the next read recovers. A take proves the reap
+/// only if the fixture ran inside the budget (the shell writes the pid file); a starved take is
+/// repeated with a larger budget. The child sleeps `JOB`, far past every budget, so a read that
 /// waited for the child instead of its budget is caught by cause.
 #[cfg(unix)]
 #[test]
@@ -186,10 +186,8 @@ fn machine_command_timeout_reaps_owned_child_and_refresh_recovers() {
     let error = result.unwrap_err();
     assert!(elapsed < JOB, "the read waited for its child: {elapsed:?}");
     assert!(error.contains("timed out"), "{error}");
-    // Reaped, by the helper or, when the kill's exit outlasts the helper's 250 ms
-    // cleanup tail (it did at load 108), by the reaper it hands the child to;
-    // `machine_command_child_outliving_cleanup_is_still_reaped` pins that
-    // hand-off. Which of the two did it is a latency, not a contract.
+    // Reaped by the helper or, when the kill's exit outlasts its 250 ms cleanup reserve, by the
+    // reaper it hands the child to (`machine_command_child_outliving_cleanup_is_still_reaped`).
     assert!(
         !child_still_ours(pid, aterm_spec::wait::MUST_HAPPEN),
         "the timed-out child was left an unreaped zombie: {error}"
@@ -217,8 +215,7 @@ fn machine_command_timeout_reaps_owned_child_and_refresh_recovers() {
     assert!(!service.machine().refreshing);
     assert!(service.machine().state.is_some());
 
-    // Historical no-deadline waiting would still own this sleeping child;
-    // verify that premise before exercising the same bounded cleanup seam.
+    // `stop_machine_read_child` ends and reaps a still-running child within its deadline.
     let mut old = aterm_uds::spawnfd::command("/bin/sleep")
         .arg("30")
         .spawn()
@@ -230,24 +227,18 @@ fn machine_command_timeout_reaps_owned_child_and_refresh_recovers() {
     ));
 }
 
-/// A timed-out read whose child's exit outlasts the cleanup budget still
-/// reaps it. The child holds a terminal with unread output queued, so after
-/// SIGKILL its exit sits in the tty drain past the budget (`ps` state `?E`)
-/// and the error says "could not be confirmed".
+/// A timed-out read whose child's exit outlasts the cleanup budget still reaps it. The child holds
+/// a terminal with unread output queued, so after SIGKILL its exit sits in the tty drain past the
+/// budget (`ps` state `?E`) and the error says "could not be confirmed". Dropping a running
+/// `spawnfd::Child` hands it to `aterm_uds::reaper`, so no path here leaves it unreaped.
 ///
-/// Negative control: without the hand-off to `aterm_pty::reap_in_background`
-/// this fails with the fixture still our unreaped child.
-///
-/// macOS only: `ttyname_r` (declared only in `aterm-libc`'s darwin modules)
-/// and the exit that sleeps in the tty drain are Darwin's; on Linux the exit
-/// never outlasts the budget.
+/// macOS only: `ttyname_r` (declared only in `aterm-libc`'s darwin modules) and the exit that
+/// sleeps in the tty drain are Darwin's.
 #[cfg(target_os = "macos")]
 #[test]
 fn machine_command_child_outliving_cleanup_is_still_reaped() {
     use std::time::Duration;
-    // A take counts only if the fixture ran inside the budget (the shell wrote its pid
-    // file); a take whose spawn a starved machine delayed past it is repeated on a
-    // fresh terminal with a larger budget, as in the tests above and below.
+    // A starved take (no pid file) is repeated on a fresh terminal with a larger budget.
     const BUDGETS: [Duration; 3] = [
         Duration::from_secs(2),
         Duration::from_secs(8),
@@ -324,21 +315,12 @@ fn machine_command_child_outliving_cleanup_is_still_reaped() {
     );
 }
 
-/// An exited child is not stdout EOF, and a flood is capped; both bounded by
-/// cause, not by a guess about load.
-///
-/// The grandchild holding the inherited stdout sleeps `JOB`, far past any
-/// budget, so a read waiting for EOF instead of the budget returns after
-/// `JOB`. The test kills the grandchild (by the pid the fixture writes) as
-/// soon as the call returns, so it does not keep this process's unflagged
-/// descriptors alive for sibling tests. The shell runs in its own process
-/// group, recorded before it forks, so a take killed before the pid write
-/// still has a group to kill.
-///
-/// A take counts only if the fixture ran inside the budget (spawned, forked
-/// the holder and exited, as the pid file records); a starved take is
-/// repeated with a larger budget. The flood's take is repeated on the same
-/// terms.
+/// An exited child is not stdout EOF, and a flood is capped; both bounded by cause. The grandchild
+/// holding the inherited stdout sleeps `JOB`, far past any budget, so a read waiting for EOF
+/// instead of the budget returns after `JOB`; the test kills it as soon as the call returns, so it
+/// does not hold this process's unflagged descriptors open for sibling tests. A take counts only
+/// if the fixture ran inside the budget (the pid file records it); a starved take, the flood's
+/// too, is repeated with a larger budget.
 #[cfg(unix)]
 #[test]
 fn machine_command_bounds_inherited_pipe_eof_and_output_flood() {
@@ -601,9 +583,8 @@ fn machine_read_dispatch_conforms_and_rejects_the_historical_orphan() {
         assert!(!service.machine().refreshing);
     }
 
-    // Replay the old GUI completion sequence with the real reducers: it
-    // requests admission a second time for the reserved rerun, so the
-    // finished worker has no successor despite the refreshing flag.
+    // Negative control: a completion that requests admission again for the reserved rerun leaves
+    // the finished worker with no successor despite the refreshing flag.
     let mut historical = PackagesService::new();
     assert!(historical.request_machine_read());
     assert!(!historical.request_machine_read());
@@ -709,7 +690,8 @@ fn rapid_serious_mode_intents_compose_against_the_queued_projection() {
             NativeConfigOrigin::SeriousMode { desired } => *desired,
             NativeConfigOrigin::View { .. }
             | NativeConfigOrigin::Control { .. }
-            | NativeConfigOrigin::Presence { .. } => {
+            | NativeConfigOrigin::Presence { .. }
+            | NativeConfigOrigin::ThemeChoice { .. } => {
                 panic!("unexpected non-Serious-Mode request")
             }
         })
@@ -860,9 +842,9 @@ fn malformed_legacy_serious_mode_value_cannot_poison_toggle_projection() {
     ));
 }
 
-/// A reconciliation worker that comes back broken answers every queued
-/// request, so a blocked `aterm-ctl settings set` gets a bounded ERR instead
-/// of holding its one-shot until the wire deadline.
+/// A reconciliation worker that comes back broken answers every queued request, so a blocked
+/// `aterm ctl settings set` gets a bounded ERR instead of holding its one-shot until the wire
+/// deadline.
 #[test]
 fn failed_reconciliation_answers_queued_callers_instead_of_leaving_them_pending() {
     let mut app = App::headless_for_test();
@@ -1147,6 +1129,22 @@ fn legacy_control_enqueue_reports_preflight_errors_without_stranding_a_reply() {
             .contains("unknown key")
     );
 
+    // A retired key is not an unknown one: `settings set|unset` tells its
+    // removal story, the band's sentence, for both verbs.
+    for value in [Some("off".to_string()), None] {
+        let (retired_reply, retired_completion) = std::sync::mpsc::channel();
+        app.queue_control_settings_field(
+            "title_summary_provider".to_string(),
+            value,
+            retired_reply,
+        );
+        let error = retired_completion.recv().unwrap().unwrap_err();
+        assert_eq!(
+            error,
+            "title_summary_provider does nothing: Smart Titles was removed; safe to delete"
+        );
+    }
+
     let (reply, completion) = std::sync::mpsc::channel();
     app.queue_control_settings_field(
         crate::prefs::EDIT_COPY_ON_SELECT.to_string(),
@@ -1234,7 +1232,8 @@ fn three_rapid_serious_mode_intents_rebase_through_each_completion() {
             NativeConfigOrigin::SeriousMode { desired } => desired,
             NativeConfigOrigin::View { .. }
             | NativeConfigOrigin::Control { .. }
-            | NativeConfigOrigin::Presence { .. } => {
+            | NativeConfigOrigin::Presence { .. }
+            | NativeConfigOrigin::ThemeChoice { .. } => {
                 panic!("unexpected non-Serious-Mode request")
             }
         };
@@ -1302,7 +1301,8 @@ fn three_rapid_serious_mode_intents_rebase_through_each_completion() {
                 NativeConfigOrigin::SeriousMode { desired } => desired,
                 NativeConfigOrigin::View { .. }
                 | NativeConfigOrigin::Control { .. }
-                | NativeConfigOrigin::Presence { .. } => {
+                | NativeConfigOrigin::Presence { .. }
+                | NativeConfigOrigin::ThemeChoice { .. } => {
                     panic!("unexpected non-Serious-Mode request")
                 }
             })
@@ -1639,9 +1639,8 @@ fn durable_marker_is_observed_before_installed_bundle_identity() {
     assert!(facts.durable.is_none() && facts.installed.is_none());
     assert!(!facts.installed_unproven, "no bundle is a proven absence");
 
-    // Round eight, #80: an installed bundle whose verification did not FINISH
-    // (a passing refusal: `spctl` past its ceiling) is unproven — no
-    // observation; one REFUSED as a verdict is a proven absence.
+    // An installed bundle whose verification did not finish (a passing refusal: `spctl` past its
+    // ceiling) is unproven, no observation; one refused as a verdict is a proven absence.
     let read = |installed: Result<Option<InstalledUpdate>, String>| {
         read_native_update_reconcile_facts_with(
             NativeUpdateReconcileTicket {
@@ -1704,9 +1703,8 @@ fn saturated_boot_health_queue_retains_nonblocking_retry() {
         app.request_native_boot_health_confirmation(),
         NativeUpdateDispatch::Queued
     );
-    // The fixture is headless: its confirmation says so, and settles only a
-    // trial no window has launched (round eight, #8). A windowed App's is a
-    // window's.
+    // The fixture is headless: its confirmation says so, and settles only a trial no window has
+    // launched. A windowed App's is a window's.
     assert!(matches!(
         receiver.recv().unwrap(),
         NativeUpdateWorkerRequest::ConfirmBootHealth {
@@ -1813,8 +1811,7 @@ fn idle_reconcile_park_never_materializes_a_destination_or_warning_path() {
 /// visible boundary, not worker scheduling.
 #[test]
 fn native_update_worker_queue_conforms_to_saturation_coalescing_and_disconnect() {
-    // Records an apply refusal in the process-wide update ledger, whose
-    // standing slot other tests assert on: hold the ledger lock.
+    // Records an apply refusal in the shared update ledger.
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let model = aterm_spec::derive::native_update_worker_queue_model();
     let mut state = model.init_state();
@@ -2368,8 +2365,6 @@ fn reconcile_facts(
     reconcile_facts_with_installed(request_sequence, observation_sequence, durable, None)
 }
 
-// The installed-bundle term was never exercised: every reconcile test passed
-// `installed: None`, which is exactly why a floor that folded it in shipped.
 fn reconcile_facts_with_installed(
     request_sequence: u64,
     observation_sequence: u64,
@@ -2426,15 +2421,10 @@ fn assert_activation_stage(app: &App, build: u64, commit: &str) {
     );
 }
 
-/// The activation lane: an on-disk bundle already at the staged build while
-/// the process runs the older image is imported as an activation stage
-/// (stage → automatic apply → seamless handoff, with the bundle under the
-/// executable as the artifact), and the answer is stable across reconciles
-/// (owner, 2026-08-18).
-/// The "Update ready" announcement and level-up fire on a real stage import
-/// through `finish_native_update_reconcile`. Returned-apply arms carrying
-/// disk facts (`finish_async_native_update_handoff` with `reconcile: Some`,
-/// which shipping sites leave `None`) reduce through the arming door, so an
+/// The activation lane: an on-disk bundle already at the staged build while the process runs the
+/// older image is imported as an activation stage, the bundle under the executable as the
+/// artifact. Returned-apply arms carrying disk facts (`finish_async_native_update_handoff` with
+/// `reconcile: Some`, which shipping sites leave `None`) reduce through the arming door, so an
 /// activation our own child installed is armed, not left idle.
 #[test]
 fn a_returned_apply_whose_child_swapped_the_bundle_arms_the_activation() {
@@ -2699,8 +2689,7 @@ fn a_bundle_newer_than_the_process_becomes_an_activation_stage_and_stays_one() {
         Some(installed.clone()),
     ));
     assert_activation_stage(&app, 12, &installed.commit);
-    // The reducer's sentence for the same state, by the bundle's version — not a
-    // second wording ("build 12 … activation is pending") that the page would show.
+    // The reducer's sentence, by the bundle's version: the one wording the page shows.
     let outcome = app.native_updater_service.snapshot().outcome.clone();
     assert_eq!(
         outcome, "aterm v1.0.12 is installed; switching to it keeps your shells running",
@@ -2784,14 +2773,11 @@ fn installed_environment_repair_conforms_and_preserves_unrelated_budgets() {
     use crate::update_apply_trouble::ApplyRetry;
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let model = aterm_spec::derive::native_update_environment_repair_model();
-    // Good, stale, unknown, wrong build, wrong commit, unrelated latch,
-    // newer cache, auto opt-out, an ordinary exhausted budget, a verified
-    // but noninstallable (for example dev-marked) source, and a FOLDER this
-    // user cannot write under a copy that verifies, its own refusal the
-    // newest verdict on record (round eight, finding 14): the installed
-    // copy's observation is not the model's `Verify` for a folder. A pass of
-    // the check that asks the folder is, and its own bind is
-    // `a_folder_that_took_the_write_since_it_refused_releases_its_block`.
+    // Good, stale, unknown, wrong build, wrong commit, unrelated latch, newer cache, auto
+    // opt-out, an ordinary exhausted budget, a verified but noninstallable (e.g. dev-marked)
+    // source, and a folder this user cannot write under a copy that verifies: the installed
+    // copy's observation is not the model's `Verify` for a folder (that bind is
+    // `a_folder_that_took_the_write_since_it_refused_releases_its_block`).
     for case in 0..11 {
         let mut app = App::headless_for_test();
         app.native_updater_service = NativeUpdaterService::new(10, "test", true);
@@ -2982,34 +2968,21 @@ fn installed_environment_repair_conforms_and_preserves_unrelated_budgets() {
                 case != 7,
                 "historical cause cannot override current repaired scheduling"
             );
-            // Historical permanent-latch behavior fails this recovery law.
+            // A permanent latch fails this recovery law.
             after.insert("latched", 1);
             assert!(!model.check_invariant("RepairedSourceRecovers", &after));
         }
     }
 }
 
-/// ROUND-EIGHT UPDATE AUDIT, FINDING 14 (the finding's own test) — A
-/// NON-WRITABLE INSTALL LOCATION STAYS THE PERSON'S THROUGH A RECONCILE. A
-/// standard user runs a signed aterm.app from an admin-owned
-/// /Applications: the pre-park check refuses with the install location's
-/// refusal, a person's to clear, and the automatic attempt takes the
-/// environment block — a deadline-less latch, the remedy said once. The
-/// block's release rule was written for a bad INSTALLED BUNDLE: "the
-/// installed copy now verifies against the running image". For this
-/// refusal that is always true — the bundle is fine, only its folder is not
-/// writable — so the next reconcile (opening Software Update is one)
-/// released it: the intent re-armed, Settings said "It will try again by
-/// itself", and the refusal came round again, booking another apply
-/// failure each time. And the row named neither the folder nor the fix: it
-/// said "install it from the Version menu", which cannot work. Now the
-/// block holds through a reconcile whose installed copy verifies, the row
-/// names the cause and the remedy, and the negative control — the same
-/// reconcile over an installed-bundle refusal — still releases it. (What
-/// does release the folder's block — a pass of the check that asks the
-/// folder, published after the block — is
-/// `a_folder_that_took_the_write_since_it_refused_releases_its_block`, to
-/// which this test is the no-new-verdict control.)
+/// A non-writable install location stays the person's through a reconcile. A standard user runs a
+/// signed aterm.app from an admin-owned /Applications: the pre-park check refuses with the install
+/// location's refusal, and the automatic attempt takes the environment block. The installed copy
+/// verifying against the running image proves nothing about its folder, so the block holds
+/// through such a reconcile, and the row names the cause and the remedy, never the Version menu.
+/// Negative control: the same reconcile over an installed-bundle refusal releases it. What does
+/// release the folder's block is a pass of the folder's check
+/// (`a_folder_that_took_the_write_since_it_refused_releases_its_block`).
 // `aterm_update::refusal_needs_person` is macOS's: no other lane has a
 // refusal only a person can clear.
 #[cfg(target_os = "macos")]
@@ -3038,10 +3011,9 @@ fn a_non_writable_install_location_stays_the_persons_through_a_reconcile() {
             grant_chunks: false,
             policy: None,
         });
-        // The attempt, as the synchronous arm meets it: the cached verdict
-        // answers it (`cold_lane_verdict_gate`, the seamless short-circuit's
-        // twin — a headless `App`'s one session holds the lanes a gate
-        // earlier), and the arm books it by that verdict.
+        // The attempt, as the synchronous arm meets it: the cached verdict answers it
+        // (`cold_lane_verdict_gate`, the seamless short-circuit's twin: a headless `App`'s one
+        // session stops the lanes a gate earlier), and the arm books it by that verdict.
         let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
             11,
             PREFLIGHT_TEST_COMMIT,
@@ -3125,27 +3097,14 @@ fn a_non_writable_install_location_stays_the_persons_through_a_reconcile() {
     }
 }
 
-/// ROUND-EIGHT UPDATE AUDIT, FINDING 14'S REVIEW — A FOLDER THAT TOOK THE
-/// SWAP'S WRITE SINCE IT REFUSED RELEASES ITS BLOCK. Finding 14 kept the
-/// folder's block through every reconcile — the installed copy's
-/// observation says nothing about a folder — and named the person's retry as
-/// what clears it. Only a retry that LANDED did: a person who had the folder
-/// opened and pressed Install now passed the pre-park check, which asks the
-/// folder for the swap's write, and then failed for an ordinary reason (a
-/// successor that died). The block stood for the rest of the process: the
-/// automatic lane never retried build 11, `apply_retry_for` still answered
-/// NeedsPerson, and the standing reason, no longer the folder's, sent the
-/// page to "Install the signed release from the release DMG" for a copy and
-/// a folder that were both fine. Now the reconcile that follows releases the
-/// block on that pass. The Tier-1 bind of `NativeUpdateEnvironmentRepair`'s
-/// folder case: the block owns its latch (`Own`), the pass was published
-/// after the block was taken (`Fresh`), and it is a pass of exactly the
-/// blocked artifact by the check that asks the folder (`Verify`). NEGATIVE
-/// CONTROLS, each of which keeps the block: the folder's refusal met again, a
-/// pass no later than the block, a pass of another artifact, a block that no
-/// longer owns its latch, an activation's pass (its check never asks the
-/// folder), a disabled updater — and a reconcile with no new verdict at all
-/// (`a_non_writable_install_location_stays_the_persons_through_a_reconcile`).
+/// A folder that took the swap's write since it refused releases its block: a person's retry
+/// that passed the pre-park check (which asks the folder for the swap's write) and then failed for
+/// an ordinary reason (a successor that died) proves the folder, so the reconcile that follows
+/// releases the block. The Tier-1 bind of `NativeUpdateEnvironmentRepair`'s folder case: the block
+/// owns its latch (`Own`), the pass was published after the block (`Fresh`), and it is a pass of
+/// exactly the blocked artifact by the check that asks the folder (`Verify`). Negative controls
+/// (cases 1–5 below, a disabled updater, and no new verdict in
+/// `a_non_writable_install_location_stays_the_persons_through_a_reconcile`) keep the block.
 #[cfg(unix)]
 #[test]
 fn a_folder_that_took_the_write_since_it_refused_releases_its_block() {
@@ -3258,10 +3217,9 @@ fn a_folder_that_took_the_write_since_it_refused_releases_its_block() {
                 before = model.successors(action, &before).remove(0);
             }
         }
-        // The reconcile the worker posts once a returned attempt is
-        // reaped (`send_post_failure_reconcile_facts`): the scenario's own,
-        // through the production entry; the controls through the reduction
-        // it makes, as the source case's bind drives it.
+        // The reconcile the worker posts once a returned attempt is reaped
+        // (`send_post_failure_reconcile_facts`): case 0 through the production entry, the
+        // controls through the reduction it makes.
         let mut durable = if case == 5 {
             status(None, 0)
         } else {
@@ -3370,27 +3328,18 @@ fn a_folder_that_took_the_write_since_it_refused_releases_its_block() {
                 .contains("try again by itself"),
             "the page says the lane retries"
         );
-        // The historical law, a block only a landed retry releases, fails
-        // the model's recovery invariant.
+        // A block only a landed retry releases fails the model's recovery invariant.
         after.insert("latched", 1);
         assert!(!model.check_invariant("RepairedSourceRecovers", &after));
     }
 }
 
-/// ROUND-EIGHT UPDATE AUDIT, FINDING 14 (the returned attempt) — AN ATTEMPT
-/// THAT OUTRAN THE ARM-TIME READ AND MET THE FOLDER'S REFUSAL IS THE PERSON'S,
-/// NOT THE BUILD'S. The launched lane's worker verifies for itself when no
-/// verdict is cached yet, and its refusal is filed `PreparationFailed`
-/// (structural): two of those converged the artifact and stranded it as a
-/// build that "couldn't take over", while the folder this user cannot write
-/// was what refused. The worker now keeps its verdict where the arm-time
-/// read keeps it (`PreverifyPublisher::publish_refusal`), and the returned
-/// attempt is booked by it as the synchronous arm books it: the environment
-/// block, no structural budget spent. NEGATIVE CONTROL: a structural
-/// refusal no person can clear still spends the budget and takes the
-/// physical latch.
-// `aterm_update::refusal_needs_person` is macOS's: no other lane has a
-// refusal only a person can clear.
+/// An attempt that outran the arm-time read and met the folder's refusal is the person's, not the
+/// build's. The launched lane's worker verifies for itself when no verdict is cached and keeps its
+/// verdict where the arm-time read does (`PreverifyPublisher::publish_refusal`); the returned
+/// attempt is booked by it as the synchronous arm books it: the environment block, no structural
+/// budget spent. Negative control: a structural refusal no person can clear still spends the
+/// budget and takes the physical latch.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_returned_attempt_the_folder_refused_is_the_persons_not_the_builds() {
@@ -3464,20 +3413,13 @@ fn a_returned_attempt_the_folder_refused_is_the_persons_not_the_builds() {
     }
 }
 
-/// ROUND-EIGHT UPDATE AUDIT, FINDING 14'S REVIEW — A STANDING BLOCK NAMES ITS
-/// OWN REMEDY OVER A LATER BOOKING. A standard user under an admin-owned
-/// /Applications holds the folder's block for build 11, and Settings says to
-/// move aterm. On a loaded desk they press Install now; the apply lock's
-/// wait or the staged copy's `codesign` runs past its budget — a passing
-/// refusal, met before the folder is asked — and the ledger books that
-/// reason. The block rightly holds (nothing answered the folder), but the
-/// remedy was read off the ledger's latest reason: Settings, the Version
-/// menu and the palette sent the person to "install the signed release",
-/// for a copy that is fine and a folder they cannot write. The remedy is
-/// now the block's, on the page, the menu tail, the compact detail and the
-/// row of the press itself; the cause clause still says how the press
-/// ended. CONTROL: the installed copy's block over the same booking still
-/// says the signed release.
+/// A standing block names its own remedy over a later booking. With the folder's block standing
+/// for build 11, a press fails on a passing refusal (the apply lock's wait or the staged
+/// `codesign` past its budget) before the folder is asked, and the ledger books that reason. The
+/// block holds, and the remedy is the block's, not the ledger's latest reason: on the page, the
+/// menu tail, the compact detail and the press's row; the cause clause still says how the press
+/// ended. Control: the installed copy's block over the same booking still says the signed
+/// release.
 #[cfg(unix)]
 #[test]
 fn a_standing_block_names_its_own_remedy_over_a_later_booking() {
@@ -3591,19 +3533,13 @@ fn a_standing_block_names_its_own_remedy_over_a_later_booking() {
     }
 }
 
-/// ROUND-EIGHT UPDATE AUDIT, THE REVIEW OF FINDING 14'S REVIEW — A PRESS THE
-/// FOLDER ANSWERED IS NOT SENT BACK TO THE FOLDER. The folder's block stands
-/// for build 11. The person fixes the folder and presses Install now: the
-/// worker's pre-park check asks the folder, passes and keeps its pass
-/// (`PreverifyPublisher::publish_pass`), then the successor dies. The worker
-/// sends the completion first and the reconcile facts after it, so the
-/// press's failure is surfaced while the block still stands — and its row
-/// (and Settings, the menu) took the block's remedy: "Move aterm to a
-/// folder you can write to … then retry", about a folder that had just
-/// taken the write. Now the pass is read where the remedy is: the row
-/// names the Version menu, nothing is asked of the person, and the
-/// reconcile that follows still releases the block. NEGATIVE CONTROL: a
-/// press the folder refused again keeps the folder's remedy everywhere.
+/// A press the folder answered is not sent back to the folder. With the folder's block standing
+/// for build 11, the person fixes the folder and presses Install now: the worker's pre-park check
+/// passes and keeps its pass (`PreverifyPublisher::publish_pass`), then the successor dies. The
+/// completion is surfaced before the reconcile facts arrive, while the block still stands, so the
+/// pass is read where the remedy is: the row names the Version menu, nothing is asked of the
+/// person, and the following reconcile releases the block. Negative control: a press the folder
+/// refused again keeps the folder's remedy everywhere.
 #[cfg(unix)]
 #[test]
 fn a_press_the_folder_answered_is_not_sent_back_to_the_folder() {
@@ -3726,25 +3662,14 @@ fn a_press_the_folder_answered_is_not_sent_back_to_the_folder() {
     }
 }
 
-/// ROUND-EIGHT UPDATE AUDIT, THE REVIEW OF FINDING 14'S REVIEW — A LATER
-/// REFUSAL OF ANOTHER CAUSE NAMES THE STANDING BLOCK. The folder's block
-/// stands for build 11. An administrator makes the folder writable; the
-/// person retries, and the press's pre-park check — the folder asked first,
-/// the installed copy after it — passes the folder and refuses the
-/// installed copy ("cannot be the rollback source"), which only a person
-/// can clear too. The block stayed on the folder's cause for the rest of
-/// the process: every surface paired the cause clause about the installed
-/// copy with "Move aterm to a folder you can write to … then retry", and
-/// nothing could release it — only a pass releases the folder's block, and
-/// none comes while the installed copy refuses. Now the refusal re-keys the
-/// block before the press's row is built: the row, the page and
-/// `apply_retry_for` name the signed release, and the reconcile releases
-/// the block once the installed copy verifies, as for any block of its
-/// cause — the reconcile re-keys by the same reading when no settle came
-/// before it (the third case). NEGATIVE CONTROL: the folder's refusal met
-/// again keeps the folder's block, and that reconcile releases nothing.
-// `aterm_update::refusal_needs_person` is macOS's: no other lane has a
-// refusal only a person can clear.
+/// A later refusal of another cause names the standing block. With the folder's block standing
+/// for build 11, the person retries and the press's pre-park check passes the folder but refuses
+/// the installed copy ("cannot be the rollback source"), which only a person can clear too. The
+/// refusal re-keys the block before the press's row is built, so the row, the page and
+/// `apply_retry_for` name the signed release, and the reconcile releases the block once the
+/// installed copy verifies; with no settle before it (the third case) the reconcile re-keys by
+/// the same reading. Negative control: the folder's refusal met again keeps the folder's block,
+/// and that reconcile releases nothing.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_later_refusal_of_another_cause_names_the_standing_block() {
@@ -3879,11 +3804,10 @@ fn a_later_refusal_of_another_cause_names_the_standing_block() {
     }
 }
 
-/// THE OS BANNER OF AN UPDATE-HEALTH ANNOUNCEMENT is owed to one cause: the
-/// copy in Applications is not the signed release, so no lane can install
-/// over it until the owner acts (`NeedsPerson`). NEGATIVE CONTROLS: every
-/// other kind, an install the lane will try again, and `desktop_alerts` off
-/// post nothing — the setting still decides last.
+/// The OS banner of an update-health announcement is owed to one cause: the copy in Applications
+/// is not the signed release, so no lane can install over it until the owner acts
+/// (`NeedsPerson`). Negative controls: every other kind, an install the lane will try again, and
+/// `desktop_alerts` off post nothing.
 #[cfg(unix)]
 #[test]
 fn the_health_banner_is_posted_for_an_install_only_the_owner_can_mend() {
@@ -4175,8 +4099,7 @@ fn facts_read_before_the_stage_import_cannot_retire_it_however_late_they_land() 
 /// stale.
 #[test]
 fn a_parked_control_apply_rides_the_next_newer_facts_instead_of_going_stale() {
-    // Records an apply refusal in the process-wide update ledger, whose
-    // standing slot other tests assert on: hold the ledger lock.
+    // Records an apply refusal in the shared update ledger.
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let mut app = App::headless_for_test();
     let running = app.native_updater_service.snapshot().current_build;
@@ -4405,10 +4328,9 @@ fn old_hidden_output_without_present_ages_to_automatic_attempt() {
 }
 
 #[cfg(unix)]
-/// An activity-revoked overlap schedules spaced re-attempts that saturate at
-/// 30 s and never exhaust (inside the ladder's one-minute bound). Physical
-/// failures keep their small exhausting budget, and a preflight block its
-/// own smaller one.
+/// An activity-revoked overlap schedules spaced re-attempts that saturate at 30 s (inside the
+/// ladder's one-minute bound) and never exhaust; physical failures and preflight blocks keep
+/// their small exhausting budgets.
 #[test]
 fn activity_revoked_retry_spacing_saturates_and_never_exhausts() {
     use std::time::Duration;
@@ -4448,8 +4370,7 @@ fn activity_revoked_retry_spacing_saturates_and_never_exhausts() {
         ),
         None
     );
-    // A physical failure is not free to repeat: its epoch budget is small
-    // and it IS spent.
+    // A physical failure is not free to repeat: its small epoch budget is spent.
     for cycles in 0..MAX_PHYSICAL_FAILURE_CYCLES {
         assert!(
             automatic_retry_delay(cycles, AutomaticRetryKind::PhysicalFailure).is_some(),
@@ -4494,8 +4415,7 @@ fn the_physical_failure_budget_converges_under_its_own_schedule() {
         .map(|verdict| match verdict {
             PhysicalFailureSchedule::Retry(at) => {
                 let secs = at.saturating_duration_since(now).as_secs();
-                // Real `Instant`s, so name the schedule each delay came from
-                // rather than asserting to the second.
+                // Real `Instant`s: name the rung, not the second.
                 if secs >= 1000 {
                     "retry-1800"
                 } else {
@@ -4527,11 +4447,8 @@ fn the_physical_failure_budget_converges_under_its_own_schedule() {
         "the artifact costs exactly {PHYSICAL_FAILURE_LIFETIME_ATTEMPTS} \
          park/spawn/paint round trips in total"
     );
-    // …and it stays converged: a duplicate or reordered completion cannot
-    // mint a fourth epoch out of the saturating counter.
-    //
-    // For this transient shape convergence is a quiet re-sample one epoch
-    // cooldown out, every time, not a latch that never lapses.
+    // …and it stays converged: a late completion cannot mint a fourth epoch, and for this
+    // transient shape convergence is a quiet re-sample one epoch cooldown out, every time.
     for extra in 0..4 {
         let verdict =
             app.spend_physical_failure_budget(build, dmg, false, PhysicalFailureShape::Transient);
@@ -4763,8 +4680,8 @@ fn observe_after_the_attempt(app: &mut App, installed: &InstalledUpdate, observa
     );
 }
 
-/// Put a structural latch's ONE re-sample deadline — the latch's and the
-/// verdict's, which are the same instant — in the past: the day passing.
+/// Put a structural latch's one re-sample deadline (the latch's and the verdict's, the same
+/// instant) in the past: the day passing.
 fn let_the_day_pass(app: &mut App) {
     let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
     let latch = app
@@ -4824,15 +4741,10 @@ fn land_the_supersede(app: &mut App, installed: &InstalledUpdate, newer: u64, se
     });
 }
 
-/// A converged latch on the activation is superseded by a newer release.
-///
-/// A launched-lane candidate installs build 11, fails structurally twice, and
-/// the lane converges on 11's installed activation. Build 12 arriving starts
-/// the retire of 11's activation (the latch holds and nothing arms 11), and
-/// when the retire lands 12 is the stage, armed on its own ladder, with the
-/// latch gone; 11 is never armed again. A latch with no verdict behind it
-/// (the policy fail-safe, the environment block) is not this path's to
-/// release.
+/// A converged latch on the activation is superseded by a newer release: build 12 arriving starts
+/// the retire of 11's activation (the latch holds and nothing arms 11), and when the retire lands
+/// 12 is the stage, armed on its own ladder, with the latch gone. A latch with no verdict behind
+/// it (the policy fail-safe, the environment block) is not this path's to release.
 #[test]
 fn a_converged_activation_latch_is_superseded_by_a_newer_release_and_arms_it() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -5455,13 +5367,11 @@ fn a_newer_release_already_on_disk_at_convergence_supersedes_at_the_first_look()
     );
 }
 
-/// With no newer release the latch holds and the person is told, with no
-/// press: a converged activation latch whose re-sample the boot trial cannot
-/// afford has no deadline, and no start of the build may be offered (its
-/// next launch is the one the trial reverts on). The health warning raised
-/// at convergence is said again naming only the newer release, and the
-/// staged row's posture (computed as a windowed process would, with the
-/// handoff available) is a record with no `Install now`.
+/// With no newer release the latch holds and the person is told, with no press: a converged
+/// activation latch whose re-sample the boot trial cannot afford has no deadline, and no start of
+/// the build may be offered (its next launch is the one the trial reverts on). The health warning
+/// is said again naming only the newer release, and the staged posture (computed as a windowed
+/// process would) is a record with no `Install now`.
 #[test]
 fn a_converged_activation_latch_with_no_newer_release_is_said_and_left_to_a_newer_release() {
     use crate::update_words::{
@@ -5592,10 +5502,8 @@ fn a_converged_activation_latch_with_no_newer_release_is_said_and_left_to_a_newe
             "{said}"
         );
     }
-    // A control `update apply` — the press that reaches the apply — is
-    // refused, and nothing launches: through the reconcile it rides, no
-    // row offers the Version menu or `Install now` for the start the trial
-    // rolls back, and `apply_refusal=` says it is on hold.
+    // A control `update apply` is refused and nothing launches: through its reconcile no row
+    // offers the Version menu or `Install now`, and `apply_refusal=` says it is on hold.
     let what = app
         .native_updater_service
         .snapshot()
@@ -5776,12 +5684,9 @@ fn a_structural_latch_resamples_once_a_day_after_it_converged() {
     );
 }
 
-/// A NIGHT ASLEEP COUNTS TOWARD THE DAY (2026-09-30). The re-sample the
-/// convergence notice promises "in 24 h" was an `Instant`, which on macOS
-/// stops while the Mac sleeps, so it came after a day of AWAKE time — days
-/// later on a laptop that sleeps at night. The event loop's first turn after
-/// a sleep brings the deadline forward by the time slept, and the look takes
-/// the re-sample. A wall clock stepped back brings nothing.
+/// A night asleep counts toward the day: an `Instant` stops while a Mac sleeps, so the event
+/// loop's first turn after a sleep brings the re-sample's deadline forward by the time slept. A
+/// wall clock stepped back brings nothing.
 #[test]
 fn a_structural_resample_counts_the_night_the_mac_slept() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -5812,16 +5717,13 @@ fn a_structural_resample_counts_the_night_the_mac_slept() {
     );
 }
 
-/// NEVER THE LAUNCH THE BOOT TRIAL REVERTS ON (gap 14, 2026-09-26). A
-/// structural `ChildDied` keeps its counted trial launch, so after two of
-/// them the next launch of the installed bundle is the one
-/// `check_boot_health` reverts — and poisons — it on. The re-sample the latch
-/// earned is then held, not taken, and SAID: the log, `update status`'s
-/// `apply_refusal=`, and the stranded notice again. A newer release is no
-/// longer held with it (round three): it launches nothing — it takes the
-/// activation's place — so it goes ahead whatever the count says. A count no
-/// observation has measured yet spends nothing and moves the deadline, so
-/// the event loop does not spin on it.
+/// A structural latch never spends the launch its boot trial reverts on: a structural `ChildDied`
+/// keeps its counted trial launch, so after two the next launch of the installed bundle is the
+/// one `check_boot_health` reverts and poisons. The earned re-sample is then held and said (the
+/// log, `update status`'s `apply_refusal=`, the stranded notice). A newer release launches
+/// nothing (it takes the activation's place), so it goes ahead whatever the count. A count no
+/// observation has measured spends nothing and moves the deadline, so the event loop does not
+/// spin on it.
 #[test]
 fn a_structural_latch_never_spends_the_launch_its_boot_trial_reverts_on() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -5883,20 +5785,13 @@ fn a_structural_latch_never_spends_the_launch_its_boot_trial_reverts_on() {
     assert!(app.lapse_expired_auto_apply_manual_only());
 }
 
-/// A count read before the build's latest launch says nothing about the next
-/// one. Every attempt at the installed activation (a Version-menu press
-/// included) launches it, and whether that launch stays counted is decided
-/// after the completion (`forgives_the_counted_trial_launch`), so a count
-/// held from before may be one launch low. Two arcs could spend it:
-///
-/// * the day coming due right after an attempt, before any observation
-///   re-read the sentinel;
-/// * facts read mid-attempt (held as `Deferred`) and replayed once it
-///   returned, carrying the pre-launch count.
-///
-/// Both wait for a count observed after the attempt returned. This test
-/// drives the first; `a_trial_count_read_mid_attempt_never_authorizes_the_next`
-/// the second. The attempt here is a person's press.
+/// A count read before the build's latest launch says nothing about the next one: every attempt
+/// at the installed activation (a Version-menu press included) launches it, and whether that
+/// launch stays counted is decided after the completion (`forgives_the_counted_trial_launch`), so
+/// a count held from before may be one launch low. The day coming due right after a person's
+/// attempt waits for a count observed after the attempt returned;
+/// `a_trial_count_read_mid_attempt_never_authorizes_the_next` covers facts replayed from
+/// mid-attempt.
 #[test]
 fn a_trial_count_read_before_the_latest_attempt_never_authorizes_the_next() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -5911,7 +5806,7 @@ fn a_trial_count_read_before_the_latest_attempt_never_authorizes_the_next() {
         ..installed_update(11)
     };
 
-    // THE DAY, right behind a person's attempt.
+    // The day, right behind a person's attempt.
     let mut app = App::headless_for_test();
     let activation = converge_structurally_on_the_activation(&mut app, &one_kept, 1);
     observe_after_the_attempt(&mut app, &one_kept, 2);
@@ -6297,18 +6192,13 @@ fn project_passing_failure(
     state
 }
 
-/// Tier-1: the real booking of a passing pre-park refusal is the ladder
-/// model's `PassingFailure`.
-///
-/// Drives the submission-time arm's two steps (`cached_refusal_shape`, then
-/// `latch_after_physical_failure`) twice, the structural lane's lifetime.
-/// After the first booking the projection must equal the model's
-/// post-`PassingFailure` state (latched, a deadline, no verdict); after the
-/// second it must still have a deadline (the transient second rung).
-///
-/// Negative control: the same reason booked `Structural` converges on its
-/// second failure, projects onto the mutant `PassingFailureConverges`, and
-/// `APassingFailureNeverConverges` catches it.
+/// Tier-1: the real booking of a passing pre-park refusal is the ladder model's `PassingFailure`.
+/// The submission-time arm's two steps (`cached_refusal_shape`, then
+/// `latch_after_physical_failure`) run twice, the structural lane's lifetime: the first booking
+/// projects onto the model's post-`PassingFailure` state and the second still has a deadline.
+/// Negative control: the same reason booked `Structural` converges on its second failure,
+/// projecting onto the mutant `PassingFailureConverges`, which `APassingFailureNeverConverges`
+/// catches.
 #[test]
 fn real_passing_refusal_keeps_a_deadline_as_the_model_s_passing_failure() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -6373,26 +6263,17 @@ fn real_passing_refusal_keeps_a_deadline_as_the_model_s_passing_failure() {
     );
 }
 
-/// Round eight, #1's review (P2): A COLD RELAUNCH THAT KEEPS BEING REFUSED
-/// CONVERGES, like any failure inside one process.
+/// A cold relaunch that keeps being refused converges, like any failure inside one process. Each
+/// relaunch is a new process, so the budget is carried across them; otherwise a boot swap that
+/// keeps refusing for a reason the pre-park read cannot see (an apply lock held by a stopped
+/// sibling, a candidate that cannot start) is booked as the first failure every time. Each
+/// "process" here is a fresh `App` seeded from what the last one carried (`cold_lane_budget` →
+/// the environment → `ColdRelaunch` → `seed_refused_cold_relaunch`), its first automatic attempt
+/// answered by the refusal (`cold_lane_verdict_gate`) and booked as the synchronous arm books it.
 ///
-/// Each relaunch is a new process. The budget that makes the lane converge used
-/// to start empty in every one of them, so a boot swap that kept refusing for a
-/// reason the pre-park read cannot see (a stopped sibling holding the apply
-/// lock — a passing refusal; a candidate that cannot start — the swap's own
-/// probe) was booked as the FIRST failure every time: retry in 600 s, a
-/// relaunch into the same refusal, for ever. Driven here relaunch by relaunch:
-/// each "process" is a fresh `App` seeded from what the last one carried
-/// (`cold_lane_budget` → the environment → `ColdRelaunch` →
-/// `seed_refused_cold_relaunch`), its first automatic attempt is answered by
-/// the refusal (`cold_lane_verdict_gate`, no relaunch), and booked as the
-/// synchronous arm books it: the shape read off the cached reason, then
-/// `latch_after_physical_failure`.
-///
-/// A verdict converges on its second refusal and, its one re-sample spent,
-/// for good; a passing moment climbs the transient schedule to its ninth.
-/// NEGATIVE CONTROL: with nothing carried, every relaunch is booked at the
-/// first rung — the loop the review found.
+/// A verdict converges on its second refusal and, its one re-sample spent, for good; a passing
+/// moment climbs the transient schedule to its ninth. Negative control: with nothing carried,
+/// every relaunch is booked at the first rung.
 #[cfg(unix)]
 #[test]
 fn a_refused_cold_relaunch_converges_across_its_own_relaunches() {
@@ -6417,8 +6298,7 @@ fn a_refused_cold_relaunch_converges_across_its_own_relaunches() {
             resample_at: Some(_),
         } => "converged",
     };
-    // ONE RELAUNCH: a new process, seeded from `carried`, whose boot swap
-    // refused with `reason`.
+    // One relaunch: a new process, seeded from `carried`, whose boot swap refused with `reason`.
     let relaunch = |carried: Option<&str>, reason: &str| {
         let mut app = App::headless_for_test();
         let seed = ColdRelaunch::from_values(
@@ -6446,7 +6326,7 @@ fn a_refused_cold_relaunch_converges_across_its_own_relaunches() {
             .encode(build, &artifact)
     };
 
-    // A VERDICT: a candidate that cannot start.
+    // A verdict: a candidate that cannot start.
     let cannot_start = "staged candidate cannot start: dyld refused the binary";
     let (first, rung) = relaunch(None, cannot_start);
     assert_eq!(rung, "retry-600", "the one confirming retry");
@@ -6478,7 +6358,7 @@ fn a_refused_cold_relaunch_converges_across_its_own_relaunches() {
         "no deadline left, so no relaunch"
     );
 
-    // A PASSING MOMENT: the apply lock held past its wait, every time.
+    // A passing moment: the apply lock held past its wait, every time.
     let moment = passing_pre_park_reason();
     let mut carried: Option<String> = None;
     let mut rungs = Vec::new();
@@ -6503,21 +6383,17 @@ fn a_refused_cold_relaunch_converges_across_its_own_relaunches() {
         "the whole transient schedule, across nine relaunches"
     );
 
-    // NEGATIVE CONTROL: nothing carried — every relaunch is a first failure.
+    // Negative control: nothing carried, every relaunch is a first failure.
     for _ in 0..3 {
         assert_eq!(relaunch(None, cannot_start).1, "retry-600");
         assert_eq!(relaunch(None, &moment).1, "retry-600");
     }
 }
 
-/// The physical-failure budget must survive a latch LAPSE, or "two tries" is
-/// an unbounded ten-minute loop.
-///
-/// This is the trap the fix walked into: the obvious place to keep the count
-/// is `auto_apply_manual_only`, but that struct is cleared the moment the
-/// latch lapses, and `AutoApplyIntent::attempts` resets to 0 when a fresh
-/// intent is armed. Only a counter that outlives BOTH converges. Guard it
-/// directly: lapsing must not restore budget.
+/// The physical-failure budget survives a latch lapse, or "two tries" is an unbounded ten-minute
+/// loop: `auto_apply_manual_only` is cleared when the latch lapses and
+/// `AutoApplyIntent::attempts` resets when a fresh intent is armed, so only a counter that
+/// outlives both converges.
 #[test]
 fn a_lapsing_physical_latch_does_not_replenish_its_own_budget() {
     let mut app = App::headless_for_test();
@@ -6764,9 +6640,7 @@ fn the_activation_of_a_failed_download_continues_its_ladder_instead_of_refilling
             "post-flip cycle {cycle}"
         );
     }
-    // The rungs are counted across the flip (six attempts total, not five per
-    // artifact identity), and the last rung repeats rather than ending
-    // anything.
+    // The last rung repeats rather than ending anything.
     assert_eq!(
         app.auto_overlap_retry.map(|retry| retry.cycles),
         Some(ACTIVITY_REVOKED_LADDER_RUNGS + 1),
@@ -6863,10 +6737,9 @@ fn overlap_retry_spacing_rearms_intent_per_artifact_and_saturates() {
     );
 }
 
-/// A latch with a deadline lapses, restoring automatic apply and the
-/// artifact's activity budget; a deadline-less one does not. Deadline-less
-/// latches come only from the policy/outcome mismatch fail-safe and from
-/// physical-lane convergence; the lapse reads `retry_at` and nothing else.
+/// A latch with a deadline lapses, restoring automatic apply and the artifact's activity budget;
+/// a deadline-less one (the policy fail-safe, an environment block, a spent structural re-sample)
+/// does not. The lapse reads `retry_at` and nothing else.
 #[test]
 fn a_deadlined_manual_only_latch_lapses_but_the_fail_safe_one_does_not() {
     let mut app = App::headless_for_test();
@@ -6919,16 +6792,10 @@ fn a_deadlined_manual_only_latch_lapses_but_the_fail_safe_one_does_not() {
 
 const PREFLIGHT_TEST_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
-/// Drive the real check reducer to a Staged phase for `build`, as a
-/// completed updater worker does, so the intent under test is the one
-/// production arms.
-///
-/// The pre-park verdict is pre-seeded `passed: true` so
-/// `arm_native_auto_apply` skips its worker thread. It must be a pass: a
-/// cached refusal short-circuits in `start_unix_update_handoff` before any
-/// reader parks, so a `passed: false` fixture would describe an artifact
-/// production declines outright (a headless `App`, blocked one gate earlier,
-/// could not tell the difference).
+/// Drive the real check reducer to a Staged phase for `build`, as a completed updater worker
+/// does, so the intent under test is the one production arms. The pre-park verdict is pre-seeded
+/// `passed: true` so `arm_native_auto_apply` skips its worker thread; a `passed: false` fixture
+/// would describe an artifact `start_unix_update_handoff` declines before any reader parks.
 fn stage_one_build_for_test(app: &mut App, build: u64) {
     #[cfg(unix)]
     {
@@ -6954,10 +6821,8 @@ fn stage_one_build_for_test(app: &mut App, build: u64) {
     let CheckStart::Start(ticket) = app.native_updater_service.request_check() else {
         panic!("a fresh service must start exactly one check");
     };
-    // The reducer and `arm_native_auto_apply` run for real; only the
-    // presentation fan-out `App::finish_native_update_check` adds (repaints,
-    // tab-strip rebuilds, palette refresh) is skipped. Everything the policy
-    // reads comes out of the same reducer either way.
+    // The reducer and `arm_native_auto_apply` run for real; only the presentation fan-out
+    // `App::finish_native_update_check` adds (repaints, tab strip, palette) is skipped.
     assert_eq!(
         app.native_updater_service.finish_check(
             ticket,
@@ -7045,18 +6910,12 @@ fn last_record_title(app: &App) -> String {
         .unwrap_or_default()
 }
 
-/// A PERSON'S INSTALL HELD FOR THE CANDIDATE'S READ RUNS WHEN THE READ ENDS
-/// (round eight of the update audit, U35's review). With `[update] auto_apply
-/// = false` — the pairing the read-before-park fix exists for — the press
-/// used to be DEFERRED: nothing came back for it, its one record said "it
-/// tries again by itself", and a Version-menu press opened a Software
-/// Update page that showed no reason. Now, while the read runs, the press
-/// stands held: its row still says it installs, a second press joins it
-/// and starts nothing, and the loop looks again within the poll. Once the
-/// read ends the press runs as the person's own `Immediate` apply (here it
-/// reaches the admission gate this test process can never pass), and how
-/// it ended is a person's stop on record — never "tries again by itself" —
-/// and a row on the band, the installing row gone.
+/// A person's install held for the candidate's read runs when the read ends. With `[update]
+/// auto_apply = false`, while the read runs the press stands held: its row still says it
+/// installs, a second press joins it and starts nothing, and the loop looks again within the
+/// poll. Once the read ends the press runs as the person's own `Immediate` apply (here reaching
+/// the admission gate this process never passes), and how it ended is a person's stop on record,
+/// never "tries again by itself", with a row on the band and the installing row gone.
 #[cfg(unix)]
 #[test]
 fn a_person_s_install_held_for_the_read_runs_when_it_ends_and_says_how_it_ended() {
@@ -7144,19 +7003,12 @@ fn a_person_s_install_held_for_the_read_runs_when_it_ends_and_says_how_it_ended(
     );
 }
 
-/// The held press's bounds (round eight, U35's review): a read that outruns
-/// the hold's window does not keep the press — it runs, as the fork lane
-/// parks once the window is spent — and a stage that moved on under the
-/// hold drops it, running nothing, its row put back and its switch closed
-/// as a person's stop. While it stands, the automatic lane waits, so its
-/// own deferral cannot retire the press's row or close its record.
-///
-/// The wait is read by what the lane's own attempt would have done (round
-/// eight's U2 review): without it the lane's attempt reached the admission
-/// gate, and its error branch retired the press's installing row, closed
-/// its switch on record and re-armed the intent with one attempt spent —
-/// while the intent, the phase and the hold all read as they do here. So
-/// the row, the attempt count and the record count are what this asserts.
+/// The held press's bounds: a read that outruns the hold's window does not keep the press (it
+/// runs, as the fork lane parks once the window is spent), and a stage that moved on under the
+/// hold drops it, running nothing, its row put back and its switch closed as a person's stop.
+/// While it stands the automatic lane waits, so its own deferral cannot retire the press's row or
+/// close its record; the intent, phase and hold read the same either way, so the row, the attempt
+/// count and the record count are what this asserts.
 #[cfg(unix)]
 #[test]
 fn a_held_press_is_bounded_by_its_window_and_its_stage_and_the_lane_waits_for_it() {
@@ -7238,21 +7090,13 @@ fn a_held_press_is_bounded_by_its_window_and_its_stage_and_the_lane_waits_for_it
     );
 }
 
-/// A HELD PRESS RUN AGAIN DOES NOT DOUBLE UP (round eight, U35's review,
-/// pinned by the U2 group's review). `run_held_person_apply` runs a held
-/// press as a second start of the same attempt, so its begin finds the row
-/// installing already and its switch already on record: the begin keeps
-/// what the row said BEFORE the press (a refusal after it puts that back,
-/// never the installing words), and the switch is one start and one stop on
-/// record. Driven through the two seams directly: the press test above
-/// stops its re-run at the admission gate, before either is reached, so it
-/// passed with both guards deleted.
-///
-/// FAILS WITHOUT EITHER GUARD: with `begin_update_installing`'s early
-/// return gone, the second begin keeps the installing words as the row
-/// before the press and the refusal leaves the row at "installing…"; with
-/// `note_update_switch_started`'s `update_switch_on_record` clause gone, a
-/// second "Installing" start goes on record for the one press.
+/// A held press run again does not double up: `run_held_person_apply` runs a held press as a
+/// second start of the same attempt, which finds the row installing and its switch on record
+/// already. The begin keeps what the row said before the press (a refusal puts that back), and
+/// the switch is one start and one stop on record. Driven through the two seams directly, since
+/// the press test above stops at the admission gate before either: without
+/// `begin_update_installing`'s early return the refusal leaves the row at "installing…"; without
+/// `note_update_switch_started`'s `update_switch_on_record` clause a second start is recorded.
 #[cfg(unix)]
 #[test]
 fn a_press_begun_twice_puts_its_row_back_and_is_one_switch_on_record() {
@@ -7306,10 +7150,9 @@ fn a_press_begun_twice_puts_its_row_back_and_is_one_switch_on_record() {
     );
 }
 
-/// The held press is wired where it is made (round eight, U35's review): a
-/// held start error is no stop in `apply_staged_update_now` (its row and
-/// its record stand), and `apply_native_update` holds it — ahead of the
-/// deferral arm — and answers Accepted.
+/// The held press is wired where it is made: a held start error is no stop in
+/// `apply_staged_update_now` (its row and record stand), and `apply_native_update` holds it,
+/// ahead of the deferral arm, and answers Accepted.
 #[cfg(unix)]
 #[test]
 fn a_held_start_error_is_held_where_the_press_returns() {
@@ -7406,9 +7249,8 @@ fn retiring_a_download_for_its_activation_carries_only_its_own_latch() {
             ),
         );
 
-        // The download stage retires and the activation takes its place (the
-        // installed bundle is newer than the process), under the activation
-        // identity, not the retired DMG digest.
+        // The download stage retires and the activation (newer than the process) takes its
+        // place, under the activation identity, not the retired DMG digest.
         let staged = app
             .native_updater_service
             .snapshot()
@@ -7455,15 +7297,11 @@ fn retiring_a_download_for_its_activation_carries_only_its_own_latch() {
     }
 }
 
-/// One Settings view holding an unsaved draft, parked in a background tab
-/// while the user works in the terminal tab. Returns the settings
-/// instance/view.
-///
-/// Chosen over `pending_restore` on purpose: `pending_restore` is found by
-/// the UI-less `native_update_close_preflight`, while a Settings draft is
-/// found by `prepare_all_native_shutdown` → `CloseReadiness::Blocked` →
-/// `surface_native_close_recovery`, the path that could switch tabs, move
-/// focus, re-front the window and open Close Recovery.
+/// One Settings view holding an unsaved draft, parked in a background tab while the person works
+/// in the terminal tab; returns its instance and view. A Settings draft, not `pending_restore`
+/// (which the UI-less `native_update_close_preflight` finds): it is found by
+/// `prepare_all_native_shutdown` → `CloseReadiness::Blocked` → `surface_native_close_recovery`,
+/// the path that could switch tabs, move focus, re-front the window and open Close Recovery.
 fn park_a_settings_draft_in_a_background_tab(
     app: &mut App,
 ) -> (crate::tab_model::AppInstanceId, crate::tab_model::ViewId) {
@@ -7499,8 +7337,7 @@ fn park_a_settings_draft_in_a_background_tab(
         "PRECONDITION: the draft makes the Settings view refuse a close, which is \
          the only verdict that surfaces Close Recovery"
     );
-    // Back to the terminal tab; later assertions that this stays true show no
-    // probe dragged the user into Settings.
+    // Back to the terminal tab; later asserts that it stays active show no probe moved the person.
     app.switch_tab_in(wid, 0);
     assert!(
         app.active_native_view(wid).is_none(),
@@ -7637,13 +7474,9 @@ fn a_lane_that_waits_by_design_is_not_reported_as_landing_by_itself() {
     );
 }
 
-/// Round eight of the update audit, lead U38 (r8d #737): unsaved work a person
-/// must save holds the automatic lane for as long as it stays unsaved, and the
-/// overdue notice is off by design meanwhile (`update_lands_by_itself`, "its
-/// own row"). That row was a 45-s warning raised once per artifact: a minute
-/// later nothing on screen said why the update never landed (L5). It STANDS
-/// now, until the work is saved (the next attempt answers otherwise and it is
-/// withdrawn), the update lands, or the person reads it.
+/// Unsaved work a person must save holds the automatic lane while it stays unsaved, and the
+/// overdue notice is off meanwhile (`update_lands_by_itself`), so the waits row stands until the
+/// work is saved (the next attempt withdraws it), the update lands, or the person reads it.
 #[test]
 fn a_person_held_update_keeps_its_one_notice_while_the_overdue_one_is_off() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -7687,13 +7520,9 @@ fn a_person_held_update_keeps_its_one_notice_while_the_overdue_one_is_off() {
     assert!(!waits_row(&app), "nothing holds the update any more");
 }
 
-/// The review of round eight's lead U38 (r8d #737): EVERY WAIT ON A PERSON
-/// HAS ITS NOTICE. The standing row's key is one for every wait, and a read
-/// keeps a standing key quiet for a day: the person read the row, saved, and
-/// when unsaved work held the lane again — the same build past its budget, or
-/// the next build — the center suppressed the row while the overdue notice
-/// stayed off (L5), and past the budget nothing even raised it. A wait that
-/// begins is news; the same wait, once read, stays quiet (CONTROL).
+/// Every wait on a person has its notice: the standing row's key is shared by every wait and a
+/// read keeps a key quiet for a day, yet a wait that begins after a read one ended is news with a
+/// row of its own. The control: the same wait, once read, stays quiet.
 #[test]
 fn a_wait_that_begins_after_a_read_one_ended_is_said_again() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -7751,13 +7580,9 @@ fn a_wait_that_begins_after_a_read_one_ended_is_said_again() {
     );
 }
 
-/// The review of round eight's lead U38 (r8d #737): THE WAIT ENDS WITH THE LANE
-/// THAT WAITED. Only an attempt withdrew the standing row; a lane that stopped
-/// trying returned before any attempt (`PollDecision::Clear`: `[update]
-/// auto_apply` turned off, the stage retired or consumed), so "Save the work in
-/// the open editor" stood for its day under Problems, the overdue notice's
-/// exemption with it, and saving changed nothing. Now the Clear ends the wait,
-/// and the loop's own reconcile ends one whose intent another path dropped.
+/// The wait ends with the lane that waited: a `PollDecision::Clear` (`[update] auto_apply` turned
+/// off, the stage retired or consumed) ends it, and the loop's own reconcile
+/// (`settle_update_wait_on_person`) ends one whose intent another path dropped.
 #[test]
 fn a_wait_on_a_person_ends_when_the_lane_stops_trying() {
     for path in ["auto_apply off, the Clear", "the intent dropped, the loop"] {
@@ -7782,7 +7607,7 @@ fn a_wait_on_a_person_ends_when_the_lane_stops_trying() {
                 .is_some(),
             "{path}: PRECONDITION: the wait's row stands"
         );
-        // CONTROL: while the lane still means to land it, the wait stands.
+        // Control: while the lane still means to land it, the wait stands.
         app.settle_update_wait_on_person();
         assert_eq!(app.update_waits_on_person, Some(build), "{path}: CONTROL");
         if path.starts_with("auto_apply off") {
@@ -7816,8 +7641,6 @@ fn a_wait_on_a_person_ends_when_the_lane_stops_trying() {
 /// Duplicate (one row, one record), never a Fault echo plus a repost.
 #[test]
 fn an_announced_editor_block_stays_one_row_through_the_budget() {
-    // Every Blocked attempt books a refusal in the one per-process ledger:
-    // held, like every other writer (`UPDATE_LEDGER_TEST_LOCK`).
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let mut app = App::headless_for_test();
     let _ = park_a_settings_draft_in_a_background_tab(&mut app);
@@ -7831,7 +7654,7 @@ fn an_announced_editor_block_stays_one_row_through_the_budget() {
             .filter(|r| r.title == crate::app_update_screen::UPDATE_WAITS_FOR_YOU)
             .count()
     };
-    // The lane retries by itself: the row stands (round eight, lead U38).
+    // The lane retries by itself, so the row stands.
     let outcome_row = |app: &App| {
         app.messages
             .live_by_key(crate::update_words::KEY_WAITS_FOR_YOU)
@@ -7873,23 +7696,14 @@ fn roster_confirmation_wait(build: u64) -> String {
     )
 }
 
-/// AN AUTOMATIC ATTEMPT ON A STAGE WAITING FOR A CHECK TO CONFIRM ITS SIGNER
-/// BOOKS NO FAILURE AND NO LATCH, AND GOES ON ONCE A CHECK REPORTS THE STAGE
-/// (round eight, #503's review). A laptop opened offline with a stage confirmed
-/// a day ago: the boot swap waits for the check, and the window's automatic
-/// lane met the same wait in its pre-park check. Filed `ProducerFailed`, it was
-/// a transient PHYSICAL failure: the budget spent, the manual-only latch (600
-/// s, 1800 s, then a 6 h stand-down the confirming check never lifted), and
-/// `record_apply_failure`'s `apply` streak, whose third entry raises "aterm
-/// auto-update is failing" — for a network condition. Now it is its own lane:
-/// a deferral, the intent held for the check, nothing charged, latched or
-/// booked as a failure; the ledger's standing refusal names the wait. While it
-/// holds no attempt is made; when a check reports the stage, the lane asks the
-/// stage again and, the stage confirmed, the attempt goes on.
+/// An automatic attempt on a stage waiting for a check to confirm its signer books no failure and
+/// no latch, and goes on once a check reports the stage. The pre-park refusal is its own lane
+/// (`HandoffFailureLane::AwaitsRosterConfirmation`): a deferral, the intent held for the check,
+/// nothing charged, latched or booked toward `record_apply_failure`'s `apply` streak, and the
+/// ledger's standing refusal names the wait. While it holds no attempt is made.
 ///
-/// CONTROL: any other passing pre-park refusal (an apply lock held past its
-/// wait) is still the transient physical lane, and the classification is the
-/// same for a person's press, which is not booked as a failure either.
+/// Control: any other passing pre-park refusal (an apply lock held past its wait) is still the
+/// transient physical lane, and a person's press classifies the same way.
 #[cfg(unix)]
 #[test]
 fn a_stage_waiting_for_its_roster_confirmation_is_held_and_never_a_failure() {
@@ -7984,10 +7798,9 @@ fn a_stage_waiting_for_its_roster_confirmation_is_held_and_never_a_failure() {
         UpdaterPhase::Applying
     );
 
-    // A check reports the stage, having confirmed it: the lane asks the stage
-    // again, and it passes (here the fresh cached verdict the stage armed
-    // with, so no read is needed), and the attempt goes on. A Settings draft
-    // in a background tab stops it at the preflight, which counts it.
+    // A check reports the stage: the lane asks the stage again, it passes (on the cached verdict
+    // the stage armed with), and the attempt goes on, stopped at the preflight by a Settings
+    // draft, which counts it.
     let _ = park_a_settings_draft_in_a_background_tab(&mut app);
     app.roster_wait_check_reported(build);
     assert!(
@@ -8005,13 +7818,9 @@ fn a_stage_waiting_for_its_roster_confirmation_is_held_and_never_a_failure() {
     );
 }
 
-/// AT A LAUNCH THAT MET A STALE STAGE, THE FIRST ATTEMPT IS NEVER MADE (round
-/// eight, #503's review). The arm starts a pre-park read of the stage, and it
-/// ends waiting for a check before the lane's first attempt: the poll holds on
-/// that answer (no attempt, so no surge and nothing to book), and an older
-/// answer than the one the hold already stands on renews nothing. A re-read
-/// that answers the wait again renews the hold; one that answers anything else
-/// ends it.
+/// At a launch that met a stale stage, the first attempt is never made: the arm-time pre-park read
+/// ends waiting for a check, and the poll holds on that answer (no attempt, nothing to book). A
+/// re-read that answers the wait again renews the hold; any other answer ends it.
 #[cfg(unix)]
 #[test]
 fn the_arm_time_read_holds_the_lane_before_its_first_attempt() {
@@ -8101,22 +7910,12 @@ fn the_arm_time_read_holds_the_lane_before_its_first_attempt() {
     assert_eq!(app.auto_apply_intent.map(|intent| intent.attempts), Some(1));
 }
 
-/// A COLD RELAUNCH WHOSE BOOT SWAP WAITS FOR A ROSTER CONFIRMATION BOOKS NOTHING
-/// (round eight, #503's second review). A stale stage on a desk with no terminal:
-/// the cold lane exec'd into its own build (a person's Install does, whatever any
-/// verdict says), and that launch's gate 4d waited for a check. The launch seeded
-/// the wait as a REFUSAL verdict, kept apart for the first automatic attempt,
-/// which took it, failed, and filed the passing refusal on the transient
-/// schedule: the physical budget, the 600 s / 1800 s / 6 h manual-only latch and
-/// `record_apply_failure`'s streak — even when the check right after the launch
-/// had already confirmed the stage; and the fresh verdict kept the arm-time read,
-/// and with it the hold, from ever forming. Now the seed is a HOLD: no verdict,
-/// nothing kept apart, the carried budget put back as it was. The first attempt
-/// is never made, the cold lane defers (for a person's press too) instead of
-/// relaunching again, and nothing is booked, latched or spent; the check's
-/// report lets the lane go on.
-///
-/// CONTROL: any other boot refusal is still seeded as the verdict it is.
+/// A cold relaunch whose boot swap waits for a roster confirmation books nothing. On a desk with
+/// no terminal the cold lane execs into its own build, whose gate 4d waits for a check: the launch
+/// seeds a hold, not a refusal verdict (nothing kept apart, the carried budget put back as it
+/// was), so the first attempt is never made, the cold lane defers (for a person's press too)
+/// instead of relaunching again, nothing is booked, latched or spent, and the check's report lets
+/// the lane go on. Control: any other boot refusal is still seeded as the verdict it is.
 #[cfg(unix)]
 #[test]
 fn a_cold_relaunch_waiting_for_its_roster_confirmation_holds_and_books_nothing() {
@@ -8230,7 +8029,7 @@ fn a_cold_relaunch_waiting_for_its_roster_confirmation_holds_and_books_nothing()
         "the attempt reached the apply preflight"
     );
 
-    // CONTROL: another boot refusal is the verdict it always was.
+    // Control: any other boot refusal is seeded as a verdict.
     let refused = relaunch(None)
         .seed(&aterm_update::ApplyOutcome::Deferred(
             "staged candidate cannot start: dyld refused it".to_string(),
@@ -8243,22 +8042,16 @@ fn a_cold_relaunch_waiting_for_its_roster_confirmation_holds_and_books_nothing()
     assert_eq!(other.auto_apply_roster_wait, None);
 }
 
-/// A CHECK'S REPORT IS NEVER LOST TO A READ THAT BEGAN BEFORE IT (round eight,
-/// #503's second review). The report made a held lane ask the stage again, but
-/// it did nothing when no hold existed yet or while the hold's own re-read ran,
-/// and a read that ended waiting then built or renewed a hold whatever it had
-/// read: the lane waited ten minutes after the stage was confirmed and booked
-/// again the wait the check had just withdrawn. Two orderings, both common:
+/// A check's report is never lost to a read that began before it. Two orderings:
 ///
-/// 1. the arm-time read ends waiting; the check confirms and reports before the
-///    lane's first poll reaches the hold (that poll waits for a quiet terminal);
-/// 2. a hold's re-read starts; the check reports; the re-read, which read the
-///    marker before the confirmation, ends waiting.
+/// 1. the arm-time read ends waiting; the check confirms and reports before the lane's first poll
+///    reaches the hold (that poll waits for a quiet terminal);
+/// 2. a hold's re-read starts; the check reports; the re-read, which read the marker before the
+///    confirmation, ends waiting.
 ///
-/// Either way the stale answer is read again at once — the attempt held
-/// provisionally, looked at again in seconds, nothing said or booked — and the
-/// fresh answer decides. CONTROL: a read that began after the report and ends
-/// waiting is the stage's state: held for the re-read's ten minutes and booked.
+/// Either way the stale answer is read again at once (held provisionally, nothing said or booked)
+/// and the fresh answer decides. Control: a read that began after the report and ends waiting is
+/// the stage's state, held for the re-read's ten minutes and booked.
 #[cfg(unix)]
 #[test]
 fn a_check_report_is_never_lost_to_a_read_that_began_before_it() {
@@ -8421,8 +8214,7 @@ fn a_check_report_is_never_lost_to_a_read_that_began_before_it() {
     assert_eq!(app.auto_apply_roster_wait, None, "the hold ends");
     assert_eq!(app.auto_apply_intent.map(|intent| intent.attempts), Some(2));
 
-    // CONTROL: a read that began after the report and ends waiting is the
-    // stage's state.
+    // Control: a read that began after the report and ends waiting is the stage's state.
     no_verdict(&app);
     app.roster_wait_check_reported(build);
     let after = Instant::now() + Duration::from_millis(1);
@@ -8445,9 +8237,8 @@ fn a_check_report_is_never_lost_to_a_read_that_began_before_it() {
     );
 }
 
-/// Drive the real nonannounced timer path into a dirty-Settings refusal and
-/// read its durable answer, in a child process so the shared scratch ledger
-/// is isolated from other updater tests.
+/// Drives the real nonannounced timer path into a dirty-Settings refusal and reads its durable
+/// answer, in a child process so the shared scratch ledger is isolated from other updater tests.
 #[cfg(target_os = "macos")]
 #[test]
 fn nonannounced_automatic_blocks_are_durable_only_after_real_attempts() {
@@ -8491,9 +8282,8 @@ fn nonannounced_automatic_blocks_are_durable_only_after_real_attempts() {
     );
     assert_no_probe_disturbance(&app, wid, working_tab);
 
-    // A distinct durable marker makes an accidental rewrite visible even with
-    // second-precision timestamps. Polling a future retry must neither spend
-    // an attempt nor replace this standing explanation.
+    // A distinct marker shows an accidental rewrite despite second-precision timestamps: polling
+    // a future retry neither spends an attempt nor replaces the standing explanation.
     const BETWEEN: &str = "test marker between actual automatic attempts";
     aterm_update::record_apply_refusal(current, BETWEEN);
     for _ in 0..16 {
@@ -8524,18 +8314,13 @@ fn nonannounced_automatic_blocks_are_durable_only_after_real_attempts() {
     assert_no_probe_disturbance(&app, wid, working_tab);
 }
 
-/// A close-preflight block exhausting its budget neither retires automatic
-/// apply nor becomes a scheduled disturbance. Walks two full cooldown rounds
-/// of the real lane (`try_pending_native_auto_apply` →
-/// `apply_native_update` → `prepare_all_native_shutdown` → the service's
-/// preflight reducer) and pins one attempt per cooldown, one pill ever,
-/// nothing on screen, and a way back once the blocker clears. The blocker is
-/// an unsaved Settings draft, found by the code that could disturb the
-/// screen (see `park_a_settings_draft_in_a_background_tab`).
+/// A close-preflight block exhausting its budget neither retires automatic apply nor becomes a
+/// scheduled disturbance: two full cooldown rounds of the real lane
+/// (`try_pending_native_auto_apply` → `apply_native_update` → `prepare_all_native_shutdown` →
+/// the preflight reducer) cost one attempt per cooldown, one row ever and nothing on screen, with
+/// a way back once the blocker (an unsaved Settings draft) clears.
 #[test]
 fn an_exhausted_preflight_block_budget_neither_latches_forever_nor_nags_on_a_schedule() {
-    // Every Blocked attempt books a refusal in the one per-process ledger:
-    // held, like every other writer (`UPDATE_LEDGER_TEST_LOCK`).
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -8560,13 +8345,11 @@ fn an_exhausted_preflight_block_budget_neither_latches_forever_nor_nags_on_a_sch
 
     app.clear_messages_for_test();
     spend_one_preflight_block_budget(&mut app);
-    // The first budget is already three probes; none may have taken the
-    // screen.
+    // The first budget is already three probes; none may have taken the screen.
     assert_no_probe_disturbance(&app, wid, working_tab);
 
-    // Not permanent: the intent is retained on a long cooldown whose real
-    // deadline `about_to_wait` folds into `WaitUntil`
-    // (`fold_auto_apply_deadline`), so it fires on an idle terminal.
+    // Not permanent: the intent is retained on a cooldown that `about_to_wait` folds into
+    // `WaitUntil` (`fold_auto_apply_deadline`), so it fires on an idle terminal.
     let cooling = app
         .auto_apply_intent
         .expect("a spent preflight budget must NOT retire the automatic lane");
@@ -8585,8 +8368,7 @@ fn an_exhausted_preflight_block_budget_neither_latches_forever_nor_nags_on_a_sch
          cadence (got {cooldown:?})"
     );
 
-    // The one row, naming the one thing the person can do: the lane comes
-    // back by itself, so it says nothing about itself.
+    // The one row names the one thing the person can do; the lane comes back by itself.
     let pill = app
         .update_row_text()
         .expect("the first exhaustion tells the user once");
@@ -8600,8 +8382,7 @@ fn an_exhausted_preflight_block_budget_neither_latches_forever_nor_nags_on_a_sch
         "the row must name the blocker the person can clear"
     );
 
-    // Second round: each further attempt costs one probe and adds nothing to
-    // the screen.
+    // Further rounds: each attempt costs one probe and adds nothing to the screen.
     for round in 0..4 {
         app.clear_messages_for_test();
         force_auto_apply_attempt_now(&mut app);
@@ -8631,26 +8412,16 @@ fn an_exhausted_preflight_block_budget_neither_latches_forever_nor_nags_on_a_sch
             app.update_row_text(),
             app.update_record_text()
         );
-        // The pill is one-shot; this checks the tab switch, focus theft and
-        // recovery palette never happen either.
+        // No tab switch, focus theft or recovery palette either.
         assert_no_probe_disturbance(&app, wid, working_tab);
     }
 
-    // The way back: once the blocker clears, the next cooldown probe leaves
-    // the Blocked lane for physical replacement.
-    //
-    // This proves the authorization by two witnesses a `Blocked` outcome
-    // cannot fake:
-    //   * the receipt: the recorded refusal is the admission gate's ("Update
-    //     kept …"), reachable only past the close preflight (the reducer
-    //     answered cleanly, so no `Failed` either);
-    //   * the scheduling shape: `Blocked` retains the intent with no latch;
-    //     the physical lane does the opposite (see
-    //     `a_genuine_failure_takes_the_physical_budget_…`).
-    // It does not show the update landing (headless, so
-    // `native_update_admission::classify` never reaches `Apply(Seamless)`);
-    // `a_busy_user_eventually_gets_the_update` carries the arc to the
-    // installed artifact.
+    // The way back: once the blocker clears, the next cooldown probe leaves the Blocked lane.
+    // Two witnesses a `Blocked` outcome cannot fake: the refusal is the admission gate's
+    // ("Update kept …"), reachable only past the close preflight, and the intent stays with no
+    // latch, the opposite of the physical lane. Headless, `native_update_admission::classify`
+    // never reaches `Apply(Seamless)`; `a_busy_user_eventually_gets_the_update` carries the arc to
+    // the installed artifact.
     assert!(
         app.pool.iter().count() > 0,
         "PRECONDITION AND A SAFETY RAIL: this app must own at least one live \
@@ -8663,11 +8434,8 @@ fn an_exhausted_preflight_block_budget_neither_latches_forever_nor_nags_on_a_sch
     force_auto_apply_attempt_now(&mut app);
     app.try_pending_native_auto_apply(false);
 
-    // The cleared blocker lets the attempt reach the admission gate, which
-    // this process can never pass (no seamless lane; a live session vetoes
-    // cold). That is a refusal, not a failed attempt: past the spent budget
-    // it re-probes silently on the cooldown, with no new pill, no latch, no
-    // physical failure booked, and the intent retained.
+    // The cleared blocker reaches the admission gate, which refuses: past the spent budget the
+    // lane re-probes silently on the cooldown, with no new row, no latch and no physical failure.
     assert!(
         app.update_row_text().is_none(),
         "a refused re-probe past the exhaustion pill paints nothing: {:?}",
@@ -8754,12 +8522,10 @@ fn an_automatic_probe_is_silent_while_a_person_s_apply_still_surfaces_recovery()
     }
 }
 
-/// The pre-park verdict answers for one artifact only. A downloaded `.app`
-/// and the same build installed under our executable share (build, commit)
-/// but are different bytes: the download's `passed` must not answer for the
-/// activation (skipping the last codesign check before an exec that swaps
-/// nothing), and a corrupt download's `false` must not refuse a good
-/// installed bundle.
+/// The pre-park verdict answers for one artifact only. A downloaded `.app` and the same build
+/// installed under our executable share (build, commit) but are different bytes: the download's
+/// `passed` must not skip the activation's last codesign check, and a corrupt download's `false`
+/// must not refuse a good installed bundle.
 #[cfg(unix)]
 #[test]
 fn a_pre_park_verdict_answers_only_for_its_own_artifact() {
@@ -8820,8 +8586,7 @@ fn a_busy_user_eventually_gets_the_update() {
          admission classifier admits the destructive COLD lane and the \
          authorized apply below would `exec()` the test binary"
     );
-    // Precondition, read back as production reads it: the staged candidate is
-    // one `start_unix_update_handoff` would carry to the physical gate (a
+    // The staged candidate is one `start_unix_update_handoff` would carry to the physical gate (a
     // cached refusal would short-circuit before anything parks).
     #[cfg(unix)]
     assert_eq!(
@@ -8851,11 +8616,9 @@ fn a_busy_user_eventually_gets_the_update() {
     );
     assert_no_probe_disturbance(&app, wid, working_tab);
 
-    // Act two: the user stops being busy and the next cooldown probe is
-    // authorized. It reaches the admission gate, which this process can never
-    // pass (no seamless lane; a live session vetoes cold). That is a refusal,
-    // not a failed attempt: the intent stays on its cooldown, with no
-    // manual-only latch, no physical failure booked and no budget spent.
+    // Act two: the person stops being busy and the next cooldown probe reaches the admission
+    // gate, which this process never passes (no seamless lane; a live session vetoes cold). A
+    // refusal is not a failed attempt: no latch, no physical failure, no budget spent.
     discard_settings_drafts(&mut app, settings);
     assert_eq!(
         app.update_row_text(),
@@ -8868,26 +8631,21 @@ fn a_busy_user_eventually_gets_the_update() {
     );
     force_auto_apply_attempt_now(&mut app);
     app.try_pending_native_auto_apply(false);
-    // The draft no longer holds the lane, so its standing row leaves (round
-    // eight, lead U38), and the refusal past it paints nothing new.
+    // The draft no longer holds the lane, so its standing row leaves.
     assert_eq!(
         app.update_row_text(),
         None,
         "a refused re-probe past the exhaustion row paints nothing new"
     );
-    // Which gate refused is part of the premise: the fixture's candidate
-    // carries a passed pre-park verification, so the recorded refusal must be
-    // the admission gate's, never the verification one.
+    // The candidate passed pre-park verification, so the refusal is the admission gate's.
     let refusal = app
         .native_updater_service
         .snapshot()
         .error
         .clone()
         .expect("a refused attempt records why it stopped");
-    // Both `native_update_admission` refusals open this way ("…could not be
-    // prepared" for the seamless lane, "…could not be proven safe" for the
-    // cold lane's foreground probe); which one depends on the test process's
-    // PTY state. The claim is that the attempt reached that gate.
+    // Both `native_update_admission` refusals open this way; which one depends on the test
+    // process's PTY state.
     assert!(
         refusal.starts_with("Update kept"),
         "the attempt must reach the physical admission gate, got {refusal:?}"
@@ -8915,9 +8673,8 @@ fn a_busy_user_eventually_gets_the_update() {
     );
     assert_no_probe_disturbance(&app, wid, working_tab);
 
-    // Act three: only the clock is forced. The retained intent's deadline is
-    // moved into the past and the production poll runs verbatim; the
-    // monotone `attempts` counter advancing proves a real re-attempt.
+    // Act three: only the clock is forced; the `attempts` counter advancing proves a real
+    // re-attempt.
     let attempts_before = after_gate.attempts;
     force_auto_apply_attempt_now(&mut app);
     app.try_pending_native_auto_apply(false);
@@ -8940,13 +8697,8 @@ fn a_busy_user_eventually_gets_the_update() {
     );
     assert_no_probe_disturbance(&app, wid, working_tab);
 
-    // Act four, the attempt that lands.
-    //
-    // The comeback re-authorizes through this reducer path, the only producer
-    // of an `ApplyAttemptTicket`: `begin_apply_preflight` binds the artifact
-    // generation and `finish_apply_preflight` mints the one-shot command only
-    // for `ClosePreflight::Ready`, so holding the ticket proves the close
-    // preflight said yes.
+    // Act four, the attempt that lands. `finish_apply_preflight` mints the one-shot command only
+    // for `ClosePreflight::Ready`, so holding its ticket proves the close preflight said yes.
     let ApplyPreflightStart::Inspect(preflight) =
         app.native_updater_service.begin_apply_preflight()
     else {
@@ -8960,17 +8712,13 @@ fn a_busy_user_eventually_gets_the_update() {
     };
     let attempt = command.attempt();
     assert_eq!(attempt.target_build(), build);
-    // The one substituted step: in production this closure is
-    // `apply_staged_update_now` (parks readers, then `exec`s or spawns the
-    // successor). Everything after is the real completion path with the real
-    // ticket.
+    // The one substituted step: in production this closure is `apply_staged_update_now`.
+    // Everything after is the real completion path with the real ticket.
     command.execute(|| ());
 
-    // Event one: the handoff completion. The child swapped the bundle and
-    // failed to commit, so the parent survives; a real completion carries
-    // `reconcile: None`. This is the `(Some(attempt), None)` arm of
-    // `reduce_returned_handoff_completion`; the mode-to-lane classification is
-    // tested in `app_update_handoff.rs`.
+    // Event one: the handoff completion. The child swapped the bundle and failed to commit, so
+    // the parent survives with `reconcile: None` (the `(Some(attempt), None)` arm of
+    // `reduce_returned_handoff_completion`; `app_update_handoff.rs` tests the lane classification).
     let returned = app.abort_reaped_native_apply_before_reconcile(
         &attempt,
         "overlap handoff failed safely: handoff proof ended ChildDied".to_string(),
@@ -8990,11 +8738,9 @@ fn a_busy_user_eventually_gets_the_update() {
          the parent has no idea the child got as far as swapping the bundle"
     );
 
-    // Event two: the disk facts the worker collects after that completion
-    // (`send_warranted_handoff_failure` posts them as a separate
-    // `NativeUpdateReconcileFinished` wake). The bundle carries this build and
-    // its installed receipt names this exact artifact (build, commit and
-    // digest, re-proved against the in-memory stage).
+    // Event two: the disk facts the worker posts after that completion
+    // (`send_warranted_handoff_failure`): the bundle carries this build and its installed receipt
+    // names this exact artifact.
     let facts = reconcile_facts_with_installed(
         9,
         9,
@@ -9100,19 +8846,16 @@ fn a_busy_user_eventually_gets_the_update() {
     assert_no_probe_disturbance(&app, wid, working_tab);
 }
 
-/// `UpdateOutcome::Failed` takes the strict physical budget, never the cheap
-/// preflight cooldown, on the same artifact in the same `App`. A `Blocked`
-/// attempt leaves a live intent re-probing in ~2 h; a `Failed` one retires
-/// the intent, latches manual-only and schedules its comeback off the
-/// physical schedule (10 min, 30 min, then a stand-down epoch).
+/// `UpdateOutcome::Failed` takes the strict physical budget, never the cheap preflight cooldown,
+/// on the same artifact in the same `App`: a `Blocked` attempt leaves a live intent re-probing on
+/// `PREFLIGHT_BLOCK_COOLDOWN`; a `Failed` one retires the intent, latches manual-only and comes
+/// back on the physical schedule (10 min, 30 min, then a stand-down epoch).
 #[test]
 fn a_genuine_failure_takes_the_physical_budget_while_a_preflight_block_only_cools_down() {
-    // Every Blocked attempt books a refusal in the one per-process ledger
-    // (`aterm_update::record_apply_refusal`); hold the lock so a sibling's
-    // booking cannot land between this test's booking and its read.
+    // Every Blocked attempt books a refusal in the per-process ledger
+    // (`aterm_update::record_apply_refusal`); the lock keeps a sibling's booking out.
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
-    // The pure policy split the two lanes ride on, asserted directly so a
-    // future reclassification cannot silently swap them.
+    // The pure policy split the two lanes ride on, so a reclassification cannot swap them.
     use crate::native_update_auto_intent::{AttemptDisposition, AttemptResult, finish};
     assert_eq!(finish(AttemptResult::Blocked), AttemptDisposition::Retry);
     assert_eq!(
@@ -9159,8 +8902,7 @@ fn a_genuine_failure_takes_the_physical_budget_while_a_preflight_block_only_cool
              `None` here would be the one-unlucky-moment permanence",
         )
         .saturating_duration_since(std::time::Instant::now());
-    // The first physical cycle: ten minutes, the physical schedule, not the
-    // two-hour preflight cooldown.
+    // The first physical cycle: ten minutes, not the preflight cooldown.
     assert!(
         wait > std::time::Duration::from_secs(500) && wait <= std::time::Duration::from_secs(600),
         "a physical failure must wait its own first cycle (~600s), got {wait:?}"
@@ -9177,18 +8919,10 @@ fn a_genuine_failure_takes_the_physical_budget_while_a_preflight_block_only_cool
     );
 }
 
-/// Every physical lane shares one budget, the budget runs out, and the user
-/// is told once, when it has:
-///   * failures returning through `abort_reaped_native_apply_before_reconcile`
-///     consult the budget;
-///   * the whole lifetime is walked, so convergence is a fact about the code
-///     (the stand-down never resets the counter);
-///   * retries the lane schedules post no row; exactly one row appears, when
-///     the lane is out of retries, and it names a control.
-///
-/// The row is surfaced as the production caller does
-/// (`app_update_handoff.rs`: `surface_update_apply_outcome("automatic handoff",
-/// surfaced, false)`).
+/// Every physical lane shares one budget, the budget runs out, and the person is told once, when
+/// it has: failures returning through `abort_reaped_native_apply_before_reconcile` consult the
+/// budget, the stand-down never resets the counter, and only the lane running out of retries
+/// posts a row, naming a control.
 #[test]
 fn the_async_physical_lane_converges_and_stops_nagging() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -9227,9 +8961,8 @@ fn the_async_physical_lane_converges_and_stops_nagging() {
         pills.push(app.update_row_text());
     }
 
-    // 600 s, 1800 s, stand-down, three times over; the last stand-down is the
-    // converged lane's quiet re-sample one epoch cooldown out. Names the
-    // schedule each deadline came from, since these are real `Instant`s.
+    // 600 s, 1800 s, stand-down, three times over; the last stand-down is the converged lane's
+    // quiet re-sample one epoch cooldown out.
     let schedule = latched
         .iter()
         .map(|wait| match wait {
@@ -9271,8 +9004,7 @@ fn the_async_physical_lane_converges_and_stops_nagging() {
         "each returned failure spends exactly one attempt"
     );
 
-    // THE NAG, counted: silence while the lane is coming back, and one row
-    // at the end naming the control.
+    // The nag, counted: silence while the lane is coming back, one row at the end.
     assert_eq!(
         pills.iter().filter(|pill| pill.is_some()).count(),
         1,
@@ -9334,12 +9066,11 @@ fn health_row(app: &App) -> Option<(String, String, Vec<aterm_messages::Intent>)
     })
 }
 
-/// A structural convergence is said at once: the second failure through the
-/// shipping completion lane posts the install half's health warning
-/// (the updater's own streak gate needs 3, structural converges at 2),
-/// naming the one re-sample a day out and the Version menu, with no decision
-/// row while the re-sample is pending. A late third completion says nothing
-/// new and buys no new deadline.
+/// A structural convergence is said at once: the second failure through the shipping completion
+/// lane posts the install half's health warning (the updater's own streak gate needs 3;
+/// structural converges at 2), naming the one re-sample a day out and the Version menu, with no
+/// decision row while it is pending. A late third completion says nothing new and buys no new
+/// deadline.
 #[test]
 fn a_structural_convergence_posts_the_health_notice_at_once() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -9493,11 +9224,10 @@ fn a_spent_unexplained_budget_resamples_after_the_cooldown_and_announces_once() 
     );
 }
 
-/// Every latch writes its standing note: the asynchronous completion lane
-/// queues its schedule's note with the latch, and the surfacing writes it
-/// after the failure it explains (booking a failure clears any standing
-/// refusal). Read back from the real ledger in a child process, isolated
-/// from sibling tests.
+/// Every latch writes its standing note: the asynchronous completion lane queues its schedule's
+/// note with the latch, and the surfacing writes it after the failure it explains (booking a
+/// failure clears any standing refusal). Read back from the real ledger in a child process,
+/// isolated from sibling tests.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_async_physical_lane_records_its_schedule_after_the_failure() {
@@ -9546,16 +9276,11 @@ fn the_async_physical_lane_records_its_schedule_after_the_failure() {
     );
 }
 
-/// The Staged bar may not outlive the promise: an admission refusal on the
-/// first automatic attempt is synchronous and lands inside the bar's hold,
-/// and the bar restates at once so it never promises "applies in place"
-/// beside a Version-menu row saying the attempt did not start. A headless
-/// `App` has no seamless lane, so the physical gate refuses.
-///
-/// The gate's `seamless_capable` and the bar's posture read one predicate
-/// (`App::seamless_handoff_unavailable`), so the line painted here is
-/// already the handoff-off warning; a windowed app's promise is modelled onto
-/// the bar by hand so the restatement shows as a change of words.
+/// The Staged bar never outlives its promise: an admission refusal on the first automatic attempt
+/// is synchronous and restates the bar at once. The gate's `seamless_capable` and the bar's
+/// posture read one predicate (`App::seamless_handoff_unavailable`), so a headless `App` already
+/// paints the handoff-off warning; a windowed app's promise is modelled onto the bar by hand so
+/// the restatement shows as a change of words.
 #[test]
 fn a_stand_down_restates_the_staged_bar_while_it_is_still_up() {
     use crate::app_update_handoff::HandoffUnavailable;
@@ -9679,8 +9404,7 @@ fn a_stand_down_restates_the_staged_bar_while_it_is_still_up() {
             && !detail.contains("Version menu"),
         "{detail}"
     );
-    // …and the Version-menu row states the lane's own fact: the retained
-    // intent IS a scheduled retry.
+    // …and the Version-menu row says the retained intent is a scheduled retry.
     assert_eq!(app.apply_retry_for(Some(build)), ApplyRetry::Scheduled);
 }
 
@@ -9724,9 +9448,7 @@ fn a_reaped_abort_restates_the_staged_bar_it_stands_down() {
         veto: None,
     };
     assert_eq!(recorded(&app), staged_detail(unavailable));
-    // Model the ready row a windowed app with automatic install off paints
-    // (the restatement below looks the row up by its flow state); an
-    // automatic posture paints none.
+    // The ready row a windowed app with automatic install off paints.
     app.post_update_row(
         crate::update_words::progress(&staged, Some(ApplyPosture::ManualByConfig), ""),
         &format!("1.0.{build}"),
@@ -9766,10 +9488,9 @@ fn a_reaped_abort_restates_the_staged_bar_it_stands_down() {
     );
 }
 
-/// A native-close reducer `Err` is a failure, not a block: `Ok(false)` (an
-/// app kept its view) is the user's live state, but `Err` means the close
-/// reducer broke. Driven through the real lane with a Settings view whose
-/// instance was removed from the runtime (`RuntimeError::UnknownInstance`).
+/// A native-close reducer `Err` is a failure, not a block: `Ok(false)` (an app kept its view) is
+/// live user state, `Err` a broken reducer, driven here by removing the Settings view's instance
+/// from the runtime (`RuntimeError::UnknownInstance`).
 #[test]
 fn a_broken_close_reducer_is_a_failure_not_a_block() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -10059,8 +9780,7 @@ fn rejected_native_completion_clears_the_settings_tab_busy_indicator() {
             _ => None,
         })
         .expect("Settings reducer owns pending config work");
-    // Drive the same presentation refresh the normal initiating dispatch
-    // performs, while deliberately retaining the effect for this test.
+    // The refresh the initiating dispatch performs, with the effect kept unexecuted.
     app.refresh_native_presentation(wid, instance, view);
     assert!(
         app.windows
@@ -10145,6 +9865,77 @@ fn tab_focus_walks_the_compiled_semantic_order() {
     );
 }
 
+/// TAB WALKS THE WHOLE LIST: a Settings list has no Next button, so Tab from
+/// the last control a screen shows moves on to the list's next one, Tab into
+/// the list starts at its first, and the list scrolls to each; every control
+/// Tab lands on is on screen.
+#[test]
+fn tab_walks_the_whole_settings_list() {
+    let mut app = App::headless_for_test();
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
+    let wid = WindowId(0);
+    let (_, view) = app.active_native_view(wid).expect("active Settings view");
+    let last = crate::native_ui::UiKey::new("settings/control/matrix_rain.enabled");
+    assert!(
+        app.compiled_native_ui(wid)
+            .unwrap()
+            .semantic(&last)
+            .is_none(),
+        "the list's last control starts off screen"
+    );
+    let mut reached = false;
+    for _ in 0..64 {
+        app.move_native_focus(wid, false).unwrap();
+        let focus = app
+            .native_runtime
+            .view_state(view)
+            .and_then(|state| state.common().last_focus.clone())
+            .expect("a focused control");
+        assert!(
+            app.compiled_native_ui(wid)
+                .unwrap()
+                .semantic(&focus)
+                .is_some(),
+            "{focus:?} is on screen"
+        );
+        if focus == last {
+            reached = true;
+            break;
+        }
+    }
+    assert!(reached, "Tab reaches the list's last control");
+
+    // Round to the search field, then into the list at its first control,
+    // which the list scrolls back to.
+    let search = crate::native_ui::UiKey::new("settings/search");
+    let focus = |app: &App| {
+        app.native_runtime
+            .view_state(view)
+            .and_then(|state| state.common().last_focus.clone())
+    };
+    for _ in 0..8 {
+        if focus(&app).as_ref() == Some(&search) {
+            break;
+        }
+        app.move_native_focus(wid, false).unwrap();
+    }
+    assert_eq!(focus(&app).as_ref(), Some(&search));
+    app.move_native_focus(wid, false).unwrap();
+    // No theme follows the system: the list starts with its Dark theme slot.
+    let first = crate::native_ui::UiKey::new("settings/theme-slot/dark");
+    assert_eq!(
+        focus(&app).as_ref(),
+        Some(&first),
+        "Tab enters the list at its top"
+    );
+    assert!(
+        app.compiled_native_ui(wid)
+            .unwrap()
+            .semantic(&first)
+            .is_some()
+    );
+}
+
 #[test]
 fn focused_native_text_field_receives_space_and_submit_before_activation() {
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
@@ -10195,6 +9986,70 @@ fn focused_native_text_field_receives_space_and_submit_before_activation() {
     assert!(
         state.search_input.preedit().is_none(),
         "Return is Submit for a focused text field, not generic activation"
+    );
+}
+
+/// Searching a font list through the real key path: once a name is begun,
+/// Space is part of it ("iosevka t") instead of pressing the highlighted
+/// font, and the list stays open on what was typed.
+#[test]
+fn space_types_into_a_font_list_search_once_a_name_is_begun() {
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::TextFonts));
+    app.dispatch_native_event(
+        wid,
+        AppEvent::Action(crate::native_app::ActionInvocation {
+            id: crate::native_ui::ActionId::new("settings/font-picker/font_family"),
+            value: None,
+        }),
+    )
+    .unwrap();
+    let press = |key| crate::input::InputEvent::Key {
+        key,
+        mods: Modifiers::empty(),
+        base_layout: None,
+        layout_text: None,
+        event_type: KeyEventType::Press,
+    };
+    let takes_space = |app: &App| {
+        let (_, view) = app.active_native_view(wid).unwrap();
+        let Some(crate::native_app::AppViewState::Settings(state)) =
+            app.native_runtime.view_state(view)
+        else {
+            panic!("Settings view");
+        };
+        state.font_picker_takes_space()
+    };
+    assert!(!takes_space(&app), "an empty search leaves Space to press");
+    for ch in "iosevka".chars() {
+        assert!(app.native_input_event(wid, &press(Key::Character(ch))));
+    }
+    assert!(takes_space(&app));
+    assert!(app.native_input_event(wid, &press(Key::Named(NamedKey::Space))));
+    assert!(app.native_input_event(wid, &press(Key::Character('t'))));
+    assert!(takes_space(&app), "the list is still open");
+    let compiled = app.compiled_native_ui(wid).unwrap();
+    let title = compiled
+        .semantic(&crate::native_ui::UiKey::new(
+            "settings/choice-title/font_family",
+        ))
+        .expect("the font list is open");
+    assert!(
+        title.label.contains("\u{201c}iosevka t\u{201d}"),
+        "{}",
+        title.label
+    );
+    // Options keep their places while typing narrows the list: Iosevka Term
+    // is the second option, after Automatic.
+    assert!(
+        compiled
+            .semantic(&crate::native_ui::UiKey::new(
+                "settings/choice/font_family/1"
+            ))
+            .is_some_and(|option| option.label == "Iosevka Term")
     );
 }
 
@@ -10403,10 +10258,9 @@ fn settings_search_field_honors_readline_control_keys() {
     assert_eq!(search(&app).0, "");
 }
 
-/// Off macOS, Ctrl+←/→ and Ctrl+⌫ are word operations in Settings text
-/// fields (the cfg'd `alt_word || readline` term): Ctrl+arrow lands where
-/// Alt+arrow does, Ctrl+⌫ kills what Ctrl+W does, and the Ctrl-letter
-/// readline arms stay by-character because they match first.
+/// Off macOS, Ctrl+←/→ and Ctrl+⌫ are word operations in Settings text fields (the cfg'd
+/// `alt_word || readline` term); the Ctrl-letter readline arms stay by-character because they
+/// match first.
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn settings_search_field_ctrl_arrows_walk_words_off_macos() {
@@ -10456,8 +10310,7 @@ fn settings_search_field_ctrl_arrows_walk_words_off_macos() {
     assert_eq!(search(&app).1, alt_word_stop, "Ctrl+← = Alt+← (word left)");
     assert!(app.native_input_event(wid, &left(Modifiers::CTRL)));
     assert_eq!(search(&app).1, 0..0, "second Ctrl+← reaches the start");
-    // Forward: Ctrl+→ lands exactly where Alt+→ does (emacs-style: the END
-    // of the word, not the start of the next — hence not `alt_word_stop`).
+    // Ctrl+→ lands where Alt+→ does: the end of the word (emacs-style), not `alt_word_stop`.
     assert!(app.native_input_event(wid, &right(Modifiers::CTRL)));
     let ctrl_right_stop = search(&app).1;
     assert!(app.native_input_event(wid, &left(Modifiers::CTRL)));
@@ -10488,15 +10341,12 @@ fn explicit_font_metrics_seed_initial_and_additional_headless_windows() {
     app.backend.set_pad(crate::pad_for_scale(1.0));
     app.backend.set_head(0);
     let expected = app.unattached_window_metrics();
-    // The initial production call provides MetricsView explicitly; the
-    // constructor stores that renderer truth without deriving its own
-    // automatic-font value.
+    // `new_native` stores the metrics it is given and derives no automatic-font value.
     let initial =
         crate::WindowState::new_native(None, 24, 80, expected, crate::tab_model::TabSet::default());
     assert_eq!(initial.metrics, expected);
 
-    // Every post-startup creation seam uses the same renderer authority. Drive
-    // the real testable logical-window installation path to guard that wiring.
+    // A window installed after startup takes the same renderer metrics.
     let sid = app.next_session_id;
     let additional = app.insert_logical_window(crate::stub_session(sid), 24, 80);
     assert_eq!(app.windows[&additional].metrics, expected);
@@ -10504,11 +10354,9 @@ fn explicit_font_metrics_seed_initial_and_additional_headless_windows() {
     assert_eq!(app.win_pad(additional), app.backend.pad());
 }
 
-/// Tier-1 conformance for the exact-observation handoff: a failed
-/// reconciliation keeps the deferred external bytes and a queued semantic
-/// write, and the retry admits that generation before the write leaves the
-/// queue. The negative control shows the model rejects the lost-candidate
-/// state.
+/// Tier-1 conformance for the exact-observation handoff: a failed reconciliation keeps the
+/// deferred external bytes, and the retry admits that generation. The negative control shows the
+/// model rejects the lost-candidate state.
 #[test]
 fn exact_observation_handoff_conforms_and_preserves_failed_reconciliation() {
     fn project(
@@ -10620,10 +10468,9 @@ fn exact_observation_handoff_conforms_and_preserves_failed_reconciliation() {
     let after = project(&model, &app, 0, 0, 0, true);
     assert_step(&model, &state, &after, "FailReconcile");
     state = after;
-    // The failed reconciliation answers its queued caller with the error
-    // (see `failed_reconciliation_answers_queued_callers_…`), so the queue is
-    // empty; the external observation is its own pending state and survives
-    // for the retry.
+    // The failed reconciliation answers its queued caller with the error (see
+    // `failed_reconciliation_answers_queued_callers_…`); the external observation is its own
+    // pending state and survives for the retry.
     assert_eq!(app.native_config_pending.len(), 0);
     assert!(app.native_config_external_pending.is_some());
 
@@ -10648,8 +10495,7 @@ fn exact_observation_handoff_conforms_and_preserves_failed_reconciliation() {
         "serious_mode = true\n"
     );
     assert!(app.native_config_external_pending.is_none());
-    // Still empty: the one queued caller was answered at FailReconcile
-    // above, and nothing requeued since.
+    // Still empty: the queued caller was answered at FailReconcile.
     assert_eq!(app.native_config_pending.len(), 0);
 
     let mut lost = after;
@@ -10696,6 +10542,7 @@ fn matching_prepared_generation_reconciliation_admits_without_requeue() {
         sparkle: prepared.config.prepare_sparkle_runtime(),
         fonts: None,
         warnings: Vec::new(),
+        font_refusals: Vec::new(),
     };
 
     app.native_config_service.mark_reconciliation_required();
@@ -10745,16 +10592,14 @@ fn contended_split_presentation_keeps_its_own_title_rung() {
     app.refresh_active_split_presentation(wid);
     assert_eq!(active_title(&app), "osc-live");
 
-    // Seed the tab-label cache with a foreign rung — precisely what
-    // `tab_titles` caches for a pane whose shell reported only a cwd.
+    // A foreign rung in the tab-label cache: what `tab_titles` caches for a cwd-only pane.
     app.windows
         .get_mut(&wid)
         .expect("test window")
         .tab_title_cache
         .insert(0, "~/repo".to_string());
 
-    // Contended: the terminal mutex is held across the whole call, so the
-    // leaf read must take the WouldBlock arm.
+    // Contended: holding the terminal mutex sends the leaf read down its WouldBlock arm.
     let flood = crate::term_lock(&term);
     app.refresh_active_split_presentation(wid);
     drop(flood);
@@ -10805,13 +10650,10 @@ fn contended_split_presentation_without_a_prior_title_falls_back_to_aterm() {
     );
 }
 
-/// The watcher is the one writer of the supervisor's policy: a valid edit A
-/// still in the config lane when the next save R was refused must not lift
-/// R's kill switch when it lands. The watcher's read of R posts R's policy
-/// (`Wake::HarnessPolicyObserved` → `adopt_harness_policy`), and A's late
-/// admission (`apply_prepared_config_generation`) runs A's settings under
-/// the running policy. Controls: A's own parse carries approvals on, and the
-/// watcher's next policy post is run at once.
+/// The watcher is the one writer of the harness policy: a valid edit A still in the config lane
+/// when the next save R was refused cannot lift R's kill switch when A lands
+/// (`apply_prepared_config_generation` admits A's settings under the running policy). Controls:
+/// A's own parse carries approvals on, and the watcher's next policy post runs at once.
 #[test]
 fn a_late_admission_never_moves_the_watchers_harness_policy() {
     use crate::app_config::{Config, HarnessPolicy};
@@ -10841,6 +10683,7 @@ fn a_late_admission_never_moves_the_watchers_harness_policy() {
         sparkle,
         fonts: None,
         warnings: Vec::new(),
+        font_refusals: Vec::new(),
     };
 
     let mut app = App::headless_for_test();
@@ -10867,4 +10710,760 @@ fn a_late_admission_never_moves_the_watchers_harness_policy() {
     );
     assert_eq!(app.config.harness, lifted);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Run one queued control `settings set` request through the lane the way the
+/// worker would: reduce it against the service and publish its completion.
+/// Returns the caller's reply and the authoritative snapshot.
+fn complete_control_theme_set(
+    app: &mut App,
+    value: &str,
+) -> (
+    Result<String, String>,
+    crate::native_config_service::ConfigSnapshot,
+) {
+    complete_control_theme_field(app, Some(value))
+}
+
+fn complete_control_theme_field(
+    app: &mut App,
+    value: Option<&str>,
+) -> (
+    Result<String, String>,
+    crate::native_config_service::ConfigSnapshot,
+) {
+    let (reply, completion) = std::sync::mpsc::channel();
+    app.enqueue_control_settings_field_intent(
+        crate::prefs::EDIT_THEME.to_string(),
+        value.map(str::to_string),
+        reply,
+    );
+    let snapshot = complete_queued_control_theme_field(app);
+    (completion.try_recv().expect("answered"), snapshot)
+}
+
+fn complete_queued_control_theme_field(
+    app: &mut App,
+) -> crate::native_config_service::ConfigSnapshot {
+    let NativeConfigRequest { origin, work } = app.native_config_pending.pop_front().unwrap();
+    assert!(matches!(&origin, NativeConfigOrigin::Control { .. }));
+    let (outcome, snapshot) = match app.reduce_native_config_work(work).unwrap() {
+        ConfigPatchResult::Applied { snapshot, undo } => (
+            ConfigPatchOutcome::Applied {
+                revision: snapshot.revision,
+                undo: Some(undo.get()),
+            },
+            snapshot,
+        ),
+        ConfigPatchResult::Unchanged { snapshot } => (
+            ConfigPatchOutcome::Applied {
+                revision: snapshot.revision,
+                undo: None,
+            },
+            snapshot,
+        ),
+        other => panic!("a theme write must apply: {other:?}"),
+    };
+    app.publish_native_config_origin(origin, outcome, Some(snapshot.clone()), false, None);
+    snapshot
+}
+
+/// `settings set theme Nrod` (and `theme set Nrod`, the same lane) saves, but
+/// its OK says the name is unavailable and Default is drawn. Negative control:
+/// a name the catalog resolves says nothing more than `saved`.
+#[test]
+fn control_theme_set_of_an_unavailable_name_says_so_in_the_reply() {
+    let mut app = App::headless_for_test();
+    app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+        "theme = \"Dracula\"\n".to_string(),
+    )
+    .unwrap();
+    let (reply, _) = complete_control_theme_set(&mut app, "Nrod");
+    let reply = reply.expect("the write itself succeeds");
+    assert!(reply.starts_with("saved: theme = Nrod; "), "{reply}");
+    assert!(
+        reply.contains("\"Nrod\" is unavailable") && reply.contains("Default is used"),
+        "{reply}"
+    );
+
+    let (reply, _) = complete_control_theme_set(&mut app, "Nord");
+    assert_eq!(reply.as_deref(), Ok("saved: theme = Nord"));
+
+    // A selector issue is a miss too.
+    let (reply, _) = complete_control_theme_set(&mut app, "dark:Nord,dusk:Dracula");
+    let reply = reply.expect("saved");
+    assert!(reply.contains("; "), "the selector issue is named: {reply}");
+}
+
+/// `settings set theme dark:Work,light:GitHub Light` against a catalog that
+/// holds Work saves with no miss, and once the write is adopted the side the
+/// OS appearance picks is what every session draws.
+#[test]
+fn control_theme_set_of_a_split_installs_the_os_side() {
+    let mut app = App::headless_for_test();
+    app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+        "theme = \"Dracula\"\n".to_string(),
+    )
+    .unwrap();
+    let work = aterm_types::ColorScheme {
+        background: aterm_types::Rgb::new(0x10, 0x20, 0x30),
+        ..aterm_types::ColorScheme::default()
+    };
+    app.reload_theme_catalog(crate::app_config::ThemeCatalog::from_schemes([(
+        "Work".to_string(),
+        work.clone(),
+    )]));
+
+    let (reply, snapshot) = complete_control_theme_set(&mut app, "dark:Work,light:GitHub Light");
+    assert_eq!(
+        reply.as_deref(),
+        Ok("saved: theme = dark:Work,light:GitHub Light"),
+        "both sides resolve, so nothing is unavailable"
+    );
+
+    // The watcher's reload adopts the written config.
+    app.config = (*snapshot.config).clone();
+    app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
+    let session_bg = |app: &App| {
+        crate::term_lock(&app.pool.get(0).expect("session 0").term).default_background()
+    };
+    assert_eq!(
+        app.installed_colors.id, "Work",
+        "a dark OS draws the dark side"
+    );
+    assert_eq!(app.theme, aterm_render::Theme::from(&work));
+    assert_eq!(session_bg(&app), work.background);
+
+    app.sync_app_theme_to_appearance(aterm_types::Appearance::Light);
+    let light = aterm_types::scheme::builtin("GitHub Light").unwrap();
+    assert_eq!(
+        app.installed_colors.id, "GitHub Light",
+        "a light OS the light side"
+    );
+    assert_eq!(session_bg(&app), light.background);
+}
+
+/// Run the palette's one queued theme-choice request through the lane the way
+/// the worker would, returning the authoritative snapshot.
+fn complete_theme_choice(app: &mut App) -> crate::native_config_service::ConfigSnapshot {
+    let NativeConfigRequest { origin, work } = app.native_config_pending.pop_front().unwrap();
+    assert!(matches!(&origin, NativeConfigOrigin::ThemeChoice { .. }));
+    let (outcome, snapshot) = match app.reduce_native_config_work(work).unwrap() {
+        ConfigPatchResult::Applied { snapshot, undo } => (
+            ConfigPatchOutcome::Applied {
+                revision: snapshot.revision,
+                undo: Some(undo.get()),
+            },
+            snapshot,
+        ),
+        other => panic!("a theme write must apply: {other:?}"),
+    };
+    app.publish_native_config_origin(origin, outcome, Some(snapshot.clone()), false, None);
+    snapshot
+}
+
+/// Choosing the named dark Default is an explicit selection, including on a
+/// light OS. Its preview and its saved completion must agree. Removing the
+/// setting is a separate action whose default continues to follow the OS.
+#[test]
+fn palette_explicit_default_stays_dark_after_save_on_a_light_os() {
+    use crate::control_theme::PreviewHold;
+
+    let mut app = App::headless_for_test();
+    app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+        "theme = \"Dracula\"\n".to_string(),
+    )
+    .unwrap();
+    app.config = (*app.native_config_service.snapshot().config).clone();
+    app.on_os_appearance(aterm_types::Appearance::Light);
+    assert_eq!(app.os_appearance, aterm_types::Appearance::Light);
+    let chosen = aterm_types::scheme::builtin("Default").expect("explicit dark theme");
+    let light = aterm_types::scheme::builtin("Default Light").expect("unset light side");
+    assert_ne!(chosen.background, light.background, "the choices differ");
+
+    app.begin_theme_preview("Default", PreviewHold::Committing)
+        .expect("the named theme previews");
+    let preview = app.theme;
+    assert_eq!(preview, aterm_render::Theme::from(&chosen));
+    app.enqueue_theme_choice("Default");
+    assert_eq!(app.native_config_pending.len(), 1, "one choice write");
+    let saved = complete_theme_choice(&mut app);
+    assert_eq!(
+        saved.config.theme.as_deref(),
+        Some("Default"),
+        "the explicit choice is not an unset"
+    );
+    assert!(saved.text.contains("theme = \"Default\""), "{}", saved.text);
+    assert_eq!(app.config.theme.as_deref(), Some("Default"));
+    assert!(app.theme_preview.is_none());
+    assert_eq!(app.installed_colors.id, "Default");
+    assert_eq!(app.theme, preview, "the saved choice keeps its preview");
+    assert_eq!(
+        app.session_factory.appearance,
+        aterm_types::Appearance::Dark
+    );
+    {
+        let term = crate::term_lock(&app.pool.get(0).unwrap().term);
+        assert_eq!(term.default_background(), chosen.background);
+        assert_eq!(term.default_foreground(), chosen.foreground);
+        for (index, color) in chosen.ansi.iter().enumerate() {
+            assert_eq!(term.palette_color(index as u8), *color);
+        }
+    }
+
+    // The wire/Settings unset still means Follow system. Run that real lane,
+    // then admit its snapshot as the file watcher does.
+    let (reply, unset) = complete_control_theme_field(&mut app, None);
+    reply.expect("the explicit unset is saved");
+    assert_eq!(unset.config.theme, None);
+    assert!(!unset.text.contains("theme ="), "{}", unset.text);
+    app.config = (*unset.config).clone();
+    app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
+    assert_eq!(app.installed_colors.id, "Default Light");
+    assert_eq!(app.theme, aterm_render::Theme::from(&light));
+    assert_eq!(
+        app.session_factory.appearance,
+        aterm_types::Appearance::Light
+    );
+    assert_eq!(
+        crate::term_lock(&app.pool.get(0).unwrap().term).default_background(),
+        light.background
+    );
+}
+
+/// A commit that the disk lane admitted is no longer a timed trial: an
+/// injected clock cannot expire it while the save is pending. Its own applied
+/// or refused completion ends it, drawing the proven saved or retained config.
+#[test]
+fn control_theme_commit_stands_past_its_ttl_until_its_own_completion() {
+    let t0 = std::time::Instant::now();
+    for rejected in [false, true] {
+        let mut app = App::headless_for_test();
+        app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+            "theme = \"Dracula\"\n".to_string(),
+        )
+        .unwrap();
+        app.config = (*app.native_config_service.snapshot().config).clone();
+        app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
+        let before = app.theme;
+        app.preview_theme("Nord", std::time::Duration::from_secs(5), t0)
+            .unwrap();
+        let preview = app.theme;
+        let (reply, completion) = std::sync::mpsc::channel();
+        app.commit_theme_preview_with(reply, |app, id, request_id, reply| {
+            app.enqueue_control_settings_field_intent_with_id(
+                crate::prefs::EDIT_THEME.to_string(),
+                Some(id),
+                reply,
+                request_id,
+            );
+            Some(request_id)
+        });
+        assert_eq!(app.native_config_pending.len(), 1, "one admitted save");
+        assert!(matches!(
+            completion.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(
+            !app.expire_theme_preview(t0 + std::time::Duration::from_secs(6)),
+            "a pending commit must not expire as a trial"
+        );
+        assert_eq!(app.next_theme_preview_wake(), None);
+        assert_eq!(app.theme, preview);
+
+        if rejected {
+            let NativeConfigRequest { origin, .. } = app.native_config_pending.pop_front().unwrap();
+            app.publish_native_config_origin(
+                origin,
+                ConfigPatchOutcome::Rejected {
+                    message: "disk full".to_string(),
+                },
+                None,
+                false,
+                None,
+            );
+            assert!(completion.try_recv().expect("answered").is_err());
+            assert_eq!(app.config.theme.as_deref(), Some("Dracula"));
+            assert_eq!(
+                app.theme, before,
+                "a refused commit restores the retained config"
+            );
+        } else {
+            let saved = complete_queued_control_theme_field(&mut app);
+            completion.try_recv().expect("answered").expect("saved");
+            assert_eq!(saved.config.theme.as_deref(), Some("Nord"));
+            assert_eq!(app.config.theme.as_deref(), Some("Nord"));
+            assert_eq!(
+                app.theme, preview,
+                "completion does not flash the old theme"
+            );
+        }
+        assert!(
+            app.theme_preview.is_none(),
+            "the owning completion retires its preview"
+        );
+    }
+}
+
+/// A's real disk completion remains configured truth while a newer B preview
+/// is standing. It cannot retire B or flash A. Only B's own completion can
+/// finish B, adopting B on success or restoring the actually saved A on refusal.
+#[test]
+fn older_theme_save_completion_preserves_a_newer_committing_preview() {
+    use crate::control_theme::PreviewHold;
+    for rejected in [false, true] {
+        let mut app = App::headless_for_test();
+        app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+            "theme = \"Dracula\"\n".to_string(),
+        )
+        .unwrap();
+        app.config = (*app.native_config_service.snapshot().config).clone();
+        app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
+        app.begin_theme_preview("Nord", PreviewHold::Committing)
+            .unwrap();
+        app.enqueue_theme_choice("Nord");
+        app.begin_theme_preview("Gruvbox Light", PreviewHold::Committing)
+            .unwrap();
+        app.enqueue_theme_choice("Gruvbox Light");
+        let newer = app.theme;
+        let saved_a = complete_theme_choice(&mut app);
+        assert_eq!(saved_a.config.theme.as_deref(), Some("Nord"));
+        assert_eq!(
+            app.config.theme.as_deref(),
+            Some("Nord"),
+            "A is actual saved truth"
+        );
+        assert_eq!(
+            app.theme, newer,
+            "A cannot flash through B's pending preview"
+        );
+        assert_eq!(
+            app.theme_preview.as_ref().map(|p| p.id.as_str()),
+            Some("Gruvbox Light")
+        );
+
+        if rejected {
+            let NativeConfigRequest { origin, .. } = app.native_config_pending.pop_front().unwrap();
+            app.publish_native_config_origin(
+                origin,
+                ConfigPatchOutcome::Rejected {
+                    message: "disk full".to_string(),
+                },
+                None,
+                false,
+                None,
+            );
+            assert_eq!(app.config.theme.as_deref(), Some("Nord"));
+            assert_eq!(app.installed_colors.id, "Nord");
+            assert_eq!(
+                app.theme,
+                aterm_render::Theme::from(&aterm_types::scheme::builtin("Nord").unwrap())
+            );
+        } else {
+            let saved_b = complete_theme_choice(&mut app);
+            assert_eq!(saved_b.config.theme.as_deref(), Some("Gruvbox Light"));
+            assert_eq!(app.config.theme.as_deref(), Some("Gruvbox Light"));
+            assert_eq!(app.theme, newer);
+        }
+        assert!(
+            app.theme_preview.is_none(),
+            "only B's completion finishes B"
+        );
+    }
+}
+
+/// The queue pump can complete unchanged work inline. Binding after that
+/// completion would resurrect a hold whose completion has already happened.
+/// A preflight refusal has no pending save and also cannot leave a hold.
+#[test]
+fn control_theme_commit_inline_completion_or_queue_refusal_leaves_no_hold() {
+    for admitted in [true, false] {
+        let mut app = App::headless_for_test();
+        let text = if admitted {
+            "theme = \"Nord\"\n"
+        } else {
+            "theme = \"Dracula\"\n"
+        };
+        app.native_config_service =
+            crate::native_config_service::VersionedConfigService::new(text.to_string()).unwrap();
+        app.config = (*app.native_config_service.snapshot().config).clone();
+        app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
+        let configured = app.theme;
+        app.preview_theme(
+            "Nord",
+            std::time::Duration::from_secs(5),
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        let (reply, completion) = std::sync::mpsc::channel();
+        app.commit_theme_preview_with(reply, |app, id, request_id, reply| {
+            if !admitted {
+                let _ = reply.send(Err("queue refused".to_string()));
+                return None;
+            }
+            app.enqueue_control_settings_field_intent_with_id(
+                crate::prefs::EDIT_THEME.to_string(),
+                Some(id),
+                reply,
+                request_id,
+            );
+            complete_queued_control_theme_field(app);
+            Some(request_id)
+        });
+        assert_eq!(completion.try_recv().expect("answered").is_ok(), admitted);
+        assert!(app.native_config_pending.is_empty());
+        assert!(app.theme_preview.is_none(), "no save remains to own a hold");
+        assert_eq!(app.next_theme_preview_wake(), None);
+        assert_eq!(app.theme, configured);
+    }
+}
+
+/// An older control commit still changes configured truth after its preview
+/// is cancelled or replaced by another trial. Its completion cannot retire
+/// the newer trial, and reverting that trial reveals the actually saved theme.
+#[test]
+fn control_theme_saved_truth_survives_preview_cancellation_or_replacement() {
+    let now = std::time::Instant::now();
+    for cancelled in [true, false] {
+        let mut app = App::headless_for_test();
+        app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+            "theme = \"Dracula\"\n".to_string(),
+        )
+        .unwrap();
+        app.config = (*app.native_config_service.snapshot().config).clone();
+        app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
+        app.preview_theme("Nord", std::time::Duration::from_secs(5), now)
+            .unwrap();
+        let (reply, completion) = std::sync::mpsc::channel();
+        app.commit_theme_preview_with(reply, |app, id, request_id, reply| {
+            app.enqueue_control_settings_field_intent_with_id(
+                crate::prefs::EDIT_THEME.to_string(),
+                Some(id),
+                reply,
+                request_id,
+            );
+            Some(request_id)
+        });
+        if cancelled {
+            app.revert_theme_preview(now);
+        } else {
+            app.preview_theme("GitHub Light", std::time::Duration::from_secs(20), now)
+                .unwrap();
+        }
+        complete_queued_control_theme_field(&mut app);
+        completion.try_recv().expect("answered").expect("saved");
+        assert_eq!(app.config.theme.as_deref(), Some("Nord"));
+        if !cancelled {
+            assert_eq!(app.installed_colors.id, "GitHub Light");
+            assert!(app.theme_preview.is_some(), "the newer trial stays visible");
+            app.revert_theme_preview(now);
+        }
+        assert!(app.theme_preview.is_none());
+        assert_eq!(app.installed_colors.id, "Nord", "actual disk truth remains");
+    }
+}
+
+/// An ordinary theme set supersedes a trial already standing when it was
+/// queued. A trial or commit begun later remains newer intent. Drive the real prepared
+/// disk observation and runtime reload, not only the origin's reply formatter.
+#[test]
+fn ordinary_theme_set_retires_older_preview_but_preserves_newer_trial() {
+    let now = std::time::Instant::now();
+    for newer in [0, 1, 2] {
+        let scratch = aterm_tempfile::tempdir().expect("private config");
+        let path = scratch.path().join("aterm.toml");
+        std::fs::write(&path, "theme = \"Dracula\"\n").unwrap();
+        let mut app = App::headless_for_test();
+        app.native_config_service =
+            crate::native_config_service::VersionedConfigService::load_path(&path).unwrap();
+        app.config = (*app.native_config_service.snapshot().config).clone();
+        app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
+        app.preview_theme("Nord", std::time::Duration::from_secs(30), now)
+            .unwrap();
+        let (reply, completion) = std::sync::mpsc::channel();
+        app.enqueue_control_settings_field_intent(
+            crate::prefs::EDIT_THEME.to_string(),
+            Some("GitHub Light".to_string()),
+            reply,
+        );
+        let mut later_commit = None;
+        if newer == 1 {
+            app.preview_theme("Gruvbox Dark", std::time::Duration::from_secs(30), now)
+                .unwrap();
+        } else if newer == 2 {
+            // The same standing Nord trial now has a newer save intent than
+            // the ordinary set. Its birth alone must not decide its ordering.
+            let (reply, completion) = std::sync::mpsc::channel();
+            app.commit_theme_preview_with(reply, |app, id, request_id, reply| {
+                app.enqueue_control_settings_field_intent_with_id(
+                    crate::prefs::EDIT_THEME.to_string(),
+                    Some(id),
+                    reply,
+                    request_id,
+                );
+                Some(request_id)
+            });
+            later_commit = Some(completion);
+        }
+        let NativeConfigRequest { origin, work } = app.native_config_pending.pop_front().unwrap();
+        let (snapshot, undo) = match app.reduce_native_config_work(work).unwrap() {
+            ConfigPatchResult::Applied { snapshot, undo } => (snapshot, undo),
+            other => panic!("theme set applies: {other:?}"),
+        };
+        std::fs::write(&path, snapshot.text.as_ref()).unwrap();
+        let observation =
+            crate::native_config_service::VersionedConfigService::observe_path(&path, false)
+                .unwrap();
+        let prepared = crate::native_config_service::VersionedConfigService::prepare_observation(
+            observation,
+            std::sync::Arc::clone(&snapshot.assets.themes),
+        )
+        .unwrap();
+        app.native_config_inflight = true;
+        app.finish_native_config_write(
+            origin,
+            NativeConfigPersistenceCompletion {
+                outcome: ConfigPatchOutcome::Applied {
+                    revision: snapshot.revision,
+                    undo: Some(undo.get()),
+                },
+                observation: Ok(prepared),
+            },
+        );
+        completion.try_recv().expect("answered").expect("saved");
+        assert_eq!(app.config.theme.as_deref(), Some("GitHub Light"));
+        if let Some(later_commit) = later_commit {
+            assert_eq!(
+                app.installed_colors.id, "Nord",
+                "the later commit stays visible"
+            );
+            assert!(app.theme_preview.is_some());
+            complete_queued_control_theme_field(&mut app);
+            later_commit.try_recv().expect("answered").expect("saved");
+            assert!(app.theme_preview.is_none());
+            assert_eq!(app.config.theme.as_deref(), Some("Nord"));
+            assert_eq!(app.installed_colors.id, "Nord");
+            continue;
+        }
+        if newer == 1 {
+            assert_eq!(app.installed_colors.id, "Gruvbox Dark");
+            let preview = app.theme_preview.as_ref().expect("newer trial remains");
+            assert_eq!(
+                preview.restore, "GitHub Light",
+                "restore names actual saved truth"
+            );
+            app.revert_theme_preview(now);
+        }
+        assert!(
+            app.theme_preview.is_none(),
+            "a superseded trial is not left standing"
+        );
+        assert_eq!(app.installed_colors.id, "GitHub Light");
+        assert_eq!(
+            app.theme,
+            aterm_render::Theme::from(&aterm_types::scheme::builtin("GitHub Light").unwrap())
+        );
+    }
+}
+
+/// A theme chosen in the palette is ONE write of `theme`, and the screen goes
+/// straight from the preview to the configured (now chosen) theme: the
+/// Committing preview stands while the write is in flight, and its completion
+/// adopts the durable `theme` and ends the preview without a flash of the old
+/// theme. Choosing Default keeps that explicit named theme.
+#[test]
+fn palette_theme_choice_is_one_write_and_lands_without_a_flash() {
+    use crate::control_theme::PreviewHold;
+    let mut app = App::headless_for_test();
+    app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+        "theme = \"Dracula\"\n".to_string(),
+    )
+    .unwrap();
+    app.config = (*app.native_config_service.snapshot().config).clone();
+    app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
+    let revision = app.native_config_service.snapshot().revision;
+
+    app.begin_theme_preview("Gruvbox Dark", PreviewHold::Committing)
+        .expect("a built-in previews");
+    app.enqueue_theme_choice("Gruvbox Dark");
+    assert_eq!(app.native_config_pending.len(), 1, "one request");
+    let gruvbox = aterm_render::Theme::from(&aterm_types::scheme::builtin("Gruvbox Dark").unwrap());
+    assert_eq!(
+        app.theme, gruvbox,
+        "the choice stands while the write is in flight"
+    );
+    assert!(
+        !app.expire_theme_preview(
+            std::time::Instant::now() + std::time::Duration::from_secs(86_400)
+        ),
+        "no clock ends a committing preview"
+    );
+
+    let snapshot = complete_theme_choice(&mut app);
+    assert!(app.native_config_pending.is_empty());
+    assert_eq!(snapshot.revision, revision + 1, "exactly one write");
+    assert!(
+        snapshot.text.contains("theme = \"Gruvbox Dark\""),
+        "{}",
+        snapshot.text
+    );
+    assert_eq!(
+        app.config.theme.as_deref(),
+        Some("Gruvbox Dark"),
+        "adopted at once"
+    );
+    assert!(
+        app.theme_preview.is_none(),
+        "the preview gave way to the config"
+    );
+    assert_eq!(app.installed_colors.id, "Gruvbox Dark");
+    assert_eq!(app.theme, gruvbox);
+
+    // Default is a named dark theme, distinct from the Follow system reset.
+    app.enqueue_theme_choice("Default");
+    let snapshot = complete_theme_choice(&mut app);
+    assert!(
+        snapshot.text.contains("theme = \"Default\""),
+        "{}",
+        snapshot.text
+    );
+    assert_eq!(app.config.theme.as_deref(), Some("Default"));
+    assert_eq!(app.installed_colors.id, "Default");
+}
+
+/// A headless App on `os`, its config lane and live config holding `toml`.
+fn theme_choice_app(toml: &str, os: aterm_types::Appearance) -> App {
+    let mut app = App::headless_for_test();
+    app.native_config_service =
+        crate::native_config_service::VersionedConfigService::new(toml.to_string()).unwrap();
+    app.config = (*app.native_config_service.snapshot().config).clone();
+    app.os_appearance = os;
+    app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
+    app
+}
+
+/// A palette choice while `theme` is a light/dark pair replaces only the side
+/// the OS shows, as the Settings pickers do, so the pair keeps following the
+/// OS; Enter on the side already drawn writes nothing. Negative control: a
+/// plain name is replaced whole.
+#[test]
+fn palette_choice_keeps_a_follow_system_pair() {
+    use aterm_types::Appearance::{Dark, Light};
+    let pair = "theme = \"dark:Aterm Night,light:Aterm Day\"\n";
+    for (os, written) in [
+        (Dark, "dark:Nord,light:Aterm Day"),
+        (Light, "dark:Aterm Night,light:Nord"),
+    ] {
+        let mut app = theme_choice_app(pair, os);
+        app.enqueue_theme_choice("Nord");
+        let snapshot = complete_theme_choice(&mut app);
+        assert!(
+            snapshot.text.contains(&format!("theme = \"{written}\"")),
+            "{os:?}: {}",
+            snapshot.text
+        );
+        assert_eq!(app.installed_colors.id, "Nord", "{os:?}");
+    }
+
+    let mut app = theme_choice_app(pair, Dark);
+    let revision = app.native_config_service.snapshot().revision;
+    app.palette_choose_theme("Aterm Night");
+    assert!(app.native_config_pending.is_empty(), "nothing to write");
+    assert_eq!(app.native_config_service.snapshot().revision, revision);
+    assert_eq!(
+        app.config.theme.as_deref(),
+        Some("dark:Aterm Night,light:Aterm Day")
+    );
+
+    let mut app = theme_choice_app("theme = \"Aterm Night\"\n", Light);
+    app.enqueue_theme_choice("Nord");
+    let snapshot = complete_theme_choice(&mut app);
+    assert!(
+        snapshot.text.contains("theme = \"Nord\""),
+        "{}",
+        snapshot.text
+    );
+}
+
+/// A palette choice while `theme` is unset (which follows the OS) keeps
+/// following it, as Settings ▸ Themes' Keep and the Settings pickers do: the
+/// chosen theme on the side the OS shows, its own pair on the other.
+/// Negative control: over a plain name the choice is the plain name.
+#[test]
+fn palette_choice_from_an_unset_theme_keeps_following_the_os() {
+    use aterm_types::Appearance::{Dark, Light};
+    for (os, chosen) in [(Dark, "Aterm Night"), (Light, "Aterm Day")] {
+        let mut app = theme_choice_app("", os);
+        app.enqueue_theme_choice(chosen);
+        let snapshot = complete_theme_choice(&mut app);
+        assert!(
+            snapshot
+                .text
+                .contains("theme = \"dark:Aterm Night,light:Aterm Day\""),
+            "{os:?}: {}",
+            snapshot.text
+        );
+        assert_eq!(app.installed_colors.id, chosen, "{os:?}");
+    }
+    let mut app = theme_choice_app("theme = \"Dracula\"\n", Light);
+    app.enqueue_theme_choice("Aterm Day");
+    let snapshot = complete_theme_choice(&mut app);
+    assert!(
+        snapshot.text.contains("theme = \"Aterm Day\""),
+        "{}",
+        snapshot.text
+    );
+}
+
+/// A refused theme choice reverts its preview to the configured theme and
+/// says so; the config is untouched. Negative control: a refusal leaves a
+/// palette-held or TTL preview of someone else alone.
+#[test]
+fn palette_theme_choice_refused_reverts_and_says_why() {
+    use crate::control_theme::PreviewHold;
+    let mut app = App::headless_for_test();
+    app.config = aterm_toml::from_str("theme = \"Dracula\"\n").unwrap();
+    app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
+    let before = app.theme;
+
+    app.begin_theme_preview("Nord", PreviewHold::Committing)
+        .unwrap();
+    app.enqueue_theme_choice("Nord");
+    let NativeConfigRequest { origin, .. } = app.native_config_pending.pop_front().unwrap();
+    app.publish_native_config_origin(
+        origin,
+        ConfigPatchOutcome::Rejected {
+            message: "disk full".to_string(),
+        },
+        None,
+        false,
+        None,
+    );
+    assert!(app.theme_preview.is_none());
+    assert_eq!(
+        app.theme, before,
+        "the unsaved choice is not left on screen"
+    );
+    assert_eq!(app.config.theme.as_deref(), Some("Dracula"));
+    assert!(app.has_live_message("Couldn't save the theme"));
+
+    let now = std::time::Instant::now();
+    app.preview_theme("Nord", std::time::Duration::from_secs(60), now)
+        .unwrap();
+    app.enqueue_theme_choice("Gruvbox Dark");
+    let NativeConfigRequest { origin, .. } = app.native_config_pending.pop_front().unwrap();
+    app.publish_native_config_origin(
+        origin,
+        ConfigPatchOutcome::Rejected {
+            message: "disk full".to_string(),
+        },
+        None,
+        false,
+        None,
+    );
+    assert_eq!(
+        app.theme_preview.as_ref().map(|p| p.hold),
+        Some(PreviewHold::Until(now + std::time::Duration::from_secs(60))),
+        "a refusal ends only the committing preview"
+    );
 }

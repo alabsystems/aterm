@@ -759,6 +759,10 @@ pub struct CursorGlow {
     /// Reused by [`Self::emit_comet`]'s Laser arm for the per-layer filament
     /// polyline, so a laser frame allocates nothing after the first growth.
     comet_verts: Vec<BeamVertex>,
+    /// Reused by the light-ground body ([`Self::emit_comet_light`]) for its
+    /// ribbon polyline, so a light frame allocates nothing after the first
+    /// growth.
+    light_verts: Vec<aterm_render::RibbonVertex>,
     /// Live outgoing style crossfades (≤ [`Self::FADE_CAP`], oldest dropped);
     /// see [`OutgoingFade`] and the style-switch contract in [`Self::tick`].
     /// Empty in steady state, where the tick pays one `is_empty` test.
@@ -2022,7 +2026,16 @@ impl CursorGlow {
             // is its only sound; the timbre snapshot uses the same config.
             self.store_key_timbre(cfg);
             self.settle_key_seam(cfg, cfg.intensity > 0.0);
-            return self.classic.tick(cur, now, cfg, geom, out);
+            let fp = self.classic.tick(cur, now, cfg, geom, out);
+            // Its spawns count and log like every style's, so `trail` and
+            // `trail status` show what it drew.
+            if let Some((from, to)) = self.classic.take_spawn() {
+                self.spawns += 1;
+                self.log_licensed_as(now, from, to, AdmissionRecord::LICENCE_MOTION);
+            }
+            // A light ground's veils ride the radial stream.
+            self.halo_out.extend_from_slice(self.classic.halos());
+            return fp;
         }
 
         if self.rng == 0 {
@@ -2360,7 +2373,7 @@ impl CursorGlow {
             self.emit_bolts(now, cfg, geom, out, &mut bolt_verts);
             // No-op for Water/rainbow kitty (beam=false); on light themes the beam family
             // emits source-over veil halos instead of additive quads.
-            self.emit_comet(now, cfg, geom, cur, out, &mut halos);
+            self.emit_comet(now, cfg, geom, cur, out, &mut halos, &mut under);
             out.truncate(Self::MAX_QUADS);
             // Per-pixel fire (Fire only): FirePatches render at the under-ink
             // seam through the shared byte-exact integer field. Not gated on
@@ -2382,7 +2395,7 @@ impl CursorGlow {
             if under.len() < Self::MAX_QUADS {
                 // Water's broad reflection belongs below glyph ink. Its crown,
                 // landing ripple and free droplets remain over-ink accents.
-                self.emit_water(now, cfg, geom, cur, &mut under);
+                self.emit_water(now, cfg, geom, cur, &mut under, &mut halos);
             }
             if self.v2.engaged() {
                 // Seam point 3 (§17.2, D14): v2 owns the rainbow's whole emit
@@ -2473,7 +2486,7 @@ impl CursorGlow {
                 // (§7.1's caret seam, the ribbon's nozzle), so while v2 owns the
                 // frame the crown neither paints nor paces
                 // ([`Self::needs_frame_cadence`]).
-                self.emit_crown(now, cfg, geom, cur, &mut halos);
+                self.emit_crown(now, cfg, geom, cur, &mut halos, &mut under);
             }
             // The forge dressing rides `cursor_temp`, not the crown's window,
             // so it runs whether or not a crown is live.

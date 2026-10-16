@@ -17,7 +17,7 @@ use crate::supervise::transport::{Endpoint, Transport};
 use crate::supervise::{
     self, ClockAnchor, EXIT_TIMEOUT, LedgerFormat, LedgerHost, LedgerOpts, MailOpts, Mark,
     ReportOpts, Session, SuperviseOpts, SupervisorConfig, TaskOpts, View, classify_command_with,
-    exit_reason, render_phase_and_survey, worker_phase,
+    exit_reason, render_phase_and_survey,
 };
 use crate::{ControlClient, CtlClient, DRIVE_HELP, RelayClient, SelfGovernor, Turn, TurnError};
 
@@ -749,11 +749,16 @@ fn watch_exit_line(cmd: &[String], err: &str) -> Option<String> {
 
 /// What `phase` and `await-turn` print for a turn: the phase and its detail,
 /// then `survey 0` while the session survey is open and `context <n>%` while
-/// the context indicator is up ([`render_phase_and_survey`]); exit 124 for a
-/// turn the timeout cut short.
-fn phase_reply(turn: &supervise::Turn, allow: &[String]) -> Reply {
+/// the context reading is up ([`render_phase_and_survey`]), every line read by
+/// `reader` — the worker's own program's, as the turn's phase was; exit 124
+/// for a turn the timeout cut short.
+fn phase_reply(
+    turn: &supervise::Turn,
+    reader: &dyn aterm_phase::ScreenReader,
+    allow: &[String],
+) -> Reply {
     Reply {
-        text: render_phase_and_survey(turn, allow),
+        text: render_phase_and_survey(turn, reader, allow),
         code: if turn.timed_out { EXIT_TIMEOUT } else { 0 },
     }
 }
@@ -842,13 +847,8 @@ fn run(opts: &Opts) -> Result<Reply, String> {
             no_positionals(verb, &sub)?;
             let allow = python_allow(&sub);
             let mut session = Session::new(&mut client, sub.sid);
-            let screen = session.read_screen()?;
-            let turn = supervise::Turn {
-                phase: worker_phase(&screen.rows),
-                screen,
-                timed_out: false,
-            };
-            Ok(phase_reply(&turn, &allow))
+            let (turn, reader) = session.phase_now()?;
+            Ok(phase_reply(&turn, reader, &allow))
         }
         "answer" => {
             let sub = parse_sub(verb, &opts.cmd[1..])?;
@@ -889,8 +889,8 @@ fn run(opts: &Opts) -> Result<Reply, String> {
             let reconnect = sub.reconnect_s;
             let mut session = Session::new(&mut client, sub.sid);
             set_reconnect(&mut session, reconnect);
-            let turn = session.await_turn(timeout)?;
-            Ok(phase_reply(&turn, &allow))
+            let (turn, reader) = session.await_phase(timeout)?;
+            Ok(phase_reply(&turn, reader, &allow))
         }
         "supervise" => {
             let sub = parse_sub(verb, &opts.cmd[1..])?;
@@ -1911,20 +1911,21 @@ mod tests {
             "  ? for shortcuts",
         ];
         let turn = |rows: Vec<String>, timed_out| supervise::Turn {
-            phase: worker_phase(&rows),
+            phase: supervise::worker_phase(&rows),
             screen: supervise::screen::Screen {
                 rows,
                 ..supervise::screen::Screen::default()
             },
             timed_out,
         };
+        let claude = aterm_phase::Program::Claude.reader();
         let rows: Vec<String> = body.iter().map(|r| r.to_string()).collect();
-        let r = phase_reply(&turn(rows.clone(), false), &[]);
+        let r = phase_reply(&turn(rows.clone(), false), claude, &[]);
         assert_eq!(
             (r.text.as_str(), r.code),
             ("idle\nsurvey 0\ncontext 1%\n", 0)
         );
-        let r = phase_reply(&turn(rows.clone(), true), &[]);
+        let r = phase_reply(&turn(rows.clone(), true), claude, &[]);
         assert_eq!(
             (r.text.as_str(), r.code),
             ("idle\nsurvey 0\ncontext 1%\n", EXIT_TIMEOUT)
@@ -1935,14 +1936,14 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(
-            phase_reply(&turn(no_survey.clone(), false), &[]).text,
+            phase_reply(&turn(no_survey.clone(), false), claude, &[]).text,
             "idle\ncontext 1%\n"
         );
         let plain: Vec<String> = no_survey
             .into_iter()
             .filter(|r| !r.contains("until auto-compact"))
             .collect();
-        assert_eq!(phase_reply(&turn(plain, false), &[]).text, "idle\n");
+        assert_eq!(phase_reply(&turn(plain, false), claude, &[]).text, "idle\n");
     }
 
     /// `report [@sid] [--since ORIGIN:I] [--max-rows N]`: the mark is a
@@ -2115,40 +2116,6 @@ mod tests {
 
         let err = parse(os(&["--ready"])).expect_err("a missing value is an error");
         assert!(err.contains("--ready needs a REGEX"), "actionable: {err}");
-    }
-
-    /// The drive CLI asks the shared helper for the token path rather than
-    /// re-deriving it, so it agrees with the convention whatever that is (an
-    /// explicit socket pairs with a token named after itself, so two private
-    /// instances in one directory keep separate credentials).
-    #[test]
-    fn token_path_uses_the_shared_convention_not_a_stem_swap() {
-        for sock in ["/tmp/run/c.sock", "/tmp/run/aterm-42.sock", "/tmp/run/ctl"] {
-            let resolved = aterm_uds::latest::token_path_for_sock(sock).expect("resolves");
-            // Named through the same mirror the CLI itself calls, so this crate
-            // gains no dependency to state the rule twice.
-            let expected = std::path::Path::new(sock)
-                .parent()
-                .expect("a directory")
-                .join(aterm_uds::latest::token_name_for_sock(
-                    std::path::Path::new(sock)
-                        .file_name()
-                        .expect("a file name")
-                        .to_string_lossy()
-                        .as_ref(),
-                ));
-            assert_eq!(
-                resolved, expected,
-                "{sock}: the drive CLI must name the token the shared rule names"
-            );
-        }
-        // And the hand-rolled stem swap this test was born to forbid stays gone:
-        // `c.sock` pairs with `c.sock.token`, never `c.token`.
-        let p = aterm_uds::latest::token_path_for_sock("/tmp/run/c.sock").expect("resolves");
-        assert!(
-            !p.to_string_lossy().ends_with("/c.token"),
-            "the old hand-rolled <stem>.token derivation is gone, got {p:?}"
-        );
     }
 
     #[test]

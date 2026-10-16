@@ -285,6 +285,19 @@ unsafe impl Encode for *mut std::ffi::c_uchar {
     const ENCODING: &'static str = "*";
 }
 
+// `id *`, an array of objects: `+[NSArray arrayWithObjects:count:]` takes a
+// `const id *` (clang emits `r^@`; the qualifier is omitted as above).
+// SAFETY: a pointer to object pointers encodes as `"^@"`.
+unsafe impl Encode for *const crate::runtime::Id {
+    const ENCODING: &'static str = "^@";
+}
+// `unsigned char **`, the plane array of `-[NSBitmapImageRep
+// initWithBitmapDataPlanes:…]`, which the runtime reports as `^*`.
+// SAFETY: a pointer to C strings encodes as `"^*"`.
+unsafe impl Encode for *mut *mut std::ffi::c_uchar {
+    const ENCODING: &'static str = "^*";
+}
+
 /// `@encode(BOOL *)` for the target being compiled. Not `"^"` plus
 /// [`BOOL_ENCODING`] on x86_64, and not `*` either:
 ///

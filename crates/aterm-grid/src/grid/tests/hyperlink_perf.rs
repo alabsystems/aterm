@@ -11,17 +11,15 @@ fn test_url() -> Arc<str> {
     Arc::from("https://test.com")
 }
 
-/// After `get_or_create` (most common mutation), result is correct.
+/// After `get_or_create`; a non-link extra does not count.
 #[test]
 fn correct_after_get_or_create() {
     let url = test_url();
     let mut extras = CellExtras::new();
 
-    // Empty: no hyperlinks on any row
     assert!(!extras.row_has_hyperlinks(0));
     assert!(!extras.row_has_hyperlinks(5));
 
-    // Add hyperlink to row 5
     extras
         .get_or_create(CellCoord::new(5, 0))
         .set_hyperlink(Some(url.clone()));
@@ -30,11 +28,9 @@ fn correct_after_get_or_create() {
     assert!(!extras.row_has_hyperlinks(4));
     assert!(!extras.row_has_hyperlinks(6));
 
-    // Add non-hyperlink extra to row 3 (combining mark)
     extras
         .get_or_create(CellCoord::new(3, 0))
         .add_combining('\u{0301}');
-    // Row 3 has extras but not hyperlinks
     assert!(!extras.row_has_hyperlinks(3));
     assert!(extras.row_has_hyperlinks(5));
 }
@@ -104,7 +100,7 @@ fn correct_after_shift_rows_up() {
     assert!(extras.row_has_hyperlinks(10));
     assert!(!extras.row_has_hyperlinks(5));
 
-    // Shift all rows up by 5 (rows 0..5 discarded, row 10 → row 5)
+    // Rows 0..5 are discarded; row 10 lands on row 5.
     extras.shift_rows_up_by(0, 5);
 
     assert!(
@@ -125,7 +121,6 @@ fn correct_after_set_empty() {
         .set_hyperlink(Some(url));
     assert!(extras.row_has_hyperlinks(5));
 
-    // Setting an empty CellExtra removes the entry
     extras.set(CellCoord::new(5, 0), CellExtra::default());
     assert!(
         !extras.row_has_hyperlinks(5),
@@ -139,7 +134,6 @@ fn correct_across_mixed_mutations() {
     let url = test_url();
     let mut extras = CellExtras::new();
 
-    // Populate hyperlinks on rows 2, 5, 8, 12
     for row in [2u16, 5, 8, 12] {
         extras
             .get_or_create(CellCoord::new(row, 0))
@@ -147,7 +141,6 @@ fn correct_across_mixed_mutations() {
     }
     let initial: Vec<bool> = (0..15).map(|r| extras.row_has_hyperlinks(r)).collect();
 
-    // Mutation that doesn't change hyperlinks (combining mark on row 2)
     extras
         .get_or_create(CellCoord::new(2, 5))
         .add_combining('\u{0301}');

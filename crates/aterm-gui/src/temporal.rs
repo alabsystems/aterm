@@ -384,7 +384,7 @@ impl TemporalRecorder {
             lost_resizes: 0,
             spine: Arc::default(),
             bytes_since_keyframe: 0,
-            epoch: Instant::now(), // CLOCK-EXEMPT: recorder timeline epoch, not engine state
+            epoch: Instant::now(), // recorder timeline epoch, not engine state
             resize_policy: ResizePolicy::Native,
             handoff: None,
         }
@@ -417,7 +417,7 @@ impl TemporalRecorder {
     /// taps call this so one session shares a single monotone tick timeline.
     #[must_use]
     pub(crate) fn now(&self) -> Ticks {
-        // CLOCK-EXEMPT: derives the recorded tick from the recorder epoch; this
+        // Derives the recorded tick from the recorder epoch; this
         // is the value we RECORD, not engine state read during process().
         Ticks(u64::try_from(self.epoch.elapsed().as_micros()).unwrap_or(u64::MAX))
     }

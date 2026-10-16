@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Memory tracking and cold tier budget enforcement (#5444).
+//! Memory tracking and cold tier budget enforcement.
 
 use super::*;
 
@@ -71,7 +71,7 @@ fn scrollback_total_memory_used() {
     );
 }
 
-/// Cold tier budget enforcement (#5444): reducing the memory budget evicts cold pages.
+/// Cold tier budget enforcement: reducing the memory budget evicts cold pages.
 #[test]
 fn set_memory_budget_evicts_cold_pages() {
     // Small tiers: hot=5, warm=10, block_size=5, generous initial budget
@@ -119,8 +119,8 @@ fn set_memory_budget_evicts_cold_pages() {
     );
 }
 
-/// E10a: memory-pressure eviction is REAL retention loss and must be counted
-/// out-of-band; a user-requested line-limit truncation must NOT be.
+/// Memory-pressure eviction is real retention loss and is counted out of band;
+/// a user-requested line-limit truncation is not.
 #[test]
 fn pressure_evictions_are_counted_and_limit_truncation_is_not() {
     let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
@@ -149,7 +149,7 @@ fn pressure_evictions_are_counted_and_limit_truncation_is_not() {
     );
 }
 
-/// Cold tier budget enforcement (#5444): push_line triggers cold eviction under pressure.
+/// Cold tier budget enforcement: push_line triggers cold eviction under pressure.
 #[test]
 fn push_line_triggers_cold_eviction_when_over_budget() {
     // Tiny budget: forces eviction as soon as cold tier has data
@@ -181,7 +181,7 @@ fn push_line_triggers_cold_eviction_when_over_budget() {
     }
 }
 
-/// Cold tier budget enforcement (#5444): over_budget returns false after eviction.
+/// Cold tier budget enforcement: over_budget returns false after eviction.
 #[test]
 fn over_budget_false_after_cold_eviction() {
     let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
@@ -211,7 +211,7 @@ fn over_budget_false_after_cold_eviction() {
     );
 }
 
-/// Cold tier budget enforcement (#5444): newest lines survive eviction.
+/// Cold tier budget enforcement: newest lines survive eviction.
 #[test]
 fn cold_eviction_preserves_newest_lines() {
     let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);

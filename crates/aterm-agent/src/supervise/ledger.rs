@@ -284,9 +284,8 @@ pub struct Ledger {
     pub journal: Vec<JournalRecord>,
     /// Whether a journal was read at all.
     pub journaled: bool,
-    /// Whether a `--journal` was GIVEN and could not be read. Not the same as
-    /// none given: nothing of the watcher's loop was read, so the counts it
-    /// would have filled say that instead of `0`.
+    /// A `--journal` was given and could not be read: the counts it would have filled say so
+    /// instead of `0`.
     pub journal_unreadable: bool,
     pub mail: Vec<Mail>,
     /// Whether the process-clock stamps are on the wall clock.
@@ -365,9 +364,8 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
         Ok(r) => {
             hist = parse_history_records(&r.stdout);
             let carried = hist.iter().filter(|t| t.carried).count();
-            // An update that could not carry the ledger whole says so on the
-            // header (`unheld_below=`): then an empty ledger is not a session
-            // nobody drove.
+            // An update that could not carry the ledger whole says so (`unheld_below=`): then
+            // an empty ledger is not a session nobody drove.
             let lost = history_floor(&r).map(|floor| {
                 format!(
                     "an aterm update could not carry its ledger whole: turns before id {floor} \
@@ -402,8 +400,8 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
         }),
     }
 
-    // The process-clock → wall-clock step. Without an anchor the newest
-    // stamp read is taken as now, so the order still reads.
+    // The process clock onto the wall clock. Without an anchor the newest stamp is taken as
+    // now, so the order still reads.
     let newest = hist
         .iter()
         .filter(|t| !t.carried)
@@ -437,13 +435,8 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
         })
         .collect();
 
-    // 2. The journal.
-    //
-    // `journaled` is whether one was READ, not whether one was GIVEN: a
-    // `--journal` that does not open has no records to say anything about, and
-    // counting it as zero approvals, zero reconnects and "no EVENT
-    // idle/question in the journal" reports the watcher's loop as idle when
-    // nothing about it was read at all.
+    // 2. The journal. `journaled` is whether one was read, not given: an unreadable
+    // `--journal` must not count as zero approvals and an idle watcher.
     let mut journal = Vec::new();
     let mut journaled = false;
     let mut journal_unreadable = false;
@@ -540,12 +533,9 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
     }
     mail.sort_by_key(|m| m.t);
 
-    // When the worker stopped: the first EVENT that ended on words after each
-    // turn began, before the next one did.
-    //
-    // Only with a clock: without an anchor `turn.t` is a process-clock stamp
-    // on a fallback epoch, so `stopped - t` against the journal's wall clock is
-    // not a duration. What cannot be placed claims no latency.
+    // When the worker stopped: the first EVENT that ended on words after each turn began,
+    // before the next one did. Only with a clock: without an anchor `turn.t` sits on a fallback
+    // epoch, so `stopped - t` against the journal's wall clock is no duration.
     let starts: Vec<Option<i64>> = turns.iter().map(|t| t.t).collect();
     for (i, turn) in turns.iter_mut().enumerate().filter(|_| aligned) {
         let Some(start) = turn.t else { continue };
@@ -573,9 +563,8 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
     }
 }
 
-/// An EVENT the worker's turn ended with: it stopped and waits for words —
-/// `idle` as `watch --mail` prints it too (`turn`, its report folded in, and
-/// `idle-no-report`).
+/// An EVENT the worker's turn ended with, waiting for words: `idle`, also as `watch --mail`
+/// prints it (`turn`, its report folded in, and `idle-no-report`).
 fn ended_on_words(phase: &str) -> bool {
     matches!(
         phase,
@@ -583,11 +572,10 @@ fn ended_on_words(phase: &str) -> bool {
     )
 }
 
-/// The worker's reply to each turn, in rows: one `offscreen tail=<n> max=<n>
-/// screen=1` read, joined as `report` joins it; each turn's `❯` row found by
-/// its text (the first 60 characters, whitespace aside, or a `[Pasted text …]`
-/// row that fits), in order; a reply is its rows down to the next turn's row
-/// (to the transcript's end for the last), trailing blank rows aside.
+/// A turn's reply in rows (or why it is not known), and the turns inside that count.
+/// [`reply_sizes`] reads them from one `offscreen tail=<n> max=<n> screen=1` read joined as
+/// `report` joins it: each turn's `❯` row found in order ([`find_turn_row`]), a reply its rows
+/// down to the next turn's row found (the transcript's end for the last), trailing blanks aside.
 type ReplySize = (Result<usize, String>, Vec<u64>);
 
 fn reply_sizes<C: Ctl>(
@@ -633,7 +621,8 @@ fn reply_sizes<C: Ctl>(
             return unknown("no archive read");
         }
     };
-    let joined = join(&off);
+    // Claude Code's grammar: the turns are found by their `❯` rows.
+    let joined = join(&off, &aterm_phase::ClaudeReader);
     let rows = &joined.rows;
     let mut from = 0usize;
     let mut found: Vec<Option<usize>> = Vec::with_capacity(hist.len());
@@ -673,16 +662,14 @@ fn reply_sizes<C: Ctl>(
                 };
                 return (Err(why.to_string()), Vec::new());
             };
-            // The reply runs to the next turn's row that WAS found: a turn
-            // whose row is nowhere (it was queued, or a restart took it) has
-            // its reply inside this count, and is named.
+            // The reply runs to the next turn's row that was found: a turn whose row is
+            // nowhere (queued, or a restart took it) is inside this count, and is named.
             let next = found[i + 1..].iter().position(Option::is_some);
             let end = match next {
                 Some(k) => found[i + 1 + k].unwrap_or(rows.len()),
                 None => rows.len(),
             };
-            // With no later row found at all, every turn after this one is
-            // inside its count.
+            // With no later row found, every later turn is inside this count.
             let swallowed = hist[i + 1..][..next.unwrap_or(hist.len() - i - 1)]
                 .iter()
                 .map(|t| t.id)
@@ -712,9 +699,8 @@ fn reply_sizes<C: Ctl>(
     sizes
 }
 
-/// The first user row at or after `from` whose text begins with `text`'s
-/// first 60 characters (whitespace aside), else — for a paste-like text —
-/// the first `[Pasted text …]` row there that fits it.
+/// The first user row at or after `from` whose text begins with `text`'s first 60 characters
+/// (whitespace aside), else, for a paste-like text, the first `[Pasted text …]` row that fits.
 fn find_turn_row(rows: &[String], from: usize, text: &str) -> Option<usize> {
     let want: String = text
         .chars()
@@ -1141,8 +1127,7 @@ pub fn parse_since(s: &str, local_offset_s: i64) -> Option<i64> {
             let (sign, z) = z.split_at(1);
             let (zh, zm) = match z.split_once(':') {
                 Some(pair) => pair,
-                // Byte 2 must be a char boundary: a 4-BYTE suffix like `1é1`
-                // is not four digits, and `split_at` would panic inside it.
+                // Byte 2 must be a char boundary: `split_at` panics inside a 4-byte `1é1`.
                 None if z.len() == 4 && z.is_char_boundary(2) => z.split_at(2),
                 None => (z, "0"),
             };
@@ -1163,8 +1148,7 @@ pub fn parse_since(s: &str, local_offset_s: i64) -> Option<i64> {
             offset = z;
         }
     }
-    // Checked: the year is up to ten digits, and `9999999999-01-01` in
-    // milliseconds does not fit an `i64` — refused, not wrapped or panicked.
+    // Checked: a ten-digit year in milliseconds overflows an `i64`; refused, not wrapped.
     days_from_civil(y, mo, d)
         .checked_mul(86_400)?
         .checked_add(secs)?
@@ -1379,10 +1363,9 @@ pub fn render_md(l: &Ledger) -> String {
     out
 }
 
-/// A string for a JSON document embedded in HTML: [`json_str`] (which already
-/// spells U+2028 and U+2029, the line terminators a script would choke on, as
-/// `\u` escapes), and `<`, `>` and `&` as `\u` escapes, so no `</script>`
-/// survives.
+/// A string for a JSON document embedded in HTML: [`json_str`] (which already escapes U+2028
+/// and U+2029, which a script chokes on), with `<`, `>` and `&` as `\u` escapes too, so no
+/// `</script>` survives.
 pub(super) fn html_json_str(s: &str) -> String {
     json_str(s)
         .replace('<', "\\u003c")

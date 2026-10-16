@@ -1,102 +1,63 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A READ-ONLY tar reader for signed bundles — the parser that retired the
-//! `tar` crate (and, with it, `xattr` and `filetime`) from the shipped graph.
+//! A read-only tar reader for the `.tar.zst` payload of a signed package bundle, written by
+//! the publisher's system `tar` (bsdtar on macOS, GNU tar on Linux) and opened by
+//! [`crate::extract`]. A parser, not a library: no builder, no `unpack`, no
+//! permissions/xattr/mtime restoration (the extractor sets its own sanitized mode).
 //!
-//! # Scope, deliberately small
+//! # What it understands
 //!
-//! aterm NEVER WRITES a tar archive. It reads exactly one kind: the
-//! `.tar.zst` payload of a signed package bundle, produced by the system
-//! `tar` on the publisher's machine (bsdtar on macOS, GNU tar on Linux) and
-//! opened by [`crate::extract`]. So this is a parser, not a library: no
-//! builder, no `unpack`, no permissions/xattr/mtime restoration — the
-//! extractor sets its own sanitized mode on every file it writes, which is
-//! why the retired crate's `xattr` and `filetime` dependencies had no
-//! customer here either.
-//!
-//! # What it must understand
-//!
-//! * **USTAR** — the 512-byte header, POSIX octal fields, the `prefix`/`name`
-//!   split for paths over 100 bytes.
-//! * **GNU long names** — typeflag `L` (path) and `K` (link target), whose
-//!   body is the real name and whose *next* header is the entry it names. GNU
-//!   tar emits these by default for a long path.
-//! * **PAX extended headers** — typeflag `x`, `"<len> <key>=<value>\n"`
-//!   records. bsdtar's default "restricted pax" emits them for long paths,
-//!   high ids and sub-second times. Three keys are read: `path`, `linkpath`
-//!   and `size`. A `g` (global) header is NOT an extension header here — see
-//!   below.
-//! * **GNU base-256 numbers** — a numeric field whose top bit is set is
-//!   big-endian binary, not octal. That is how a file over 8 GiB states its
-//!   size. Only the fields that DEFINE the extension accept it (`size`);
-//!   `mode` and `chksum` are octal-only.
+//! * USTAR: the 512-byte header, POSIX octal fields, the `prefix`/`name` split for paths
+//!   over 100 bytes.
+//! * GNU long names: typeflag `L` (path) and `K` (link target), whose body is the real
+//!   name and whose next header is the entry it names.
+//! * PAX extended headers: typeflag `x`, `"<len> <key>=<value>\n"` records (bsdtar emits
+//!   them for long paths, high ids and sub-second times). Three keys are read: `path`,
+//!   `linkpath` and `size`.
+//! * GNU base-256 numbers: a numeric field whose top bit is set is big-endian binary, how
+//!   a file over 8 GiB states its size. Only `size` accepts it; `mode` and `chksum` are
+//!   octal-only.
 //!
 //! # Where two tar readers stop agreeing
 //!
-//! Everything in this section is a rule that only exists because a *second*
-//! reader would answer differently, and a bundle that two readers describe
-//! differently is a bundle whose file list can be substituted after vetting.
-//! Each of these is pinned by a case in `tests/tar_corpus.rs`.
+//! A bundle two readers describe differently is one whose file list can be substituted
+//! after vetting, so each rule below matches the `tar` crate and is pinned by a case in
+//! `tests/tar_corpus.rs`.
 //!
-//! * **A PAX `size` record OVERRIDES the header's `size` field.** Without
-//!   that, an `x` header saying `size=4` in front of a ustar header saying
-//!   `size=512` makes the two readers disagree about where the NEXT header
-//!   starts, and from there about the entire rest of the archive.
-//! * **The FIRST record of a repeated key wins**, for `path`, `linkpath` and
-//!   `size` alike. Last-wins and first-wins are both defensible; being the
-//!   only reader that picks one of them is not.
-//! * **A malformed PAX record is SKIPPED, not fatal, and does not end the
-//!   scan** — later records still apply. (For `size` alone the lookup gives
-//!   up at the first malformed record, because that is what the retired
-//!   reader's `pax_extensions_value` did.)
-//! * **A `g` (PAX global) header is an ORDINARY entry**, classified
-//!   [`EntryType::Other`] and refused upstream as a disallowed kind. It is
-//!   never allowed to supply a `path`. A global header is a default for every
-//!   following member, which is not a thing this extractor restores, and
-//!   honouring one as a rename primitive would hand a crafted archive a name
-//!   override that `vet_entry` has never been exercised against.
-//! * **`L`/`K`/`x` are extension headers only with ustar or GNU MAGIC.** A
-//!   header carrying the typeflag but neither magic is an ordinary entry —
-//!   again `Other`, again refused. Otherwise a magic-less `L` turns an archive
-//!   that every other reader rejects into one that installs under an
-//!   attacker-supplied long name.
-//! * **A second `L`, `K` or `x` before the same member is a REJECTION.** Two
-//!   long names for one member is two answers to "what is this file called".
-//! * **`prefix` is read only from a POSIX ustar header** (magic `"ustar\0"`
-//!   AND version `"00"`). In the GNU layout those same bytes are
-//!   `atime`/`ctime`/`offset`, so reading them as a path prefix invents a
-//!   directory component out of a timestamp.
+//! * A PAX `size` record overrides the header's `size` field; otherwise the readers
+//!   disagree about where the next header starts.
+//! * The first record of a repeated key wins, for `path`, `linkpath` and `size` alike.
+//! * A malformed PAX record is skipped, not fatal, and later records still apply (for
+//!   `size` alone the lookup stops at the first malformed record).
+//! * A `g` (PAX global) header is an ordinary entry, [`EntryType::Other`], refused
+//!   upstream; it never supplies a `path`, since honouring it would give a crafted archive
+//!   a name override `vet_entry` was never exercised against.
+//! * `L`/`K`/`x` are extension headers only with ustar or GNU magic; without either the
+//!   header is `Other` and refused, so a magic-less `L` cannot rename the next entry.
+//! * A second `L`, `K` or `x` before the same member is rejected: two answers to "what is
+//!   this file called".
+//! * `prefix` is read only from a POSIX ustar header (magic `"ustar\0"` and version
+//!   `"00"`): in the GNU layout those bytes are `atime`/`ctime`/`offset`.
 //!
 //! # Security posture
 //!
-//! This parses ATTACKER-INFLUENCED bytes (a downloaded bundle) before its
-//! signature has bought anything, so the rules are hard:
+//! This parses attacker-influenced bytes before their signature has bought anything:
 //!
-//! * **It never panics.** Every field is bounds-checked, every arithmetic step
-//!   is checked or saturating, and a malformed field is an `io::Error`, never
-//!   an index out of range. `#![forbid(unsafe_code)]` is inherited from the
-//!   crate.
-//! * **It never allocates on an attacker's word.** A declared size is a `u64`
-//!   the archive chose; nothing here reserves memory for it. Long-name and PAX
-//!   bodies — the only variable-length reads — are read through the CALLER's
-//!   reader, which is [`crate::extract::extract_tar_zst`]'s budget-capped
-//!   wrapper, and are additionally refused outright past
-//!   [`MAX_EXTENSION_BODY`].
-//! * **It reads strictly forward.** Every skip is a bounded `read` loop into a
-//!   fixed stack buffer, so a huge declared size costs time, not memory — and
-//!   the caller's budget stops the time too.
-//! * **It does not interpret paths.** `..`, absolute paths, symlink targets
-//!   and disallowed entry kinds are the extractor's `vet_entry` /
-//!   `vet_hardlink` decision, unchanged; this layer hands them the exact bytes
-//!   the archive carried, so that vetting still sees the truth.
+//! * It never panics: every field is bounds-checked, every arithmetic step checked or
+//!   saturating, a malformed field an `io::Error`. There is no `unsafe` here.
+//! * It never allocates on an attacker's word: long-name and PAX bodies, the only
+//!   variable-length reads, go through the caller's budget-capped reader
+//!   ([`crate::extract::extract_tar_zst`]) and are refused past [`MAX_EXTENSION_BODY`].
+//! * It reads strictly forward: every skip is a bounded `read` loop into a fixed stack
+//!   buffer, so a huge declared size costs time, which the caller's budget also caps.
+//! * It does not interpret paths: `..`, absolute paths, symlink targets and disallowed
+//!   kinds are the extractor's `vet_entry` / `vet_hardlink` decision, handed the exact
+//!   bytes the archive carried.
 //!
-//! # Evidence
-//!
-//! `tests/tar_corpus.rs` pins this reader's answers — accept-or-reject and
-//! every field the extractor reads — over hand-built adversarial headers and
-//! tens of thousands of mutated archives, recorded when every answer matched
-//! the retired `tar` crate.
+//! `tests/tar_corpus.rs` pins accept-or-reject and every field the extractor reads, over
+//! hand-built adversarial headers and tens of thousands of mutated archives, recorded when
+//! every answer matched the `tar` crate.
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -105,14 +66,10 @@ use std::path::{Path, PathBuf};
 /// padded up to a multiple of it.
 const BLOCK: usize = 512;
 
-/// The largest GNU-longname / PAX extension body this reader will read.
-///
-/// An extension header declares its body length in the same `size` field a
-/// file uses, so without a ceiling a 2^64 declaration would ask the reader to
-/// stream forever. 1 MiB dwarfs any real `PATH_MAX` name or PAX record set,
-/// and the extractor's own `TAR_ENTRY_STRUCTURAL_BUDGET` caps it again from
-/// outside — belt and braces, because this is the one place the parser holds
-/// attacker-chosen bytes in memory at all.
+/// The largest GNU-longname / PAX extension body this reader will read. Its length is
+/// declared in the same `size` field a file uses, so without a ceiling a 2^64 declaration
+/// would stream forever; 1 MiB dwarfs any real `PATH_MAX` name or PAX record set, and the
+/// extractor's `TAR_ENTRY_STRUCTURAL_BUDGET` caps it again from outside.
 const MAX_EXTENSION_BODY: u64 = 1024 * 1024;
 
 /// The tar typeflag byte, as the entry kinds this reader distinguishes.
@@ -124,8 +81,7 @@ const MAX_EXTENSION_BODY: u64 = 1024 * 1024;
 pub enum EntryType {
     /// A regular file (`0`, or the historical NUL).
     Regular,
-    /// A "continuation" of a regular file (`7`). Treated as regular, as every
-    /// reader does — no tar in living memory splits files this way.
+    /// A "continuation" of a regular file (`7`), treated as regular, as every reader does.
     Continuous,
     /// A directory (`5`).
     Directory,
@@ -175,12 +131,12 @@ mod field {
     pub const LINKNAME: (usize, usize) = (157, 100);
     /// `magic`: 6 bytes — `"ustar\0"` (POSIX) or `"ustar "` (GNU).
     pub const MAGIC: (usize, usize) = (257, 6);
-    /// `version`: 2 bytes — `"00"` (POSIX) or `" \0"` (GNU). Read TOGETHER with
+    /// `version`: 2 bytes — `"00"` (POSIX) or `" \0"` (GNU). Read together with
     /// the magic: the two formats differ by one byte of magic and both bytes of
     /// version, and the fields that follow are laid out differently in each.
     pub const VERSION: (usize, usize) = (263, 2);
     /// `prefix`: 155 bytes, prepended to `name` with a `/` when non-empty.
-    /// POSIX ustar ONLY — the GNU header puts `atime`/`ctime`/`offset` here.
+    /// POSIX ustar only: the GNU header puts `atime`/`ctime`/`offset` here.
     pub const PREFIX: (usize, usize) = (345, 155);
 }
 
@@ -190,9 +146,8 @@ fn bad(what: &str) -> io::Error {
 }
 
 impl Header {
-    /// A field's raw bytes. Returns an empty slice rather than panicking if
-    /// the offsets ever went wrong — this parser has no path to an index
-    /// panic, by construction rather than by review.
+    /// A field's raw bytes, or an empty slice if the offsets were ever wrong: never an
+    /// index panic.
     fn field(&self, (off, len): (usize, usize)) -> &[u8] {
         self.raw.get(off..off + len).unwrap_or(&[])
     }
@@ -205,39 +160,24 @@ impl Header {
         f.get(..end).unwrap_or(&[])
     }
 
-    /// Is this a POSIX ustar header — i.e. does `prefix` mean anything?
-    ///
-    /// Magic AND version, both exact. `starts_with(b"ustar")` is TRUE for a GNU
-    /// header (magic `"ustar "`), and in the GNU layout bytes 345..500 are
-    /// `atime`/`ctime`/`offset`, not `prefix`: reading them as a path prefix
-    /// manufactures a directory component out of a timestamp, which is a
-    /// different path from the one every other reader produces for the same
-    /// bytes. The retired reader required both fields exactly, and so does
-    /// this.
+    /// Is this a POSIX ustar header, i.e. does `prefix` mean anything? Magic and version,
+    /// both exact: `starts_with(b"ustar")` is also true of a GNU header, whose bytes
+    /// 345..500 are `atime`/`ctime`/`offset`.
     fn is_ustar(&self) -> bool {
         self.field(field::MAGIC) == b"ustar\0" && self.field(field::VERSION) == b"00"
     }
 
-    /// Is this a GNU header (magic `"ustar "`, version `" \0"`)?
-    ///
-    /// GNU is a different layout, not a dialect of ustar: it shares the first
-    /// 345 bytes and diverges after them. Nothing here reads a GNU-only field —
-    /// the format matters only because GNU is one of the two magics that make
-    /// an `L`/`K`/`x` typeflag mean "extension header".
+    /// Is this a GNU header (magic `"ustar "`, version `" \0"`)? It shares the first 345
+    /// bytes with ustar and matters here only as one of the two magics that make an
+    /// `L`/`K`/`x` typeflag an extension header.
     fn is_gnu(&self) -> bool {
         self.field(field::MAGIC) == b"ustar " && self.field(field::VERSION) == b" \0"
     }
 
-    /// Is this a header whose EXTENSION typeflags are meaningful?
-    ///
-    /// `L`, `K` and `x` are extensions defined by GNU tar and POSIX.1-2001; a
-    /// header carrying one of those bytes with neither magic is not speaking
-    /// either format, so the byte is just a vendor typeflag and the block is an
-    /// ordinary entry — which [`EntryType::Other`] then gets refused for. The
-    /// retired reader gated all four the same way
-    /// (`as_gnu().is_some() || as_ustar().is_some()`), and the gap matters:
-    /// without it a magic-less `L` header renames the entry after it, turning
-    /// an archive every other reader refuses into one that installs.
+    /// Is this a header whose extension typeflags (`L`, `K`, `x`) are meaningful? With
+    /// neither magic the byte is just a vendor typeflag and the block an ordinary entry,
+    /// refused as [`EntryType::Other`]; otherwise a magic-less `L` would rename the entry
+    /// after it.
     fn is_recognized(&self) -> bool {
         self.is_ustar() || self.is_gnu()
     }
@@ -261,7 +201,7 @@ impl Header {
         Ok(u32::try_from(v & 0o7777).unwrap_or(0o644))
     }
 
-    /// The number of CONTENT bytes this entry occupies in the archive.
+    /// The number of content bytes this entry occupies in the archive.
     ///
     /// # Errors
     /// When the size field is not a valid number.
@@ -269,33 +209,23 @@ impl Header {
         self.numeric(field::SIZE, "size")
     }
 
-    /// The stored checksum field. OCTAL ONLY — see [`Header::octal`].
+    /// The stored checksum field. Octal only: see [`Header::octal`].
     fn stored_checksum(&self) -> io::Result<u64> {
         self.octal(field::CHKSUM, "checksum")
     }
 
-    /// Parse a header field as NUL-terminated, whitespace-padded OCTAL, and
-    /// nothing else.
+    /// Parse a header field as NUL-terminated, whitespace-padded octal, and nothing else:
+    /// the parser for `mode` and `chksum`, which the GNU base-256 extension does not cover
+    /// (the `tar` crate reads them octal-only too).
     ///
-    /// This is the parser for every field that POSIX defines as octal and the
-    /// GNU base-256 extension does not cover: `mode` and `chksum`. The retired
-    /// reader used its octal-only path for exactly these two (`num_field_wrapper`
-    /// — the base-256-aware one — was reserved for `size`/`uid`/`gid`/`mtime`),
-    /// and the difference is not cosmetic on either field:
+    /// * `mode`: base-256 would let an attacker-chosen number carry the `0o111` bits that
+    ///   drive `safe_mode` to `0o755`; on `Err`, `extract.rs` falls back to `0o644`.
+    /// * `chksum`: base-256 would admit headers whose base-256 checksum equals their own
+    ///   byte sum.
     ///
-    /// * `mode`: a high-bit mode made the retired reader return `Err`, and
-    ///   `extract.rs` falls back to `0o644` on `Err` — non-executable. Accepting
-    ///   base-256 there would let an attacker-chosen number carry the `0o111`
-    ///   bits that drive `safe_mode` to `0o755` instead.
-    /// * `chksum`: a high-bit checksum field was a hard reject there. Accepting
-    ///   base-256 makes a header constructible whose base-256 checksum equals
-    ///   its own byte sum — a whole extra family of accepted headers, on the one
-    ///   field whose entire job is to refuse them.
-    ///
-    /// The permissiveness that IS kept is the permissiveness every reader has
-    /// to have for forty years of real archives: cut at the first NUL, trim the
-    /// surrounding whitespace, then parse what is left. Writers pad with spaces
-    /// on either side, and a stray `\n` in a checksum field is legal.
+    /// The leniency every reader needs: cut at the first NUL, trim surrounding whitespace,
+    /// parse the rest (writers pad with spaces on either side, and a stray `\n` in a
+    /// checksum field is legal).
     ///
     /// # Errors
     /// On a field that is not octal text.
@@ -312,23 +242,16 @@ impl Header {
             .map_err(|_| bad(&format!("{what} field is not an octal number")))
     }
 
-    /// Parse a numeric header field that MAY use the GNU base-256 extension:
-    /// big-endian binary when the top bit of the first byte is set, otherwise
-    /// [`octal`](Header::octal).
+    /// Parse a numeric header field that may use the GNU base-256 extension: big-endian
+    /// binary when the first byte's top bit is set, otherwise [`octal`](Header::octal).
+    /// Only `size` is read here (a file over 8 GiB cannot state its length in 11 octal
+    /// digits).
     ///
-    /// Only `size` is read through here, and `size` is one of the fields the
-    /// extension was defined for (a file over 8 GiB cannot state its length in
-    /// 11 octal digits).
-    ///
-    /// The base-256 arm reproduces the retired reader's reading EXACTLY,
-    /// including the part that looks like a bug: for a field WIDER than 8 bytes
-    /// — `size` is 12 — only the LAST 8 bytes are read, and the leading bytes,
-    /// flag byte included, are ignored. So `0x80 0x01 0x00…0x00` is size ZERO,
-    /// not 2^80. Reading all 12 bytes and rejecting the overflow would be the
-    /// stricter rule, and stricter is usually right — but not here: it makes
-    /// this the only reader in the world that refuses that archive, which is
-    /// the same disagreement class the rest of this module exists to close.
-    /// The value cannot overflow, because 8 bytes is exactly a `u64`.
+    /// For a field wider than 8 bytes (`size` is 12) only the last 8 are read and the
+    /// leading bytes, flag included, are ignored, so `0x80 0x01 0x00…0x00` is size zero,
+    /// not 2^80: the `tar` crate reads it so, and refusing the overflow would make this the
+    /// only reader that rejects that archive. 8 bytes is exactly a `u64`, so it cannot
+    /// overflow.
     ///
     /// # Errors
     /// On a field that is neither base-256 nor octal text.
@@ -340,10 +263,8 @@ impl Header {
         if first & 0x80 == 0 {
             return self.octal(spec, what);
         }
-        // The last 8 bytes, big-endian — with the flag bit stripped only when
-        // the field is exactly 8 wide and the flag byte IS one of the 8 read.
-        // (A field narrower than 8 cannot occur in this table; the arm is
-        // written total anyway rather than left to an underflow.)
+        // The last 8 bytes, big-endian, with the flag bit stripped only when the field is
+        // exactly 8 wide. (A narrower field cannot occur; the arm is total anyway.)
         let mut acc: u64 = 0;
         let skip = if f.len() > 8 {
             f.len().saturating_sub(8)
@@ -359,21 +280,12 @@ impl Header {
         Ok(acc)
     }
 
-    /// Does the header's own checksum match its bytes?
+    /// Does the header's own checksum match its bytes? The sum is the unsigned total of all
+    /// 512 bytes with the checksum field read as eight spaces.
     ///
-    /// The sum is the UNSIGNED total of all 512 bytes with the checksum field
-    /// itself replaced by eight spaces.
-    ///
-    /// Unsigned ONLY, deliberately. A handful of pre-POSIX writers summed the
-    /// bytes as signed, and a reader that accepts both readings accepts every
-    /// header whose 128-or-above bytes happen to cancel — which is a second,
-    /// weaker acceptance rule on attacker-influenced bytes, bought for the
-    /// benefit of writers that predate this project by decades. The retired
-    /// reader accepted only the unsigned sum, aterm's bundles are written by
-    /// today's bsdtar and GNU tar — a mutated header that the signed rule would
-    /// have waved through is exactly what found this.
-    ///
-    /// The sum cannot overflow: 512 bytes of at most 255 is 130 560.
+    /// Unsigned only: also accepting the signed reading some pre-POSIX writers used would
+    /// accept every header whose high bytes happen to cancel, a second, weaker rule on
+    /// attacker-influenced bytes. The sum cannot overflow: 512 × 255 is 130 560.
     fn checksum_ok(&self) -> bool {
         let Ok(stored) = self.stored_checksum() else {
             return false;
@@ -458,15 +370,19 @@ impl<R: Read> Archive<R> {
     /// Begin walking the entries.
     ///
     /// # Errors
-    /// Never at this point — the signature mirrors the retired crate's so the
-    /// extractor's error plumbing is unchanged, and so a future seek-based
-    /// variant can fail here without a call-site change.
+    /// Never at this point; the signature leaves room for a variant that can fail here.
     pub fn entries(&mut self) -> io::Result<Entries<'_, R>> {
         Ok(Entries {
             inner: &mut self.inner,
             skip: 0,
             finished: false,
         })
+    }
+
+    /// The reader, positioned wherever the walk stopped: after the end marker's first
+    /// block once [`Entries::next_entry`] has answered `None`.
+    pub fn into_inner(self) -> R {
+        self.inner
     }
 }
 
@@ -488,11 +404,8 @@ pub struct Entries<'a, R> {
 }
 
 impl<'a, R: Read> Entries<'a, R> {
-    /// Discard exactly `n` bytes from the stream.
-    ///
-    /// A fixed stack buffer, in a loop: a declared size is an attacker's
-    /// number, so skipping it must cost time proportional to the bytes that
-    /// actually exist, never memory proportional to the claim. A short read
+    /// Discard exactly `n` bytes through a fixed stack buffer, so an attacker's declared
+    /// size costs time proportional to the bytes that exist, never memory. A short read
     /// before `n` is a truncated archive.
     fn discard(&mut self, mut n: u64) -> io::Result<()> {
         let mut buf = [0u8; BLOCK];
@@ -544,17 +457,11 @@ impl<'a, R: Read> Entries<'a, R> {
         Ok(Some(Header { raw }))
     }
 
-    /// Read an extension header's body (`size` bytes plus its block padding).
-    ///
-    /// The body is the ONLY variable-length thing this parser holds in memory,
-    /// so it is streamed in fixed blocks and GROWN — never pre-allocated from
-    /// the declared size, which is a number the archive chose and may be 2^64.
-    /// The ceiling is checked as it grows, so a hostile declaration costs at
-    /// most [`MAX_EXTENSION_BODY`] of memory whatever it claims, and the
-    /// caller's own reader (the extractor's budget-capped wrapper, which is
-    /// charged for the header block too) reaches its limit first in the
-    /// shipped path — so a bomb still surfaces as the extractor's `TooLarge`,
-    /// not as this parser's rejection.
+    /// Read an extension header's body (`size` bytes plus its block padding): the only
+    /// variable-length thing this parser holds in memory, so it is streamed in fixed
+    /// blocks and grown, never pre-allocated from the declared size, and capped at
+    /// [`MAX_EXTENSION_BODY`]. In the shipped path the caller's budget-capped reader
+    /// reaches its limit first, so a bomb surfaces as the extractor's `TooLarge`.
     fn read_extension_body(&mut self, size: u64) -> io::Result<Vec<u8>> {
         let mut body: Vec<u8> = Vec::new();
         let mut buf = [0u8; BLOCK];
@@ -585,13 +492,10 @@ impl<'a, R: Read> Entries<'a, R> {
 
     /// Advance to the next entry, or `Ok(None)` at the end of the archive.
     ///
-    /// GNU `L`/`K` and PAX `x` headers are consumed here and folded into the
-    /// entry they describe, so a caller only ever sees real entries — and,
-    /// crucially, their bodies are read through the SAME reader the caller
-    /// supplied, which is how the extractor's per-entry budget gets to bound
-    /// them. A PAX `g` (global) header is NOT consumed: it falls through as an
-    /// ordinary entry, which [`EntryType::Other`] and the extractor's
-    /// `DisallowedKind` then refuse.
+    /// GNU `L`/`K` and PAX `x` headers are consumed here and folded into the entry they
+    /// describe, their bodies read through the caller's reader so the extractor's
+    /// per-entry budget bounds them. A PAX `g` header falls through as an ordinary entry,
+    /// which [`EntryType::Other`] and the extractor's `DisallowedKind` refuse.
     ///
     /// # Errors
     /// On a truncated stream, a header whose checksum does not match, a
@@ -606,33 +510,23 @@ impl<'a, R: Read> Entries<'a, R> {
         self.skip = 0;
         self.discard(pending)?;
 
-        // Overrides accumulated from extension headers preceding this entry.
-        //
-        // GNU and PAX are tracked SEPARATELY rather than overwriting one
-        // another, because when an archive carries both for the same entry the
-        // GNU long name wins whatever order they appeared in — that is the
-        // precedence the retired reader had, and an entry's path is not a
-        // detail to resolve differently: it is what `vet_entry` judges and
-        // what lands on disk. Order-of-arrival precedence would let a crafted
-        // archive show one reader one path and another reader another.
+        // Overrides accumulated from extension headers preceding this entry. GNU and PAX
+        // are tracked separately: when both name one entry the GNU long name wins
+        // whatever their order (the `tar` crate's precedence), since order-of-arrival
+        // precedence would let a crafted archive show two readers two paths.
         let mut gnu_path: Option<Vec<u8>> = None;
         let mut gnu_link: Option<Vec<u8>> = None;
         let mut pax: Option<PaxRecords> = None;
-        // Whether an extension header has been consumed and is still waiting
-        // for the entry it describes. An archive that ENDS there — at EOF or
-        // at the zero-block marker — is truncated, not finished: something
-        // announced a name for an entry that never arrived. Ending the walk
-        // cleanly would silently drop that entry, so it is a rejection.
+        // Whether an extension header is still waiting for the entry it describes. An
+        // archive that ends there (at EOF or the end marker) is truncated, not finished,
+        // and is rejected.
         let mut saw_extension = false;
 
         loop {
             let Some(header) = self.read_header()? else {
-                // A clean EOF with no end marker. Real archives always carry
-                // the marker, but a stream that simply stops between entries
-                // is not on its own a reason to fail: the extractor's
-                // tree_root comparison is what decides whether the payload was
-                // complete. Ending on a DANGLING extension header is a
-                // different thing — see `saw_extension`.
+                // A clean EOF with no end marker is not on its own a failure (the
+                // extractor's tree_root comparison decides whether the payload was
+                // complete), unless an extension header is dangling.
                 if saw_extension {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -657,45 +551,24 @@ impl<'a, R: Read> Entries<'a, R> {
             }
             let size = header.entry_size()?;
             let flag = header.raw.get(field::TYPEFLAG).copied().unwrap_or(0);
-            // GNU SPARSE (`S`) is REFUSED, not parsed.
-            //
-            // A sparse entry's content is not the bytes that follow it: the
-            // header carries a map of (offset, length) chunks, optionally
-            // continued into further blocks, and the real file is those chunks
-            // interleaved with implicit zero runs. Two readers that disagree
-            // about that map disagree about the file's bytes AND about where
-            // the next header starts — the same class this whole module is
-            // about, with a much larger surface.
-            //
-            // The retired reader implemented it, and errored on essentially
-            // every sparse header that is not perfectly consistent (its
-            // `real_size` alone rejects an all-zero field, because an empty
-            // string is not an octal number). Refusing outright is therefore
-            // the same answer for every archive either reader is likely to
-            // meet, and it is the RIGHT answer for a bundle regardless: aterm's
-            // bundles are ordinary files written by `tar -c`, a sparse entry is
-            // classified `Other`, and `vet_entry` aborts the whole staged group
-            // on an `Other` entry anyway. So refusing costs nothing and removes
-            // a parser. `tests/tar_corpus.rs` pins the refusal.
+            // GNU sparse (`S`) is refused, not parsed: its content is a map of
+            // (offset, length) chunks interleaved with implicit zero runs, and two
+            // readers that disagree about the map disagree about the file's bytes and
+            // where the next header starts. aterm's bundles are ordinary files written
+            // by `tar -c`, so refusing costs nothing (`tests/tar_corpus.rs` pins it).
             if flag == b'S' {
                 return Err(bad("GNU sparse entries are not supported"));
             }
-            // An extension typeflag only MEANS an extension on a header that
-            // speaks ustar or GNU. Without this gate a magic-less `L` renames
-            // the entry after it — an archive every other reader refuses,
-            // installed under an attacker-supplied name. See
-            // [`Header::is_recognized`].
+            // An extension typeflag means an extension only on a header that speaks
+            // ustar or GNU ([`Header::is_recognized`]).
             let extension = header.is_recognized();
             match flag {
-                // GNU long name / long link: the body IS the name, and the
+                // GNU long name / long link: the body is the name, and the
                 // next header is the entry it belongs to.
                 b'L' | b'K' if extension => {
-                    // A SECOND long name for one member is two answers to
-                    // "what is this file called", and last-wins would make the
-                    // answer depend on which parser you asked. The retired
-                    // reader rejected the archive; so does this — and it
-                    // decides BEFORE reading the body, so a duplicate costs the
-                    // extractor's budget nothing.
+                    // A second long name for one member is two answers to "what is this
+                    // file called": rejected before the body is read, so a duplicate
+                    // costs the extractor's budget nothing.
                     let slot = if flag == b'L' {
                         &mut gnu_path
                     } else {
@@ -704,34 +577,23 @@ impl<'a, R: Read> Entries<'a, R> {
                     if slot.is_some() {
                         return Err(bad("two long name entries describing the same member"));
                     }
-                    // Charge the advance BEFORE reading, so an unadvanceable
+                    // Charge the advance before reading, so an unadvanceable
                     // size is refused on an extension header exactly as it is
                     // on an ordinary one.
                     advance_for(size)?;
                     let mut body = self.read_extension_body(size)?;
                     saw_extension = true;
-                    // GNU writes the name NUL-terminated, and exactly ONE
-                    // trailing NUL comes off. Truncating at the FIRST NUL
-                    // instead would silently shorten a name that carries an
-                    // interior NUL — a different path than the archive
-                    // declared, and therefore a different thing for
-                    // `vet_entry` to judge than the one that will be written.
-                    // The retired `tar` crate dropped only the terminator too.
+                    // GNU writes the name NUL-terminated; exactly one trailing NUL comes
+                    // off. Truncating at the first NUL would shorten a name with an
+                    // interior NUL, so `vet_entry` would judge a different path than the
+                    // one written.
                     if body.last() == Some(&0) {
                         body.pop();
                     }
                     *slot = Some(body);
                 }
-                // PAX extended header. `x` applies to the next entry; only
-                // `path`, `linkpath` and `size` are read — every other record
-                // (times, ids, xattrs) describes metadata this extractor
-                // deliberately does not restore.
-                //
-                // `g` is DELIBERATELY ABSENT from this arm. A global header is
-                // a default for every following member, and honouring one here
-                // would make it a rename primitive; falling through leaves it
-                // an ordinary entry, classified `Other` and refused upstream,
-                // which is what the retired reader did.
+                // PAX extended header for the next entry; only `path`, `linkpath` and
+                // `size` are read. `g` is absent on purpose (module doc).
                 b'x' if extension => {
                     if pax.is_some() {
                         return Err(bad("two pax extensions entries describing the same member"));
@@ -743,23 +605,13 @@ impl<'a, R: Read> Entries<'a, R> {
                 }
                 _ => {
                     let pax = pax.unwrap_or_default();
-                    // A PAX `size` record OVERRIDES the header's size field —
-                    // otherwise the two readers disagree about where the next
-                    // header begins, and from there about the whole archive.
-                    //
-                    // …except on a header whose TYPEFLAG is an extension flag.
-                    // An extension header's own body length is its own
-                    // business, and the retired reader suppressed the override
-                    // on the TYPEFLAG ALONE — before, and independently of, the
-                    // magic check that decides whether the block is actually
-                    // treated as an extension header. So a `K` header with a
-                    // bad magic reaches this arm as an ordinary entry AND keeps
-                    // its own size field, while still taking the `path`
-                    // override (which that reader applied unconditionally).
-                    // Two independent gates on two nearly-identical conditions
-                    // is not a design anyone would choose; it is a shape a
-                    // crafted archive can aim at, which is exactly why it is
-                    // reproduced here instead of tidied.
+                    // A PAX `size` record overrides the header's size field, or the
+                    // readers disagree about where the next header begins. Not on a
+                    // header whose typeflag is an extension flag: the `tar` crate
+                    // suppresses the override on the typeflag alone, independent of the
+                    // magic check, so a bad-magic `K` reaches this arm as an ordinary
+                    // entry, keeps its own size and still takes the `path` override.
+                    // Reproduced, not tidied: a crafted archive can aim at the difference.
                     let extension_flag = matches!(flag, b'L' | b'K' | b'x' | b'g');
                     let size = if extension_flag {
                         size
@@ -768,15 +620,10 @@ impl<'a, R: Read> Entries<'a, R> {
                     };
                     let advance = advance_for(size)?;
                     let path_bytes = gnu_path.or(pax.path).unwrap_or_else(|| header.path_bytes());
-                    // An override that EXISTS but is empty is still an
-                    // override: `Some("")`, not `None`. Only the header's own
-                    // `linkname` field collapses an empty value to "no link
-                    // target", because there the emptiness is the absence. A
-                    // zero-length `K` body or an empty `linkpath` record is an
-                    // archive SAYING the link target is the empty string, and
-                    // flattening the two makes a hardlink entry look
-                    // target-less to one reader and empty-targeted to the
-                    // other — different `vet_hardlink` inputs from one archive.
+                    // An override that exists but is empty is still an override
+                    // (`Some("")`); only the header's own `linkname` collapses empty to
+                    // "no link target". Flattening the two would give `vet_hardlink`
+                    // different inputs from one archive in two readers.
                     let link_bytes = gnu_link.or(pax.link).or_else(|| {
                         let raw = header.link_bytes();
                         (!raw.is_empty()).then_some(raw)
@@ -786,7 +633,7 @@ impl<'a, R: Read> Entries<'a, R> {
                         Some(bytes) => Some(bytes_to_path(&bytes)?),
                         None => None,
                     };
-                    // What the NEXT `next_entry` must discard if the caller
+                    // What the next `next_entry` must discard if the caller
                     // reads none of this entry's content.
                     self.skip = advance;
                     return Ok(Some(Entry {
@@ -803,15 +650,13 @@ impl<'a, R: Read> Entries<'a, R> {
     }
 }
 
-/// Bytes to advance past an entry of `size` content bytes: the size itself plus
-/// its zero padding, rounded up to a whole block.
+/// Bytes to advance past an entry of `size` content bytes: the size plus its zero padding,
+/// rounded up to a whole block.
 ///
 /// # Errors
-/// When the rounding would overflow a `u64` — a `size` within 511 of `u64::MAX`.
-/// The retired reader refused those with its own `checked_add` before yielding
-/// the entry, and refusing at the same MOMENT matters: saturating instead would
-/// hand the caller one entry the other reader never produced before failing on
-/// the following read.
+/// When the rounding would overflow a `u64` (a `size` within 511 of `u64::MAX`). Refused
+/// before the entry is yielded, as the `tar` crate does: saturating would hand the caller
+/// one entry another reader never produced.
 fn advance_for(size: u64) -> io::Result<u64> {
     let block = BLOCK as u64;
     let rounded = size
@@ -836,24 +681,19 @@ struct PaxRecords {
     path: Option<Vec<u8>>,
     /// A `linkpath` record — the entry's real link target.
     link: Option<Vec<u8>>,
-    /// A `size` record — the entry's real content length, OVERRIDING the
+    /// A `size` record — the entry's real content length, overriding the
     /// header's `size` field.
     size: Option<u64>,
 }
 
-/// Split one PAX record — `"<len> <key>=<value>"`, newline already removed —
-/// into its key and value.
-///
-/// The declared `<len>` counts the WHOLE record including its own digits and
-/// the newline, so it is a self-describing length a hostile archive can make
-/// inconsistent; a record whose declared length does not match the line it was
-/// actually split from is malformed and yields `None`. That single check is
-/// also what makes an embedded newline malformed for free: the newline split
-/// the line early, so the declared length no longer matches.
+/// Split one PAX record (`"<len> <key>=<value>"`, newline already removed) into key and
+/// value. `<len>` counts the whole record including its own digits and the newline; a
+/// record whose declared length does not match the line it was split from is malformed,
+/// which also makes an embedded newline malformed (it split the line early).
 ///
 /// # Returns
-/// `None` for any malformed record — no space, a non-numeric length, a length
-/// that disagrees with the line, or no `=`.
+/// `None` for any malformed record: no space, a non-numeric length, a length that
+/// disagrees with the line, or no `=`.
 fn pax_record(line: &[u8]) -> Option<(&[u8], &[u8])> {
     let sp = line.iter().position(|&b| b == b' ')?;
     let digits = line.get(..sp)?;
@@ -867,33 +707,18 @@ fn pax_record(line: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((kv.get(..eq)?, kv.get(eq.checked_add(1)?..)?))
 }
 
-/// Parse a PAX extended-header body into the records this reader acts on.
+/// Parse a PAX extended-header body into the records this reader acts on: records split on
+/// newlines, one per line. Each rule matches the `tar` crate, since the other answer would
+/// make two readers describe one archive differently:
 ///
-/// The body is a sequence of newline-terminated records, and it is parsed as
-/// exactly that: SPLIT ON NEWLINES, one record per line. Three rules come out
-/// of that shape, and all three are the retired reader's, because each one is a
-/// place where picking the other answer would make two readers describe one
-/// archive differently:
+/// * An empty line ends the scan (the body's trailing newline produces one).
+/// * The first record of a repeated key wins: `path=a.txt` then `path=../evil` is `a.txt`.
+/// * A malformed record is skipped, not fatal, and later records still apply; it supplies
+///   no override, so the entry falls back to its header's name, which the extractor vets.
 ///
-/// * **An EMPTY line ends the scan.** The body's trailing newline produces one,
-///   which is the normal termination; a blank line in the middle stops it too.
-/// * **The FIRST record of a repeated key wins.** A body carrying
-///   `path=a.txt` then `path=../evil` resolves to `a.txt`.
-/// * **A malformed record is SKIPPED, not fatal, and does not end the scan.**
-///   Later records still apply, so a junk record cannot suppress a real `path`
-///   that follows it. Nothing is lost by the leniency: a record that does not
-///   parse supplies no override, so the entry falls back to the name in its own
-///   header, which the extractor vets exactly as it vets every other name.
-///
-/// `size` alone has a fourth rule: its lookup GIVES UP at the first malformed
-/// record, rather than skipping past it. That asymmetry is not a design choice
-/// here, it is the retired reader's `pax_extensions_value` (which returns `None`
-/// on the first `Err` the record iterator yields) as against its `path_bytes`
-/// (which filters errors out and takes the first match) — and since the whole
-/// point of the `size` override is that both readers agree on where the next
-/// header starts, matching it exactly is the only version worth having.
-///
-/// Termination is structural: the scan is a `split` over a finite slice.
+/// `size` alone stops at the first malformed record rather than skipping past it, as the
+/// `tar` crate's `pax_extensions_value` does: the `size` override exists so both readers
+/// agree on where the next header starts.
 fn parse_pax(body: &[u8]) -> PaxRecords {
     let mut out = PaxRecords::default();
     // Set once the `size` lookup has stopped — at the first malformed record,
@@ -912,9 +737,7 @@ fn parse_pax(body: &[u8]) -> PaxRecords {
             b"linkpath" if out.link.is_none() => out.link = Some(value.to_vec()),
             b"size" if !size_settled => {
                 size_settled = true;
-                // A `size` value that is not a plain decimal `u64` supplies no
-                // override — the retired reader's `value.parse::<u64>()`, whose
-                // failure it turns into `None` rather than an error.
+                // A `size` value that is not a plain decimal `u64` supplies no override.
                 out.size = std::str::from_utf8(value).ok().and_then(|v| v.parse().ok());
             }
             // Every other record is metadata this extractor does not restore
@@ -937,9 +760,8 @@ pub struct Entry<'e, 'a, R> {
     header: Header,
     path: PathBuf,
     link_name: Option<PathBuf>,
-    /// The entry's EFFECTIVE content length — the header's `size` field, or the
-    /// PAX `size` record where one overrode it. This is the number that decides
-    /// where the next header begins, so it is the number every caller must use.
+    /// The entry's effective content length: the header's `size` field, or the PAX `size`
+    /// record where one overrode it ([`Entry::entry_size`]).
     size: u64,
     /// Content bytes not yet handed to the caller.
     remaining: u64,
@@ -952,26 +774,19 @@ impl<R: Read> Entry<'_, '_, R> {
         &self.header
     }
 
-    /// The entry's EFFECTIVE content length.
-    ///
-    /// Use this, never `header().entry_size()`. A PAX `size` record overrides
-    /// the header field, and the override is exactly the thing a crafted
-    /// archive uses to make two readers see two different file lists: the
-    /// header says 512 and the `x` record says 4, and a caller that trusts the
-    /// header is describing bytes that are actually the next entry's. This is
-    /// the number the walk itself advances by.
+    /// The entry's effective content length. Use this, never `header().entry_size()`: a
+    /// PAX `size` record overrides the header field, and a caller trusting the header
+    /// would describe bytes that are the next entry's. The walk advances by this number.
     #[must_use]
     pub const fn entry_size(&self) -> u64 {
         self.size
     }
 
-    /// The entry's path, as the archive declared it — including any GNU
-    /// longname or PAX `path` override.
+    /// The entry's path as the archive declared it, including any GNU longname or PAX
+    /// `path` override.
     ///
     /// # Errors
-    /// Never; the fallible decode happened when the entry was read. The
-    /// signature mirrors the retired crate's so the extractor's `?` plumbing
-    /// is unchanged.
+    /// Never; the fallible decode happened when the entry was read.
     pub fn path(&self) -> io::Result<std::borrow::Cow<'_, Path>> {
         Ok(std::borrow::Cow::Borrowed(self.path.as_path()))
     }
@@ -986,7 +801,7 @@ impl<R: Read> Entry<'_, '_, R> {
 }
 
 impl<R: Read> Read for Entry<'_, '_, R> {
-    /// Hand out content bytes, and NEVER more than the header declared: the
+    /// Hand out content bytes, and never more than the header declared: the
     /// entry ends at its own size, so a caller reading to EOF cannot walk into
     /// the next header. The bytes the caller does take are debited from what
     /// the walk must skip afterwards.
@@ -1022,7 +837,7 @@ mod tests {
     }
 
     /// Fill in a header's checksum field the way every writer does: the
-    /// UNSIGNED sum of all 512 bytes with the field itself read as spaces.
+    /// unsigned sum of all 512 bytes with the field itself read as spaces.
     fn seal(h: &mut [u8; 512]) {
         h[148..156].fill(b' ');
         let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
@@ -1125,12 +940,8 @@ mod tests {
         }
     }
 
-    /// A reader that hands out at most `chunk` bytes per `read` call.
-    ///
-    /// Every loop in this module is written against the `Read` contract rather
-    /// than against "one call fills the buffer", and a reader that satisfies
-    /// the contract while never filling a buffer is the only thing that proves
-    /// it. A zstd decoder behaves exactly like this in the shipped path.
+    /// A reader that hands out at most `chunk` bytes per `read` call, as a zstd decoder
+    /// does in the shipped path: the proof that every loop honours the `Read` contract.
     struct Dribble<'a> {
         bytes: &'a [u8],
         chunk: usize,
@@ -1146,8 +957,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Golden evidence, held IN TREE, in the same shape `crates/aterm-hash`
-    // pins golden vectors for the hash it replaced.
+    // Golden evidence.
     // -----------------------------------------------------------------------
 
     /// The shapes a real bundle is made of, decoded to exact expected values.
@@ -1203,7 +1013,7 @@ mod tests {
         );
     }
 
-    /// A ustar `prefix` joins to `name` with a slash — and ONLY on a POSIX
+    /// A ustar `prefix` joins to `name` with a slash — and only on a POSIX
     /// header. On a GNU header those bytes are `atime`/`ctime`/`offset`.
     #[test]
     fn golden_prefix_is_posix_ustar_only() {
@@ -1225,7 +1035,7 @@ mod tests {
         }
     }
 
-    /// A GNU long name replaces the header's, and exactly ONE trailing NUL
+    /// A GNU long name replaces the header's, and exactly one trailing NUL
     /// comes off — an interior NUL is part of the name.
     #[test]
     fn golden_gnu_long_name_drops_one_trailing_nul() {
@@ -1251,7 +1061,7 @@ mod tests {
     }
 
     /// A PAX `size` record decides the entry's length and therefore where the
-    /// NEXT header begins.
+    /// next header begins.
     #[test]
     fn golden_pax_size_overrides_the_header_field() {
         let rec = pax("size", "4");
@@ -1273,7 +1083,7 @@ mod tests {
         assert_eq!(seen[1].content, b"xyz");
     }
 
-    /// `Entry::entry_size` is the EFFECTIVE size; `header().entry_size()` is
+    /// `Entry::entry_size` is the effective size; `header().entry_size()` is
     /// the raw field. The extractor's directory guard reads the former.
     #[test]
     fn golden_effective_and_raw_sizes_are_both_reachable() {
@@ -1296,7 +1106,7 @@ mod tests {
         );
     }
 
-    /// The FIRST record of a repeated key wins, and a malformed record neither
+    /// The first record of a repeated key wins, and a malformed record neither
     /// ends the scan nor suppresses what follows it.
     #[test]
     fn golden_pax_precedence_and_recovery() {
@@ -1386,7 +1196,7 @@ mod tests {
         }
     }
 
-    /// An override that EXISTS but is empty is `Some("")`, not `None`.
+    /// An override that exists but is empty is `Some("")`, not `None`.
     #[test]
     fn golden_empty_link_override_is_not_absence() {
         let mut v = Vec::new();
@@ -1409,7 +1219,7 @@ mod tests {
         assert_eq!(seen[0].link, None);
     }
 
-    /// A base-256 `size` reads the LOW EIGHT BYTES of the 12-byte field and
+    /// A base-256 `size` reads the low eight bytes of the 12-byte field and
     /// ignores everything above them.
     #[test]
     fn golden_base256_size_reads_the_low_eight_bytes() {
@@ -1425,10 +1235,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Deliberate deviations from the retired `tar` crate.
+    // Deliberate deviations from the `tar` crate.
     // -----------------------------------------------------------------------
 
-    /// The [`MAX_EXTENSION_BODY`] ceiling. The retired crate had no such limit.
+    /// The [`MAX_EXTENSION_BODY`] ceiling.
     #[test]
     fn extension_body_ceiling_refuses_an_oversized_long_name() {
         let over = MAX_EXTENSION_BODY + 512;
@@ -1455,18 +1265,13 @@ mod tests {
         assert_eq!(seen[0].path.len(), usize::try_from(under).expect("fits"));
     }
 
-    /// The checksum is the UNSIGNED byte sum and nothing else.
-    ///
-    /// A handful of pre-POSIX writers summed the bytes as SIGNED, and a reader
-    /// that accepts both readings accepts every header whose ≥128 bytes happen
-    /// to cancel — a second, weaker acceptance rule on attacker-influenced
-    /// bytes. This builds a header that passes the signed rule and fails the
-    /// unsigned one, and requires the refusal.
+    /// The checksum is the unsigned byte sum only: a header that passes the signed rule and
+    /// fails the unsigned one is refused.
     #[test]
     fn a_signed_only_checksum_is_refused() {
         let mut h = header("x.txt", b'0', 0);
         // A high byte in the name field makes the signed and unsigned sums
-        // differ by 256; seal to the SIGNED total.
+        // differ by 256; seal to the signed total.
         h[5] = 0x80;
         h[148..156].fill(b' ');
         let signed: i64 = h.iter().map(|&b| i64::from(b as i8)).sum();
@@ -1637,7 +1442,7 @@ mod tests {
     }
 
     /// A size within a block of `u64::MAX` cannot be advanced past, and that is
-    /// a refusal BEFORE the entry is yielded — not one entry followed by a
+    /// a refusal before the entry is yielded — not one entry followed by a
     /// failure, which would be a different entry list from any other reader's.
     #[test]
     fn an_unadvanceable_size_is_refused_before_the_entry() {

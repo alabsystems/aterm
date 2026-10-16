@@ -6,11 +6,11 @@
 //! GENERATED, and deliberately: every value below is a fact about this
 //! platform's ABI, measured for THIS TRIPLE and checked against the
 //! conformance oracle in `libc-oracle/` (see `src/lib.rs` for the method;
-//! regenerate with `libc-oracle/gen/regen.sh`). The only hand-written code
-//! in this file is the
-//! bodies of the C macros libc reimplements in Rust and the inherent
-//! siginfo_t accessors. The oracle audits their exact sets and checks
-//! their behavior against the reference libc.
+//! regenerate with `targo --unverified run -q -p aterm-libc-oracle -- regen`).
+//! The only hand-written code in this file is the bodies of the C macros
+//! libc reimplements in Rust and the inherent siginfo_t accessors. The
+//! oracle audits their exact sets and checks their behavior against the
+//! reference libc.
 
 #[allow(unused_imports)]
 use core::ffi::{
@@ -581,6 +581,18 @@ pub struct ucred {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "extra_traits", derive(PartialEq, Eq, Hash))]
+pub struct utsname {
+    pub sysname: [c_char; 65],
+    pub nodename: [c_char; 65],
+    pub release: [c_char; 65],
+    pub version: [c_char; 65],
+    pub machine: [c_char; 65],
+    pub domainname: [c_char; 65],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "extra_traits", derive(PartialEq, Eq, Hash))]
 pub struct winsize {
     pub ws_row: c_ushort,
     pub ws_col: c_ushort,
@@ -721,6 +733,9 @@ pub const EDQUOT: c_int = 122;
 pub const EEXIST: c_int = 17;
 pub const EFAULT: c_int = 14;
 pub const EFBIG: c_int = 27;
+pub const EFD_CLOEXEC: c_int = 0x80000;
+pub const EFD_NONBLOCK: c_int = 0x800;
+pub const EFD_SEMAPHORE: c_int = 0x1;
 pub const EFS_SUPER_MAGIC: c_long = 0x00414a53;
 pub const EHOSTDOWN: c_int = 112;
 pub const EHOSTUNREACH: c_int = 113;
@@ -1290,6 +1305,8 @@ pub const ST_WRITE: c_ulong = 128;
 pub const SYSFS_MAGIC: c_long = 0x62656572;
 pub const SYS_futex: c_long = 98;
 pub const SYS_getrandom: c_long = 278;
+pub const SYS_gettid: c_long = 178;
+pub const SYS_memfd_create: c_long = 279;
 pub const SYS_openat2: c_long = 437;
 pub const SYS_pivot_root: c_long = 41;
 pub const SYS_renameat2: c_long = 276;
@@ -1450,6 +1467,7 @@ unsafe extern "C" {
     pub fn dup2(src: c_int, dst: c_int) -> c_int;
     pub fn dup3(oldfd: c_int, newfd: c_int, flags: c_int) -> c_int;
     pub fn eaccess(pathname: *const c_char, mode: c_int) -> c_int;
+    pub fn eventfd(initval: c_uint, flags: c_int) -> c_int;
     pub fn execv(prog: *const c_char, argv: *const *const c_char) -> c_int;
     pub fn execve(
         prog: *const c_char,
@@ -1775,6 +1793,7 @@ unsafe extern "C" {
     pub fn tcsetpgrp(fd: c_int, pgrp: pid_t) -> c_int;
     pub fn truncate(path: *const c_char, length: off_t) -> c_int;
     pub fn umask(mask: mode_t) -> mode_t;
+    pub fn uname(buf: *mut utsname) -> c_int;
     pub fn unlink(c: *const c_char) -> c_int;
     pub fn unlinkat(dirfd: c_int, pathname: *const c_char, flags: c_int) -> c_int;
     pub fn unlockpt(fd: c_int) -> c_int;

@@ -2,74 +2,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! FRM-1 AS A COUNT: a repainted band is filled ONCE, not twice.
+//! The background-fill elision as a count: a repainted band is filled once, not twice.
 //!
-//! # The hole this closes
+//! `tests/bg_base_elision.rs` pins the elision byte for byte but cannot see it go away,
+//! since repainting a band's base colour over itself is byte-identical. A count is exact,
+//! machine-independent and runs with the ordinary tests; it guards how many fills a frame
+//! emits, not what each costs.
 //!
-//! `tests/bg_base_elision.rs` is FRM-1's correctness gate and it is a good one —
-//! it pins the four fixtures where a naive elision predicate breaks, byte for
-//! byte. What it cannot do is notice the elision GOING AWAY. Painting a band's
-//! base colour and then painting the identical colour over it again is
-//! byte-identical output; every pixel assertion in that file stays green while
-//! the frame pays for a whole extra framebuffer of stores. The measured win
-//! (keystroke_echo 43.24 -> 41.33 us, scrolled_back_wheel 102.38 -> 96.65 us,
-//! 7/7 rounds) would be handed back in silence.
-//!
-//! Only the frame's own bench could see it, and the bench is not in the merge
-//! contract — `xtask perf` is a TIMING gate that needs release builds of
-//! several harnesses and has not run green in a month. A COUNT has none of those
-//! problems: it is exact, machine-independent, cannot flake under load, and
-//! rides `cargo test` — hence `tools/verify.sh`, the merge contract — at
-//! zero marginal cost.
-//!
-//! WHAT A COUNT CANNOT CATCH: a constant-factor slowdown with the counts
-//! unchanged. If `fill_rect` itself became 3x slower this file stays green. It
-//! guards the STRUCTURE of the win — how many fills a frame emits — not its
-//! cost.
-//!
-//! # The identity being pinned
-//!
-//! With no wallpaper live, every background run whose colour is the band's own
-//! base is skipped, so
+//! With no wallpaper, every background run whose colour is the band's own base is
+//! skipped, so
 //!
 //! ```text
 //!     emitted + at_base == total
 //! ```
 //!
-//! and, for the fixture to prove anything, `at_base > 0` — the redundant state
-//! must actually be reached. A giveback (the `.filter(|_| run_bg != band_base)`
-//! conjuncts deleted) reads `emitted == total` with `at_base` unchanged, and
-//! fails here.
+//! with `at_base > 0` for the fixture to prove anything. Under a live wallpaper the base
+//! is backdrop texels, nothing may be elided, and the identity is `emitted == total` with
+//! `at_base == 0`.
 //!
-//! The other side is pinned too: under a live WALLPAPER the band's base is
-//! backdrop texels rather than one scalar, nothing may be elided, and the same
-//! identity degenerates to `emitted == total` with `at_base == 0`. A predicate
-//! that dropped the `!wallpaper` conjunct — punching the picture through a
-//! selection band — moves this count before it moves a pixel anyone reports.
+//! `render_row_bg` elides at three sites, each reached by its own fixture:
 //!
-//! # THE ELISION IS THREE COMPILE SITES, AND EACH NEEDS ITS OWN FIXTURE
+//! | site | where | fixture |
+//! |------|-------|---------|
+//! | mid-run flush of the uniform coalescing arm | `run_bg != band_base` on the colour change | [`a_base_run_that_ends_mid_row_is_elided_at_the_mid_run_flush`] |
+//! | final flush at end of row | `run_bg != band_base` after the column loop | [`a_plain_frame_never_fills_a_band_with_the_colour_it_already_carries`] |
+//! | per-column mixed (split-pane) arm | `band_base != Some(color)` | [`a_composed_split_row_elides_the_pane_sitting_on_the_frame_default`] |
 //!
-//! `render_row_bg` skips a base-coloured background in three separate places,
-//! and "delete the elision and watch this file go red" is only honest if it is
-//! checked ONE SITE AT A TIME. It was not, when this file landed:
-//!
-//! | site | where | fixture that reaches it |
-//! |------|-------|-------------------------|
-//! | mid-run flush of the uniform coalescing arm | `run_bg.filter(..)` on the colour change | [`a_base_run_that_ends_mid_row_is_elided_at_the_mid_run_flush`] |
-//! | final flush at end of row | `run_bg.filter(..)` after the column loop | [`a_plain_frame_never_fills_a_band_with_the_colour_it_already_carries`] |
-//! | per-column MIXED (split-pane) arm | `band_base != Some(color)` | [`a_composed_split_row_elides_the_pane_sitting_on_the_frame_default`] |
-//!
-//! With only the first two fixtures present, deleting the MID-RUN or the MIXED
-//! site alone left this file GREEN — a plain themed row is one run of the band
-//! base spanning the whole row, so it reaches nothing but the final flush. Those
-//! two blind spots were the materialized PREFIX and the split-pane path, i.e.
-//! most of the area the measured win came from.
-//!
-//! MAINTENANCE RULE: a new elision site is a new fixture, and the claim that a
-//! fixture covers it is made by MUTATING THAT SITE ALONE and seeing this file
-//! fail — never by mutating all of them together, which is how the gap above got
-//! in. Each fixture's REACH assertions exist so that a fixture which stops
-//! entering its site fails loudly instead of passing vacuously.
+//! A new elision site needs a new fixture, and coverage is claimed by mutating that site
+//! alone and seeing this file fail. Each fixture's reach assertions make a fixture that
+//! stops entering its site fail instead of passing vacuously.
 
 use aterm_core::grid::LineSize;
 use aterm_core::render::{LineSizeSpan, SceneAtlas};
@@ -80,12 +41,9 @@ use aterm_render::{DefaultBgSpan, Renderer, Theme, WindowCpu, rgb_to_u32, row_is
 const ROWS: usize = 6;
 const COLS: usize = 20;
 
-/// A terminal whose LIVE default background is the renderer theme's — the state
-/// the shipping app is always in, and the only state in which "the base clear
-/// and a default cell are the same colour" is true at all. A `Terminal::new`
-/// fixture publishes `default_bg = COLOR_UNSET` and renders VT-spec BLACK over a
-/// theme clear, which is the black-backed-text arrangement the product does not
-/// ship — and which reaches none of this.
+/// A terminal whose live default background is the renderer theme's, as in the shipping
+/// app. A bare `Terminal::new` publishes `default_bg = COLOR_UNSET` and renders VT black
+/// over the theme clear, which reaches none of this.
 fn themed_term() -> Terminal {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     let bg = Theme::default().bg;
@@ -114,8 +72,7 @@ fn a_plain_frame_never_fills_a_band_with_the_colour_it_already_carries() {
     let (total, at_base) = r.last_bg_runs();
     let emitted = r.last_bg_fills();
 
-    // REACH, first: without redundant runs in the frame there is nothing to
-    // elide and the identity below is satisfied by doing nothing.
+    // Reach: without base-coloured runs the identity below holds vacuously.
     assert!(total > 0, "the frame resolved no background run at all");
     assert!(
         at_base > 0,
@@ -124,7 +81,7 @@ fn a_plain_frame_never_fills_a_band_with_the_colour_it_already_carries() {
          identity would hold vacuously"
     );
 
-    // THE CLAIM: every base-coloured run was SKIPPED.
+    // The claim: every base-coloured run was skipped.
     assert_eq!(
         emitted + at_base,
         total,
@@ -138,9 +95,8 @@ fn a_plain_frame_never_fills_a_band_with_the_colour_it_already_carries() {
 
 #[test]
 fn under_a_live_wallpaper_no_background_run_is_elided() {
-    // The `!wallpaper` conjunct, from the cost side. Under a wallpaper the base
-    // is backdrop texels, so `band_base` is `None`, nothing compares equal to
-    // it, and every resolved run must be paid for.
+    // The `!wallpaper` conjunct from the cost side: the base is backdrop texels, so
+    // `band_base` is `None` and every resolved run is paid for.
     let theme_bg = Theme::default().bg;
     let theme = Theme {
         selection: theme_bg,
@@ -199,8 +155,7 @@ fn under_a_live_wallpaper_no_background_run_is_elided() {
     );
 }
 
-/// The band base as a cell's `[r, g, b]` — the composed-row fixture below hands
-/// panes their live default background by colour, and `RenderCell::bg` is bytes.
+/// A packed colour as a cell's `[r, g, b]` (`RenderCell::bg` is bytes).
 fn rgb_bytes(c: u32) -> [u8; 3] {
     [
         ((c >> 16) & 0xff) as u8,
@@ -209,36 +164,20 @@ fn rgb_bytes(c: u32) -> [u8; 3] {
     ]
 }
 
-/// SITE COVERAGE — the MID-RUN flush of the uniform run-coalescing path.
-///
-/// # Why the plain fixture above does not reach it
-///
-/// A plain single-pane row of text is ONE coalesced run of the band's base
-/// colour spanning the whole row, so it only ever leaves through the FINAL
-/// flush at end of row. The MID-RUN flush — the one that fires when a run's
-/// colour CHANGES, and the one that carries the materialized PREFIX, which is
-/// where the area is — is never entered by that shape. Deleting its
-/// `.filter(|_| run_bg != band_base)` ALONE therefore left this file GREEN —
-/// measured: with only the two original fixtures the counts did not move by so
-/// much as one fill, because neither frame ever entered that flush. A refactor
-/// could hand back that half of the win in total silence.
-///
-/// # The shape that reaches it
-///
-/// An SGR-background span sits BETWEEN two default-background spans on one row.
-/// The leading base-coloured run now ends on a COLOUR CHANGE rather than at
-/// EOL, so it can only leave through the mid-run flush.
+/// Site coverage: the mid-run flush of the uniform coalescing arm. A plain row is one
+/// base-coloured run leaving through the final flush; an SGR-background span between two
+/// default-background spans makes the leading base run end on a colour change, so it can
+/// only leave through the mid-run flush.
 #[test]
 fn a_base_run_that_ends_mid_row_is_elided_at_the_mid_run_flush() {
     let mut r = Renderer::from_system(18.0, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
     let mut term = themed_term();
-    // Cursor hidden: this fixture is background-run STRUCTURE and nothing else.
+    // Cursor hidden: this fixture is background-run structure only.
     term.process(b"\x1b[?25lab\x1b[48;2;200;40;40mXY\x1b[0mcd");
     let input = term.cell_frame(ROWS, COLS);
 
-    // FIXTURE SHAPE, asserted rather than assumed — the mid-run argument below
-    // is only airtight while every counted run comes from ONE row.
+    // The mid-run argument holds only while every counted run comes from one row.
     assert_eq!(
         input.cells[0].len(),
         6,
@@ -254,11 +193,8 @@ fn a_base_run_that_ends_mid_row_is_elided_at_the_mid_run_flush() {
     let (total, at_base) = r.last_bg_runs();
     let emitted = r.last_bg_fills();
 
-    // REACH — and specifically reach of the MID-RUN flush. One row resolved TWO
-    // runs carrying the band's base colour, and at most ONE run per row leaves
-    // through the final flush, so at least one of those two necessarily went out
-    // through the mid-run flush. That is the site this fixture exists to cover,
-    // and this inequality is what proves it is still being entered.
+    // Reach of the mid-run flush: at most one run per row leaves through the final
+    // flush, so of two base-coloured runs on one row at least one left mid-run.
     assert!(
         at_base >= 2,
         "row 0 resolved {at_base} base-coloured run(s) of {total} — this fixture \
@@ -267,16 +203,14 @@ fn a_base_run_that_ends_mid_row_is_elided_at_the_mid_run_flush() {
          fewer, the row coalesced differently and this file is back to covering \
          the final flush alone"
     );
-    // The other half of the shape: the SGR span really is a distinct colour, so
-    // the row is genuinely split rather than one run the walk merged away.
+    // The SGR span really is a distinct colour, so the row is split.
     assert!(
         emitted > 0,
         "no fill was emitted at all — the SGR background span did not survive \
          into the frame, so nothing forced the base run to end mid-row"
     );
 
-    // THE CLAIM, unchanged: every base-coloured run was SKIPPED — including the
-    // one that flushed mid-row.
+    // The claim: every base-coloured run was skipped, including the mid-row one.
     assert_eq!(
         emitted + at_base,
         total,
@@ -286,26 +220,11 @@ fn a_base_run_that_ends_mid_row_is_elided_at_the_mid_run_flush() {
     );
 }
 
-/// SITE COVERAGE — the per-column MIXED (non-uniform) path.
-///
-/// # Why the fixtures above do not reach it
-///
-/// `row_is_uniform` is true for every single-pane frame, so both fixtures above
-/// take the coalescing arm and the mixed arm's own elision (`band_base !=
-/// Some(color)`) is never executed. Deleting it ALONE left this file GREEN —
-/// measured: with only the two original fixtures the counts did not move at all,
-/// because no frame in the file carried a mixed row. That arm is the SPLIT-PANE
-/// path — the composed frame whose rows are the widest the product paints — so
-/// the gate was under-covering exactly where the area is.
-///
-/// # The shape that reaches it
-///
-/// A composed split row: the left pane sits on a DEC double-width line, which is
-/// what puts a `LineSizeSpan` on the row and makes it MIXED, and the right pane
-/// carries its OWN live default background (`DefaultBgSpan` — two panes with
-/// different OSC 11 state). Both sides of the decision are then live on one row:
-/// the left pane resolves to the band's own base and must be skipped, the right
-/// pane resolves to a different colour and must be paid for.
+/// Site coverage: the per-column mixed (split-pane) arm, which no single-pane frame
+/// reaches (`row_is_uniform` is true for all of them). The left pane sits on a DEC
+/// double-width line, which makes the row mixed; the right pane has its own default
+/// background (`DefaultBgSpan`). The left pane resolves to the band's base and must be
+/// skipped, the right to another colour and must be filled.
 #[test]
 fn a_composed_split_row_elides_the_pane_sitting_on_the_frame_default() {
     let mut r = Renderer::from_system(18.0, Theme::default())
@@ -314,8 +233,7 @@ fn a_composed_split_row_elides_the_pane_sitting_on_the_frame_default() {
     let mut term = themed_term();
     term.process(b"\x1b[?25l");
     let mut input = term.cell_frame(ROWS, COLS);
-    // The `themed_term` trap, checked: a frame still publishing COLOR_UNSET
-    // reaches none of this and the counts below would be measuring nothing.
+    // A frame still publishing COLOR_UNSET would reach none of this.
     assert_eq!(
         input.default_bg, theme_bg,
         "fixture: the frame's live default background must BE the theme's"
@@ -329,20 +247,17 @@ fn a_composed_split_row_elides_the_pane_sitting_on_the_frame_default() {
          nothing on this row can be counted as emitted"
     );
 
-    // The composed row. `line_size_spans` non-empty is exactly what
-    // `row_is_uniform` reads, and this is the compositor's own frame shape: one
-    // span for the DEC pane, the other pane left unclaimed, with
-    // `line_sizes[row]` carrying the row-level summary.
+    // The compositor's frame shape: one line-size span for the DEC pane (what
+    // `row_is_uniform` reads), the other pane unclaimed, `line_sizes[row]` summarizing.
     input.line_size_spans.resize_with(ROWS, Vec::new);
     input.line_size_spans[0] = vec![LineSizeSpan::new(0, SPLIT, LineSize::DoubleWidth)];
     input.line_sizes[0] = LineSize::DoubleWidth;
     input.default_bg_spans.resize_with(ROWS, Vec::new);
     input.default_bg_spans[0] = vec![DefaultBgSpan::new(SPLIT, COLS, pane_bg)];
 
-    // Materialize the whole row so it is the PREFIX loop that walks it (the
-    // sparse tail is a separate, uncounted path): the left half at the frame
-    // default — the band's own base, nothing to write — and the right half at
-    // its pane's default, which must be filled.
+    // Materialize the whole row so the prefix loop walks it (the sparse tail is a
+    // separate, uncounted path): the left half at the frame default, the right half
+    // at its pane's default.
     let blank = term.implicit_blank_render_cell();
     input.cells[0].resize(COLS, blank);
     for (c, cell) in input.cells[0].iter_mut().enumerate() {
@@ -365,10 +280,8 @@ fn a_composed_split_row_elides_the_pane_sitting_on_the_frame_default() {
     let (total, at_base) = r.last_bg_runs();
     let emitted = r.last_bg_fills();
 
-    // REACH, three-sided here. The mixed arm counts one run PER COLUMN (it
-    // cannot merge — each column clamps to its own pane's run box), so a row
-    // that resolved `COLS` runs is proof the per-column arm, and not the
-    // coalescing one, did the walking.
+    // Reach: the mixed arm counts one run per column (each column clamps to its own
+    // pane's run box), so `COLS` runs proves the per-column arm did the walking.
     assert_eq!(
         total, COLS as u32,
         "the composed row resolved {total} run(s), not one per column — the \
@@ -388,7 +301,7 @@ fn a_composed_split_row_elides_the_pane_sitting_on_the_frame_default() {
          decision is live"
     );
 
-    // THE CLAIM, unchanged: every base-coloured column was SKIPPED.
+    // The claim: every base-coloured column was skipped.
     assert_eq!(
         emitted + at_base,
         total,

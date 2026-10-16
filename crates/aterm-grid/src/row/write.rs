@@ -266,6 +266,9 @@ impl Row {
     #[must_use]
     #[inline]
     pub(crate) fn orphaned_wide_halves(&self, start: u16, end: u16) -> [Option<u16>; 2] {
+        if !self.flags.contains(RowFlags::HAS_WIDE_CHARS) {
+            return [None, None];
+        }
         let cells_len = self.cells.len();
         let end = usize::from(end).min(cells_len);
         if usize::from(start) >= end {
@@ -280,6 +283,16 @@ impl Row {
             && self.cells[end - 1].flags().contains(CellFlags::WIDE))
         .then(|| u16_from_usize(end));
         [head, continuation]
+    }
+
+    /// Whether any cell in `[start, end)` carries `HAS_EXTRAS`.
+    #[must_use]
+    #[inline]
+    pub(crate) fn any_has_extras_in_range(&self, start: u16, end: u16) -> bool {
+        let cells = self.cells.as_slice();
+        let s = usize::from(start).min(cells.len());
+        let e = usize::from(end).min(cells.len());
+        s < e && cells[s..e].iter().any(Cell::has_extras)
     }
 
     /// Write a wide (double-width) character at the given column.

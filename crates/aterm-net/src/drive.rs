@@ -1263,6 +1263,24 @@ where
     // force-close) tears the connection down.
     let unauth = (|| -> io::Result<TlsTransport<rustls::ClientConnection>> {
         let mut transport = tls::connect(tcp, tls::fixed_server_name(), config)?;
+        if let Some(pin) = &pin {
+            let configured = pin.fingerprint.trim();
+            let configured = configured.strip_prefix("sha256:").unwrap_or(configured);
+            let observed = transport
+                .stream()
+                .conn
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+                .map(|cert| tls::cert_fingerprint(cert.as_ref()));
+            let matches = observed
+                .is_some_and(|fp| crate::hex_decode(configured).as_deref() == Some(fp.as_slice()));
+            if !matches {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "the remote certificate does not match the endpoint fingerprint",
+                ));
+            }
+        }
         let exporter = transport.exporter().to_vec();
         present_capability(transport.stream(), &exporter, src, op, token)?;
         Ok(transport)
@@ -1292,9 +1310,8 @@ where
     }
 
     // Enforce the session-NONCE rebind guard BEFORE any control bytes relay, if the
-    // caller configured a pin. The cert-fingerprint half is already TLS-enforced (a
-    // non-pinned cert never completes the handshake above), so the observed
-    // fingerprint provably equals `pin.fingerprint`; only the launch-nonce half
+    // caller configured a pin. The cert-fingerprint half was checked against the
+    // presented certificate before the capability above; only the launch-nonce half
     // remains, read here via `observe_nonce`. A pinned session the remote does not
     // report (`None`) FAILS CLOSED — an operator-requested guard is never silently
     // skipped.
@@ -1311,7 +1328,7 @@ where
             )
         })?;
         let refusal = match observed {
-            Some(nonce) if pin.matches(&pin.fingerprint, &nonce) => None,
+            Some(nonce) if pin.nonce == nonce => None,
             Some(_) if !pin.sid.is_empty() => Some(format!(
                 "session {sid} was relaunched: its launch nonce no longer matches expect_nonce; \
                  nothing was relayed"
@@ -1390,7 +1407,7 @@ mod tests {
         // sleep-based implementation pays the whole five minutes and fails by a
         // wide margin. The wake ceiling is a minute's hang detector (AGENTS.md),
         // never a latency budget, so it still distinguishes that negative
-        // control and no scheduler starvation of a loaded gate reaches it.
+        // control and no scheduler starvation of a loaded machine reaches it.
         const TEST_WAIT: Duration = Duration::from_secs(300);
         const MAX_READY_WAKE: Duration = MUST_HAPPEN;
 
@@ -2014,7 +2031,7 @@ mod tests {
             host: addr.to_string(),
             sid: "s1".into(),
             nonce: "0011".into(),
-            fingerprint: "pinned".into(),
+            fingerprint: aterm_uds::rand::hex_encode(&cert_fingerprint(TEST_CERT_DER)),
         };
         let error = dial_result("the roster", move || {
             dial_and_relay_pinned_inner(
@@ -2411,6 +2428,55 @@ mod tests {
     }
 
     #[test]
+    fn an_endpoint_fingerprint_disagreeing_with_tls_is_refused_before_auth() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
+        let host = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut tls = tls::accept(tcp, scfg).unwrap();
+            let mut byte = [0u8; 1];
+            match tls.stream().read(&mut byte) {
+                Ok(0) => {}
+                // Refusing the pin can close TLS before a close-notify. macOS
+                // may surface the resulting TCP close as reset instead of EOF.
+                // Both are accepted only on the first application-byte read;
+                // any received byte still fails this no-authentication check.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                    ) => {}
+                other => panic!("no authentication byte may cross a mismatched pin: {other:?}"),
+            }
+        });
+        let ccfg = client_config(cert_fingerprint(TEST_CERT_DER));
+        let (drv_local, _drv_client) = CtlStream::pair().unwrap();
+        let pin = RemoteEndpoint {
+            host: addr.to_string(),
+            sid: "s-1".into(),
+            nonce: "nonce".into(),
+            fingerprint: "00".repeat(32),
+        };
+        let error = dial_and_relay_pinned_inner(
+            addr,
+            ccfg,
+            "dial",
+            "drive",
+            &EdgeToken::generate(),
+            b"",
+            drv_local,
+            HANDSHAKE_TIMEOUT,
+            Some(pin),
+            None,
+            |_tls| panic!("a mismatched fingerprint must precede the nonce read"),
+        )
+        .expect_err("the explicit endpoint pin must also match");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        host.join().unwrap();
+    }
+
+    #[test]
     fn a_matching_launch_nonce_pin_passes_and_relays_a_verb() {
         // The observer supplies the MATCHING live nonce (standing in for the
         // roster read, which `the_roster_observer_*` drives for real), so the rebind guard holds
@@ -2442,9 +2508,7 @@ mod tests {
             host: addr.to_string(),
             sid: "s-1".into(),
             nonce: "nonce-live".into(),
-            // The fingerprint half is TLS-enforced; `matches` self-compares it (the
-            // observed value provably equals the pin), so only the nonce is at issue.
-            fingerprint: "fp".into(),
+            fingerprint: aterm_uds::rand::hex_encode(&cert_fingerprint(TEST_CERT_DER)),
         };
         let (drv_local, mut drv_client) = CtlStream::pair().unwrap();
         let driver = std::thread::spawn(move || {
@@ -2482,7 +2546,7 @@ mod tests {
             host: "ignored".into(),
             sid: "s-1".into(),
             nonce: "nonce-pinned".into(),
-            fingerprint: "fp".into(),
+            fingerprint: aterm_uds::rand::hex_encode(&cert_fingerprint(TEST_CERT_DER)),
         };
         // The remote reports a DIFFERENT live nonce (a relaunched/rebound session):
         // the rebind guard must refuse to relay.
@@ -2504,7 +2568,7 @@ mod tests {
             host: "ignored".into(),
             sid: "s-1".into(),
             nonce: "nonce-pinned".into(),
-            fingerprint: "fp".into(),
+            fingerprint: aterm_uds::rand::hex_encode(&cert_fingerprint(TEST_CERT_DER)),
         };
         let res = dial_with_pin(pin, None);
         let err = res.expect_err("an unverifiable pin must fail closed");
@@ -2611,7 +2675,10 @@ mod tests {
             host: "loopback".into(),
             sid: sid.into(),
             nonce: nonce.into(),
-            fingerprint: "fp".into(),
+            fingerprint: format!(
+                " sha256:{} ",
+                aterm_uds::rand::hex_encode(&cert_fingerprint(TEST_CERT_DER)).to_uppercase()
+            ),
         };
         let got = dial_roster(pin("s-b", "bbbb"), ROSTER).expect("the pinned session is live");
         assert_eq!(

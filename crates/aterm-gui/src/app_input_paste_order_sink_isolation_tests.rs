@@ -25,10 +25,10 @@ fn fill_socket_to_backpressure(writer: &mut std::os::unix::net::UnixStream) -> u
     wedged
 }
 
-/// Tier-1: the model's Begin/Complete actions drive the real sink counter,
-/// and each Read action is compared with the shipping GUI decision. The
-/// negative control is A pending while B is idle: a process-wide ACTIVE
-/// decision would queue B, but B's own sink answers inline.
+/// Tier-1: the model's Begin/Complete actions drive the real sink counter, and
+/// each Read action is compared with the shipping GUI decision. Negative
+/// control: A pending while B is idle, where a process-wide decision would
+/// queue B but B's own sink answers inline.
 #[test]
 fn a_sink_reads_only_its_own_ordered_input_jobs() {
     let model = paste_order_sink_isolation_model();
@@ -132,11 +132,10 @@ fn an_unrelated_key_decides_while_the_cold_registry_is_locked() {
     }
 }
 
-/// Two real, independent input sinks: A submits a paste and a following
-/// key to its writer while B submits many keys to its own PTY. Holding A's
-/// ordering pin makes this interleaving independent of worker scheduling;
-/// every B receipt must be an inline acceptance, and A's bytes must keep
-/// their own FIFO order.
+/// Two real, independent input sinks: A submits a paste and a key to its
+/// writer while B submits many keys to its own PTY. A's held ordering pin fixes
+/// the interleaving; every B receipt is an inline acceptance, and A's bytes keep
+/// their FIFO order.
 #[cfg(unix)]
 #[test]
 fn a_paste_in_one_session_does_not_queue_another_sessions_keys() {

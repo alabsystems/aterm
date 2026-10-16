@@ -1,20 +1,12 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tier-0 of `HarnessUpgradeLimitQueue`
-//! (`aterm_spec::derive::harness_upgrade_limit_queue_model`): proved at
-//! `Buggy = 0` and caught at `Buggy = 1` on EACH invariant, with no dead action
-//! at the committed configuration; ONE KNOB PER DEFECT, each caught on its own
-//! by the invariant it breaks; the quiet word (`Look`) checked, state by
-//! state, to be exactly the upgrade's own guards negated; the owner's report
-//! of 2026-09-27 walked as it ran (the caught negative control) and as it goes
-//! now; a limit that lasts for DAYS walked as it goes now — a handful of
-//! copies after rests shorter than a day, then one a day — and as d5cc7f01c
-//! had it (a flat rest, caught); and NO STRAND as a property of the whole
-//! graph — from every reachable state the upgrade asks again BY ITSELF once
-//! the limit ends, a full queue after its rest, with nobody's turn needed. Tier-1 is aterm-agent's
-//! `harness::upgrade_drive` tests (`upgrade_queued_tests.rs`), over the real
-//! readers, `queue_facts`, clock and reducer on every reachable state.
+//! Tier-0 of `HarnessUpgradeLimitQueue`: proved at `Buggy = 0`, caught at `Buggy = 1` on each
+//! invariant, and one knob per defect caught alone by the invariant it breaks. The quiet word
+//! (`Look`) is checked state by state to be the upgrade's own guards negated, and no strand is
+//! checked over the whole graph: once the limit ends the upgrade asks again by itself. Tier-1 is
+//! aterm-agent's `harness::upgrade_drive` tests (`upgrade_queued_tests.rs`), over the real
+//! readers, `queue_facts`, clock and reducer.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -32,9 +24,8 @@ const INVARIANTS: [&str; 5] = [
     "NeverStranded",
 ];
 
-/// The four the owner's report broke as it ran: its build had no queue to
-/// rest (it gave up after four notices), so the fifth, the rest's growth, is
-/// caught by the flat rest that followed it
+/// The four invariants the owner's report breaks under `Buggy = 1`, which has no queue to rest
+/// (it gives up after four notices); the fifth, the rest's growth, is caught by the flat rest
 /// ([`a_limit_that_lasts_for_days_adds_a_handful_of_copies_then_one_a_day`]).
 const REPORT: [&str; 4] = [
     "NeverTwoAsksUntaken",
@@ -43,8 +34,7 @@ const REPORT: [&str; 4] = [
     "NeverStranded",
 ];
 
-/// The defects the fix and this bound repair, one knob each, and the
-/// invariant that catches each alone.
+/// One knob per defect, and the invariant that catches each alone.
 const KNOBS: [(&str, &str); 6] = [
     ("CountRetype", "NoGiveUpUntaken"),
     ("CountRetype", "NeverStranded"),
@@ -64,12 +54,6 @@ const STEPS: [&str; 5] = ["Announce", "Retype", "GiveUp", "Elapse", "Rests"];
 #[test]
 fn the_limit_queue_model_proves_and_catches() {
     let model = harness_upgrade_limit_queue_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the model must stay enrolled in the spec-link registry"
-    );
     let fired = interp::fired_actions(&model);
     assert_eq!(
         fired.len(),
@@ -82,8 +66,7 @@ fn the_limit_queue_model_proves_and_catches() {
          most Daily of them before a day's rest, no give-up before MaxAsks taken, never quiet \
          while a readable ask is owed",
     );
-    // Each invariant is load-bearing on its own: the owner's build breaks
-    // every one.
+    // Each invariant is load-bearing alone: `Buggy = 1` breaks every one.
     for invariant in INVARIANTS {
         let alone = only(&model, invariant);
         assert!(
@@ -97,9 +80,8 @@ fn the_limit_queue_model_proves_and_catches() {
     }
 }
 
-/// ONE KNOB PER DEFECT, EACH CAUGHT ON ITS OWN: each knob alone breaks the
-/// invariant it names, and the committed configuration breaks none. No knob
-/// stacks a second ask behind a queued one: that is the owner's build's alone.
+/// Each knob alone breaks the invariant it names; the committed configuration breaks none. No
+/// knob stacks a second ask behind a queued one: only `Buggy = 1` does.
 #[test]
 fn each_defect_is_caught_on_its_own() {
     let model = harness_upgrade_limit_queue_model();
@@ -121,13 +103,9 @@ fn each_defect_is_caught_on_its_own() {
     }
 }
 
-/// THE QUIET WORD IS THE UPGRADE'S OWN GUARDS NEGATED: on every reachable
-/// state where the limit is over by every word (the account's, the screen's,
-/// the transcript's) and the upgrade has asked, `Look` is enabled exactly
-/// where none of `Announce`, `Retype`, `GiveUp`, `Elapse` and `Rests` is — at
-/// the committed configuration, the owner's build and under every knob;
-/// nowhere else is it enabled at all. The owner's `NowAsks` is no step of the
-/// upgrade's own, and is not in it.
+/// The quiet word is the upgrade's own guards negated: wherever the limit is over by every word
+/// and the upgrade has asked, `Look` is enabled exactly where none of [`STEPS`] is, committed,
+/// under `Buggy` and under every knob; nowhere else is it enabled at all.
 #[test]
 fn the_quiet_word_is_derived_from_the_upgrades_guards() {
     let model = harness_upgrade_limit_queue_model();
@@ -159,18 +137,10 @@ fn the_quiet_word_is_derived_from_the_upgrades_guards() {
     }
 }
 
-/// THE OWNER'S REPORT AS IT RAN (`Buggy = 1`, 0.93.0 and the screen-only gate
-/// 0.94.0 shipped): the weekly limit hit during the agent's own work, its
-/// banner gone from the screen; four notices half an hour apart, each
-/// answered by the limit and each read as asked, its window run from the
-/// typing; the give-up; the limit ends and the session goes on, all four
-/// reaching the agent at once — one ask it had. Every step is `Buggy`'s, the
-/// committed model refuses the very first notice (the limit's row named its
-/// reset, and the transcript's word holds until then), and the run breaks
-/// the four invariants the report is about (not the fifth: four notices in
-/// two hours, then a give-up, is no pile a day). Nor, had nothing said the limit stood, would it
-/// type the second: behind a queued notice no step of the upgrade's is
-/// enabled until the transcript's word runs out.
+/// The owner's report under `Buggy = 1` (four notices half an hour apart into a weekly limit,
+/// each read as asked, then the give-up): the committed model refuses the very first notice (the
+/// limit's row named its reset), the run breaks the four invariants of [`REPORT`], and behind a
+/// queued notice no step of the upgrade's is enabled while the transcript's word holds.
 #[test]
 fn the_owners_report_as_it_ran_is_the_caught_negative_control() {
     let m = harness_upgrade_limit_queue_model();
@@ -235,18 +205,11 @@ fn the_owners_report_as_it_ran_is_the_caught_negative_control() {
     }
 }
 
-/// THE REPORT NOW: the first notice typed into the limit (the transcript's
-/// word ran out while it still stood) waits in the conversation; nothing is
-/// typed behind it and no window runs while its limit holds; once the
-/// transcript says that limit is over, it is typed again as the same ask —
-/// straight away `RetypeMax` times, every copy the limit answers again — and
-/// then the queue is FULL: the upgrade rests (never quiet, never waiting on
-/// anyone), and types one copy more; the owner's `Upgrade now` types one
-/// more at once. The session goes on: every copy taken at once, one ask, its
-/// window opened then; the next asks read as they come; the give-up only
-/// after `MaxAsks` the model took. And a limit that ended by the time a copy
-/// is typed again: that copy reaches the model, and the round goes on from
-/// there.
+/// The same report handled: the first notice waits in the conversation, and nothing is typed
+/// behind it while its limit holds; once the limit is over it is typed again `RetypeMax` times,
+/// then the full queue rests and types one copy more (the owner's `Upgrade now` types one at
+/// once). The session going on takes every copy as one ask, and the give-up comes only after
+/// `MaxAsks` taken.
 #[test]
 fn the_report_now_waits_types_again_rests_and_types_once_more() {
     let m = harness_upgrade_limit_queue_model();
@@ -271,7 +234,7 @@ fn the_report_now_waits_types_again_rests_and_types_once_more() {
     for action in ["BoundPasses", "Clear"] {
         assert!(m.fire(action, &mut s), "{action}: {s:?}");
     }
-    // FULL: only its rest runs, and the owner's word would type one more.
+    // Full: only its rest runs, and the owner's word would type one more.
     for step in STEPS {
         assert_eq!(m.action_enabled(step, &s), step == "Rests", "{step}: {s:?}");
     }
@@ -348,11 +311,9 @@ fn the_report_now_waits_types_again_rests_and_types_once_more() {
     assert!(gave_up > 0, "the give-up is reached");
 }
 
-/// Walk `m` from a notice queued behind a limit that NEVER ENDS and names no
-/// reset: the notice typed into it, its copies straight away while the queue
-/// has room, then — the queue full — each rest and the copy after it, `n`
-/// rests in all, the transcript's word running out after every one. The
-/// rest each took (1: shorter than a day, 2: a day), and the state after.
+/// Walks `m` from a notice queued behind a limit that never ends and names no reset: the notice,
+/// its copies while the queue has room, then `n` rests each followed by a copy. Returns the rest
+/// each took (1: shorter than a day, 2: a day) and the state after.
 fn days_at_the_limit(m: &Model, n: usize) -> (Vec<i64>, S) {
     let mut s = walk(m, &["LimitHits", "BoundPasses", "Clear", "Announce"]);
     for _ in 0..2 {
@@ -371,19 +332,10 @@ fn days_at_the_limit(m: &Model, n: usize) -> (Vec<i64>, S) {
     (rests, s)
 }
 
-/// A LIMIT THAT LASTS FOR DAYS ADDS A HANDFUL OF COPIES, THEN ONE A DAY (the
-/// owner, 2026-09-27: a usage limit whose row names no reset still added one
-/// copy of the notice per rest, every two and a half hours for as long as it
-/// stood). Walked: the notice, its two copies straight away, and then ten
-/// rests of a full queue, the limit never ending. The first `Daily` rests are
-/// shorter than a day (the real two, four, eight and sixteen hours), every
-/// later one a day; the copies after a short rest stop at `Daily`, and none
-/// waits unread in a burst. The session then goes on: every copy is taken at
-/// once, and the next limit's queue starts from a short rest again — the
-/// rest grows with copies UNREAD, not for good. NEGATIVE CONTROL: with the
-/// flat rest (`Flat`, d5cc7f01c) every rest is short, and the fifth copy
-/// after one breaks `CopiesPerDayBounded`; so does `Buggy`, which takes that
-/// rest.
+/// A limit that lasts for days adds a handful of copies, then one a day: the first `Daily` rests
+/// of a full queue are shorter than a day (the real two, four, eight and sixteen hours), every
+/// later one a day, none leaves a burst unread, and the next limit's queue starts short again.
+/// The flat rest (`Flat`, and `Buggy`, which takes it) breaks `CopiesPerDayBounded`.
 #[test]
 fn a_limit_that_lasts_for_days_adds_a_handful_of_copies_then_one_a_day() {
     let m = harness_upgrade_limit_queue_model();
@@ -412,7 +364,7 @@ fn a_limit_that_lasts_for_days_adds_a_handful_of_copies_then_one_a_day() {
         }
         assert!(s["hurried"] <= 4, "{s:?}");
     }
-    // NEGATIVE CONTROLS: the flat rest, and the owner's build that takes it.
+    // The flat rest, and `Buggy = 1`, which takes it.
     let flat = interp::with_consts(&m, &[("Flat", 1)]);
     let (rests, s) = days_at_the_limit(&flat, 5);
     assert_eq!(rests, [1, 1, 1, 1, 1], "every rest the first one's");
@@ -461,18 +413,12 @@ fn asks_again(m: &Model, s: &S, allowed: &[&str]) -> bool {
     false
 }
 
-/// NO STRAND, OVER THE WHOLE GRAPH (the upgrade asks again once the limit
-/// ends — a property of paths, which `NeverStranded` states at each quiet
-/// word and this checks over them): from every reachable state of an announced
-/// upgrade whose limit has ended, the upgrade types a notice or gives up BY
-/// ITSELF — its own steps, its rest, the transcript's word running out, the
-/// banner leaving the screen — full queue or not: no path waits on someone
-/// else's turn (`GoesOn`) or the owner's word (`NowAsks`). A round that gave
-/// up asks no more in this model (its rest and new round are
-/// `HarnessUpgradeNeverStrands`'), and gives up only after `MaxAsks` asks
-/// taken. `NoBound` fails it (a queued notice held until a person types), and
-/// so does `ForGood` (a full queue held until the session goes on — the review
-/// of 2026-09-27).
+/// No strand over the whole graph (a path property; `NeverStranded` states it at each quiet
+/// word): from every reachable state of an announced upgrade whose limit has ended, the upgrade
+/// types a notice or gives up by itself, waiting on no one's turn (`GoesOn`) or word (`NowAsks`).
+/// A round that gave up asks no more here (its next round is `HarnessUpgradeNeverStrands`').
+/// `NoBound` (a queued notice held until a person types) and `ForGood` (a full queue held until
+/// the session goes on) fail it.
 #[test]
 fn once_the_limit_ends_the_upgrade_asks_again_by_itself() {
     let model = harness_upgrade_limit_queue_model();

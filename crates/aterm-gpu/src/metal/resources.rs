@@ -127,10 +127,10 @@ impl SharedBuffer {
         &self.0
     }
 
-    /// A second +1 handle to the SAME buffer ([`Obj::clone_retained`]) — the
-    /// armed renderer's per-frame rig borrows nothing, so it clones handles.
-    pub(crate) fn clone_handle(&self) -> Self {
-        Self(self.0.clone_retained())
+    /// The raw buffer, by value: a one-shot buffer the caller binds and drops
+    /// on this thread.
+    pub(crate) fn into_obj(self) -> Obj {
+        self.0
     }
 }
 

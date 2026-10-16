@@ -162,7 +162,7 @@ fn note_readable(source: &Source) {
 }
 
 /// The note a HEALTHY status outcome ends with — how often this machine looks,
-/// ` · checks every 10 min`, and nothing about HOW it reads the channel: Settings
+/// ` · checks every 2 min`, and nothing about HOW it reads the channel: Settings
 /// paints this sentence under "You're up to date.".
 /// One cadence, no knob, so the note is a constant of [`crate::cadence::INTERVAL_SECS`].
 fn cadence_note() -> String {
@@ -1823,8 +1823,8 @@ fn resolve_web_head(
 ///
 /// What is bound is the TAG and the DMG name, not the repository: the publisher signs `url`
 /// under the compiled-in public channel's slug (`manifest_out.rs` `repo_slug` =
-/// `[workspace.metadata.aterm] update_channel`, the key `build.rs` stamps into
-/// `DEFAULT_OWNER`/`DEFAULT_REPO`), so an updater REPOINTED at a mirror that carries the
+/// `[workspace.metadata.aterm] update_channel`, the slug `DEFAULT_OWNER`/`DEFAULT_REPO`
+/// name), so an updater REPOINTED at a mirror that carries the
 /// upstream-signed appcast would otherwise refuse every release as a `manifest`-class
 /// failure blamed on a publisher who did nothing wrong. The repository half adds nothing to
 /// (d): `pointer::parse_location` already scopes every GET after the HEAD to the source
@@ -2539,7 +2539,8 @@ fn check_and_stage_inner(
         let msg = if appcast_fetch_error {
             // Manifests exist but could not be downloaded while the channel head was
             // readable — a `pipeline`-class failure. The ledger decides the honest
-            // wording: a streak ≥ PERSISTENT_AFTER is not called "deferred".
+            // wording: a persistent streak (`Health::persistent_class`: the count and
+            // the span) is not called "deferred".
             let host = ASSET_HOST;
             crate::status::set_delivery_note(ASSET_BLOCKED_NOTE);
             let h = crate::health::Health::record_failure(
@@ -2547,7 +2548,9 @@ fn check_and_stage_inner(
                 "pipeline",
                 &format!("release manifests exist but could not be fetched from {host}"),
             );
-            if h.pipeline_failures >= crate::PERSISTENT_AFTER {
+            if h.persistent_class()
+                .is_some_and(|(class, _)| class == "pipeline")
+            {
                 format!(
                     "FAILING ({} consecutive checks since {}): release manifests exist \
                      but cannot be downloaded from {host} — this build's download \
@@ -2589,7 +2592,10 @@ fn check_and_stage_inner(
                 })
                 .flatten()
                 .map_or_else(String::new, |note| format!("; {note}"));
-            let line = if h.manifest_failures >= crate::PERSISTENT_AFTER {
+            let line = if h
+                .persistent_class()
+                .is_some_and(|(class, _)| class == "manifest")
+            {
                 if is_stale_anchor_refusal(reason) {
                     format!(
                         "FAILING ({} consecutive checks since {}): {reason}",

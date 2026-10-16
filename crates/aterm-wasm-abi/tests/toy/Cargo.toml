@@ -1,0 +1,33 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# The toy module `verify wasm-glue` builds, binds with `verify glue`
+# and drives under node (drive.mjs): one export per boundary type of
+# aterm-wasm-abi. Its own workspace, so the aterm workspace never builds it
+# natively; it is built for wasm32-unknown-unknown only, on rustup's stable
+# (STOCK EXCEPTION: Trust has no wasm32 std). The check builds a staged copy:
+# it rewrites `path = "../.."` and `[workspace]` below to stage aterm-wasm-abi
+# and its closure as members beside the toy (crates/aterm-verify/src/wasm_glue/toy.rs).
+
+[package]
+name = "aterm-wasm-abi-toy"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+aterm-wasm-abi = { path = "../..", features = ["export"] }
+
+[workspace]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

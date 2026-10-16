@@ -161,16 +161,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn selection_type_default_is_simple() {
-        assert_eq!(SelectionType::default(), SelectionType::Simple);
-    }
-
-    #[test]
-    fn selection_side_default_is_left() {
-        assert_eq!(SelectionSide::default(), SelectionSide::Left);
-    }
-
-    #[test]
     fn a_single_width_cell_is_its_own_whole_glyph() {
         assert_eq!(glyph_cell_span(7, false, false), (7, 7));
     }

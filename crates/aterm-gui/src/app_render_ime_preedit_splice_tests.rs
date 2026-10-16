@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! IME routing (app half): an in-flight composition goes to the grid, the
-//! find field or the rename field ([`crate::app_input::PreeditOwner`]); the
-//! two field splices paint it inline and author their candidate-window
-//! anchors.
-//!
-//! The grid arm's ink is `RenderInput::overlay_ime_preedit` (tested in
-//! aterm-core and `crate::preedit_fingerprint_tests`); its anchor is covered
-//! by `ime_candidate_anchor_tests`. A real OS IME driving `Ime::Preedit`
-//! through winit cannot be exercised headless.
+//! IME routing, app half: an in-flight composition goes to the grid, the find field or the
+//! rename field ([`crate::app_input::PreeditOwner`]); the field splices paint it inline and
+//! anchor the candidate window. The grid arm's ink is `RenderInput::overlay_ime_preedit`
+//! (tested in aterm-core and `crate::preedit_fingerprint_tests`), its anchor in
+//! `ime_candidate_anchor_tests`. A real OS IME cannot run headless.
 
 use crate::{App, WindowId, term_lock};
 use aterm_core::terminal::UnderlineStyle;
@@ -77,7 +73,7 @@ fn find_field_owns_the_preedit() {
         ws.last_ime_rect.is_some(),
         "the candidate window anchored on the well's caret"
     );
-    // The composition is DISPLAY-only: the search state itself is untouched.
+    // Display-only: the query itself is untouched.
     assert_eq!(ws.search.as_ref().unwrap().query, "ab");
 }
 
@@ -99,8 +95,7 @@ fn native_view_composition_stays_out_of_the_find_well() {
         .unwrap()
         .set_query("ab".to_string());
     fill_scratch(&mut app, wid);
-    // A native view comes to the front with the find bar's state behind it.
-    // The ids are synthetic: `preedit_owner` only asks whether one is frontmost.
+    // Synthetic ids: `preedit_owner` only asks whether a native view is frontmost.
     app.windows.get_mut(&wid).unwrap().front_content =
         Some(crate::front_content::FrontContent::Native {
             instance: crate::tab_model::AppInstanceId::from_stored(7),
@@ -133,8 +128,7 @@ fn native_view_composition_stays_out_of_the_find_well() {
 fn rename_field_outranks_find_for_the_preedit() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    // The in-grid rename surface only presents while the strip is on screen
-    // (headless defaults it off) — same seeding as the strip's own tests.
+    // The rename surface presents only while the strip is on screen (off headless).
     app.tab_strip_rows = 1;
     app.begin_active_session_rename(wid);
     assert!(app.inline_rename_edit(wid).is_some(), "rename field open");
@@ -144,9 +138,8 @@ fn rename_field_outranks_find_for_the_preedit() {
         crate::app_input::PreeditOwner::Rename
     );
     fill_scratch(&mut app, wid);
-    // The candidate window anchors on the well (the strip's row, above the
-    // terminal band), not the grid caret; the strip splice is the frame's
-    // one reporter for `Rename`.
+    // The candidate window anchors on the well in the strip row, not on the grid caret;
+    // the strip splice is the frame's one reporter for `Rename`.
     app.splice_tab_strip(wid);
     let (cw, ch) = app.win_cell_size(wid);
     let (band_x, band_y) = app.frame_origin(wid);

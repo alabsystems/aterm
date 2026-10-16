@@ -42,8 +42,6 @@ fn osc21_dynamic_cursor_tracks_osc10_in_main_frame_pixels_and_wake() {
     let fx = app
         .cursor_frame(
             wid,
-            // Only the fields this test is ABOUT are spelled out; the rest
-            // ride the shared fixture, so a new field lands in one place.
             CursorFxInputs {
                 default_fg: aterm_render::rgb_to_u32(terminal_blank_cell(&term).fg),
                 rows: 2,
@@ -59,12 +57,9 @@ fn osc21_dynamic_cursor_tracks_osc10_in_main_frame_pixels_and_wake() {
     );
 }
 
-/// The default cursor wears the cursor colour too. `draw_cursor` (and its
-/// GPU twin) take `cursor_fill_override` instead of `frame_cursor(input)`
-/// whenever the host sets one, so a body effect must bloom from the cursor
-/// colour or it eats OSC 12 and `cursor_color`. Two different live cursor
-/// colours produce two different block fills, each dominated by its own
-/// channel.
+/// The default cursor wears the cursor colour too: `draw_cursor` (and its GPU twin) paints
+/// `cursor_fill_override` instead of `frame_cursor(input)` whenever the host sets one, so a
+/// body effect must bloom from the cursor colour or it eats OSC 12 and `cursor_color`.
 #[test]
 fn osc12_recolours_the_effect_owned_block_cursor_not_only_the_plain_one() {
     let mut app = App::headless_for_test();
@@ -80,16 +75,14 @@ fn osc12_recolours_the_effect_owned_block_cursor_not_only_the_plain_one() {
     app.windows.get_mut(&wid).expect("fixture window").focused = true;
 
     let t0 = Instant::now();
-    // A SETTLED caret (no keystrokes fed) is the state the defect was
-    // reported in — and the state the hue phase is frozen in, so the only
-    // thing that can move this fill between the two ticks is the base.
+    // A settled caret (no keystrokes) freezes the hue phase, so only the base can move
+    // the fill between ticks.
     let mut fill_at = |rgb: [u8; 3], now| {
         app.cursor_frame(
             wid,
             CursorFxInputs {
                 live_cursor_rgb: rgb,
-                // This fixture models a pinned colour (OSC 12 / a configured
-                // `cursor_color`): the value it feeds was asked for.
+                // A pinned colour (OSC 12 or a configured `cursor_color`).
                 cursor_color_pinned: true,
                 ..CursorFxInputs::sample_for_test(now)
             },
@@ -121,8 +114,7 @@ fn osc12_recolours_the_effect_owned_block_cursor_not_only_the_plain_one() {
         bb > 200 && br < 110 && bg < 110,
         "OSC 12 #0000FF must reach the effect-owned block, got {blue:#08x}"
     );
-    // …and the CONFIGURED theme cursor, which arrives through the very same
-    // channel when no OSC 12 is in force.
+    // The theme cursor arrives through the same channel when no OSC 12 is in force.
     let (tr, tg, tb) = chans(theme);
     assert!(
         tg > 200 && tg > tr && tg > tb,
@@ -144,7 +136,6 @@ fn osc12_recolours_the_phaser_emitter_block_too() {
     app.config.cursor_trail = Some(true);
     app.config.cursor_trail_style = Some("phaser".into());
     app.config.trail_sounds = Some(false);
-    // No pinned trail colour: the cursor colour is what the effects follow.
     app.config.cursor_trail_color = None;
     let wid = WindowId(0);
     app.windows.get_mut(&wid).expect("fixture window").focused = true;
@@ -155,8 +146,6 @@ fn osc12_recolours_the_phaser_emitter_block_too() {
             wid,
             CursorFxInputs {
                 live_cursor_rgb: rgb,
-                // This fixture models a pinned colour (OSC 12 / a configured
-                // `cursor_color`): the value it feeds was asked for.
                 cursor_color_pinned: true,
                 ..CursorFxInputs::sample_for_test(now)
             },
@@ -221,9 +210,8 @@ fn trail_status_names_the_style_that_owns_the_block_fill() {
                 wid,
                 CursorFxInputs {
                     live_cursor_rgb: rgb,
-                    // Pinned iff the test body wrote a `cursor_color`
-                    // into the config — the row's provenance must track
-                    // that switch, which is the whole point of the test.
+                    // Pinned iff the config has a `cursor_color`; the row's provenance
+                    // must track it.
                     cursor_color_pinned: app.config.cursor_color.is_some(),
                     ..CursorFxInputs::sample_for_test(now)
                 },
@@ -241,9 +229,8 @@ fn trail_status_names_the_style_that_owns_the_block_fill() {
         app.trail_status().expect("a front window exists")
     };
 
-    // The default, unpinned: the rainbow block owns the caret and, with no
-    // `cursor_color` configured, builds from white. The row reports what
-    // the owner was handed: `base=none from=white` (owner, 2026-08-29).
+    // The default, unpinned: the rainbow block owns the caret and, with no `cursor_color`
+    // configured, builds from white (`base=none from=white`).
     let line = status_after_projection(&mut app, "rainbow kitty", [0xFF, 0x00, 0x00], t0);
     assert!(
         line.contains(" block_fill=rainbow")
@@ -273,9 +260,7 @@ fn trail_status_names_the_style_that_owns_the_block_fill() {
             && line.contains(" block_fill_base_from=cursor_color"),
         "a pinned cursor colour reaches the caret and the row must say so: {line}"
     );
-    // …and the colour it PAINTED, which is the caret on the glass. Since
-    // the fix it tracks the base; the row prints both precisely so a build
-    // where it stops tracking is visible here rather than in a capture.
+    // The painted colour (`block_fill_rgb`) tracks the base.
     let painted = line
         .split(" block_fill_rgb=")
         .nth(1)
@@ -287,8 +272,7 @@ fn trail_status_names_the_style_that_owns_the_block_fill() {
         "the painted caret must be the red it was told to bloom from, got {painted:#08x}"
     );
 
-    // The phaser: the same ownership, the same provenance, a different
-    // cursor colour — the A/B the capture runs, read off the sensor.
+    // The phaser: the same provenance from a different cursor colour.
     let line = status_after_projection(
         &mut app,
         "phaser",
@@ -317,9 +301,8 @@ fn trail_status_names_the_style_that_owns_the_block_fill() {
         "fire owns its body colour deliberately: {line}"
     );
 
-    // An unfocused window paints no body at all: the caret goes back to the
-    // terminal's own cursor colour, and the row must not keep naming the
-    // style that owned it a frame ago.
+    // An unfocused window paints no body: the caret takes the terminal's own cursor
+    // colour, and the row stops naming last frame's owner.
     app.windows.get_mut(&wid).expect("fixture window").focused = false;
     let line = status_after_projection(
         &mut app,

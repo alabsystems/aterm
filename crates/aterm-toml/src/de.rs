@@ -8,7 +8,8 @@
 //! aterm calls `from_str` 168 times, and 43 of those are typed
 //! (`from_str::<Config>`), standing on 161 `#[derive(Deserialize)]` models. A
 //! replacement that handed back an untyped value tree would mean rewriting all
-//! 161 by hand — so the replacement is a `Deserializer`, and serde stays.
+//! 161 by hand — so the replacement is a `Deserializer`, and serde stays the
+//! interface (first-party `crates/aterm-serde` since the audit's SP.6).
 //!
 //! # Spans
 //!

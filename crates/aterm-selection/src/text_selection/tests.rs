@@ -353,8 +353,7 @@ fn test_adjust_for_scroll_negative_delta() {
 
 #[test]
 fn test_adjust_for_scroll_negative_delta_pushes_past_max() {
-    // With max_rows=24, max_row = 24.
-    // Selection at row 20, delta -5 => new row = 20 - (-5) = 25 > max_row.
+    // Selection at row 20, delta -5 => new row = 25, outside the 24 rows.
     // Should be cleared.
     let mut sel = TextSelection::new();
     sel.start_selection(20, 0, SelectionSide::Left, SelectionType::Simple);
@@ -368,47 +367,32 @@ fn test_adjust_for_scroll_negative_delta_pushes_past_max() {
 
 #[test]
 fn test_adjust_for_scroll_exact_max_row_boundary() {
-    // With max_rows=24, max_row = 24 (one past last visible row index 23).
-    // Selection at row 20, delta -4 => new row = 20 - (-4) = 24 = max_row.
-    // The check is `> max_row`, so row 24 exactly is still considered visible.
-    // This documents current behavior: max_row is inclusive upper bound.
+    // Row 24 is one past the last visible row of a 24-row terminal.
     let mut sel = TextSelection::new();
     sel.start_selection(20, 0, SelectionSide::Left, SelectionType::Simple);
     sel.update_selection(20, 10, SelectionSide::Right);
     sel.complete_selection();
 
     let visible = sel.adjust_for_scroll(-4, 24, 23);
-    assert!(
-        visible,
-        "row 24 == max_row should be considered visible (inclusive upper bound)"
-    );
-    assert!(sel.has_selection());
-    assert_eq!(sel.normalized_start().row, 24);
-}
+    assert!(!visible, "row 24 is outside a 24-row terminal");
+    assert!(!sel.has_selection());
 
-#[test]
-fn test_adjust_for_scroll_exact_min_row_boundary() {
-    // With floor=23, min_row = -floor = -23.
-    // Selection at row 0, delta 23 => new row = 0 - 23 = -23 = min_row.
-    // The check is `< min_row`, so row -23 exactly is still considered visible.
-    // Complements test_adjust_for_scroll_boundary_just_visible by checking
-    // from the min_row perspective with explicit boundary arithmetic.
-    let mut sel = TextSelection::new();
-    sel.start_selection(0, 5, SelectionSide::Left, SelectionType::Simple);
-    sel.update_selection(0, 10, SelectionSide::Right);
-    sel.complete_selection();
+    let mut retained = TextSelection::new();
+    retained.start_selection(23, 0, SelectionSide::Left, SelectionType::Simple);
+    retained.update_selection(23, 10, SelectionSide::Right);
+    assert!(retained.adjust_for_scroll(0, 24, 23));
 
-    // Verify boundary is inclusive
-    assert!(sel.adjust_for_scroll(23, 24, 23));
-    assert_eq!(sel.normalized_start().row, -23);
-
-    // One more clears it
-    let mut sel2 = TextSelection::new();
-    sel2.start_selection(0, 5, SelectionSide::Left, SelectionType::Simple);
-    sel2.update_selection(0, 10, SelectionSide::Right);
-    sel2.complete_selection();
-    assert!(!sel2.adjust_for_scroll(24, 24, 23));
-    assert!(!sel2.has_selection());
+    for method in [0, 1] {
+        let mut outside = TextSelection::new();
+        outside.start_selection(23, 0, SelectionSide::Left, SelectionType::Simple);
+        outside.update_selection(24, 10, SelectionSide::Right);
+        if method == 0 {
+            assert!(!outside.adjust_for_scroll(0, 24, 23));
+        } else {
+            assert!(!outside.adjust_for_row_splice(10, 1, 24, 23));
+        }
+        assert!(!outside.has_selection());
+    }
 }
 
 #[test]
@@ -416,7 +400,7 @@ fn test_adjust_for_scroll_asymmetric_selection_span() {
     // Selection spanning both positive and negative rows after scroll.
     // Start at row 5, end at row 10 in a 24-row terminal.
     // Delta 8 => start at row -3 (scrollback), end at row 2 (visible).
-    // Both within bounds: min_row=-23 (floor=23), max_row=24.
+    // Both within bounds: -23 <= row < 24.
     let mut sel = TextSelection::new();
     sel.start_selection(5, 0, SelectionSide::Left, SelectionType::Simple);
     sel.update_selection(10, 10, SelectionSide::Right);
@@ -431,7 +415,7 @@ fn test_adjust_for_scroll_asymmetric_selection_span() {
 #[test]
 fn test_adjust_for_scroll_single_row_terminal() {
     // Edge case: 1-row terminal with no scrollback. floor=0 => min_row = 0,
-    // max_row = 1. This means only rows 0 and 1 are valid.
+    // only row 0 is valid.
     let mut sel = TextSelection::new();
     sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
     sel.update_selection(0, 5, SelectionSide::Right);
@@ -728,10 +712,9 @@ fn test_adjust_for_row_splice_clears_only_after_real_history_eviction() {
 /// `selection_contains_linear` function produces identical results to calling
 /// `TextSelection::contains()` per-cell.
 ///
-/// This validates the correctness invariant for the render-loop optimization:
-/// instead of calling `contains()` per cell (which recomputes `normalized_start`
-/// and `normalized_end` on every invocation), render paths should call
-/// `normalized_bounds()` once and use `PrecomputedSelectionBounds::contains()`.
+/// These anchors make `normalized_bounds()` equal `side_adjusted_bounds()`.
+/// A renderer caching arbitrary anchors must use `side_adjusted_bounds()` so
+/// Right-sided starts and Left-sided ends keep the same selected cells.
 #[test]
 fn precomputed_bounds_equivalent_to_contains_linear() {
     let rows = 12_i32;
@@ -974,6 +957,27 @@ fn test_include_all_noop_on_no_selection() {
     assert!(!sel.has_selection());
 }
 
+#[test]
+fn include_all_covers_both_endpoints_for_either_drag_direction() {
+    for (start, end) in [((0, 5), (0, 10)), ((0, 10), (0, 5)), ((2, 5), (0, 10))] {
+        let mut sel = TextSelection::new();
+        sel.start_selection(start.0, start.1, SelectionSide::Left, SelectionType::Simple);
+        sel.update_selection(end.0, end.1, SelectionSide::Right);
+        sel.include_all();
+        assert!(sel.contains(start.0, start.1), "the original start cell");
+        assert!(sel.contains(end.0, end.1), "the original end cell");
+        let (first, last) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        assert_eq!(
+            sel.side_adjusted_bounds(),
+            Some((first.0, first.1, last.0, last.1))
+        );
+    }
+}
+
 // ── contains_cell wide character tests ──
 
 #[test]
@@ -1159,6 +1163,53 @@ fn a_lines_selection_paints_every_half_of_every_glyph_on_its_rows() {
     assert!(sel.contains_cell(2, 79, true, false));
     assert!(!sel.contains_cell(3, 0, true, false), "rows below are not");
     assert!(!sel.contains_cell(0, 79, true, false), "nor rows above");
+}
+
+/// Full-row geometry must agree before gesture adapters expand the columns,
+/// including shift-click endpoints on the left side of column zero.
+#[test]
+fn lines_bounds_projection_and_hits_ignore_anchor_columns_and_sides() {
+    for (start_row, end_row) in [(1, 2), (2, 1), (1, 1), (i32::MIN, i32::MIN)] {
+        for start_side in [SelectionSide::Left, SelectionSide::Right] {
+            for end_side in [SelectionSide::Left, SelectionSide::Right] {
+                for (start_col, end_col) in [(0, 0), (3, 0), (0, 3), (3, 7)] {
+                    let mut sel = TextSelection::new();
+                    sel.start_selection(start_row, start_col, start_side, SelectionType::Lines);
+                    sel.update_selection(end_row, end_col, end_side);
+                    let first = start_row.min(end_row);
+                    let last = start_row.max(end_row);
+                    assert_eq!(sel.side_adjusted_bounds(), Some((first, 0, last, u16::MAX)));
+                    assert_eq!(
+                        sel.project_range(79),
+                        Some(SelectionProjection {
+                            start_row: first,
+                            start_col: 0,
+                            end_row: last,
+                            end_col: 79,
+                            is_block: false,
+                        })
+                    );
+                    for row in [first, last] {
+                        assert!(sel.contains(row, 0));
+                        assert!(sel.contains(row, 79));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_linear_end_before_the_first_representable_row_is_empty() {
+    for kind in [SelectionType::Simple, SelectionType::Semantic] {
+        let mut sel = TextSelection::new();
+        sel.start_selection(i32::MIN, 0, SelectionSide::Left, kind);
+        sel.update_selection(i32::MIN, 0, SelectionSide::Left);
+        assert_eq!(sel.side_adjusted_bounds(), None);
+        assert_eq!(sel.project_range(79), None);
+        assert!(!sel.contains(i32::MIN, 0));
+        assert!(!sel.contains(i32::MAX, 0));
+    }
 }
 
 #[test]

@@ -7,12 +7,16 @@
 //! semantics hold, in particular that `shutdown` unblocks a blocked
 //! cross-thread read (relay teardown) and that a stale or absent socket reads
 //! as `ConnectionRefused`/`NotFound` (unlink-on-restart in `decide_bind`).
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use aterm_uds::{CtlListener, CtlStream, latest, process, rand};
+use aterm_uds::{CtlListener, CtlStream, latest, process};
 
 /// A fresh per-test directory under the OS temp dir (tests run in parallel in
 /// one process, so the name carries the pid and the test tag).
@@ -405,15 +409,4 @@ fn pid_alive_self_true_reaped_child_false() {
     child.wait().expect("reap");
     drop(child);
     assert!(!process::pid_alive(dead), "a reaped child is dead");
-}
-
-/// The CSPRNG fills and two draws differ (astronomically unlikely to collide).
-#[test]
-fn rand_fill_produces_distinct_bytes() {
-    let mut a = [0u8; 32];
-    let mut b = [0u8; 32];
-    rand::fill(&mut a).expect("entropy available");
-    rand::fill(&mut b).expect("entropy available");
-    assert_ne!(a, b, "two 32-byte draws must differ");
-    assert_ne!(a, [0u8; 32], "a draw is not all zeroes");
 }

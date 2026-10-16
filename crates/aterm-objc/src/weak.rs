@@ -2,12 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Weak references, for AppKit's object graph (a window retains its content
-//! view, and the view names its window back):
-//!
-//! ```text
-//! // Weak reference because the window keeps a strong reference to the view
-//! _ns_window: WeakId<NSWindow>,
-//! ```
+//! view, and the view names its window back).
 //!
 //! # A weak reference is a registration of an address
 //!
@@ -45,15 +40,8 @@
 //!
 //! is unsound: `objc_loadWeak` autoreleases into the innermost pool on the
 //! thread, while `'p` names whatever pool the caller chose. Inside
-//! `autoreleasepool(|inner| …)` the caller can name `outer`, `inner` pops, and
-//! safe code holds a freed object:
-//!
-//! ```text
-//! x12-A:  slot after inner pop = id(nil)          <- the target IS deallocated
-//!         borrowed.id() = 0x1014d1e20 = original  <- and safe code still holds it
-//! x12-A2: freed block REUSED; borrowed.id() is now a DIFFERENT live object
-//! x12-A3: -retainCount on the escaped borrow  ->  SIGSEGV
-//! ```
+//! `autoreleasepool(|inner| …)` the caller can name `outer`; when `inner` pops
+//! the target deallocates and safe code still holds a freed object.
 //!
 //! No bound on [`crate::autoreleasepool`]'s `R` fixes it (a `Cell` in the outer
 //! scope carries the borrow out of a closure returning `()`). It would not be
@@ -89,7 +77,7 @@ unsafe extern "C" {
     /// `id objc_loadWeakRetained(id *location)` — the object at +1, or nil,
     /// retained under the runtime's weak lock.
     fn objc_loadWeakRetained(location: *mut Id) -> Id;
-    /// `id objc_loadWeak(id *location)` — the object AUTORELEASED (+0), or nil.
+    /// `id objc_loadWeak(id *location)` — the object autoreleased (+0), or nil.
     fn objc_loadWeak(location: *mut Id) -> Id;
     /// `id objc_storeWeak(id *location, id value)` — re-point an initialised
     /// slot: unregister it from its old target, register it with `value`.
@@ -166,7 +154,7 @@ impl WeakSlot {
     ///
     /// # Safety
     /// The slot must be initialised. The caller owns the +1; wrap it in [`Obj`]
-    /// or [`Retained`], as [`WeakObj::load`] does.
+    /// or [`crate::Retained`], as [`WeakObj::load`] does.
     #[must_use]
     pub unsafe fn load_retained(&self) -> Id {
         // SAFETY: the slot is initialised; the runtime reads it under the weak

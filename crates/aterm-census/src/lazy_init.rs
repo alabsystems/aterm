@@ -3,7 +3,7 @@
 // Author: Andrew Yates
 
 //! Lazy-init reentrancy census (OB-19..OB-21): the L0 deadlock class in its
-//! reentrancy sense, as a fail-closed, build-blocking obligation.
+//! reentrancy sense, as a fail-closed obligation.
 //!
 //! The shape it guards against:
 //!
@@ -19,15 +19,12 @@
 //! ```
 //!
 //! `Once::call` marks the cell running before invoking the initializer, so the
-//! nested call parks the thread on its own `Once` forever. Reached from the
-//! winit main thread, that freezes the whole terminal. It is not a lock-order
-//! cycle (OB-7), not an unbounded sink (OB-1..OB-6), and clippy has no lint for
-//! it. This census derives every lazy cell in `crates/*/src` and which fns
-//! block on each, and fails the build if an initializer can reach a blocking
-//! touch of its own cell, directly or around a cycle.
-//!
-//! Consumers: the `aterm-census` bin (`targo --unverified run -p aterm-census
-//! -- --lazy-init`) and `tools/freeze-safety-gate/build.rs`.
+//! nested call parks the thread on its own `Once` forever; on the winit main
+//! thread that freezes the whole terminal. It is neither a lock-order cycle
+//! (OB-7) nor an unbounded sink (OB-1..OB-6), and clippy has no lint for it.
+//! This census derives every lazy cell in `crates/*/src` and the fns that block
+//! on each, and fails if an initializer can reach a blocking touch of its own
+//! cell, directly or around a cycle.
 //!
 //! Obligations (`[OB-n]` tags in the diagnostics; none has a waiver):
 //!
@@ -35,25 +32,22 @@
 //!   cell (always a deadlock).
 //! * OB-20 mutual reentrancy: the lazy-init graph (`S -> T` when `S`'s
 //!   initializer can reach a blocking touch of `T`) is acyclic.
-//! * OB-21 liveness: an anti-vacuity floor. It fires only when the tree-wide
-//!   count of cells, initializers or blocking touches reaches zero, so it does
-//!   not catch a single site hidden behind a wrapper type; per-site coverage
-//!   rests on the vocabulary and join rules.
+//! * OB-21 liveness: fires only when the tree-wide count of files, cells,
+//!   initializers or blocking touches is zero; per-site coverage rests on the
+//!   vocabulary below.
 //!
-//! Blocking touches are the operations that can park: `get_or_init` /
-//! `get_or_try_init` on `OnceLock`/`OnceCell`, `call_once` / `call_once_force`
-//! on `Once`, and any use of a `LazyLock`/`Lazy` cell. `OnceLock::get`, `::set`,
+//! Blocking touches are [`BLOCKING_METHODS`] on a `OnceLock`/`OnceCell`/`Once`
+//! and any use of a `LazyLock`/`Lazy` cell. `OnceLock::get`, `::set`,
 //! `::get_mut` and `Once::is_completed` are ignored: re-entering through
 //! `get()` is the supported escape.
 
-use crate::CensusOutcome;
+use crate::{CensusOutcome, Floor};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-/// The honest limits of this walker, printed verbatim in every RED diagnostic.
-// NOTE: a plain multi-line literal (no `\` continuations, which would strip the
-// leading indentation the diagnostic relies on).
+/// This walker's limits, printed after every red verdict. A plain multi-line
+/// literal: `\` continuations would strip the indentation it relies on.
 pub const LAZY_INIT_PRECISION_NOTE: &str =
     "    PRECISION / SCOPE (the honest limits of this census):
       - LEXICAL, name-based: cells are found at their `static NAME: <Lazy…>`
@@ -84,16 +78,13 @@ pub const LAZY_INIT_PRECISION_NOTE: &str =
         `LazyLock` FIELD re-entered by a plain deref is NOT caught, and a field
         written without rustfmt's trailing comma is not seen as a field.
       - SCOPE: non-test sources of every workspace member (`crates/*/src`).
-        `tools/*/src` and the sibling workspaces (`aterm-link/`,
-        `astream-oracle/`) are NOT censused — they are dev/host code outside the
-        shipped binary — so a lazy cell there is unguarded; there is one today,
-        at tools/temporal-extract/src/main.rs. This crate's own sources are
-        excluded as well, because its red fixtures quote whole Rust programs.
-        Within the scanned set,
-        with `#[cfg(test)]` items blanked: test-only code
-        never ships, and a deadlock in a test is a stopped suite, not a frozen
-        terminal. Cells declared INSIDE a fn body are covered (the shipped bug
-        was one).
+        `tools/*/src` and the sibling workspaces are NOT censused — they are
+        dev/host code outside the shipped binary — so a lazy cell there is
+        unguarded. This crate's own sources are excluded as well, because its
+        red fixtures quote whole Rust programs. Within the scanned set,
+        `#[cfg(test)]` items are blanked: test-only code never ships, and a
+        deadlock in a test is a stopped suite, not a frozen terminal. Cells
+        declared INSIDE a fn body are covered (the shipped bug was one).
       - NOT flagged: `OnceLock::get`, `::set`, `Once::is_completed` and other
         NON-blocking touches. Re-entering a cell through `get()` is the
         supported escape from this hazard, not an instance of it.
@@ -224,7 +215,7 @@ fn report(root: &str, file_count: usize, d: &Derived) -> CensusOutcome {
              this census is BLIND, not clean. Either the scan root moved, or the \
              lazy-init idiom was renamed (a wrapper type, a macro) — in which case teach \
              the walker the new spelling in `DEREF_LAZY_TYPES` / `METHOD_LAZY_TYPES` / \
-             `BLOCKING_METHODS`. Do NOT delete this obligation to make the build pass: a \
+             `BLOCKING_METHODS`. Do NOT delete this obligation to make the census pass: a \
              blind census is exactly how the v0.65.0 freeze shipped.",
             d.cells.len(),
             d.inits.len(),
@@ -299,27 +290,35 @@ fn report(root: &str, file_count: usize, d: &Derived) -> CensusOutcome {
             "  ✓ GREEN [OB-19] no initializer reaches a blocking touch of its own cell\n\
              \x20 ✓ GREEN [OB-20] the lazy-init graph is ACYCLIC ({} edge(s) between cells)\n\
              \x20 ✓ GREEN [OB-21] the walk sees the idiom (cells, initializers and touches \
-             all non-empty)\n\
-             lazy-init census: GREEN — {} lazy cell(s) over {file_count} file(s), no \
-             reentrancy cycle.",
+             all non-empty)",
             edges.len(),
+        );
+        let summary = format!(
+            "{} lazy cell(s) over {file_count} file(s), no reentrancy cycle.",
             d.cells.len()
         );
+        let missed = "the walk lost most of the tree (a moved scan root or a renamed \
+                      idiom), so OB-19..OB-21 hold vacuously; teach the walker the new \
+                      spelling";
+        CensusOutcome::green(LAZY_INIT, log, summary).with_floors(vec![
+            Floor::at_least("non-test source files read", file_count, 500, missed),
+            Floor::at_least("lazy cells derived", d.cells.len(), 20, missed),
+        ])
     } else {
-        let _ = writeln!(
-            log,
-            "lazy-init census: FAILED — {failures} obligation violation(s). There is NO \
-             waiver channel for a reentrancy cycle: it can only be fixed."
-        );
         log.push_str(LAZY_INIT_PRECISION_NOTE);
-    }
-
-    if failures == 0 {
-        CensusOutcome::green(log)
-    } else {
-        CensusOutcome::red(log)
+        CensusOutcome::red(
+            LAZY_INIT,
+            log,
+            format!(
+                "{failures} obligation violation(s). There is NO waiver channel for a \
+                 reentrancy cycle: it can only be fixed."
+            ),
+        )
     }
 }
+
+/// The lazy-init census's verdict title.
+const LAZY_INIT: &str = "lazy-init census";
 
 // Derivation.
 
@@ -394,11 +393,10 @@ fn read_sources(root: &Path, files: &[PathBuf]) -> Vec<(String, String)> {
     out
 }
 
-/// The derivation proper, over `(repo-relative path, masked text)` pairs — the
+/// The derivation proper, over `(repo-relative path, raw text)` pairs — the
 /// seam the unit tests drive with synthetic sources.
 fn derive_from_sources(raw_sources: &[(String, String)]) -> Derived {
-    // Test-only items never ship: a deadlock there stops a
-    // suite, which is loud, not a terminal, which is silent.
+    // Test-only items never ship; a deadlock there stops a suite, not a terminal.
     let sources: Vec<(String, String)> = raw_sources
         .iter()
         .map(|(rel, raw)| (rel.clone(), crate::lock_order::mask_cfg_test_items(raw)))
@@ -436,7 +434,7 @@ fn derive_from_sources(raw_sources: &[(String, String)]) -> Derived {
         collect_cells(text, rel, &mut cells);
     }
 
-    // PASS 2: blocking touches and initializers, now that every cell is known.
+    // Pass 2: blocking touches and initializers, now that every cell is known.
     let mut touches: Vec<Touch> = Vec::new();
     let mut inits: Vec<Initializer> = Vec::new();
     for (rel, text) in sources {
@@ -532,10 +530,8 @@ fn collect_field_cells(text: &str, rel: &str, out: &mut Vec<Cell>) {
             name,
             kind,
             span: format!("{rel}:{}", i + 1),
-            // Field cells are tracked through blocking methods only, never bare
-            // mentions: names like `cache` are not unique and would manufacture
-            // edges. So a `LazyLock` field re-entered by a bare deref is not
-            // caught (recorded in the precision note).
+            // Touched through blocking methods only: a bare mention of a common
+            // name like `cache` is no touch (see the precision note).
             deref_lazy: false,
             field: true,
         });
@@ -925,9 +921,9 @@ fn initializer_callees(body: &[String]) -> BTreeSet<String> {
         .trim_end_matches(')')
         .trim();
     if !inner.contains('|') && !inner.contains('(') && !inner.is_empty() {
-        // A qualified path's last segment is followed too; the ambiguity filter
-        // in `reachable` drops merged names like `new`, while a unique name
-        // such as `Type::with_builtin_rules` is worth following.
+        // A qualified path's last segment is followed too: `reachable` stops at
+        // over-merged names like `new`, while a unique name such as
+        // `Type::with_builtin_rules` is worth following.
         let last = inner.rsplit("::").next().unwrap_or(inner);
         let ident: String = last
             .chars()
@@ -1085,7 +1081,7 @@ fn find_cycles(edges: &[Edge]) -> (Vec<Edge>, Vec<Vec<Edge>>) {
     }
 
     // Iterative Tarjan: the graph is derived, so its depth is not something a
-    // build-blocking gate gets to assume.
+    // census gets to assume.
     let n = order.len();
     let mut index = vec![usize::MAX; n];
     let mut low = vec![0usize; n];
@@ -1159,7 +1155,7 @@ fn find_cycles(edges: &[Edge]) -> (Vec<Edge>, Vec<Vec<Edge>>) {
 }
 
 /// Drive the census over synthetic `(path, source)` pairs, through the same
-/// derivation and verdict logic as the build gate.
+/// derivation and verdict logic as the live census.
 #[cfg(test)]
 fn run_synth_sources(sources: &[(String, String)]) -> CensusOutcome {
     let derived = derive_from_sources(sources);
@@ -1169,37 +1165,14 @@ fn run_synth_sources(sources: &[(String, String)]) -> CensusOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan_set::test_fixtures::repo_root;
 
     fn src(path: &str, body: &str) -> (String, String) {
         (path.to_string(), body.to_string())
     }
 
-    /// Green is not vacuous: the walk sees the idiom on this tree.
-    #[test]
-    fn the_real_tree_derivation_is_not_empty() {
-        let files = scan_files(&repo_root());
-        let derived = derive_from_sources(&read_sources(&repo_root(), &files));
-        assert!(
-            files.len() > 500,
-            "scan set collapsed: {} file(s)",
-            files.len()
-        );
-        assert!(
-            derived.cells.len() > 20,
-            "too few lazy cells derived ({}) — the walker has gone blind",
-            derived.cells.len()
-        );
-        assert!(!derived.inits.is_empty() && !derived.touches.is_empty());
-    }
-
     /// The self-reentrant `debug_seamless_reexec_armed` shape (fn-local
-    /// `OnceLock`, multi-statement closure, self-call first) plus its
+    /// `OnceLock`, multi-statement closure, self-call first) and its
     /// main-thread caller.
-    ///
-    /// Hoisted out of the fixture body because `xtask`'s non-vacuity checker
-    /// bounds a fixture at the first `\n    }` after its `fn` line, and this
-    /// snippet's own `    })` would truncate it.
     const V065_SHIPPED_SHAPE: &str = r#"
 pub(crate) fn debug_seamless_reexec_armed() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1218,8 +1191,8 @@ pub(crate) fn apply_staged_update_now() -> bool {
 }
 "#;
 
-    /// Non-vacuity fixture: the self-reentrant fn-local `OnceLock` shape must
-    /// go red.
+    /// The self-reentrant fn-local `OnceLock` shape is red, naming the cell and
+    /// the accessor.
     #[test]
     fn the_v065_self_recursive_once_lock_is_red_with_its_path() {
         let sources = vec![src(
@@ -1470,8 +1443,7 @@ fn build_rules() -> Rules {
         );
     }
 
-    /// `#[cfg(test)]` code never ships, and a deadlock there stops a suite
-    /// rather than a terminal — so it is masked out, not reported.
+    /// `#[cfg(test)]` code is masked out, not reported.
     #[test]
     fn a_test_only_self_recursion_is_not_a_shipped_finding() {
         let sources = vec![src(

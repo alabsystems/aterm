@@ -125,6 +125,7 @@ fn audited_availability() -> SettingsAvailability {
         notifications: true,
         trail_audio: true,
         packages: PackageAdmission::Ready,
+        update_installable: true,
     }
 }
 
@@ -135,7 +136,7 @@ fn test_patch(edits: &[(&str, &str)]) -> ConfigPatch {
             .iter()
             .map(|(key, value)| ConfigEdit {
                 key: (*key).to_string(),
-                expected: ExpectedConfigValue::Any,
+                expected: ExpectedConfigValue::Exact(None),
                 value: Some((*value).to_string()),
             })
             .collect(),
@@ -193,6 +194,22 @@ fn authored_visual_state(key: &str, value: Option<&str>) -> SettingsViewState {
     ) {
         Config {
             cursor_trail_style: Some("comet".to_string()),
+            ..Config::default()
+        }
+    } else if key == prefs::EDIT_CURSOR_BLINK {
+        // A caret that is typing, or that a rainbow body owns, holds steady
+        // exactly as in a terminal; the blink shows on a resting caret: Off,
+        // with the typing glow (which types even under Off) off too.
+        Config {
+            cursor_trail_style: Some("off".to_string()),
+            cursor_momentum_glow: Some(false),
+            ..Config::default()
+        }
+    } else if key == prefs::EDIT_CURSOR_MOMENTUM_GLOW {
+        // The rainbow owns its caret and keeps the momentum glow off it.
+        Config {
+            cursor_trail: Some(true),
+            cursor_trail_style: Some("lumen".to_string()),
             ..Config::default()
         }
     } else {
@@ -282,25 +299,28 @@ fn preview_body_pixels(compiled: &crate::native_ui::CompiledUi, pixels: &[u8]) -
 
 #[test]
 fn result_count_copy_uses_singular_and_plural_nouns() {
+    // Nothing at all: the empty card says so, once.
+    assert_eq!(settings_count_summary(0, 0, 0), None);
     assert_eq!(
-        settings_count_summary(1, 0, false, SettingsWidth::Wide),
-        "1 setting  ·  choices save immediately; text saves on Return"
+        settings_count_summary(0, 0, 1).as_deref(),
+        Some("1 key in aterm.toml")
     );
     assert_eq!(
-        settings_count_summary(1, 0, false, SettingsWidth::Compact),
-        "1 setting"
+        settings_count_summary(0, 0, 2).as_deref(),
+        Some("2 keys in aterm.toml")
     );
     assert_eq!(
-        settings_count_summary(2, 0, false, SettingsWidth::Wide),
-        "2 settings  ·  choices save immediately; text saves on Return"
+        settings_count_summary(1, 0, 3).as_deref(),
+        Some("1 setting")
     );
     assert_eq!(
-        settings_count_summary(1, 1, true, SettingsWidth::Wide),
-        "1 setting · 1 Manual config key"
+        settings_count_summary(2, 0, 0).as_deref(),
+        Some("2 settings")
     );
+    assert_eq!(settings_count_summary(0, 1, 0).as_deref(), Some("1 page"));
     assert_eq!(
-        settings_count_summary(2, 3, true, SettingsWidth::Compact),
-        "2 settings · 3 Manual config keys"
+        settings_count_summary(3, 2, 0).as_deref(),
+        Some("2 pages · 3 settings")
     );
     assert_eq!(counted_value_label("entry", "entries", 0), "0 entries");
     assert_eq!(counted_value_label("entry", "entries", 1), "1 entry");
@@ -309,12 +329,12 @@ fn result_count_copy_uses_singular_and_plural_nouns() {
     assert_eq!(manual_override_preview("12", None), UNKNOWN_KEY_PREVIEW);
     assert_eq!(
         unknown_key_preview("scrollback_lnies"),
-        "Did you mean scrollback_lines? · Open Manual to inspect"
+        "Unknown key · Did you mean scrollback_lines?"
     );
 }
 
 #[test]
-fn all_58_visual_fields_preview_candidate_semantics_fingerprint_pixels_and_isolation() {
+fn every_visual_field_previews_candidate_semantics_fingerprint_pixels_and_isolation() {
     // The `window_theme` candidate must land on the side OPPOSITE the one
     // this fixture's Auto resolves to, or the sample titlebar cannot move.
     // Ask the painter's own resolver which side that is — a hand-kept
@@ -322,13 +342,20 @@ fn all_58_visual_fields_preview_candidate_semantics_fingerprint_pixels_and_isola
     // pixel-blind the day the rule changes (Linux Auto follows the host
     // TERMINAL theme, the other platforms the OS appearance, and both of
     // those answers moved during the 2026-08 window-chrome work).
+    //
+    // A dark OS throughout, so the unset theme draws the dark Default: the
+    // SDR glow boost rolls itself off on a light background
+    // (`sdr_glow_budget`), so its candidate is visible only on a dark one.
+    let dark_os = crate::native_app::ViewMotionCx {
+        system_dark: true,
+        ..Default::default()
+    };
     let auto_window_sample_light = renderer_preview_spec(
         &authored_visual_state(prefs::EDIT_WINDOW_THEME, None),
         720,
-        crate::native_app::ViewMotionCx::default(),
+        dark_os,
         13.0,
         1.0,
-        aterm_render::Theme::default(),
     )
     .expect("base preview for window_theme")
     .window_sample_is_light(aterm_render::Theme::default());
@@ -348,7 +375,7 @@ fn all_58_visual_fields_preview_candidate_semantics_fingerprint_pixels_and_isola
     } else {
         "true"
     };
-    let cases: [(&str, &str); 57] = [
+    let cases: [(&str, &str); 54] = [
         (prefs::EDIT_THEME, "Nord"),
         (prefs::EDIT_FOREGROUND, "#00FF66"),
         (prefs::EDIT_BACKGROUND, "#101820"),
@@ -391,6 +418,7 @@ fn all_58_visual_fields_preview_candidate_semantics_fingerprint_pixels_and_isola
         (prefs::EDIT_FONT_VARIATION, "wdth=85, slnt=-8"),
         (prefs::EDIT_CURSOR_STYLE, "bar"),
         (prefs::EDIT_CURSOR_BLINK, "false"),
+        (prefs::EDIT_CURSOR_MOMENTUM_GLOW, "false"),
         (prefs::EDIT_CURSOR_TRAIL, CURSOR_TRAIL_CANDIDATE),
         (prefs::EDIT_CURSOR_TRAIL_STYLE, "water"),
         (prefs::EDIT_CURSOR_TRAIL_MS, "900"),
@@ -409,10 +437,6 @@ fn all_58_visual_fields_preview_candidate_semantics_fingerprint_pixels_and_isola
         (prefs::EDIT_CURSOR_GLOW_SDR_BOOST, "0.8"),
         (prefs::EDIT_MOTION, "reduced"),
         (prefs::EDIT_LOAD_ADAPTIVE_MOTION, "false"),
-        (prefs::EDIT_COLUMNS, "120"),
-        (prefs::EDIT_LINES, "40"),
-        (prefs::EDIT_TAB_STRIP_ROWS, "3"),
-        (prefs::EDIT_SHOW_BUILD_BADGE, "true"),
     ];
     assert_eq!(
         cases.iter().map(|(key, _)| *key).collect::<BTreeSet<_>>(),
@@ -454,24 +478,10 @@ fn all_58_visual_fields_preview_candidate_semantics_fingerprint_pixels_and_isola
         } else {
             720
         };
-        let base = renderer_preview_spec(
-            &base_state,
-            phase_ms,
-            crate::native_app::ViewMotionCx::default(),
-            13.0,
-            1.0,
-            aterm_render::Theme::default(),
-        )
-        .unwrap_or_else(|| panic!("base preview for {key}"));
-        let candidate = renderer_preview_spec(
-            &candidate_state,
-            phase_ms,
-            crate::native_app::ViewMotionCx::default(),
-            13.0,
-            1.0,
-            aterm_render::Theme::default(),
-        )
-        .unwrap_or_else(|| panic!("candidate preview for {key}"));
+        let base = renderer_preview_spec(&base_state, phase_ms, dark_os, 13.0, 1.0)
+            .unwrap_or_else(|| panic!("base preview for {key}"));
+        let candidate = renderer_preview_spec(&candidate_state, phase_ms, dark_os, 13.0, 1.0)
+            .unwrap_or_else(|| panic!("candidate preview for {key}"));
         let base_font = crate::tray_raster::prepare_semantic_font(&base.font_candidate);
         let candidate_font = if candidate.font_candidate == base.font_candidate {
             base_font.clone()
@@ -721,21 +731,21 @@ fn snapshot_projection_covers_depth_two_dotted_keys() {
     assert!(!absent.is_explicit("sparkle_words.profanity.enabled"));
 }
 
+/// Loaded trail packs are styles too: each is a row of its own, after Off
+/// and the built-in trails, named for its id where its manifest gives no
+/// name (never "Trail pack ·" again under the TRAIL PACKS caption).
 #[test]
-fn native_trail_picker_has_dynamic_choices_and_human_labels() {
-    let config = Config {
-        cursor_trail_style: Some("pack:synthwave".to_string()),
-        ..Config::default()
-    };
-    let state = SettingsViewState::new(&config);
+fn cursor_styles_list_loaded_trail_packs_by_name() {
+    let mut state = SettingsViewState::new(&Config::default());
+    state.legacy.trail_pack_ids = vec!["synthwave".to_string(), "ember_fall".to_string()];
     let field = state
         .legacy
         .fields
         .iter()
         .find(|field| field.key == prefs::EDIT_CURSOR_TRAIL_STYLE)
         .expect("trail style field");
-    let ids = vec!["synthwave".to_string(), "ember_fall".to_string()];
-    let choices = choices_for_field(field, &ids, &state.assets.themes).expect("trail choices");
+    let choices = choices_for_field(field, &state.legacy.trail_pack_ids, &state.assets.themes)
+        .expect("trail choices");
     assert_eq!(
         &choices[..prefs::CURSOR_TRAIL_STYLES.len()],
         prefs::CURSOR_TRAIL_STYLES
@@ -744,37 +754,196 @@ fn native_trail_picker_has_dynamic_choices_and_human_labels() {
         &choices[prefs::CURSOR_TRAIL_STYLES.len()..],
         ["pack:ember_fall", "pack:synthwave"]
     );
-
-    let picker = ChoicePicker::new(
-        prefs::EDIT_CURSOR_TRAIL_STYLE,
-        choices,
-        "pack:synthwave",
-        true,
-        true,
-        "phaser",
-        &state.assets.themes,
-    );
+    let listed = listed_cursor_styles(&state);
+    let packs = listed
+        .iter()
+        .filter(|style| style.group == CursorStyleGroup::Packs)
+        .map(|style| (style.value.as_str(), style.name.as_str()))
+        .collect::<Vec<_>>();
     assert_eq!(
-        picker.options[picker.selected].value.as_deref(),
-        Some("pack:synthwave")
+        packs,
+        [
+            ("pack:ember_fall", "Ember fall"),
+            ("pack:synthwave", "Synthwave"),
+        ]
     );
-    assert_eq!(
-        picker.options[picker.selected].label,
-        "Trail Pack · Synthwave"
-    );
-    assert!(picker.options.iter().any(|option| {
-        option.label == "Trail Pack · Ember fall"
-            && option.value.as_deref() == Some("pack:ember_fall")
-    }));
-    assert_eq!(
-        picker
-            .options
+    let position = |value: &str| {
+        listed
             .iter()
-            .filter(|option| option.value.as_deref() == Some("pack:synthwave"))
-            .count(),
-        1,
-        "the configured pack appears exactly once"
+            .position(|style| style.value == value)
+            .unwrap()
+    };
+    assert_eq!(position("off"), 0, "Off opens the list");
+    assert!(position("classic") < position("pack:ember_fall"));
+    assert_eq!(position("pack:synthwave"), listed.len() - 1);
+}
+
+/// THE PREVIEW'S COMPANION WEARS THE WINDOW'S CAT: the coat and eyes the
+/// host says the cursor companion wears (`ViewMotionCx::companion_look`: the
+/// favourite, the tenured program cat or the launch kitty) reach the cursor
+/// preview, and a different cat repaints it rather than serving a stale
+/// grey one from the raster memo.
+#[test]
+fn the_cursor_preview_wears_the_windows_companion_coat() {
+    let state = SettingsViewState::new(&Config::default());
+    let spec_for = |coat: u8, iris: u8| {
+        let motion = crate::native_app::ViewMotionCx {
+            companion_look: aterm_effects::kitty_registry::KittyLook {
+                coat,
+                iris,
+                ..aterm_effects::kitty_registry::KittyLook::default()
+            },
+            ..crate::native_app::ViewMotionCx::default()
+        };
+        renderer_preview_spec_for_key_with_font(
+            &state,
+            prefs::EDIT_CURSOR_TRAIL_STYLE,
+            0,
+            motion,
+            14.0,
+            1.0,
+            None,
+        )
+        .expect("a cursor preview")
+    };
+    let tan = spec_for(2, 1);
+    assert_eq!(
+        (
+            tan.post_fx.companion_look.coat,
+            tan.post_fx.companion_look.iris
+        ),
+        (2, 1)
     );
+    assert_ne!(
+        tan.paint_fingerprint(),
+        spec_for(7, 3).paint_fingerprint(),
+        "another cat repaints the preview"
+    );
+}
+
+/// A LOADED PACK SAYS ITS OWN WORDS: its row takes the manifest's name and
+/// description (Emberfall: "Warm red→gold beam shedding slow falling
+/// embers."), each its own, never a shared filler line, and the saved pack's
+/// Adjust card and the preview name it the same way.
+#[test]
+fn trail_pack_rows_use_their_manifests_name_and_description() {
+    let paths = [
+        trail_pack_asset("emberfall.toml"),
+        trail_pack_asset("synthwave.toml"),
+    ];
+    let service = VersionedConfigService::new(trail_pack_config(&paths, "pack:emberfall")).unwrap();
+    let state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+    let packs: Vec<(String, String)> = listed_cursor_styles(&state)
+        .into_iter()
+        .filter(|style| style.group == CursorStyleGroup::Packs)
+        .map(|style| (style.name, style.description))
+        .collect();
+    assert_eq!(packs.len(), 2, "{packs:?}");
+    assert_eq!(packs[0].0, "Emberfall");
+    assert_eq!(
+        packs[0].1,
+        "Warm red\u{2192}gold beam shedding slow falling embers."
+    );
+    assert_eq!(packs[1].0, "Synthwave");
+    assert_ne!(packs[0].1, packs[1].1, "each pack describes itself");
+    assert_eq!(
+        cursor_style_name_in("pack:emberfall", state.trail_pack_catalog()),
+        "Emberfall"
+    );
+    // The cursor style's row on Top Settings, Search and Modified, and the
+    // save's words, name it so too; a pack that is not loaded keeps saying
+    // what it is.
+    assert_eq!(
+        setting_choice_label_in(&state, prefs::EDIT_CURSOR_TRAIL_STYLE, "pack:emberfall"),
+        "Emberfall"
+    );
+    assert_eq!(
+        setting_choice_label_in(&state, prefs::EDIT_CURSOR_TRAIL_STYLE, "pack:no_such"),
+        "Trail pack \u{b7} No such"
+    );
+    let spec = renderer_preview_spec_for_key_with_font(
+        &state,
+        prefs::EDIT_CURSOR_TRAIL_STYLE,
+        0,
+        crate::native_app::ViewMotionCx::default(),
+        14.0,
+        1.0,
+        None,
+    )
+    .expect("a cursor preview");
+    assert_eq!(spec.cursor.trail_style_label(), "Emberfall");
+}
+
+fn cursor_pack_punctuation_fixture() -> (aterm_tempfile::TempDir, String) {
+    let dir = aterm_tempfile::tempdir().expect("private trail packs");
+    let template = std::fs::read_to_string(trail_pack_asset("synthwave.toml"))
+        .expect("the real trail pack fixture");
+    let mut paths = Vec::new();
+    for id in ["ember-fall", "ember_fall"] {
+        let source = template.replace("id = \"synthwave\"", &format!("id = {id:?}"));
+        let path = dir.path().join(format!("{id}.toml"));
+        std::fs::write(&path, source).expect("write private trail pack");
+        paths.push(path.to_str().expect("fixture path is UTF-8").to_string());
+    }
+    let source = trail_pack_config(&paths, "off");
+    (dir, source)
+}
+
+/// Distinct valid IDs retain distinct controls after actual pack loading;
+/// punctuation must not make a real Cursor Styles screen fail to compile.
+#[test]
+fn cursor_pack_punctuation_keeps_both_loaded_rows_renderable() {
+    let (_dir, source) = cursor_pack_punctuation_fixture();
+    let (runtime, instance, view) = cursor_styles_runtime(&source);
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!();
+    };
+    assert_eq!(state.legacy.trail_pack_ids, ["ember-fall", "ember_fall"]);
+    for id in ["ember-fall", "ember_fall"] {
+        assert!(
+            state.trail_pack_catalog().get(id).is_some(),
+            "{id} compiled"
+        );
+    }
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 2_000.0));
+    let mut keys = BTreeSet::new();
+    for id in ["ember-fall", "ember_fall"] {
+        let key = UiKey::new(cursor_style_row_key(&format!("pack:{id}")));
+        assert!(compiled.semantic(&key).is_some(), "{id} has its own row");
+        assert!(keys.insert(key), "the two rows keep different identities");
+    }
+}
+
+/// Activating either loaded pack's own row saves that exact pack, while an
+/// ordinary built-in still follows the same action path.
+#[test]
+fn cursor_pack_punctuation_selects_the_exact_loaded_style() {
+    let (_dir, source) = cursor_pack_punctuation_fixture();
+    for wanted in ["pack:ember-fall", "pack:ember_fall", "water"] {
+        let (mut runtime, instance, view) = cursor_styles_runtime(&source);
+        let outcome = runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(cursor_style_row_key(wanted)),
+                    value: None,
+                }),
+            )
+            .expect("activate the actual style row");
+        let patches = config_patches(&outcome);
+        assert_eq!(patches.len(), 1, "{wanted} starts one save");
+        let edit = patches[0]
+            .edits
+            .iter()
+            .find(|edit| edit.key == prefs::EDIT_CURSOR_TRAIL_STYLE)
+            .expect("the style is saved");
+        assert_eq!(
+            edit.value.as_deref(),
+            Some(wanted),
+            "save the selected style"
+        );
+    }
 }
 
 #[test]
@@ -796,106 +965,201 @@ fn native_theme_picker_keeps_builtins_first_and_adds_user_themes_once() {
         "user themes append in discovery order and cannot duplicate a built-in"
     );
 
-    let picker = ChoicePicker::new(
-        prefs::EDIT_THEME,
-        ["Nord".to_string()],
-        "Nord",
-        true,
-        true,
-        "Default",
-        &crate::app_config::ThemeCatalog::default(),
-    );
-    let nord = picker
-        .options
-        .iter()
-        .find(|option| option.value.as_deref() == Some("Nord"))
-        .expect("Nord picker option");
-    assert_eq!(
-        nord.terminal_theme,
-        aterm_types::scheme::builtin("Nord")
-            .as_ref()
-            .map(PreviewTerminalTheme::from_scheme),
-        "picker-open parsing caches the exact live preview palette"
-    );
-
+    // A highlighted row previews through the one runtime resolver, from the
+    // catalog this Settings generation carries: no per-row cache, no file read.
     let work_scheme = aterm_types::scheme::builtin("Dracula").unwrap();
     let custom =
         crate::app_config::ThemeCatalog::from_schemes([("Work".to_string(), work_scheme.clone())]);
     assert!(settings_theme_options(&custom).ends_with(&["Work".to_string()]));
-    let custom_picker = ChoicePicker::new(
-        prefs::EDIT_THEME,
-        settings_theme_options(&custom),
-        "work",
-        true,
-        true,
-        "Default",
-        &custom,
+    let mut state = settings_state_with_themes("", custom.clone());
+    state.choice_picker = Some(ChoicePicker::for_themes(&custom, "Default", true, false));
+    for (value, scheme) in [
+        ("Nord", aterm_types::scheme::builtin("Nord").unwrap()),
+        ("Work", work_scheme.clone()),
+    ] {
+        hover_theme_choice(&mut state, Some(value));
+        assert_eq!(
+            preview_terminal_theme(&state, true),
+            PreviewTerminalTheme::from_scheme(&scheme),
+            "hovering {value} previews its palette"
+        );
+    }
+    // Picker and runtime share case-insensitive custom-theme identity.
+    assert_eq!(
+        preview_terminal_theme(
+            &settings_state_with_themes("theme = \"work\"\n", custom),
+            true
+        ),
+        PreviewTerminalTheme::from_scheme(&work_scheme),
     );
-    let work = custom_picker
+}
+
+/// A Settings view over `source` whose catalog is `themes`.
+fn settings_state_with_themes(
+    source: &str,
+    themes: Arc<crate::app_config::ThemeCatalog>,
+) -> SettingsViewState {
+    let config: Config = aterm_toml::from_str(source).unwrap();
+    let mut assets = (*crate::app_config::ConfigAssetCatalog::empty()).clone();
+    assets.themes = themes;
+    SettingsViewState::from_config_and_assets(&config, Arc::new(assets))
+}
+
+/// Hover the open theme picker's row whose value is `value` (`None` is the
+/// Reset row), scrolling it into view as a pointer user would.
+fn hover_theme_choice(state: &mut SettingsViewState, value: Option<&str>) {
+    let picker = state.choice_picker.as_ref().expect("theme picker");
+    let index = picker
         .options
         .iter()
-        .find(|option| option.value.as_deref() == Some("Work"))
-        .unwrap();
+        .position(|option| option.value.as_deref() == value)
+        .expect("theme row");
+    picker.reveal(index);
+    state.common.hovered = Some(UiKey::new(format!(
+        "settings/choice/{}/{index}",
+        prefs::EDIT_THEME
+    )));
+}
+
+fn packed_ansi(scheme: &aterm_types::ColorScheme) -> [u32; 16] {
+    PreviewTerminalTheme::from_scheme(scheme).ansi
+}
+
+#[test]
+fn settings_preview_of_a_pristine_config_draws_the_default_scheme_ansi() {
+    let pristine = settings_state_with_themes("", crate::app_config::ThemeCatalog::empty());
+    let default_ansi = packed_ansi(&aterm_types::ColorScheme::default());
+    // No theme previews the unset default's palette for the OS appearance
+    // (Default, or Default Light), not a stand-in table.
+    for (system_dark, name) in [(true, "Default"), (false, "Default Light")] {
+        assert_eq!(
+            preview_terminal_theme(&pristine, system_dark).ansi,
+            packed_ansi(&aterm_types::scheme::builtin(name).unwrap()),
+            "{name}"
+        );
+    }
+    // Negative control: an explicit theme previews its own ANSI colours.
+    let nord = settings_state_with_themes(
+        "theme = \"Nord\"\n",
+        crate::app_config::ThemeCatalog::empty(),
+    );
+    let nord_ansi = packed_ansi(&aterm_types::scheme::builtin("Nord").unwrap());
+    assert_ne!(nord_ansi, default_ansi);
+    assert_eq!(preview_terminal_theme(&nord, true).ansi, nord_ansi);
+}
+
+#[test]
+fn settings_preview_applies_configured_and_drafted_palette_entries() {
+    let configured = settings_state_with_themes(
+        "theme = \"Nord\"\npalette = [\"#010203\", \"#A1B2C3\"]\n",
+        crate::app_config::ThemeCatalog::empty(),
+    );
+    let mut expected = packed_ansi(&aterm_types::scheme::builtin("Nord").unwrap());
+    expected[0] = 0x01_0203;
+    expected[1] = 0xA1_B2C3;
+    assert_eq!(preview_terminal_theme(&configured, true).ansi, expected);
+
+    // A draft that has not been saved yet: `palette[1]` only.
+    let mut drafted = settings_state_with_themes("", crate::app_config::ThemeCatalog::empty());
+    let before = preview_terminal_theme(&drafted, true);
+    drafted.field_inputs.insert(
+        prefs::EDIT_PALETTE.to_string(),
+        crate::native_text_input::TextInputState::new("#000000, #C0FFEE".to_string()),
+    );
+    let after = preview_terminal_theme(&drafted, true);
     assert_eq!(
-        work.terminal_theme,
-        Some(PreviewTerminalTheme::from_scheme(&work_scheme)),
-        "picker and runtime share case-insensitive custom-theme identity without a second file read"
+        after.ansi[1], 0xC0_FFEE,
+        "the drafted palette[1] is previewed"
+    );
+    assert_eq!(after.ansi[0], 0x00_0000);
+    assert_eq!(
+        after.ansi[2..],
+        before.ansi[2..],
+        "other slots keep the theme"
+    );
+    assert_ne!(
+        before.ansi[1], 0xC0_FFEE,
+        "negative control: the draft is what changed it"
     );
 }
 
 #[test]
-fn choice_picker_page_resize_preserves_selected_or_intentionally_paged_window() {
-    for selected in [6_usize, 7] {
-        for target in [3_usize, 2, 1] {
-            let values = (0..10).map(|index| format!("Choice {index}"));
-            let current = format!("Choice {selected}");
-            let picker = ChoicePicker::new(
-                prefs::EDIT_THEME,
-                values,
-                &current,
-                false,
-                true,
-                "Choice 0",
-                &crate::app_config::ThemeCatalog::default(),
-            );
-            picker.page_size.set(4);
-            picker.offset.set(4);
-            picker.configure_page_size(target);
-            assert!(
-                picker.visible_range().contains(&selected),
-                "4→{target} must keep selected boundary {selected} visible"
-            );
-            assert_eq!(picker.offset.get(), (selected / target) * target);
-        }
-    }
-
-    let picker = ChoicePicker::new(
-        prefs::EDIT_THEME,
-        (0..10).map(|index| format!("Choice {index}")),
-        "Choice 7",
-        false,
-        true,
-        "Choice 0",
-        &crate::app_config::ThemeCatalog::default(),
-    );
-    picker.page_size.set(4);
-    picker.offset.set(0);
-    picker.configure_page_size(3);
-    assert_eq!(picker.offset.get(), 0);
-    assert!(
-        !picker.visible_range().contains(&picker.selected),
-        "an intentionally paged-away selection must not pull the user's window"
-    );
-
-    picker.page_size.set(1);
-    picker.offset.set(7);
-    picker.configure_page_size(4);
-    assert!(picker.visible_range().contains(&picker.selected));
+fn settings_preview_selection_foreground_follows_the_theme_unless_configured() {
+    let mut scheme = aterm_types::scheme::builtin("Nord").unwrap();
+    scheme.selection_fg = Some(aterm_types::Rgb::new(0x12, 0x34, 0x56));
+    let themes = crate::app_config::ThemeCatalog::from_schemes([("Marked".to_string(), scheme)]);
+    let spec = |source: &str| {
+        let mut state = settings_state_with_themes(source, themes.clone());
+        state.route = SettingsRoute::Appearance;
+        renderer_preview_spec(
+            &state,
+            0,
+            crate::native_app::ViewMotionCx::default(),
+            13.0,
+            1.0,
+        )
+        .expect("appearance preview")
+        .appearance
+        .selection_foreground
+    };
+    assert_eq!(spec("theme = \"Marked\"\n"), Some(0x12_3456));
     assert_eq!(
-        picker.offset.get(),
-        4,
-        "1→4 expansion realigns around selection"
+        spec("theme = \"Marked\"\nselection_foreground = \"#ABCDEF\"\n"),
+        Some(0xAB_CDEF),
+        "config beats theme"
     );
+    assert_eq!(
+        spec(""),
+        None,
+        "Default sets none: the renderer's floor applies"
+    );
+}
+
+#[test]
+fn settings_preview_hovering_default_with_no_theme_set_changes_nothing() {
+    let mut state = settings_state_with_themes(
+        "foreground = \"#123456\"\n",
+        crate::app_config::ThemeCatalog::empty(),
+    );
+    let before = preview_terminal_theme(&state, true);
+    state.choice_picker = Some(ChoicePicker::for_themes(
+        &state.assets.themes,
+        "Default",
+        true,
+        false,
+    ));
+    hover_theme_choice(&mut state, Some("Default"));
+    assert_eq!(preview_terminal_theme(&state, true), before);
+    hover_theme_choice(&mut state, None);
+    assert_eq!(preview_terminal_theme(&state, true), before, "Reset row");
+    // Negative control: another row does change the preview.
+    hover_theme_choice(&mut state, Some("Nord"));
+    assert_ne!(preview_terminal_theme(&state, true), before);
+}
+
+/// With no theme set on a light OS the preview draws Default Light, the
+/// reset row previews that same unset value, and the Default row pins the
+/// dark Default (negative control: it changes the preview).
+#[test]
+fn settings_preview_unset_theme_on_a_light_os_is_default_light() {
+    let mut state = settings_state_with_themes("", crate::app_config::ThemeCatalog::empty());
+    let before = preview_terminal_theme(&state, false);
+    let default_light = aterm_types::scheme::builtin("Default Light").unwrap();
+    assert_eq!(
+        before.bg,
+        PreviewTerminalTheme::from_scheme(&default_light).bg,
+        "an unset theme on a light OS draws Default Light"
+    );
+    state.choice_picker = Some(ChoicePicker::for_themes(
+        &state.assets.themes,
+        crate::app_config::UNSET_THEME,
+        true,
+        false,
+    ));
+    hover_theme_choice(&mut state, None);
+    assert_eq!(preview_terminal_theme(&state, false), before, "Reset row");
+    hover_theme_choice(&mut state, Some("Default"));
+    assert_ne!(preview_terminal_theme(&state, false), before);
 }
 
 #[test]
@@ -905,12 +1169,8 @@ fn split_theme_preview_follows_os_appearance_not_overridden_background_luminance
     )
     .unwrap();
     let state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
-    let misleading_dark_host = aterm_render::Theme {
-        bg: 0x000000,
-        ..aterm_render::Theme::default()
-    };
-    let light = preview_terminal_theme(&state, misleading_dark_host, false);
-    let dark = preview_terminal_theme(&state, misleading_dark_host, true);
+    let light = preview_terminal_theme(&state, false);
+    let dark = preview_terminal_theme(&state, true);
     let expected_light =
         PreviewTerminalTheme::from_scheme(&aterm_types::scheme::builtin("GitHub Light").unwrap());
     let expected_dark =
@@ -926,12 +1186,7 @@ fn split_theme_preview_follows_os_appearance_not_overridden_background_luminance
 
 #[test]
 fn theme_projection_and_preview_share_catalog_split_and_default_fallback_semantics() {
-    let state_with_themes = |source: &str, themes: Arc<crate::app_config::ThemeCatalog>| {
-        let config: Config = aterm_toml::from_str(source).unwrap();
-        let mut assets = (*crate::app_config::ConfigAssetCatalog::empty()).clone();
-        assets.themes = themes;
-        SettingsViewState::from_config_and_assets(&config, Arc::new(assets))
-    };
+    let state_with_themes = settings_state_with_themes;
     let project = |state: &SettingsViewState| {
         setting_effect_projection(
             state,
@@ -941,12 +1196,6 @@ fn theme_projection_and_preview_share_catalog_split_and_default_fallback_semanti
             crate::native_app::ViewMotionCx::default(),
         )
     };
-    let host = aterm_render::Theme {
-        fg: 0x01_0203,
-        bg: 0x04_0506,
-        cursor: 0x07_0809,
-        selection: 0x0A_0B0C,
-    };
     let default = PreviewTerminalTheme::from_scheme(&aterm_types::ColorScheme::default());
 
     let builtin = state_with_themes(
@@ -954,7 +1203,7 @@ fn theme_projection_and_preview_share_catalog_split_and_default_fallback_semanti
         crate::app_config::ThemeCatalog::empty(),
     );
     assert_eq!(
-        preview_terminal_theme(&builtin, host, false),
+        preview_terminal_theme(&builtin, false),
         PreviewTerminalTheme::from_scheme(
             &aterm_types::scheme::builtin("Nord").expect("built-in Nord")
         )
@@ -965,7 +1214,7 @@ fn theme_projection_and_preview_share_catalog_split_and_default_fallback_semanti
         "theme = \"Office Missing\"\n",
         crate::app_config::ThemeCatalog::empty(),
     );
-    assert_eq!(preview_terminal_theme(&missing, host, false), default);
+    assert_eq!(preview_terminal_theme(&missing, false), default);
     assert!(effect_note_contains(&project(&missing), "Default fallback"));
 
     let split_missing = state_with_themes(
@@ -973,12 +1222,12 @@ fn theme_projection_and_preview_share_catalog_split_and_default_fallback_semanti
         crate::app_config::ThemeCatalog::empty(),
     );
     assert_eq!(
-        preview_terminal_theme(&split_missing, host, true),
+        preview_terminal_theme(&split_missing, true),
         PreviewTerminalTheme::from_scheme(
             &aterm_types::scheme::builtin("Dracula").expect("built-in Dracula")
         )
     );
-    assert_eq!(preview_terminal_theme(&split_missing, host, false), default);
+    assert_eq!(preview_terminal_theme(&split_missing, false), default);
     let split_note = project(&split_missing);
     assert!(effect_note_contains(
         &split_note,
@@ -990,29 +1239,23 @@ fn theme_projection_and_preview_share_catalog_split_and_default_fallback_semanti
         "theme = \"dark:Dracula\"\n",
         crate::app_config::ThemeCatalog::empty(),
     );
-    assert_eq!(preview_terminal_theme(&omitted_light, host, false), default);
-    assert_eq!(
-        preview_terminal_theme(&omitted_light, host, true),
-        PreviewTerminalTheme::from_scheme(
-            &aterm_types::scheme::builtin("Dracula").expect("built-in Dracula")
-        )
+    let dracula = PreviewTerminalTheme::from_scheme(
+        &aterm_types::scheme::builtin("Dracula").expect("built-in Dracula"),
     );
+    // The omitted light side draws the side the value names, as the runtime does.
+    assert_eq!(preview_terminal_theme(&omitted_light, false), dracula);
+    assert_eq!(preview_terminal_theme(&omitted_light, true), dracula);
     assert!(
         project(&omitted_light).notes.is_empty(),
-        "an intentionally omitted side is Default, not an unavailable theme"
+        "an intentionally omitted side is not an unavailable theme"
     );
 
     let invalid_split = state_with_themes(
         "theme = \"dark:Dracula,night:Nord\"\n",
         crate::app_config::ThemeCatalog::empty(),
     );
-    assert_eq!(
-        preview_terminal_theme(&invalid_split, host, true),
-        PreviewTerminalTheme::from_scheme(
-            &aterm_types::scheme::builtin("Dracula").expect("built-in Dracula")
-        )
-    );
-    assert_eq!(preview_terminal_theme(&invalid_split, host, false), default);
+    assert_eq!(preview_terminal_theme(&invalid_split, true), dracula);
+    assert_eq!(preview_terminal_theme(&invalid_split, false), dracula);
     let invalid_projection = project(&invalid_split);
     assert!(effect_note_contains(
         &invalid_projection,
@@ -1030,10 +1273,65 @@ fn theme_projection_and_preview_share_catalog_split_and_default_fallback_semanti
         crate::app_config::ThemeCatalog::from_schemes([("Work".to_string(), work_scheme.clone())]),
     );
     assert_eq!(
-        preview_terminal_theme(&custom, host, false),
+        preview_terminal_theme(&custom, false),
         PreviewTerminalTheme::from_scheme(&work_scheme)
     );
     assert!(project(&custom).notes.is_empty());
+}
+
+/// With no theme authored the preview paints Default's real palette (on a
+/// dark OS), never a neon xterm table, and authored `palette` entries layer
+/// over it by index as the terminal applies them.
+#[test]
+fn resting_preview_palette_is_the_default_theme_with_authored_palette_entries() {
+    let default = PreviewTerminalTheme::from_scheme(&aterm_types::ColorScheme::default());
+    let resting = preview_terminal_theme(&SettingsViewState::new(&Config::default()), true);
+    assert_eq!(resting, default);
+    assert_eq!(
+        resting.ansi[9], 0x00FF_6E67,
+        "Default's bright red, not #FF0000"
+    );
+
+    let config: Config =
+        aterm_toml::from_str("palette = [\"#123456\", \"nope\", \"#ABCDEF\"]\n").unwrap();
+    let palette = preview_terminal_theme(&SettingsViewState::new(&config), true);
+    assert_eq!(palette.ansi[0], 0x0012_3456);
+    assert_eq!(
+        palette.ansi[1], default.ansi[1],
+        "an unreadable entry keeps its slot"
+    );
+    assert_eq!(palette.ansi[2], 0x00AB_CDEF);
+    assert_eq!(palette.ansi[3..], default.ansi[3..]);
+}
+
+/// A search preview demonstrates a setting the results show: never a hidden
+/// row or a Manual-only key, and never a focused control outside the results.
+#[test]
+fn search_previews_only_a_visible_matching_setting() {
+    let mut state = SettingsViewState::new(&Config::default());
+    state.search = "columns".to_string();
+    assert_eq!(focused_preview_key(&state), None, "Manual-only results");
+    state.search = "trail".to_string();
+    assert_ne!(
+        focused_preview_key(&state).as_deref(),
+        Some(prefs::EDIT_CURSOR_TRAIL),
+        "the hidden effects master is never the preview"
+    );
+    state.common.last_focus = Some(UiKey::new(format!(
+        "settings/control/{}",
+        prefs::EDIT_CURSOR_STYLE
+    )));
+    state.search = "columns".to_string();
+    assert_eq!(
+        focused_preview_key(&state),
+        None,
+        "focus outside the results"
+    );
+    state.search = "ligature".to_string();
+    assert!(
+        focused_preview_key(&state).is_some_and(|key| key.contains("ligature")),
+        "a matching text setting previews"
+    );
 }
 
 #[test]
@@ -1047,9 +1345,7 @@ fn highlighted_uncommitted_trail_pack_is_the_live_preview_candidate() {
     let mut state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
     state.navigate(SettingsRoute::CursorMotion);
     let motion = crate::native_app::ViewMotionCx::default();
-    let theme = aterm_render::Theme::default();
-    let before =
-        renderer_preview_spec(&state, 900, motion, 13.0, 1.0, theme).expect("committed preview");
+    let before = renderer_preview_spec(&state, 900, motion, 13.0, 1.0).expect("committed preview");
 
     let field = state
         .legacy
@@ -1065,16 +1361,12 @@ fn highlighted_uncommitted_trail_pack_is_the_live_preview_candidate() {
         state.is_explicit(prefs::EDIT_CURSOR_TRAIL_STYLE),
         field.seed.is_some(),
         &effective_default_for_field(prefs::EDIT_CURSOR_TRAIL_STYLE),
-        &state.assets.themes,
     );
     let pack_index = picker
         .options
         .iter()
         .position(|option| option.value.as_deref() == Some("pack:synthwave"))
         .expect("pack option");
-    picker
-        .offset
-        .set((pack_index / ChoicePicker::PAGE_SIZE) * ChoicePicker::PAGE_SIZE);
     state.choice_picker = Some(picker);
     state.common.last_focus = Some(UiKey::new(format!(
         "settings/choice/{}/{pack_index}",
@@ -1082,7 +1374,7 @@ fn highlighted_uncommitted_trail_pack_is_the_live_preview_candidate() {
     )));
 
     let candidate =
-        renderer_preview_spec(&state, 900, motion, 13.0, 1.0, theme).expect("candidate preview");
+        renderer_preview_spec(&state, 900, motion, 13.0, 1.0).expect("candidate preview");
     assert_eq!(candidate.cursor.trail_style, PreviewTrailStyle::Custom);
     assert_eq!(
         candidate
@@ -1115,7 +1407,6 @@ fn renderer_preview_carries_rainbow_variant_identity_from_config() {
     use aterm_effects::kitty_pet::PetSpecies;
 
     let motion = crate::native_app::ViewMotionCx::default();
-    let theme = aterm_render::Theme::default();
     for (raw, expected) in [
         // The underline spelling is a GEOMETRY of the kitty family and
         // draws the family's companion. It used to answer FlyingKitty here
@@ -1149,11 +1440,16 @@ fn renderer_preview_carries_rainbow_variant_identity_from_config() {
         .unwrap();
         let mut state = SettingsViewState::new(&config);
         state.navigate(SettingsRoute::CursorMotion);
-        let preview = renderer_preview_spec(&state, 900, motion, 13.0, 1.0, theme)
+        let preview = renderer_preview_spec(&state, 900, motion, 13.0, 1.0)
             .unwrap_or_else(|| panic!("preview for {raw}"));
 
         assert_eq!(preview.cursor.trail_style, PreviewTrailStyle::RainbowKitty);
-        assert_eq!(preview.cursor.effective_trail_style_raw(), raw);
+        // The preview names the style by its listed spelling: `… tall` is a
+        // spelling of the default.
+        assert_eq!(
+            preview.cursor.effective_trail_style_raw(),
+            prefs::cursor_trail_style_canonical(raw).unwrap()
+        );
         assert_eq!(preview.cursor.trail_companion(), expected, "{raw}");
     }
 }
@@ -1169,14 +1465,12 @@ fn preview_activity_comes_from_the_exact_authored_spec() {
         ..Config::default()
     });
     let motion = crate::native_app::ViewMotionCx::default();
-    let theme = aterm_render::Theme::default();
     assert_eq!(
         home.preview_animation(
             100,
             motion,
             13.0,
             1.0,
-            theme,
             LogicalRect::new(0.0, 0.0, 1_200.0, 720.0),
         ),
         PreviewAnimation::Continuous,
@@ -1188,42 +1482,45 @@ fn preview_activity_comes_from_the_exact_authored_spec() {
             motion,
             13.0,
             1.0,
-            theme,
             LogicalRect::new(0.0, 0.0, 390.0, 568.0),
         ),
         PreviewAnimation::None,
         "compact Top Settings page 0 renders only a static theme sample"
     );
-    home.page_scroll = 2;
+    // Once the compact list shows the trail card, its preview animates.
+    home.page_reveal = Some(UiKey::new(format!(
+        "settings/control/{}",
+        prefs::EDIT_CURSOR_TRAIL_STYLE
+    )));
+    let _ = settings_route_at(&home, &view_cx_at(390.0, 568.0));
     assert_eq!(
         home.preview_animation(
             100,
             motion,
             13.0,
             1.0,
-            theme,
             LogicalRect::new(0.0, 0.0, 390.0, 568.0),
         ),
         PreviewAnimation::Continuous,
-        "the visible cursor-trail slice keeps its live preview"
+        "the visible cursor-trail card keeps its live preview"
     );
 
     let mut appearance = SettingsViewState::new(&Config::default());
     appearance.navigate(SettingsRoute::Appearance);
     assert_eq!(
-        appearance.preview_animation(100, motion, 13.0, 1.0, theme, view_cx().viewport),
+        appearance.preview_animation(100, motion, 13.0, 1.0, view_cx().viewport),
         PreviewAnimation::None,
         "Appearance is a genuinely static renderer sample"
     );
     assert!(
-        renderer_preview_spec(&appearance, 100, motion, 17.5, 1.0, theme)
+        renderer_preview_spec(&appearance, 100, motion, 17.5, 1.0)
             .unwrap()
             .audit_value()
             .contains("17.5 px"),
         "an unset font-size preview uses the renderer's applied size"
     );
     assert!(
-        renderer_preview_spec(&appearance, 100, motion, 1.0, 1.0, theme)
+        renderer_preview_spec(&appearance, 100, motion, 1.0, 1.0)
             .unwrap()
             .audit_value()
             .contains("6 px"),
@@ -1243,7 +1540,7 @@ fn preview_activity_comes_from_the_exact_authored_spec() {
         let mut state = SettingsViewState::new(&config);
         state.navigate(SettingsRoute::CursorMotion);
         assert_eq!(
-            renderer_preview_spec(&state, 100, motion, 13.0, 1.0, theme)
+            renderer_preview_spec(&state, 100, motion, 13.0, 1.0)
                 .unwrap()
                 .cursor
                 .style,
@@ -1259,7 +1556,7 @@ fn preview_activity_comes_from_the_exact_authored_spec() {
     let mut hidden = SettingsViewState::new(&hidden);
     hidden.navigate(SettingsRoute::CursorMotion);
     assert_eq!(
-        hidden.preview_animation(100, motion, 13.0, 1.0, theme, view_cx().viewport),
+        hidden.preview_animation(100, motion, 13.0, 1.0, view_cx().viewport),
         PreviewAnimation::BlinkEdge { after_ms: 430 },
         "an unknown configured cursor style falls back to the runtime's blinking Block"
     );
@@ -1271,20 +1568,32 @@ fn preview_activity_comes_from_the_exact_authored_spec() {
     let mut blink = SettingsViewState::new(&blink);
     blink.navigate(SettingsRoute::CursorMotion);
     assert_eq!(
-        blink.preview_animation(100, motion, 13.0, 1.0, theme, view_cx().viewport),
+        blink.preview_animation(100, motion, 13.0, 1.0, view_cx().viewport),
         PreviewAnimation::BlinkEdge { after_ms: 430 }
     );
 
     let zero: Config = aterm_toml::from_str(
-        "cursor_blink = false\ncursor_trail = true\ncursor_trail_style = \"phaser\"\ncursor_trail_intensity = 0.0\n",
+        "cursor_blink = false\ncursor_trail = true\ncursor_trail_style = \"phaser\"\ncursor_trail_intensity = 0.0\ncursor_momentum_glow = false\n",
     )
     .unwrap();
     let mut zero = SettingsViewState::new(&zero);
     zero.navigate(SettingsRoute::CursorMotion);
     assert_eq!(
-        zero.preview_animation(100, motion, 13.0, 1.0, theme, view_cx().viewport),
+        zero.preview_animation(100, motion, 13.0, 1.0, view_cx().viewport),
         PreviewAnimation::None,
         "a zero-intensity trail does not arm invisible work"
+    );
+    // The typing glow is its own visible work at any trail intensity, as in
+    // a terminal, so it types.
+    let glowing: Config = aterm_toml::from_str(
+        "cursor_blink = false\ncursor_trail = true\ncursor_trail_style = \"phaser\"\ncursor_trail_intensity = 0.0\n",
+    )
+    .unwrap();
+    let mut glowing = SettingsViewState::new(&glowing);
+    glowing.navigate(SettingsRoute::CursorMotion);
+    assert_eq!(
+        glowing.preview_animation(100, motion, 13.0, 1.0, view_cx().viewport),
+        PreviewAnimation::Continuous
     );
 }
 
@@ -1296,18 +1605,13 @@ fn canonical_non_cursor_previews_are_pixel_static_across_live_blink_edges() {
     )
     .unwrap();
     let motion = crate::native_app::ViewMotionCx::default();
-    let theme = aterm_render::Theme::default();
 
-    for route in [
-        SettingsRoute::Appearance,
-        SettingsRoute::TextFonts,
-        SettingsRoute::WindowTabs,
-    ] {
+    for route in [SettingsRoute::Appearance, SettingsRoute::TextFonts] {
         let mut state = SettingsViewState::new(&config);
         state.navigate(route);
-        let early = renderer_preview_spec(&state, 100, motion, 13.0, 1.0, theme)
+        let early = renderer_preview_spec(&state, 100, motion, 13.0, 1.0)
             .unwrap_or_else(|| panic!("early {route:?} preview"));
-        let late = renderer_preview_spec(&state, 600, motion, 13.0, 1.0, theme)
+        let late = renderer_preview_spec(&state, 600, motion, 13.0, 1.0)
             .unwrap_or_else(|| panic!("late {route:?} preview"));
 
         assert_eq!(early.animation(), PreviewAnimation::None, "{route:?}");
@@ -1348,7 +1652,6 @@ fn serious_mode_suppresses_native_preview_trails_post_fx_and_cadence() {
         "settings/control/{}",
         prefs::EDIT_CURSOR_FIRE_SHIMMER
     )));
-    let theme = aterm_render::Theme::default();
 
     let active = renderer_preview_spec(
         &state,
@@ -1356,7 +1659,6 @@ fn serious_mode_suppresses_native_preview_trails_post_fx_and_cadence() {
         crate::native_app::ViewMotionCx::default(),
         13.0,
         1.0,
-        theme,
     )
     .expect("active cursor preview");
     assert!(
@@ -1373,7 +1675,7 @@ fn serious_mode_suppresses_native_preview_trails_post_fx_and_cadence() {
         serious: true,
         ..crate::native_app::ViewMotionCx::default()
     };
-    let serious = renderer_preview_spec(&state, 100, serious_motion, 13.0, 1.0, theme)
+    let serious = renderer_preview_spec(&state, 100, serious_motion, 13.0, 1.0)
         .expect("serious cursor preview remains available");
     assert!(serious.reduced_motion);
     assert!(!serious.cursor.trail_enabled);
@@ -1386,102 +1688,50 @@ fn serious_mode_suppresses_native_preview_trails_post_fx_and_cadence() {
 }
 
 #[test]
-fn serious_mode_trail_picker_previews_the_atomic_post_commit_candidate() {
+fn serious_mode_style_candidate_previews_the_atomic_post_commit_state() {
     let config: Config = aterm_toml::from_str(
         "serious_mode = true\ncursor_trail = true\ncursor_trail_style = \"fire\"\n",
     )
     .unwrap();
     let mut state = SettingsViewState::new(&config);
-    let field = state
-        .legacy
-        .fields
-        .iter()
-        .find(|field| field.key == prefs::EDIT_CURSOR_TRAIL_STYLE)
-        .unwrap();
-    let picker = ChoicePicker::new(
-        prefs::EDIT_CURSOR_TRAIL_STYLE,
-        choices_for_field(field, &state.legacy.trail_pack_ids, &state.assets.themes).unwrap(),
-        SettingsState::display_value(field),
-        state.is_explicit(prefs::EDIT_CURSOR_TRAIL_STYLE),
-        field.seed.is_some(),
-        &effective_default_for_field(prefs::EDIT_CURSOR_TRAIL_STYLE),
-        &state.assets.themes,
-    );
-    let water = picker
-        .options
-        .iter()
-        .position(|option| option.value.as_deref() == Some("water"))
-        .unwrap();
-    let off = picker
-        .options
-        .iter()
-        .position(|option| option.value.as_deref() == Some("off"))
-        .unwrap();
-    state.choice_picker = Some(picker);
+    state.navigate(SettingsRoute::CursorStyles);
     let serious = crate::native_app::ViewMotionCx {
         serious: true,
         ..crate::native_app::ViewMotionCx::default()
     };
-    let theme = aterm_render::Theme::default();
-
-    let focus_candidate = |state: &mut SettingsViewState, index: usize| {
-        let picker = state.choice_picker.as_mut().unwrap();
-        let page_size = picker.page_size.get();
-        picker.offset.set((index / page_size) * page_size);
-        state.common.hovered = None;
-        state.common.last_focus = Some(UiKey::new(format!(
-            "settings/choice/{}/{index}",
-            prefs::EDIT_CURSOR_TRAIL_STYLE
-        )));
+    let preview = |state: &SettingsViewState| {
+        renderer_preview_spec_for_key_with_font(
+            state,
+            prefs::EDIT_CURSOR_TRAIL_STYLE,
+            100,
+            serious,
+            13.0,
+            1.0,
+            None,
+        )
+        .unwrap()
     };
-    focus_candidate(&mut state, water);
-    let focused = renderer_preview_spec_for_key_with_font(
-        &state,
-        prefs::EDIT_CURSOR_TRAIL_STYLE,
-        100,
-        serious,
-        13.0,
-        1.0,
-        theme,
-        None,
-    )
-    .unwrap();
+
+    // Nothing tried: the preview reads what Serious Mode draws, no trail.
+    let resting = preview(&state);
+    assert!(!resting.cursor.trail_enabled);
+    assert_eq!(resting.focused_value, "off");
+
+    state.common.last_focus = Some(UiKey::new(cursor_style_row_key("water")));
+    let focused = preview(&state);
     assert!(focused.cursor.trail_enabled);
     assert!(!focused.reduced_motion);
     assert_eq!(focused.cursor.trail_style, PreviewTrailStyle::Water);
     assert!(focused.post_fx.motion_reason.contains("post-commit"));
 
-    state.common.last_focus = Some(UiKey::new("settings/control/cursor_trail_style"));
-    state.common.hovered = Some(UiKey::new(format!(
-        "settings/choice/{}/{water}",
-        prefs::EDIT_CURSOR_TRAIL_STYLE
-    )));
-    let hovered = renderer_preview_spec_for_key_with_font(
-        &state,
-        prefs::EDIT_CURSOR_TRAIL_STYLE,
-        100,
-        serious,
-        13.0,
-        1.0,
-        theme,
-        None,
-    )
-    .unwrap();
+    state.common.last_focus = None;
+    state.common.hovered = Some(UiKey::new(cursor_style_row_key("water")));
+    let hovered = preview(&state);
     assert!(hovered.cursor.trail_enabled);
     assert_eq!(hovered.cursor.trail_style, PreviewTrailStyle::Water);
 
-    focus_candidate(&mut state, off);
-    let off_candidate = renderer_preview_spec_for_key_with_font(
-        &state,
-        prefs::EDIT_CURSOR_TRAIL_STYLE,
-        100,
-        serious,
-        13.0,
-        1.0,
-        theme,
-        None,
-    )
-    .unwrap();
+    state.common.hovered = Some(UiKey::new(cursor_style_row_key("off")));
+    let off_candidate = preview(&state);
     assert!(!off_candidate.cursor.trail_enabled);
     assert!(off_candidate.reduced_motion);
     assert!(field_bool(&state, prefs::EDIT_SERIOUS_MODE, false));
@@ -1552,6 +1802,7 @@ fn top_settings_paints_direct_labels_but_keeps_complete_label_semantics() {
         None,
         SettingsWidth::Wide,
         LogicalRect::new(0.0, 0.0, 900.0, 80.0),
+        true,
     )
     .unwrap();
     let compiled = UiTree::new(row)
@@ -1559,7 +1810,11 @@ fn top_settings_paints_direct_labels_but_keeps_complete_label_semantics() {
         .unwrap();
     let wrapper_key = UiKey::new(format!("settings/label/{}", prefs::EDIT_THEME));
     let semantic = compiled.semantic(&wrapper_key).unwrap();
-    assert!(semantic.label.contains("Default"), "{}", semantic.label);
+    assert!(
+        semantic.label.starts_with(&expected_visual),
+        "{}",
+        semantic.label
+    );
     let visual_key = UiKey::new(format!("settings/label/{}/visual", prefs::EDIT_THEME));
     let visual = compiled
         .paint
@@ -1581,26 +1836,33 @@ fn top_settings_paints_direct_labels_but_keeps_complete_label_semantics() {
     assert!(compiled.semantic(&visual_key).is_none());
 }
 
+/// THE MUSIC EFFECTS STATUS SAYS WHAT REALLY SILENCES ITS VOICES, AND NOTHING
+/// ELSE: no output, volume 0, a trail that draws nothing (the typing notes
+/// alone) and a reduced motion policy (the bonk and the streak's note alone,
+/// by the voice table). This window's focus is not a gate: the chime plays
+/// from any window and each window plays its own keys.
 #[test]
 fn music_suppression_resolver_covers_every_reason_and_priority() {
     let motion = crate::native_app::ViewMotionCx::default();
-    // THE LADDER NEEDS ITS TOP RUNG STANDING. "Cursor trail is Off" outranks
-    // every runtime suppression below it, and the master's absent-key default
-    // is platform-split (`app_config::DEFAULT_DECORATIVE_EFFECTS`) — so an
-    // inherited default would mask every LOWER reason this test exists to
-    // order. Each case therefore ASKS for the master unless it authors one
-    // itself; the trail-Off rung below still reaches its reason through
-    // `cursor_trail_style = "off"`, which is the same Off by a different door.
+    // The cursor effects switch's absent-key default is platform-split
+    // (`app_config::DEFAULT_DECORATIVE_EFFECTS`), so an inherited default
+    // would change which reason a case reaches. Each case therefore ASKS for
+    // the switch unless it authors one itself; the typing-notes rung below
+    // reaches its reason through `cursor_trail_style = "off"`.
     let state = |config: Config| {
         SettingsViewState::new(&Config {
             cursor_trail: config.cursor_trail.or(Some(true)),
             ..config
         })
     };
+    let reduced = || Config {
+        motion: Some("reduced".to_string()),
+        ..Config::default()
+    };
 
     assert_eq!(
         top_music_suppression_reason_for_output(&state(Config::default()), motion, false),
-        Some("Saved On for macOS; audio output is unavailable on this platform.")
+        Some(MusicStatus::NoOutput { saved_on: true })
     );
     assert_eq!(
         top_music_suppression_reason_for_output(
@@ -1611,7 +1873,7 @@ fn music_suppression_resolver_covers_every_reason_and_priority() {
             motion,
             false,
         ),
-        Some("Saved Off; audio output is unavailable on this platform.")
+        Some(MusicStatus::NoOutput { saved_on: false })
     );
     assert_eq!(
         top_music_suppression_reason_for_output(
@@ -1649,33 +1911,31 @@ fn music_suppression_resolver_covers_every_reason_and_priority() {
             &state(Config {
                 cursor_trail_style: Some("off".to_string()),
                 trail_sound_volume: Some(0.0),
-                motion: Some("reduced".to_string()),
-                ..Config::default()
+                ..reduced()
             }),
             all_runtime_suppressions,
             true,
         ),
-        Some("On, currently silent because Cursor trail is Off."),
-        "trail Off has priority over every later runtime suppression"
+        Some(MusicStatus::VolumeZero),
+        "what silences every sound outranks what silences some"
     );
-    for style in ["pack:", "pack:missing"] {
+    // ONLY THE TYPING NOTES need a drawn trail: the chime, the bonk, the riff
+    // and the output sounds play without one, so the status claims no silence.
+    for style in ["off", "pack:", "pack:missing"] {
         let reason = top_music_suppression_reason_for_output(
             &state(Config {
                 cursor_trail_style: Some(style.to_string()),
-                ..Config::default()
+                ..reduced()
             }),
             motion,
             true,
         );
         assert_eq!(
             reason,
-            Some("On, currently silent because Cursor trail style is unavailable."),
-            "{style:?} has no admitted trail/audio runtime"
+            Some(MusicStatus::TypingNotesOff),
+            "{style:?} draws no trail, the larger silence beside Reduce motion's"
         );
-        assert_eq!(
-            reason.map(top_music_suppression_visual),
-            Some("Trail unavailable")
-        );
+        assert_eq!(reason.map(MusicStatus::visual), Some("Typing notes off"));
     }
     // A TYPO IS NOT A SILENCER. It resolves to the default style and the
     // trail renders, so the synth keeps its voice — only a resolution that
@@ -1692,41 +1952,36 @@ fn music_suppression_resolver_covers_every_reason_and_priority() {
         None,
         "an unknown style falls back to the default trail and still plays"
     );
+    // A BACKGROUND WINDOW SILENCES NOTHING of a setting every window plays.
     assert_eq!(
         top_music_suppression_reason_for_output(
-            &state(Config {
-                trail_sound_volume: Some(0.0),
-                motion: Some("reduced".to_string()),
-                ..Config::default()
-            }),
-            all_runtime_suppressions,
+            &state(Config::default()),
+            crate::native_app::ViewMotionCx {
+                focused: false,
+                ..motion
+            },
             true,
         ),
-        Some("On, currently silent because trail sound volume is 0."),
-        "zero volume has priority over focus and motion"
+        None,
+        "this window's focus is not a gate of Music effects"
     );
+    // REDUCE MOTION PAUSES ONLY THE VOICES WHOSE LIGHT IT STOPS, named in
+    // the Motion picker's own words.
+    let paused =
+        top_music_suppression_reason_for_output(&state(reduced()), all_runtime_suppressions, true);
     assert_eq!(
-        top_music_suppression_reason_for_output(
-            &state(Config {
-                motion: Some("reduced".to_string()),
-                ..Config::default()
-            }),
-            all_runtime_suppressions,
-            true,
-        ),
-        Some("On, currently silent while this window is unfocused."),
-        "window focus has priority over motion"
+        paused,
+        Some(MusicStatus::MotionPaused(MotionReduction::Setting))
     );
-    assert_eq!(
-        top_music_suppression_reason_for_output(
-            &state(Config {
-                motion: Some("reduced".to_string()),
-                ..Config::default()
-            }),
-            motion,
-            true,
-        ),
-        Some("On, currently suppressed by Motion: Reduced.")
+    let full = paused.unwrap().full();
+    assert!(
+        full.starts_with("On. ")
+            && full.contains(&reduce_motion_words())
+            && full.contains("the bonk")
+            && full.contains("the note when a program starts printing")
+            && full.contains("other sounds still play")
+            && !full.contains("silent"),
+        "{full}"
     );
     assert_eq!(
         top_music_suppression_reason_for_output(
@@ -1738,7 +1993,7 @@ fn music_suppression_resolver_covers_every_reason_and_priority() {
             },
             true,
         ),
-        Some("On, currently suppressed by system Reduce Motion."),
+        Some(MusicStatus::MotionPaused(MotionReduction::System)),
         "system policy has priority over the adaptive limiter"
     );
     assert_eq!(
@@ -1750,7 +2005,7 @@ fn music_suppression_resolver_covers_every_reason_and_priority() {
             },
             true,
         ),
-        Some("On, currently suppressed under heavy load.")
+        Some(MusicStatus::MotionPaused(MotionReduction::HeavyLoad))
     );
     assert_eq!(
         top_music_suppression_reason_for_output(
@@ -1803,22 +2058,29 @@ fn music_effects_discloses_effective_motion_suppression_without_rewriting_toggle
             let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                 unreachable!()
             };
-            state.reduce_page_scroll(5, SettingsPageScrollCommand::Absolute(3));
+            state.page_reveal = Some(UiKey::new(format!(
+                "settings/control/{}",
+                prefs::EDIT_TRAIL_SOUNDS
+            )));
         }
         let mut cx = view_cx_at(width, height);
         cx.motion.system_reduced = true;
         let compiled = compile_settings_view(&runtime, instance, view, &cx);
         let status = compiled
             .semantic(&UiKey::new("settings/top/music-effects/suppression"))
-            .expect("compact Music page carries its own suppression status");
+            .expect("the compact Music row carries its own suppression status");
+        // Reduce Motion pauses some voices, never the switch: the status says
+        // which, and that the rest play.
         assert!(
             status
                 .label
                 .contains(if crate::trail_audio::output_available() {
-                    "system Reduce Motion"
+                    "System Reduce Motion pauses the bonk"
                 } else {
                     "audio output is unavailable"
-                })
+                }),
+            "{}",
+            status.label
         );
         let toggle = compiled
             .semantic(&UiKey::new(format!(
@@ -1830,104 +2092,58 @@ fn music_effects_discloses_effective_motion_suppression_without_rewriting_toggle
     }
 }
 
+/// On a phone-sized page under Serious Mode, Cursor Styles keeps its
+/// preview pinned and contained, says why the cursor has no trail, and every
+/// style row scrolls whole into view.
 #[test]
-fn compact_serious_trail_picker_keeps_disclosure_preview_and_every_choice_reachable() {
+fn compact_serious_cursor_styles_keep_status_preview_and_every_style_reachable() {
     for (width, height) in [(320.0, 568.0), (568.0, 320.0)] {
-        let service = VersionedConfigService::new("serious_mode = true\n".to_string()).unwrap();
-        let (mut runtime, instance, view) = setup();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-            unreachable!()
-        };
-        **state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
-        runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: ActionId::new(format!("settings/set/{}", prefs::EDIT_CURSOR_TRAIL_STYLE)),
-                    value: None,
-                }),
-            )
-            .unwrap();
-
+        let (mut runtime, instance, view) = cursor_styles_runtime("serious_mode = true\n");
         let mut cx = view_cx_at(width, height);
         cx.motion.serious = true;
-        let mut seen = BTreeSet::new();
-        // THE SWEEP GOES BOTH WAYS, and that is not belt-and-braces. The picker
-        // opens on the AUTHORED candidate (`top_authored_trail_value`), and with
-        // no `cursor_trail` key that value follows the platform default: a
-        // mid-list style where the trail ships on, and the LAST option (`off`)
-        // on Windows, where `DEFAULT_DECORATIVE_EFFECTS` makes the resident pet
-        // an opt-in. A next-only walk would therefore have measured one page on
-        // Windows and called it reachability. Paging back to the first page and
-        // then forward to the last runs the same containment assertions over
-        // every page on every host, from wherever the picker happened to open.
-        for step in ["settings/choice-page-prev", "settings/choice-page-next"] {
-            for _ in 0..16 {
-                let compiled = compile_settings_view(&runtime, instance, view, &cx);
-                compiled.validate_parity().unwrap();
-                for key in [
-                    "settings/top/serious-mode",
-                    "settings/top/choice-preview",
-                    "settings/choice-close",
-                    "settings/choice-page-prev",
-                    "settings/choice-page-next",
-                ] {
-                    let node = compiled
-                        .semantic(&UiKey::new(key))
-                        .unwrap_or_else(|| panic!("{width}×{height} picker is missing {key}"));
-                    assert!(node.rect.right() <= width + 0.01, "{key}: {:?}", node.rect);
-                    assert!(
-                        node.rect.bottom() <= height + 0.01,
-                        "{key}: {:?}",
-                        node.rect
-                    );
-                }
-                for node in &compiled.semantics {
-                    if node.key.as_str().starts_with(&format!(
-                        "settings/choice/{}/",
-                        prefs::EDIT_CURSOR_TRAIL_STYLE
-                    )) {
-                        seen.insert(node.key.as_str().to_string());
-                    }
-                }
-                for hit in &compiled.hits {
-                    assert!(
-                        hit.rect.right() <= width + 0.01,
-                        "{width}×{height}: {hit:?}"
-                    );
-                    assert!(
-                        hit.rect.bottom() <= height + 0.01,
-                        "{width}×{height}: {hit:?}"
-                    );
-                }
-                let more = compiled
-                    .semantic(&UiKey::new(step))
-                    .and_then(|node| node.state.as_ref())
-                    .is_some_and(|state| state.enabled);
-                if !more {
-                    break;
-                }
-                runtime
-                    .dispatch(
-                        instance,
-                        view,
-                        AppEvent::Action(ActionInvocation {
-                            id: ActionId::new(step),
-                            value: None,
-                        }),
-                    )
-                    .unwrap();
-            }
-        }
-        let AppViewState::Settings(state) = runtime.view_state(view).unwrap() else {
-            unreachable!()
+        let styles = {
+            let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+                unreachable!();
+            };
+            listed_cursor_styles(state)
         };
-        assert_eq!(
-            seen.len(),
-            state.choice_picker.as_ref().unwrap().options.len(),
-            "{width}×{height} reaches every trail choice"
+        let mut seen = BTreeSet::new();
+        each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+            let context = format!("{width}×{height} screen {top}");
+            compiled.validate_parity().unwrap();
+            assert_zero_top_paint(compiled, &context);
+            let preview = compiled
+                .semantic(&UiKey::new("settings/preview/cursor-styles"))
+                .unwrap_or_else(|| panic!("{context}: the preview stays pinned"));
+            assert!(preview.rect.bottom() <= height + 0.01, "{context}");
+            assert!(
+                matches!(&preview.value, SemanticValue::Text(value) if value.contains("no trail")),
+                "{context}: {:?}",
+                preview.value
+            );
+            if let Some(status) = compiled.semantic(&UiKey::new("settings/cursor-styles/status")) {
+                assert!(status.label.contains("Serious Mode"), "{context}");
+                seen.insert("status".to_string());
+            }
+            for hit in &compiled.hits {
+                assert!(hit.rect.right() <= width + 0.01, "{context}: {hit:?}");
+                assert!(hit.rect.bottom() <= height + 0.01, "{context}: {hit:?}");
+                if hit.key.as_str().starts_with("settings/cursor-style/") {
+                    seen.insert(hit.key.as_str().to_string());
+                }
+            }
+        });
+        assert!(
+            seen.contains("status"),
+            "{width}×{height}: the Serious Mode note"
         );
+        for style in &styles {
+            assert!(
+                seen.contains(&cursor_style_row_key(&style.value)),
+                "{width}×{height}: {} unreachable",
+                style.name
+            );
+        }
     }
 }
 
@@ -1950,19 +2166,16 @@ fn highlighted_motion_candidate_resolves_against_live_host_facts_before_commit()
         true,
         true,
         &effective_default_for_field(prefs::EDIT_MOTION),
-        &state.assets.themes,
     );
     state.choice_picker = Some(picker);
     let focus = |state: &mut SettingsViewState, value: &str| {
-        let picker = state.choice_picker.as_mut().unwrap();
+        let picker = state.choice_picker.as_ref().unwrap();
+        // The default row (Automatic) writes nothing; it means `auto`.
         let index = picker
             .options
             .iter()
-            .position(|option| option.value.as_deref() == Some(value))
+            .position(|option| option.value.as_deref().unwrap_or("auto") == value)
             .unwrap();
-        picker
-            .offset
-            .set((index / ChoicePicker::PAGE_SIZE) * ChoicePicker::PAGE_SIZE);
         state.common.last_focus = Some(UiKey::new(format!(
             "settings/choice/{}/{index}",
             prefs::EDIT_MOTION
@@ -1979,7 +2192,6 @@ fn highlighted_motion_candidate_resolves_against_live_host_facts_before_commit()
                 motion,
                 13.0,
                 1.0,
-                aterm_render::Theme::default(),
                 None,
             )
             .expect("the Motion row has a live preview")
@@ -2267,7 +2479,6 @@ fn view_cx_at(width: f32, height: f32) -> ViewCx<'static> {
         motion: crate::native_app::ViewMotionCx::default(),
         terminal_font_px: 12.0,
         terminal_scale: 1.0,
-        terminal_theme: aterm_render::Theme::default(),
         semantic_font: None,
         document: None,
     }
@@ -2277,11 +2488,12 @@ fn view_cx_at(width: f32, height: f32) -> ViewCx<'static> {
 // The macOS access block (design §3.4, §3.7)
 // -----------------------------------------------------------------------
 
-/// Every phrase `tools/grep_guard.sh` B12 fences, plus the shapes the
-/// value-level guard in `update_words.rs` enumerates. Belt and braces: the
-/// guard reads the FILE, this reads the strings a reader actually sees,
-/// including the ones built by `format!` that no grep can evaluate.
-const BANNED_PANEL_PHRASES: &[&str] = &[
+/// Every restart phrase the owner's ruling bars, plus the shapes the
+/// value-level guard in `update_words.rs` enumerates: the strings a reader
+/// actually sees, including the ones built by `format!`. The Developer Tools
+/// surfaces sweep it with the design's own bans on top
+/// (`devtools_helper::test_arms::ruled_out`).
+pub(crate) const BANNED_PANEL_PHRASES: &[&str] = &[
     "restart",
     "relaunch",
     "re-launch",
@@ -2339,6 +2551,7 @@ fn access_fixture(fda: FdaState, dr: DrClass, scope: aterm_containment::FdaScope
         retire_status: None,
         debugger: crate::debugger_access::DebuggerFacts::default(),
         devtools: DevToolsFacts::default(),
+        askpass_relay_off: false,
     }
 }
 
@@ -3127,7 +3340,7 @@ fn a_press_queued_behind_a_confirmed_alert_asks_nothing() {
 // THE DEBUGGER-ACCESS ROW (docs/DESIGN-macos-debugger-access-2026-09-29.md
 // §3.3, §3.4; owner rulings O7 and O8, 2026-09-29). Every press here goes
 // through the injected `confirm` arm: no test reaches `menu::confirm_owner`
-// (AGENTS.md, grep_guard B9f), and none reaches `run_devtools`,
+// (AGENTS.md, the aterm-census guard `test-appkit-door`), and none reaches `run_devtools`,
 // which only the host calls.
 // -----------------------------------------------------------------------
 
@@ -4158,10 +4371,103 @@ fn the_macos_access_panel_renders_every_state_and_never_speaks_about_scope() {
     }
 }
 
+/// THE CARD EXPLAINS ITSELF ON AN ORDINARY WINDOW (measured live 2026-10-16:
+/// on a 774x782 window the card had shed to its one row, every sentence of the
+/// explanation unsaid). The full MACOS ACCESS block runs past a screen on any
+/// window, so the card is not held to leaving that block's actions row on the
+/// first screen: it says what one screen holds, the block's heading stays in
+/// view under it, and the list scrolls on to the block's actions row.
+#[test]
+fn the_devtools_card_explains_itself_on_an_ordinary_window() {
+    use aterm_containment::consent::{DevToolList, DevToolListLabel as LL, DevToolListing as Li};
+    use aterm_containment::{DevToolProbe, DevToolProbeLabel, DevToolState};
+    let probe = DevToolProbe {
+        state: DevToolState::Unlisted,
+        label: DevToolProbeLabel::Observed,
+        requests: Some(1),
+        not_allowed: Some(1),
+        answered_at_ms: Some(DEVTOOLS_ANSWERED_AT_MS),
+    };
+    // The owner's Mac (aterm reads the list) and a fresh one (it cannot).
+    let lists = [
+        devtools_list(Li::Absent, LL::Read, None, Some(2)),
+        DevToolList::refused(LL::NoFullDiskAccess),
+    ];
+    // The owner's own window (1419x992 points less its toolbar) says
+    // everything; the live window's app viewport and a laptop's half-height
+    // window keep at least the state and how to add aterm, shedding the rest
+    // by priority.
+    for (width, height, whole) in [
+        (1_419.0, 908.0, true),
+        (774.0, 700.0, false),
+        (1_280.0, 560.0, false),
+    ] {
+        for list in lists {
+            let facts = DevToolsFacts {
+                enabled: true,
+                probe,
+                answer_minutes: Some(1),
+                list,
+                grant: aterm_containment::consent::devtool_grant(&list, &probe),
+                opened_minutes: None,
+                declined: None,
+            };
+            let context = format!("{width}x{height} {:?}", list.label);
+            let access = devtools_access(facts, SpikeEvidence::UNMEASURED);
+            let (mut runtime, instance, view) = setup();
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!();
+                };
+                state.navigate(SettingsRoute::Security);
+                assert!(state.replace_macos_access(access.clone()));
+            }
+            let cx = view_cx_at(width, height);
+            let first = compile_settings_view(&runtime, instance, view, &cx);
+            first.validate_parity().unwrap();
+            let mut keys = vec![
+                "settings/developer-tools".to_string(),
+                "settings/macos-access/heading".to_string(),
+            ];
+            let mut lines: Vec<&str> = devtools_card_lines(&devtools_card_copy(&access), false)
+                .into_iter()
+                .map(|(key, ..)| key)
+                .collect();
+            lines.sort_by_key(|key| devtools_card_priority(key));
+            assert!(lines.len() > 2, "{context}");
+            let kept = if whole { lines.len() } else { 2 };
+            keys.extend(
+                lines
+                    .iter()
+                    .take(kept)
+                    .map(|key| format!("settings/macos-access/devtools/{key}")),
+            );
+            for key in &keys {
+                assert!(
+                    first.semantic(&UiKey::new(key.as_str())).is_some(),
+                    "{key} is on the first screen: {context}"
+                );
+            }
+            let mut reached = false;
+            each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
+                compiled.validate_parity().unwrap();
+                reached |= compiled
+                    .hits
+                    .iter()
+                    .any(|hit| hit.key == UiKey::new(MACOS_ACCESS_OPEN_FDA));
+            });
+            assert!(
+                reached,
+                "the list scrolls on to the block's actions row: {context}"
+            );
+        }
+    }
+}
+
 /// THE BLOCK IS REACHABLE ON THE WINDOW IT WAS MEASURED ABSENT ON
-/// (2026-09-10): 624x348 logical takes the landscape pager, which never
-/// carried it; and on a short compact page it is a page-0 disclosure, so
-/// page 1 shows a control row instead of the block again.
+/// (2026-09-10): at 624x348 logical the DEVELOPER TOOLS card and the block
+/// lead the Security list, and the list scrolls on to the permission rows
+/// under them.
 #[test]
 fn the_macos_access_block_is_reachable_on_a_short_landscape_window() {
     use aterm_containment::FdaScope;
@@ -4175,13 +4481,45 @@ fn the_macos_access_block_is_reachable_on_a_short_landscape_window() {
         assert!(state.replace_macos_access(access.clone()));
     }
     let cx = view_cx_at(624.0, 348.0);
-    let compiled = compile_settings_view(&runtime, instance, view, &cx);
-    compiled.validate_parity().unwrap();
+    let at = |runtime: &mut NativeRuntime, page: usize| {
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.page_scroll = page;
+        }
+        let compiled = compile_settings_view(runtime, instance, view, &cx);
+        compiled.validate_parity().unwrap();
+        compiled
+    };
+    // The first screen leads with the DEVELOPER TOOLS card, shed to its one
+    // row so the block's actions row stays on glass under it.
+    let first = at(&mut runtime, 0);
+    assert!(
+        first
+            .semantic(&UiKey::new("settings/developer-tools"))
+            .is_some(),
+        "the list leads with the DEVELOPER TOOLS card"
+    );
+    for key in [MACOS_ACCESS_OPEN_DEVTOOLS, MACOS_ACCESS_OPEN_FDA] {
+        assert!(
+            first.hits.iter().any(|hit| hit.key == UiKey::new(key)),
+            "{key} is a hit target on the first screen"
+        );
+    }
+    assert!(
+        first
+            .semantic(&UiKey::new("settings/macos-access/heading"))
+            .is_some(),
+        "the block follows the card on the first screen"
+    );
+    // The next stop leads with the block itself.
+    let compiled = at(&mut runtime, 1);
     assert!(
         compiled
             .semantic(&UiKey::new("settings/macos-access/heading"))
             .is_some(),
-        "page 0 of the landscape pager is the block"
+        "the second stop leads with the block"
     );
     assert!(
         compiled
@@ -4189,26 +4527,15 @@ fn the_macos_access_block_is_reachable_on_a_short_landscape_window() {
             .is_some(),
         "and its Open Privacy & Security button is a hit target there"
     );
-    // Page 1 is a control row, not the block again.
-    {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-            unreachable!();
-        };
-        state.page_scroll = 1;
-    }
-    let next = compile_settings_view(&runtime, instance, view, &cx);
-    next.validate_parity().unwrap();
-    assert!(
-        next.semantic(&UiKey::new("settings/macos-access/heading"))
-            .is_none(),
-        "the block is a page-0 slice"
-    );
-    assert!(
-        next.semantics
+    let mut rows = false;
+    each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
+        compiled.validate_parity().unwrap();
+        rows |= compiled
+            .semantics
             .iter()
-            .any(|node| node.key.as_str().starts_with("settings/row/")),
-        "page 1 reaches a permission toggle"
-    );
+            .any(|node| node.key.as_str().starts_with("settings/row/"));
+    });
+    assert!(rows, "the list reaches a permission toggle");
     // A tall page carries the complete block: identity, attribution and
     // every service class in words.
     {
@@ -4217,16 +4544,45 @@ fn the_macos_access_block_is_reachable_on_a_short_landscape_window() {
         };
         state.page_scroll = 0;
     }
-    let tall = compile_settings_view(&runtime, instance, view, &view_cx_at(1_280.0, 900.0));
-    tall.validate_parity().unwrap();
+    let tall_cx = view_cx_at(1_280.0, 900.0);
+    let mut carried = BTreeSet::new();
+    each_screen(&mut runtime, instance, view, &tall_cx, |compiled, _| {
+        compiled.validate_parity().unwrap();
+        carried.extend(
+            compiled
+                .semantics
+                .iter()
+                .map(|node| node.key.as_str().to_string()),
+        );
+    });
     for key in [
         "settings/macos-access/identity",
         "settings/macos-access/responsible",
         "settings/macos-access/service/0",
         "settings/macos-access/service/6",
+        MACOS_ACCESS_OPEN_FDA,
+        MACOS_ACCESS_OPEN_DEVTOOLS,
     ] {
-        assert!(tall.semantic(&UiKey::new(key)).is_some(), "{key}");
+        assert!(carried.contains(key), "{key}");
     }
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.page_scroll = 0;
+    }
+    let tall = compile_settings_view(&runtime, instance, view, &tall_cx);
+    tall.validate_parity().unwrap();
+    let top = |key: &str| {
+        tall.semantic(&UiKey::new(key))
+            .unwrap_or_else(|| panic!("{key}"))
+            .rect
+            .y
+    };
+    assert!(
+        top("settings/developer-tools") < top("settings/macos-access/heading"),
+        "the DEVELOPER TOOLS card leads the page"
+    );
     let copy = macos_access_copy(&access);
     assert!(
         copy.identity.contains("installed in Applications"),
@@ -4605,12 +4961,16 @@ fn an_unpublished_or_unarmed_settings_view_reaches_no_os_consent_surface() {
     }
     let cx = view_cx_at(1_280.0, 900.0);
     let compiled = compile_settings_view(&runtime, instance, view, &cx);
-    assert!(
-        compiled
-            .semantic(&UiKey::new("settings/macos-access"))
-            .is_none(),
-        "no card, and therefore no button, on an unpublished view"
-    );
+    for key in [
+        "settings/macos-access",
+        "settings/developer-tools",
+        MACOS_ACCESS_OPEN_DEVTOOLS,
+    ] {
+        assert!(
+            compiled.semantic(&UiKey::new(key)).is_none(),
+            "no card, and therefore no button, on an unpublished view: {key}"
+        );
+    }
 
     // Even pressed directly, the gestures are inert: nothing opens and
     // nothing spawns.
@@ -4632,9 +4992,11 @@ fn an_unpublished_or_unarmed_settings_view_reaches_no_os_consent_surface() {
     );
 }
 
-/// The published block renders on Security, its every hit target is whole
-/// at each responsive width, and the route stays in words beside the button
-/// because `openURL:` cannot promise the pane scrolled to the row.
+/// The published block renders on Security under the DEVELOPER TOOLS card
+/// that leads it, every hit target of either is whole at each responsive
+/// width, the card's wrapped copy fits its column, and the block's actions row
+/// is reached: on the first screen where the list's room holds it under the
+/// card, else on a later one.
 #[test]
 fn the_published_macos_access_block_paints_whole_on_the_security_page() {
     use aterm_containment::FdaScope;
@@ -4656,20 +5018,56 @@ fn the_published_macos_access_block_paints_whole_on_the_security_page() {
         let cx = view_cx_at(width, 900.0);
         let compiled = compile_settings_view(&runtime, instance, view, &cx);
         compiled.validate_parity().unwrap();
+        // The block may run on past the list's edge (its card is cut there),
+        // but it is on the page with its heading.
         assert!(
             compiled
-                .semantic(&UiKey::new("settings/macos-access"))
+                .semantic(&UiKey::new("settings/macos-access/heading"))
                 .is_some(),
             "the block is on the Security page at width {width}"
         );
-        assert!(
-            compiled
-                .semantic(&UiKey::new(MACOS_ACCESS_OPEN_FDA))
-                .is_some(),
-            "Open Privacy & Security… at width {width}"
-        );
+        // Its actions row is on glass under the card where the list's room
+        // holds both; a taller block's is a later screen's.
+        let fda = compiled
+            .semantic(&UiKey::new(MACOS_ACCESS_OPEN_FDA))
+            .is_some()
+            || screen_showing(&mut runtime, instance, view, &cx, MACOS_ACCESS_OPEN_FDA).is_some();
+        assert!(fda, "Open Privacy & Security… at width {width}");
+        for key in [
+            "settings/developer-tools",
+            "settings/macos-access/devtools/state",
+            MACOS_ACCESS_OPEN_DEVTOOLS,
+        ] {
+            assert!(
+                compiled.semantic(&UiKey::new(key)).is_some(),
+                "{key} at width {width}"
+            );
+        }
+        // Wrapped, not elided: every painted line of the card fits its box.
+        for node in &compiled.paint {
+            if !node
+                .key
+                .as_str()
+                .starts_with("settings/macos-access/devtools/")
+                || !node.key.as_str().contains("/line-")
+            {
+                continue;
+            }
+            if let UiContent::Text(spec) = &node.content {
+                let (px, face) = crate::native_ui::text_paint_metrics(spec.role, spec.style);
+                let measured = crate::tray_raster::ui_text_width_for(face, &spec.text, px);
+                assert!(
+                    measured <= node.rect.width + 0.5,
+                    "{:?} overflows at width {width}: {measured} > {}",
+                    node.key,
+                    node.rect.width
+                );
+            }
+        }
         for hit in &compiled.hits {
-            if !hit.key.as_str().starts_with("settings/macos-access") {
+            if !hit.key.as_str().starts_with("settings/macos-access")
+                && !hit.key.as_str().starts_with("settings/developer-tools")
+            {
                 continue;
             }
             let painted = compiled
@@ -4806,7 +5204,7 @@ fn ask_again_folds_the_injected_arms_result_onto_the_panel() {
     );
 }
 
-/// A posture whose Developer Tools row reads `facts` under `evidence`.
+/// A posture whose DEVELOPER TOOLS card reads `facts` under `evidence`.
 fn devtools_access(facts: DevToolsFacts, evidence: SpikeEvidence) -> MacosAccess {
     MacosAccess {
         devtools: facts,
@@ -4819,9 +5217,49 @@ fn devtools_access(facts: DevToolsFacts, evidence: SpikeEvidence) -> MacosAccess
     }
 }
 
-/// Every Developer Tools facts value the row can be asked to render: each
-/// state and label, the switch on and off, the cost counts and the answer
-/// ages that change the words.
+/// tccd's newest answer in the fixtures below (2026-10-07 13:58:21 UTC).
+const DEVTOOLS_ANSWERED_AT_MS: i64 = 1_791_381_501_820;
+
+/// A list row the fixtures read.
+fn devtools_list(
+    listing: aterm_containment::consent::DevToolListing,
+    label: aterm_containment::consent::DevToolListLabel,
+    modified_at_s: Option<i64>,
+    rows: Option<u32>,
+) -> aterm_containment::consent::DevToolList {
+    aterm_containment::consent::DevToolList {
+        listing,
+        label,
+        modified_at_s,
+        rows,
+    }
+}
+
+/// The lists the card can be asked to render: each listing read whole (a row
+/// that changed before tccd's answer and one that changed after it), an empty
+/// list, and the reads that learned nothing.
+fn every_devtools_list() -> Vec<aterm_containment::consent::DevToolList> {
+    use aterm_containment::consent::{DevToolList, DevToolListLabel as LL, DevToolListing as Li};
+    vec![
+        devtools_list(Li::On, LL::Read, Some(1_791_000_000), Some(2)),
+        devtools_list(Li::On, LL::Read, Some(1_792_000_000), Some(2)),
+        devtools_list(Li::Off, LL::Read, Some(1_791_000_000), Some(2)),
+        devtools_list(Li::Off, LL::Read, Some(1_792_000_000), Some(2)),
+        devtools_list(Li::Absent, LL::Read, None, Some(2)),
+        devtools_list(Li::Absent, LL::Read, None, Some(0)),
+        DevToolList::refused(LL::NoFullDiskAccess),
+        DevToolList::refused(LL::TimedOut),
+        DevToolList::pending(),
+        DevToolList::refused(LL::RefusedDisabled),
+    ]
+}
+
+/// Every DEVELOPER TOOLS facts value the card can be asked to render: each
+/// tccd state and label, the cost counts, the answer ages, every list, the
+/// last opening before and after tccd's answer where it changes the words (and
+/// with or without one elsewhere), and one reading with aterm's checks off,
+/// which reads "Not checked" whatever was read. The verdict is the one the host
+/// publishes, `consent::devtool_grant` of the two.
 fn every_devtools_facts() -> Vec<DevToolsFacts> {
     use aterm_containment::{DevToolProbe, DevToolProbeLabel as L, DevToolState as S};
     let labels = [
@@ -4842,22 +5280,75 @@ fn every_devtools_facts() -> Vec<DevToolsFacts> {
         L::UnsupportedPlatform,
     ];
     let mut out = Vec::new();
-    for enabled in [false, true] {
-        for state in [S::Allowed, S::Denied, S::Unlisted, S::Unknown] {
-            for label in labels {
-                for not_allowed in [None, Some(0), Some(1), Some(233)] {
-                    for answer_minutes in [None, Some(0), Some(1), Some(7)] {
-                        out.push(DevToolsFacts {
-                            enabled,
-                            probe: DevToolProbe {
-                                state,
-                                label,
-                                requests: not_allowed,
-                                not_allowed,
-                                answered_at_ms: answer_minutes.map(|_| 1_791_381_501_820),
-                            },
-                            answer_minutes,
-                        });
+    // aterm's checks off: the card says "Not checked" whatever was read, so one
+    // reading stands for all of them, crossed with the last opening only.
+    let off_probe = DevToolProbe::refused(L::RefusedDisabled);
+    let off_list = aterm_containment::consent::DevToolList::refused(
+        aterm_containment::consent::DevToolListLabel::RefusedDisabled,
+    );
+    for opened_minutes in [None, Some(0), Some(30)] {
+        out.push(DevToolsFacts {
+            enabled: false,
+            probe: off_probe,
+            answer_minutes: None,
+            list: off_list,
+            grant: aterm_containment::consent::devtool_grant(&off_list, &off_probe),
+            opened_minutes,
+            declined: None,
+        });
+    }
+    for label in labels {
+        // tccd's state, its cost counts and its answer's age reach the words only
+        // through an observed answer (`devtool_grant` reads no other); any other
+        // label is crossed with one state, and with a count and an age on and off,
+        // so a count or an age that leaked into its words would still show.
+        let observed = label == L::Observed;
+        let states: &[S] = if observed {
+            &[S::Allowed, S::Denied, S::Unlisted, S::Unknown]
+        } else {
+            &[S::Unknown]
+        };
+        let counts: &[Option<u32>] = if observed {
+            &[None, Some(0), Some(1), Some(233)]
+        } else {
+            &[None, Some(233)]
+        };
+        let ages: &[Option<u64>] = if observed {
+            &[None, Some(1), Some(45)]
+        } else {
+            &[None, Some(45)]
+        };
+        for &state in states {
+            for &not_allowed in counts {
+                for &answer_minutes in ages {
+                    let probe = DevToolProbe {
+                        state,
+                        label,
+                        requests: not_allowed,
+                        not_allowed,
+                        answered_at_ms: answer_minutes.map(|_| DEVTOOLS_ANSWERED_AT_MS),
+                    };
+                    for list in every_devtools_list() {
+                        // The last opening changes the words only where tccd's answer
+                        // decides (no read row: "can't confirm yet" when the answer is
+                        // older); a read row is crossed with the line's presence alone.
+                        let read = list.label == aterm_containment::consent::DevToolListLabel::Read;
+                        let opened: &[Option<u64>] = if read {
+                            &[None, Some(30)]
+                        } else {
+                            &[None, Some(0), Some(30)]
+                        };
+                        for &opened_minutes in opened {
+                            out.push(DevToolsFacts {
+                                enabled: true,
+                                probe,
+                                answer_minutes,
+                                list,
+                                grant: aterm_containment::consent::devtool_grant(&list, &probe),
+                                opened_minutes,
+                                declined: None,
+                            });
+                        }
                     }
                 }
             }
@@ -4866,19 +5357,25 @@ fn every_devtools_facts() -> Vec<DevToolsFacts> {
     out
 }
 
-/// The design's by-state table (debugger design §9.1, O10 and O15), over
-/// every facts value and every D13 × D14 evidence:
+/// THE CARD'S STATE TABLE (debugger design §9.1, O10 and O15; owner ask
+/// 2026-10-15), over every facts value and every D13 × D14 evidence. The state
+/// line follows the joined verdict and says where it came from:
 ///
-/// * "not listed" / "not on the list" only for an observed `unlisted`;
-/// * the cost sentence exactly when an observed answer counts at least one
-///   program macOS checked;
+/// * a list read whole decides the words: on (Success only when the verdict is
+///   granted), off, absent, or on while tccd's newer answer still checks;
+/// * without one, tccd's answer: "not on the list" only for its `unlisted`,
+///   "switched off" for `denied` only once D13 is measured, "did not allow it"
+///   before, "can't confirm yet" when it is older than aterm's last opening;
+/// * "aterm is allowed" only for tccd's own `allowed` with no read row;
 /// * "should" exactly while D14 is unmeasured;
-/// * "listed, switched off" exactly for an observed `denied` once D13 is
-///   measured;
+/// * the how is the switch-on words exactly for a row read off;
+/// * the Full Disk Access pointer exactly for a list refused for want of it
+///   while the verdict is not granted;
 /// * no restart, relaunch, elimination or coverage word anywhere.
 #[test]
-fn the_devtools_row_follows_the_observed_state_table() {
-    use aterm_containment::{DevToolProbeLabel as L, DevToolState as S};
+fn the_devtools_card_follows_the_joined_state_table() {
+    use aterm_containment::consent::{DevToolListLabel as LL, DevToolListing as Li};
+    use aterm_containment::{DevToolGrant as G, DevToolProbeLabel as L, DevToolState as S};
     for facts in every_devtools_facts() {
         for (shapes, skips) in [(false, false), (true, false), (false, true), (true, true)] {
             let evidence = SpikeEvidence {
@@ -4886,253 +5383,825 @@ fn the_devtools_row_follows_the_observed_state_table() {
                 devtool_skips_first_run_check: skips,
                 ..SpikeEvidence::UNMEASURED
             };
-            let copy = devtools_row_copy(&devtools_access(facts, evidence));
+            let copy = devtools_card_copy(&devtools_access(facts, evidence));
             let all = copy.strings().join("\n");
             let lower = all.to_ascii_lowercase();
-            let context = format!("{facts:?} D13={shapes} D14={skips}\n{all}");
-            let observed = facts.enabled && facts.probe.label == L::Observed;
-            let answered = observed && facts.probe.state != S::Unknown;
+            // Formatted only when an assert fails.
+            let context = || format!("{facts:?} D13={shapes} D14={skips}\n{all}");
+            let on = facts.enabled;
+            let observed = on && facts.probe.label == L::Observed;
+            let read = on && facts.list.label == LL::Read;
+            let granted = on && facts.grant == G::Granted;
+            let stale = !read
+                && facts.grant == G::NotGranted
+                && facts
+                    .answer_minutes
+                    .zip(facts.opened_minutes)
+                    .is_some_and(|(answer, opened)| answer > opened);
+            let from_tccd = on && !read && facts.grant == G::NotGranted && !stale;
 
-            assert!(
-                copy.headline.starts_with("Developer Tools \u{2014} "),
-                "{context}"
+            assert_eq!(copy.state.starts_with("Not checked"), !on, "{}", context());
+            assert_eq!(copy.granted, granted, "{}", context());
+            assert_eq!(
+                copy.state_style == StyleRef::Success,
+                granted,
+                "{}",
+                context()
             );
             assert_eq!(
-                lower.contains("not listed") || lower.contains("not on the list"),
-                observed && facts.probe.state == S::Unlisted,
-                "{context}"
+                copy.state.contains("not on the list"),
+                (read && facts.list.listing == Li::Absent)
+                    || (from_tccd && facts.probe.state == S::Unlisted),
+                "{}",
+                context()
             );
             assert_eq!(
-                copy.state.contains("before letting"),
-                answered && facts.probe.not_allowed.unwrap_or(0) >= 1,
-                "{context}"
-            );
-            // The wait is present tense only while aterm is not allowed.
-            assert_eq!(
-                copy.state.contains("It checks them one at a time"),
-                answered
-                    && facts.probe.not_allowed.unwrap_or(0) >= 1
-                    && facts.probe.state != S::Allowed,
-                "{context}"
+                copy.state.contains("list, switched off"),
+                (read && facts.list.listing == Li::Off)
+                    || (from_tccd && shapes && facts.probe.state == S::Denied),
+                "{}",
+                context()
             );
             assert_eq!(
-                copy.state.contains("It checked them one at a time"),
-                observed
-                    && facts.probe.state == S::Allowed
-                    && facts.probe.not_allowed.unwrap_or(0) >= 1,
-                "{context}"
-            );
-            // A refusal says what aterm holds, never that the build has
-            // no bundle identifier: a bundle under a protected root has
-            // one aterm declined to read.
-            assert!(!lower.contains("has no bundle identifier"), "{context}");
-            assert_eq!(lower.contains("should"), !skips, "{context}");
-            assert_eq!(
-                lower.contains("listed, switched off")
-                    || lower.contains("on the list, switched off"),
-                shapes && observed && facts.probe.state == S::Denied,
-                "{context}"
-            );
-            // The most permissive words, only for tccd's own `allowed`:
-            // no other state, and no unread answer, reaches them.
-            assert_eq!(
-                copy.headline.contains("aterm is allowed"),
-                observed && facts.probe.state == S::Allowed,
-                "{context}"
-            );
-            assert_eq!(
-                copy.state.contains("aterm is allowed"),
-                observed && facts.probe.state == S::Allowed,
-                "{context}"
-            );
-            // Only the store check blames the account; a failed `log`
-            // run never does.
-            assert_eq!(
-                lower.contains("administrator"),
-                facts.enabled && facts.probe.label == L::LogUnavailable,
-                "{context}"
-            );
-            assert_eq!(
-                copy.headline.contains("not checked"),
-                !facts.enabled,
-                "{context}"
-            );
-            assert_eq!(
-                copy.headline.contains("checking"),
-                facts.enabled && facts.probe.label == L::Pending,
-                "{context}"
+                copy.state.contains("did not allow it"),
+                from_tccd
+                    && facts.probe.state != S::Unlisted
+                    && !(shapes && facts.probe.state == S::Denied),
+                "{}",
+                context()
             );
             assert_eq!(
                 copy.state
-                    .contains("shows here after the next new program starts"),
-                answered,
-                "{context}"
+                    .starts_with("aterm is on the list and switched on."),
+                read && facts.list.listing == Li::On && granted,
+                "{}",
+                context()
             );
-            for banned in BANNED_PANEL_PHRASES
-                .iter()
-                .chain(&["eliminat", "cover", "never prompt"])
-            {
-                assert!(!lower.contains(banned), "{banned:?}: {context}");
+            assert_eq!(
+                copy.state.contains("but macOS still checks"),
+                read && facts.list.listing == Li::On && !granted,
+                "{}",
+                context()
+            );
+            // The most permissive tccd words, only for its own `allowed`.
+            assert_eq!(
+                copy.state.contains("aterm is allowed"),
+                !read && granted,
+                "{}",
+                context()
+            );
+            if copy.state.contains("aterm is allowed") {
+                assert!(observed && facts.probe.state == S::Allowed, "{}", context());
             }
-            assert!(copy.route.contains("Developer Tools"), "{context}");
+            assert_eq!(
+                copy.state.starts_with("Can't confirm yet"),
+                on && stale,
+                "{}",
+                context()
+            );
+            assert_eq!(
+                copy.state == "Checking\u{2026}",
+                on && facts.grant == G::Unknown
+                    && (facts.probe.label == L::Pending || facts.list.label == LL::Pending),
+                "{}",
+                context()
+            );
+            assert_eq!(
+                copy.state.starts_with("aterm can't tell: "),
+                on && facts.grant == G::Unknown
+                    && facts.probe.label != L::Pending
+                    && facts.list.label != LL::Pending,
+                "{}",
+                context()
+            );
+            assert_eq!(
+                copy.unread.is_some(),
+                on && !granted && facts.list.label == LL::NoFullDiskAccess,
+                "{}",
+                context()
+            );
+            // The how follows the read row while aterm is not granted: off asks for
+            // its switch, on (while macOS still checks) has nothing to add, and only
+            // the add words ever say drag.
+            assert_eq!(
+                copy.how == atpkg::devtools::HELPER_SWITCH_ON,
+                read && facts.list.listing == Li::Off && !granted,
+                "{}",
+                context()
+            );
+            assert_eq!(
+                copy.how == atpkg::devtools::HELPER_LISTED_ON,
+                read && facts.list.listing == Li::On && !granted,
+                "{}",
+                context()
+            );
+            assert!(!copy.how.contains("Drag") || copy.how == atpkg::devtools::HELPER_HOW);
+            // The floor's words: a word or two, never the sentence.
+            assert!(
+                !copy.state_short.is_empty() && copy.state_short.chars().count() <= 17,
+                "{}",
+                context()
+            );
+            assert_eq!(
+                copy.state_short == "on",
+                read && facts.list.listing == Li::On && granted,
+                "{}",
+                context()
+            );
+            assert_eq!(
+                copy.checked.is_some(),
+                observed && facts.probe.not_allowed.unwrap_or(0) >= 1,
+                "{}",
+                context()
+            );
+            assert_eq!(
+                copy.opened.is_some(),
+                facts.opened_minutes.is_some(),
+                "{}",
+                context()
+            );
+            // Only the store check blames the account.
+            if lower.contains("administrator") {
+                assert_eq!(facts.probe.label, L::LogUnavailable, "{}", context());
+            }
+            assert_eq!(lower.contains("should"), !skips, "{}", context());
+            assert!(lower.contains("developer tools access"), "{}", context());
+            assert!(copy.route.contains("Developer Tools"), "{}", context());
+            assert_eq!(
+                crate::devtools_helper::test_arms::ruled_out(&all),
+                None,
+                "{}",
+                context()
+            );
         }
     }
 }
 
-/// The exact words for the design's example, and the singular, the age
-/// buckets and the route an installed copy gets.
+/// The exact words: each state by its source, the date a switch on was
+/// changed, the route an installed copy gets, the trade and the why in
+/// atpkg's one spelling, and the last opening's age buckets.
 #[test]
-fn the_devtools_row_says_the_designs_words() {
+fn the_devtools_card_says_the_designs_words() {
+    use aterm_containment::consent::{DevToolList, DevToolListLabel as LL, DevToolListing as Li};
     use aterm_containment::{DevToolProbe, DevToolProbeLabel as L, DevToolState as S};
-    let observed = |state, not_allowed, answer_minutes| DevToolsFacts {
-        enabled: true,
-        probe: DevToolProbe {
-            state,
-            label: L::Observed,
-            requests: Some(233),
-            not_allowed: Some(not_allowed),
-            answered_at_ms: Some(1_791_381_501_820),
-        },
-        answer_minutes: Some(answer_minutes),
+    let probe = |state, label, not_allowed| DevToolProbe {
+        state,
+        label,
+        requests: not_allowed,
+        not_allowed,
+        answered_at_ms: Some(DEVTOOLS_ANSWERED_AT_MS),
     };
-    let copy = devtools_row_copy(&devtools_access(
-        observed(S::Unlisted, 233, 0),
-        SpikeEvidence::UNMEASURED,
+    let facts = |probe: DevToolProbe, answer_minutes, list, opened_minutes| DevToolsFacts {
+        enabled: true,
+        probe,
+        answer_minutes,
+        list,
+        grant: aterm_containment::consent::devtool_grant(&list, &probe),
+        opened_minutes,
+        declined: None,
+    };
+    let card = |facts| devtools_card_copy(&devtools_access(facts, SpikeEvidence::UNMEASURED));
+    let absent = devtools_list(Li::Absent, LL::Read, None, Some(2));
+
+    // aterm read off the list, and macOS checked 233 programs.
+    let copy = card(facts(
+        probe(S::Unlisted, L::Observed, Some(233)),
+        Some(0),
+        absent,
+        None,
     ));
+    assert_eq!(copy.state, "aterm is not on the list.");
+    assert_eq!(copy.state_style, StyleRef::Primary);
+    assert_eq!(copy.unread, None);
     assert_eq!(
-        copy.headline,
-        "Developer Tools \u{2014} aterm is not listed."
+        copy.kind,
+        "macOS's Privacy & Security \u{25b8} Developer Tools list: in Apple's words, apps \
+         allowed to \"run software locally that does not meet the system's security policy\". \
+         Not debugger access: it does not stop the \"Developer Tools Access\" password dialog."
     );
+    assert_eq!(copy.why, atpkg::devtools::why(false));
     assert_eq!(
-        copy.state,
-        "macOS's latest answer, under a minute ago: aterm is not on the list. In the last 10 \
-         minutes macOS checked 233 new programs run in aterm before letting each start. It \
-         checks them one at a time, so a build or test run that starts many new programs \
-         waits for it. A change in System Settings shows here after the next new program \
-         starts in aterm."
+        copy.checked.as_deref(),
+        Some(
+            "In the last 10 minutes macOS checked 233 new programs run in aterm before letting \
+             each start."
+        )
     );
+    assert_eq!(copy.how, atpkg::devtools::HELPER_HOW);
     assert_eq!(
-        copy.stops,
-        "Stops: Should stop macOS's first-run check of each new program run in aterm, and \
-         the wait for it."
-    );
-    assert_eq!(
-        copy.grants,
-        "Who grants: Only you, in System Settings. aterm opens the page; macOS has no dialog \
-         for this."
+        copy.route,
+        "System Settings \u{25b8} Privacy & Security \u{25b8} Developer Tools \u{2014} this \
+         aterm is /Applications/fixture.app."
     );
     assert_eq!(
         copy.trade,
-        "Trade: Everything run in aterm, agents and downloaded tools included, should then \
-         start without macOS's first-run malware scan or Gatekeeper's prompt for unsigned or \
-         quarantined code."
+        "Everything run in aterm, agents and downloaded tools included, should then start \
+         without macOS's first-run malware scan or Gatekeeper's prompt for unsigned or \
+         quarantined code. You can switch it off there at any time."
+    );
+    assert_eq!(copy.opened, None);
+    assert_eq!(
+        devtools_card_lines(&copy, false)
+            .iter()
+            .map(|(key, ..)| *key)
+            .collect::<Vec<_>>(),
+        [
+            "state", "kind", "why", "checked", "how", "only", "route", "trade"
+        ],
+        "which switch after how; the route before the trade whose \"there\" it is"
     );
     assert_eq!(
-        copy.route,
-        "System Settings \u{25b8} Privacy & Security \u{25b8} Developer Tools \u{2014} switch \
-         on /Applications/fixture.app; use + to add it if absent. The Processor Trace switch \
-         on that page is a different setting."
+        devtools_card_lines(&copy, true)
+            .iter()
+            .map(|(key, ..)| *key)
+            .collect::<Vec<_>>(),
+        ["state"]
     );
-    let one = devtools_row_copy(&devtools_access(
-        observed(S::Denied, 1, 1),
-        SpikeEvidence::UNMEASURED,
+
+    // On, and nothing newer from tccd: since the day the switch changed. The
+    // card keeps the state and the trade.
+    let on = card(facts(
+        probe(S::Allowed, L::Observed, Some(0)),
+        Some(7),
+        devtools_list(Li::On, LL::Read, Some(1_792_000_000), Some(2)),
+        None,
     ));
     assert_eq!(
-        one.headline,
-        "Developer Tools \u{2014} aterm is not allowed."
+        on.state,
+        "aterm is on the list and switched on. Since 2026-10-14."
     );
+    assert_eq!(on.state_style, StyleRef::Success);
+    assert_eq!(
+        devtools_card_lines(&on, false)
+            .iter()
+            .map(|(key, ..)| *key)
+            .collect::<Vec<_>>(),
+        ["state", "trade"]
+    );
+    // On, but tccd answered after the switch changed and still checks.
+    let checks = card(facts(
+        probe(S::Denied, L::Observed, Some(3)),
+        Some(1),
+        devtools_list(Li::On, LL::Read, Some(1_791_000_000), Some(2)),
+        None,
+    ));
+    assert_eq!(
+        checks.state,
+        "aterm is switched on, but macOS still checks its new programs."
+    );
+    // Listed and on: nothing to drag in.
+    assert_eq!(checks.how, atpkg::devtools::HELPER_LISTED_ON);
+    assert_eq!(checks.state_short, "still checks");
+    // No usable bundle id: what aterm holds, never what the build lacks (O11).
+    let no_subject = card(facts(
+        DevToolProbe::refused(L::RefusedNoSubject),
+        None,
+        DevToolList::refused(LL::RefusedNoSubject),
+        None,
+    ));
     assert!(
-        one.state.starts_with(
-            "macOS's latest answer, 1 minute ago: aterm is not allowed. In the last 10 \
-             minutes macOS checked 1 new program run in aterm before letting it start."
-        ),
+        no_subject
+            .state
+            .contains("aterm holds no usable bundle identifier")
+            && !no_subject.state.contains("build has no"),
         "{}",
-        one.state
+        no_subject.state
     );
-    let quiet = devtools_row_copy(&devtools_access(
-        observed(S::Allowed, 0, 7),
-        SpikeEvidence::UNMEASURED,
+    // Off: its own switch, never a second drag.
+    let off = card(facts(
+        probe(S::Unknown, L::NoRecentRequest, None),
+        None,
+        devtools_list(Li::Off, LL::Read, Some(1_792_000_000), Some(2)),
+        None,
+    ));
+    assert_eq!(off.state, "aterm is on the list, switched off.");
+    assert_eq!(off.how, atpkg::devtools::HELPER_SWITCH_ON);
+
+    // No Full Disk Access: tccd decides, held to D13.
+    let unread = DevToolList::refused(LL::NoFullDiskAccess);
+    let denied = card(facts(
+        probe(S::Denied, L::Observed, Some(1)),
+        Some(1),
+        unread,
+        None,
     ));
     assert_eq!(
-        quiet.state,
-        "macOS's latest answer, 7 minutes ago: aterm is allowed. A change in System Settings \
-         shows here after the next new program starts in aterm."
+        denied.state,
+        "macOS checked a new program aterm started 1 minute ago and did not allow it."
     );
+    assert_eq!(
+        denied.unread.as_deref(),
+        Some("Full Disk Access (below) lets aterm read this list.")
+    );
+    assert_eq!(
+        denied.checked.as_deref(),
+        Some(
+            "In the last 10 minutes macOS checked 1 new program run in aterm before letting it start."
+        )
+    );
+    let measured = devtools_card_copy(&devtools_access(
+        facts(
+            probe(S::Denied, L::Observed, Some(1)),
+            Some(1),
+            unread,
+            None,
+        ),
+        SpikeEvidence {
+            devtool_answer_shapes_measured: true,
+            ..SpikeEvidence::UNMEASURED
+        },
+    ));
+    assert_eq!(
+        measured.state,
+        "macOS's latest answer, 1 minute ago: aterm is on the list, switched off."
+    );
+    let unlisted = card(facts(
+        probe(S::Unlisted, L::Observed, Some(2)),
+        Some(0),
+        unread,
+        None,
+    ));
+    assert_eq!(
+        unlisted.state,
+        "macOS's latest answer, under a minute ago: aterm is not on the list."
+    );
+    let allowed = card(facts(
+        probe(S::Allowed, L::Observed, Some(0)),
+        Some(7),
+        unread,
+        None,
+    ));
+    assert_eq!(
+        allowed.state,
+        "macOS's latest answer, 7 minutes ago: aterm is allowed."
+    );
+    assert!(allowed.granted && allowed.unread.is_none());
+    // tccd's answer is older than aterm's last opening: the owner may have
+    // switched it on since.
+    let stale = card(facts(
+        probe(S::Unlisted, L::Observed, Some(2)),
+        Some(45),
+        unread,
+        Some(30),
+    ));
+    assert_eq!(
+        stale.state,
+        "Can't confirm yet: macOS answers again when aterm next starts a new program."
+    );
+    assert_eq!(
+        stale.opened.as_deref(),
+        Some("aterm last opened this list in System Settings for you 30 minutes ago.")
+    );
+
+    // Neither read: why, in atpkg's words, once when both say the same.
+    let cant = card(facts(
+        probe(S::Unknown, L::NoRecentRequest, None),
+        None,
+        unread,
+        None,
+    ));
+    assert_eq!(
+        cant.state,
+        "aterm can't tell: the system TCC.db that holds the list opens only to an app with \
+         Full Disk Access, and no new program started under aterm in the last 10 minutes, so \
+         tccd gave no answer."
+    );
+    assert_eq!(cant.state_style, StyleRef::Quiet);
+    let observer_off = card(facts(
+        DevToolProbe::refused(L::RefusedObserverOff),
+        None,
+        DevToolList::refused(LL::RefusedObserverOff),
+        None,
+    ));
+    assert_eq!(
+        observer_off.state,
+        "aterm can't tell: observer = false in aterm.toml's [privacy]."
+    );
+    let pending = card(facts(
+        DevToolProbe::pending(),
+        None,
+        DevToolList::pending(),
+        None,
+    ));
+    assert_eq!(pending.state, "Checking\u{2026}");
+    assert_eq!(
+        devtools_card_copy(&devtools_access(
+            DevToolsFacts::default(),
+            SpikeEvidence::UNMEASURED
+        ))
+        .state,
+        "Not checked: aterm's privacy checks are switched off in aterm.toml."
+    );
+
+    // The last opening's ages.
+    for (minutes, words) in [
+        (0, "under a minute ago"),
+        (59, "59 minutes ago"),
+        (90, "1 hour ago"),
+        (180, "3 hours ago"),
+        (4_320, "3 days ago"),
+    ] {
+        assert_eq!(
+            card(facts(DevToolProbe::pending(), None, absent, Some(minutes)))
+                .opened
+                .as_deref(),
+            Some(
+                format!("aterm last opened this list in System Settings for you {words}.").as_str()
+            )
+        );
+    }
+    // D14 measured: the why and the trade drop "should".
+    let skips = devtools_card_copy(&devtools_access(
+        facts(
+            probe(S::Unlisted, L::Observed, Some(2)),
+            Some(0),
+            absent,
+            None,
+        ),
+        SpikeEvidence {
+            devtool_skips_first_run_check: true,
+            ..SpikeEvidence::UNMEASURED
+        },
+    ));
+    assert_eq!(skips.why, atpkg::devtools::why(true));
+    assert_eq!(skips.trade, atpkg::devtools::trade(true));
     // A copy that is not installed gets the route alone.
-    let mut elsewhere = devtools_access(observed(S::Unlisted, 0, 0), SpikeEvidence::UNMEASURED);
+    let mut elsewhere = devtools_access(
+        facts(
+            probe(S::Unlisted, L::Observed, Some(2)),
+            Some(0),
+            absent,
+            None,
+        ),
+        SpikeEvidence::UNMEASURED,
+    );
     elsewhere.install = "translocated";
     assert_eq!(
-        devtools_row_copy(&elsewhere).route,
+        devtools_card_copy(&elsewhere).route,
         "System Settings \u{25b8} Privacy & Security \u{25b8} Developer Tools"
+    );
+    // Which switch matters, and the owner's Not now while it holds: why aterm
+    // leaves the page alone and until when, and that the button still opens it —
+    // never on a granted card, which keeps only the state and the trade.
+    let at = 1_791_381_501;
+    let declined = DevToolsFacts {
+        declined: Some((at, at + 30 * 86_400)),
+        ..facts(
+            probe(S::Unlisted, L::Observed, Some(2)),
+            Some(0),
+            absent,
+            None,
+        )
+    };
+    let quiet = card(declined);
+    assert_eq!(quiet.only, atpkg::devtools::only_aterm(false));
+    assert_eq!(
+        quiet.declined.as_deref(),
+        Some(
+            "You said Not now on 2026-10-07: aterm won't open System Settings at this list by \
+             itself until 2026-11-06. Open Developer Tools\u{2026} still opens it."
+        )
+    );
+    let keys = devtools_card_lines(&quiet, false)
+        .into_iter()
+        .map(|(key, ..)| key)
+        .collect::<Vec<_>>();
+    assert!(
+        keys.contains(&"only") && keys.contains(&"declined"),
+        "{keys:?}"
+    );
+    let granted_list = devtools_list(Li::On, LL::Read, Some(1_792_000_000), Some(2));
+    let granted = card(DevToolsFacts {
+        declined: Some((at, at + 30 * 86_400)),
+        ..facts(
+            probe(S::Unlisted, L::Observed, Some(2)),
+            Some(0),
+            granted_list,
+            None,
+        )
+    });
+    assert!(granted.granted && granted.declined.is_none());
+    assert!(
+        devtools_card_lines(&granted, false)
+            .iter()
+            .all(|(key, ..)| *key != "only" && *key != "declined")
     );
 }
 
-/// The card draws what its height counts: one line per Developer Tools
-/// row line, and its button row only in the tall card — in both layouts,
-/// over a sweep of facts values.
+/// The card draws what its height counts: its heading, the wrapped lines of
+/// each line it keeps, and its one button in every form; compact keeps the
+/// state line, a granted verdict the state and the trade, and a short budget
+/// keeps the state line and sheds the rest by priority. The MACOS ACCESS card
+/// carries no Developer Tools line any more.
 #[test]
-fn the_macos_access_block_draws_the_devtools_row_it_measures() {
-    fn walk(node: &UiNode, out: &mut Vec<(String, Option<String>)>) {
-        let text = match &node.content {
-            UiContent::Text(spec) => Some(spec.text.clone()),
-            _ => None,
-        };
-        out.push((node.key.as_str().to_string(), text));
+fn the_devtools_card_draws_what_it_measures() {
+    fn walk(node: &UiNode, out: &mut Vec<String>) {
+        out.push(node.key.as_str().to_string());
         for child in &node.children {
             walk(child, out);
         }
     }
     let line_height = 24.0_f32.max(20.0 * settings_text_scale());
-    let baseline = |compact| {
-        let access = devtools_access(DevToolsFacts::default(), SpikeEvidence::UNMEASURED);
-        macos_access_height(&access, compact)
-            - devtools_row_lines(&macos_access_copy(&access).devtools, compact).len() as f32
-                * line_height
+    let heading = 28.0_f32.max(22.0 * settings_text_scale());
+    let chrome = heading + scaled_control_height() + 24.0;
+    let wide = DevToolsCardFit {
+        text_width: 640.0,
+        line_budget: 400,
     };
+    // How often the one-line budget drew the state whole, and in the floor's words.
+    let (mut state_whole, mut state_floor) = (0_usize, 0_usize);
     for facts in every_devtools_facts().into_iter().step_by(11) {
+        let access = devtools_access(facts, SpikeEvidence::UNMEASURED);
+        let copy = devtools_card_copy(&access);
         for compact in [false, true] {
-            let access = devtools_access(facts, SpikeEvidence::UNMEASURED);
-            let card = macos_access_card(&access, compact);
-            let mut nodes = Vec::new();
-            walk(&card, &mut nodes);
-            let lines = devtools_row_lines(&macos_access_copy(&access).devtools, compact);
-            let drawn = nodes
-                .iter()
-                .filter(|(key, text)| {
-                    key.starts_with("settings/macos-access/devtools/") && text.is_some()
-                })
-                .count();
-            assert_eq!(drawn, lines.len(), "{facts:?} compact={compact}");
-            let button = nodes
-                .iter()
-                .any(|(key, _)| key == MACOS_ACCESS_OPEN_DEVTOOLS);
-            assert_eq!(button, !compact, "{facts:?} compact={compact}");
-            let expected = baseline(compact) + lines.len() as f32 * line_height;
+            let context = format!("{facts:?} compact={compact}");
+            let (card, height) = devtools_card(&access, compact, wide);
+            assert_eq!(card.key, UiKey::new("settings/developer-tools"));
+            assert_eq!(card.layout.height, Length::Fixed(height), "{context}");
+            let mut keys = Vec::new();
+            walk(&card, &mut keys);
             assert!(
-                (macos_access_height(&access, compact) - expected).abs() < 0.01,
+                keys.iter().any(|key| key == MACOS_ACCESS_OPEN_DEVTOOLS),
+                "{context}"
+            );
+            assert!(
+                keys.iter()
+                    .filter(|key| key.as_str() != "settings/developer-tools")
+                    .all(|key| key.starts_with(MACOS_ACCESS_GESTURE_PREFIX)),
+                "every key `act` could name is refused: {context}"
+            );
+            let lines = devtools_card_lines(&copy, compact);
+            let drawn = keys.iter().filter(|key| key.contains("/line-")).count();
+            for (key, ..) in &lines {
+                assert!(
+                    keys.contains(&format!("settings/macos-access/devtools/{key}")),
+                    "{key} is kept with room for everything: {context}"
+                );
+            }
+            assert!(drawn >= lines.len(), "{context}");
+            assert!(
+                (height - (chrome + drawn as f32 * line_height)).abs() < 0.01,
+                "{context}"
+            );
+            if compact {
+                assert_eq!(lines.len(), 1, "{context}");
+            }
+            if copy.granted && !compact {
+                assert_eq!(lines.len(), 2, "{context}");
+            }
+            // One line of budget: the state line alone, never cut short — the
+            // whole sentence when it fits the line, else the floor's words.
+            let (short, short_height) = devtools_card(
+                &access,
+                compact,
+                DevToolsCardFit {
+                    text_width: 300.0,
+                    line_budget: 1,
+                },
+            );
+            let mut short_keys = Vec::new();
+            walk(&short, &mut short_keys);
+            assert_eq!(
+                short_keys
+                    .iter()
+                    .filter(|key| key.contains("/line-"))
+                    .count(),
+                1,
+                "{context}"
+            );
+            assert!(
+                short_keys.contains(&"settings/macos-access/devtools/state".to_string()),
+                "{context}"
+            );
+            let state_line = {
+                fn find(node: &UiNode) -> Option<String> {
+                    if node.key == UiKey::new("settings/macos-access/devtools/state/line-0")
+                        && let UiContent::Text(spec) = &node.content
+                    {
+                        return Some(spec.text.clone());
+                    }
+                    node.children.iter().find_map(find)
+                }
+                find(&short).expect("the state's line")
+            };
+            assert!(
+                state_line == copy.state
+                    || state_line == devtools_floor_state(copy.state_short, 300.0),
+                "the state whole, or the floor's words: {state_line:?} {context}"
+            );
+            assert!(
+                !state_line.ends_with('\u{2026}') || copy.state == state_line,
+                "{context}"
+            );
+            if state_line == copy.state {
+                state_whole += 1;
+            } else {
+                state_floor += 1;
+            }
+            assert!(
+                short_keys
+                    .iter()
+                    .any(|key| key == MACOS_ACCESS_OPEN_DEVTOOLS),
+                "the button stays: {context}"
+            );
+            assert!(
+                (short_height - (chrome + line_height)).abs() < 0.01,
+                "{context}"
+            );
+            // No line to spare: one row, the state in a word or two beside the
+            // button, whole — named when that fits, the words alone when not.
+            let floor_text = |node: &UiNode| {
+                fn find(node: &UiNode) -> Option<String> {
+                    if node.key == UiKey::new("settings/macos-access/devtools/state")
+                        && let UiContent::Text(spec) = &node.content
+                    {
+                        return Some(spec.text.clone());
+                    }
+                    node.children.iter().find_map(find)
+                }
+                find(node).expect("the floor's state")
+            };
+            let room = |width: f32| {
+                width
+                    - (crate::native_ui::native_button_label_width("Open Developer Tools\u{2026}")
+                        + 28.0)
+                    - 8.0
+            };
+            for width in [300.0, 640.0] {
+                let (floor, _) = devtools_card(
+                    &access,
+                    compact,
+                    DevToolsCardFit {
+                        text_width: width,
+                        line_budget: 0,
+                    },
+                );
+                let text = floor_text(&floor);
+                assert_eq!(
+                    crate::native_ui::fit_native_text_label(&text, room(width)),
+                    text,
+                    "the floor's words are whole at {width}: {context}"
+                );
+                assert!(
+                    text.to_lowercase().ends_with(copy.state_short),
+                    "{text:?}: {context}"
+                );
+            }
+            let (wide_floor, _) = devtools_card(
+                &access,
+                compact,
+                DevToolsCardFit {
+                    text_width: 640.0,
+                    line_budget: 0,
+                },
+            );
+            assert!(
+                floor_text(&wide_floor).starts_with("Developer Tools \u{2014} "),
+                "named where it fits: {context}"
+            );
+            let (floor, floor_height) = devtools_card(
+                &access,
+                compact,
+                DevToolsCardFit {
+                    text_width: 300.0,
+                    line_budget: 0,
+                },
+            );
+            let mut floor_keys = Vec::new();
+            walk(&floor, &mut floor_keys);
+            assert_eq!(
+                floor_keys,
+                [
+                    "settings/developer-tools",
+                    "settings/macos-access/devtools/actions",
+                    "settings/macos-access/devtools/state",
+                    MACOS_ACCESS_OPEN_DEVTOOLS,
+                ],
+                "{context}"
+            );
+            assert!(
+                (floor_height - (scaled_control_height() + 24.0)).abs() < 0.01,
+                "{context}"
+            );
+        }
+        // The MACOS ACCESS card no longer carries the Developer Tools row.
+        for compact in [false, true] {
+            let mut keys = Vec::new();
+            walk(&macos_access_card(&access, compact), &mut keys);
+            assert!(
+                !keys
+                    .iter()
+                    .any(|key| key.starts_with("settings/macos-access/devtools")
+                        || key == MACOS_ACCESS_OPEN_DEVTOOLS),
                 "{facts:?} compact={compact}"
             );
         }
     }
+    assert!(
+        state_whole > 0 && state_floor > 0,
+        "both forms drawn: {state_whole} whole, {state_floor} in the floor's words"
+    );
+    // Every state's floor words, not only the sampled ones, are whole beside the
+    // button at the narrow width (the sampled facts above check the row's shape).
+    let shorts = every_devtools_facts()
+        .into_iter()
+        .map(|facts| {
+            devtools_card_copy(&devtools_access(facts, SpikeEvidence::UNMEASURED)).state_short
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let room = 300.0
+        - (crate::native_ui::native_button_label_width("Open Developer Tools\u{2026}") + 28.0)
+        - 8.0;
+    for short in shorts {
+        let text = devtools_floor_state(short, room);
+        assert_eq!(
+            crate::native_ui::fit_native_text_label(&text, room),
+            text,
+            "{short:?} is whole at 300"
+        );
+    }
+    // A growing budget keeps a growing PREFIX of the priority order (never a
+    // later line in place of an earlier one that did not fit), and draws it in
+    // reading order.
+    let access = devtools_access(
+        DevToolsFacts {
+            enabled: true,
+            list: aterm_containment::consent::DevToolList {
+                listing: aterm_containment::consent::DevToolListing::Absent,
+                label: aterm_containment::consent::DevToolListLabel::Read,
+                modified_at_s: None,
+                rows: Some(2),
+            },
+            grant: aterm_containment::DevToolGrant::NotGranted,
+            ..DevToolsFacts::default()
+        },
+        SpikeEvidence::UNMEASURED,
+    );
+    let reading = ["state", "kind", "why", "how", "only", "route", "trade"];
+    let priority = ["state", "how", "trade", "kind", "why", "route", "only"];
+    let mut kept_before = 1;
+    for budget in 1..200 {
+        let (card, _) = devtools_card(
+            &access,
+            false,
+            DevToolsCardFit {
+                text_width: 640.0,
+                line_budget: budget,
+            },
+        );
+        let kept = card
+            .children
+            .iter()
+            .filter_map(|child| {
+                child
+                    .key
+                    .as_str()
+                    .strip_prefix("settings/macos-access/devtools/")
+            })
+            .filter(|key| reading.contains(key))
+            .collect::<Vec<_>>();
+        let mut by_priority = kept.clone();
+        by_priority.sort_by_key(|key| priority.iter().position(|p| p == key));
+        assert_eq!(
+            by_priority,
+            priority[..kept.len()],
+            "budget {budget}: a prefix of the priority order"
+        );
+        let positions = kept
+            .iter()
+            .map(|key| reading.iter().position(|name| name == key))
+            .collect::<Vec<_>>();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "budget {budget}: reading order {kept:?}"
+        );
+        assert!(kept.len() >= kept_before, "budget {budget}: {kept:?}");
+        kept_before = kept.len();
+        if kept.len() == reading.len() {
+            break;
+        }
+    }
+    assert_eq!(
+        kept_before,
+        reading.len(),
+        "every line fits a big enough budget"
+    );
 }
 
-/// *Open Developer Tools…* only opens System Settings, at the Developer
-/// Tools list, through the injected arm: no alert, the route in words on
-/// every outcome, and it is not the access card's *Open Settings* (no
-/// `consent_open_requests`). `act` refuses it: it sits under the prefix.
+/// *Open Developer Tools…* asks the HOST for the one hand-over
+/// (`App::hand_devtools_to_owner`, which shows aterm's helper panel beside the
+/// page): the press records a request and says the page is opening, asks
+/// nothing, reaches no gesture arm and is not the access card's *Open
+/// Settings* (no `consent_open_requests`). What the host did lands on the bar
+/// with the route in words on every outcome, only on the Security page.
+/// `act` refuses the button: it sits under the prefix.
 #[test]
-fn the_developer_tools_button_opens_only_its_pane() {
+fn the_developer_tools_button_asks_the_host_for_the_one_hand_over() {
+    use crate::devtools_helper::{HandOver, Refusal};
     use std::sync::atomic::{AtomicU8, Ordering};
-    static PANE: AtomicU8 = AtomicU8::new(0);
-    fn recording(pane: crate::menu::PrivacyPane) -> crate::menu::SettingsOpen {
-        PANE.store(
-            match pane {
-                crate::menu::PrivacyPane::FullDiskAccess => 1,
-                crate::menu::PrivacyPane::FilesAndFolders => 2,
-                crate::menu::PrivacyPane::DeveloperTools => 3,
-            },
-            Ordering::Release,
-        );
+    static OPENS: AtomicU8 = AtomicU8::new(0);
+    fn recording(_pane: crate::menu::PrivacyPane) -> crate::menu::SettingsOpen {
+        OPENS.fetch_add(1, Ordering::AcqRel);
         crate::menu::SettingsOpen::Anchored
     }
     fn never_confirm(_: &str, _: &str, _: &str) -> Option<bool> {
@@ -5140,36 +6209,133 @@ fn the_developer_tools_button_opens_only_its_pane() {
     }
     assert!(MACOS_ACCESS_OPEN_DEVTOOLS.starts_with(MACOS_ACCESS_GESTURE_PREFIX));
     let words = crate::menu::privacy_settings_path_words(crate::menu::PrivacyPane::DeveloperTools);
-    type Open = fn(crate::menu::PrivacyPane) -> crate::menu::SettingsOpen;
-    for (open, said, records) in [
+    let (mut runtime, instance, view) = setup();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.navigate(SettingsRoute::Security);
+        state.replace_macos_access(access_fixture(
+            FdaState::Unknown,
+            DrClass::Identity,
+            aterm_containment::FdaScope::Unknown,
+        ));
+        state.arm_consent_gestures(ConsentGestures {
+            open_settings: recording,
+            confirm: never_confirm,
+            asks_devtools_hand_over: || true,
+            ..ConsentGestures::inert()
+        });
+        assert!(
+            !state.take_devtools_hand_over_request(),
+            "nothing pressed yet"
+        );
+    }
+    for _ in 0..2 {
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(MACOS_ACCESS_OPEN_DEVTOOLS),
+                    value: None,
+                }),
+            )
+            .unwrap();
+    }
+    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        unreachable!();
+    };
+    assert_eq!(
+        state.feedback.as_deref(),
+        Some(format!("Opening System Settings at {words}\u{2026}").as_str())
+    );
+    assert_eq!(
+        OPENS.load(Ordering::Acquire),
+        0,
+        "the host opens it, not the reducer"
+    );
+    assert!(
+        !state.take_consent_open_request(),
+        "the Developer Tools pane is not the access card's Open Settings"
+    );
+    assert!(state.take_devtools_hand_over_request(), "one request");
+    assert!(
+        !state.take_devtools_hand_over_request(),
+        "two presses before the park are one request"
+    );
+    for (outcome, said) in [
         (
-            recording as Open,
+            HandOver::Opened,
             "Opened System Settings \u{2014} look under",
-            true,
         ),
         (
-            inert_open_settings as Open,
+            HandOver::Listing,
+            "Asking macOS to show the Developer Tools list",
+        ),
+        (
+            HandOver::OpenFailed,
             "System Settings did not open. The setting is at",
-            false,
+        ),
+        (
+            HandOver::Headless,
+            "System Settings did not open. The setting is at",
+        ),
+        (
+            HandOver::Refused(Refusal::Declined),
+            "System Settings did not open. The setting is at",
         ),
     ] {
-        PANE.store(0, Ordering::Release);
+        assert!(state.note_devtools_hand_over(outcome, None));
+        let feedback = state.feedback.clone().expect("feedback");
+        assert!(feedback.starts_with(said), "{outcome:?}: {feedback}");
+        assert!(feedback.contains(words), "{outcome:?}: {feedback}");
+        assert_eq!(
+            crate::devtools_helper::test_arms::ruled_out(&feedback),
+            None,
+            "{outcome:?}: {feedback}"
+        );
+    }
+    // A hand-over whose `spctl` run failed opened the page, and the bar says
+    // macOS did not show the list, and why, as `aterm doctor`'s did-line does.
+    assert!(state.note_devtools_hand_over(HandOver::Opened, Some("spctl exited 1")));
+    let feedback = state.feedback.clone().expect("feedback");
+    assert!(
+        feedback.starts_with(
+            "Opened System Settings, but macOS did not show the Developer Tools list \
+             (spctl exited 1)."
+        ) && feedback.contains(words),
+        "{feedback}"
+    );
+    // A view that has left the page gets no line on another one.
+    state.navigate(SettingsRoute::Appearance);
+    let before = state.feedback.clone();
+    assert!(!state.note_devtools_hand_over(HandOver::Opened, None));
+    assert_eq!(state.feedback, before);
+
+    // NEGATIVE CONTROLS: a view the host never published the page into, and one
+    // published but left with the arms it was born with, ask the host for nothing
+    // and say that nothing opened (the inert arm's other Open buttons' words).
+    for (published, armed) in [(false, true), (true, false)] {
         let (mut runtime, instance, view) = setup();
         {
             let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                 unreachable!();
             };
             state.navigate(SettingsRoute::Security);
-            state.replace_macos_access(access_fixture(
-                FdaState::Unknown,
-                DrClass::Identity,
-                aterm_containment::FdaScope::Unknown,
-            ));
-            state.arm_consent_gestures(ConsentGestures {
-                open_settings: open,
-                confirm: never_confirm,
-                ..ConsentGestures::inert()
-            });
+            if published {
+                state.replace_macos_access(access_fixture(
+                    FdaState::Unknown,
+                    DrClass::Identity,
+                    aterm_containment::FdaScope::Unknown,
+                ));
+            }
+            if armed {
+                state.arm_consent_gestures(ConsentGestures {
+                    asks_devtools_hand_over: || true,
+                    ..ConsentGestures::inert()
+                });
+            }
         }
         runtime
             .dispatch(
@@ -5184,16 +6350,13 @@ fn the_developer_tools_button_opens_only_its_pane() {
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
             unreachable!();
         };
-        let feedback = state.feedback.clone().expect("feedback");
-        assert!(feedback.starts_with(said), "{feedback}");
-        assert!(feedback.contains(words), "{feedback}");
-        assert!(
-            !state.take_consent_open_request(),
-            "the Developer Tools pane is not the access card's Open Settings"
+        let context = format!("published={published} armed={armed}");
+        assert!(!state.take_devtools_hand_over_request(), "{context}");
+        assert_eq!(
+            state.feedback.as_deref(),
+            Some(format!("System Settings did not open. The setting is at {words}.").as_str()),
+            "{context}"
         );
-        if records {
-            assert_eq!(PANE.load(Ordering::Acquire), 3, "the Developer Tools pane");
-        }
     }
 }
 
@@ -5240,10 +6403,11 @@ fn the_deep_link_gesture_always_names_the_route_in_words() {
         };
         let feedback = state.feedback.as_deref().expect("feedback");
         assert!(feedback.contains(words), "{action}: {feedback}");
-        let lower = feedback.to_ascii_lowercase();
-        for banned in BANNED_PANEL_PHRASES {
-            assert!(!lower.contains(banned), "{action}: {feedback}");
-        }
+        assert_eq!(
+            crate::devtools_helper::test_arms::ruled_out(feedback),
+            None,
+            "{action}: {feedback}"
+        );
     }
 }
 
@@ -5382,9 +6546,9 @@ fn a_reset_invocation_can_never_hold_the_main_thread_open_ended() {
 ///
 /// The ceiling HERE is a hang detector, not the product's
 /// [`RESET_INVOCATION_CEILING`]: what is proved is that the exit code of
-/// a child that exits comes back, and a `/usr/bin/true` that a loaded gate
-/// takes more than that 1 s to exec and reap is killed and reads `None`
-/// (red under a 24-way CPU load, 2026-09-29). "Not a delay" is asserted
+/// a child that exits comes back, and a `/usr/bin/true` that a loaded machine
+/// takes more than that 1 s to exec and reap is killed and reads `None` (as
+/// under a 24-way CPU load). "Not a delay" is asserted
 /// against it: a wait that sat out its ceiling before looking would take a
 /// whole minute per child.
 #[test]
@@ -5418,6 +6582,61 @@ fn compile_settings_view(
         .expect("Settings renders")
         .compile(cx.viewport)
         .expect("Settings compiles")
+}
+
+/// Walk the open `key` picker through every option the way the keyboard
+/// does — to the top, then Right one option at a time — compiling after each
+/// step. The highlighted option must be on glass and pressable every time,
+/// and every option must be met. `check` sees each frame and the index.
+fn walk_open_choice_picker(
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    cx: &ViewCx<'_>,
+    key: &str,
+    mut check: impl FnMut(&crate::native_ui::CompiledUi, usize),
+) {
+    let count = match runtime.view_state(view) {
+        Some(AppViewState::Settings(state)) => state
+            .choice_picker
+            .as_ref()
+            .expect("an open picker")
+            .options
+            .len(),
+        _ => unreachable!(),
+    };
+    let prefix = format!("settings/choice/{key}/");
+    let mut seen = BTreeSet::new();
+    let _ = compile_settings_view(runtime, instance, view, cx);
+    runtime
+        .dispatch(instance, view, AppEvent::ScrollLines(-10_000))
+        .unwrap();
+    for index in 0..count {
+        if index > 0 {
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::TextInput(TextInputEvent::Right { extend: false }),
+                )
+                .unwrap();
+        }
+        let compiled = compile_settings_view(runtime, instance, view, cx);
+        let highlighted = UiKey::new(format!("{prefix}{index}"));
+        assert!(
+            compiled.hits.iter().any(|hit| hit.key == highlighted),
+            "{key}: highlighted option {index} is on glass and pressable"
+        );
+        seen.extend(
+            compiled
+                .hits
+                .iter()
+                .filter(|hit| hit.key.as_str().starts_with(&prefix))
+                .map(|hit| hit.key.as_str().to_string()),
+        );
+        check(&compiled, index);
+    }
+    assert_eq!(seen.len(), count, "{key}: every option is reachable");
 }
 
 /// The Home page's welcome flourish: on a roomy host the rainbow banner is
@@ -5455,6 +6674,84 @@ fn top_settings_rainbow_banner_present_and_yielding() {
         compiled.semantic(&key).is_none(),
         "Serious Mode must not show the banner"
     );
+}
+
+/// Top Settings shows one specimen per card at every width: the colors card's
+/// one color sample (which carries the window-appearance sample too) takes
+/// the wide grid's spare height, never a second, identical copy above
+/// Window appearance, and never more height than its rows fill.
+#[test]
+fn top_settings_cards_show_one_preview_each() {
+    let (runtime, instance, view) = setup();
+    // At a small font size the sample's rows end before the column's slack
+    // does: the rest stays at the card's foot, not as empty terminal.
+    for font_px in [12.0, 9.0] {
+        for (width, height) in [(738.0, 418.0), (1_074.0, 684.0), (1_600.0, 900.0)] {
+            let mut cx = view_cx_at(width, height);
+            cx.terminal_font_px = font_px;
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let context = format!("{width}x{height} at {font_px}px");
+            let previews = compiled
+                .semantics
+                .iter()
+                .filter(|node| node.label == "Appearance preview")
+                .map(|node| node.key.as_str().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                previews,
+                ["settings/top/theme/preview"],
+                "one color preview at {context}"
+            );
+            let preview = compiled
+                .semantic(&UiKey::new("settings/top/theme/preview"))
+                .expect("color preview");
+            if width >= 1_000.0 && font_px == 12.0 {
+                // The wide grid's colors column gives its slack to that one
+                // preview rather than leaving it as blank card.
+                let card = compiled
+                    .semantic(&UiKey::new("settings/top/theme"))
+                    .expect("colors card");
+                let last = [
+                    "settings/top/theme/preview".to_string(),
+                    format!("settings/control/{}", prefs::EDIT_THEME),
+                    format!("settings/control/{}", prefs::EDIT_WINDOW_THEME),
+                ]
+                .iter()
+                .filter_map(|key| compiled.semantic(&UiKey::new(key.as_str())))
+                .map(|node| node.rect.bottom())
+                .fold(0.0, f32::max);
+                assert!(
+                    card.rect.bottom() - last <= 24.0,
+                    "no blank band under the colors card's rows at {context}: card {:?}, rows end {last}",
+                    card.rect
+                );
+                assert!(
+                    preview.rect.height >= 132.0,
+                    "{context}: {:?}",
+                    preview.rect
+                );
+            }
+            // However tall it grows, the sample fills it: no empty terminal
+            // under its last row.
+            let whole = compiled
+                .paint
+                .iter()
+                .find_map(|paint| match &paint.content {
+                    UiContent::SettingsPreview(spec)
+                        if paint.key.as_str() == "settings/top/theme/preview" =>
+                    {
+                        spec.whole_color_sample_height()
+                    }
+                    _ => None,
+                })
+                .expect("the colors card paints a color sample");
+            assert!(
+                preview.rect.height <= whole + 0.01,
+                "{context}: a {}pt preview for a {whole}pt sample",
+                preview.rect.height
+            );
+        }
+    }
 }
 
 /// Run `rung` once per Dynamic Type scale, each on a thread of its own and
@@ -5590,10 +6887,7 @@ fn assert_picker_descendants_contained(
     };
     for node in compiled.semantics.iter().filter(|node| {
         node.key.as_str().starts_with("settings/choice/")
-            || matches!(
-                node.key.as_str(),
-                "settings/choice-close" | "settings/choice-page-prev" | "settings/choice-page-next"
-            )
+            || node.key.as_str() == "settings/choice-close"
     }) {
         assert!(
             contains(node.rect),
@@ -5605,10 +6899,7 @@ fn assert_picker_descendants_contained(
     }
     for hit in compiled.hits.iter().filter(|hit| {
         hit.key.as_str().starts_with("settings/choice/")
-            || matches!(
-                hit.key.as_str(),
-                "settings/choice-close" | "settings/choice-page-prev" | "settings/choice-page-next"
-            )
+            || hit.key.as_str() == "settings/choice-close"
     }) {
         assert!(
             contains(hit.rect),
@@ -5722,377 +7013,6 @@ fn assert_short_landscape_geometry(
     }
 }
 
-fn assert_accessible_pager(
-    compiled: &crate::native_ui::CompiledUi,
-    key: &str,
-    page: usize,
-    total: usize,
-    context: &str,
-) {
-    assert!(total > 1);
-    let previous = compiled
-        .semantic(&UiKey::new(format!("{key}/previous")))
-        .unwrap_or_else(|| panic!("{context}: missing accessible Previous"));
-    let next = compiled
-        .semantic(&UiKey::new(format!("{key}/next")))
-        .unwrap_or_else(|| panic!("{context}: missing accessible Next"));
-    assert_eq!(
-        previous.state.expect("pager state").enabled,
-        page > 0,
-        "{context}: Previous enabled state"
-    );
-    assert_eq!(
-        next.state.expect("pager state").enabled,
-        page + 1 < total,
-        "{context}: Next enabled state"
-    );
-}
-
-fn pager_total(compiled: &crate::native_ui::CompiledUi, status_key: &str) -> usize {
-    compiled
-        .semantic(&UiKey::new(status_key))
-        .unwrap_or_else(|| panic!("missing pager status {status_key}"))
-        .label
-        .rsplit_once(" of ")
-        .and_then(|(_, total)| total.parse::<usize>().ok())
-        .unwrap_or_else(|| panic!("invalid pager status {status_key}"))
-}
-
-#[test]
-fn smart_title_health_is_runtime_backed_and_transport_truthful() {
-    let (mut runtime, instance, view) = setup();
-    let health = TitleSummaryHealth {
-        state: TitleSummaryRuntimeState::Error,
-        provider: crate::app_config::TitleSummaryProvider::Ollama,
-        model: Some("qwen3.5:4b-q4_K_M".to_string()),
-        endpoint: Some("http://127.0.0.1:11434/api/chat".to_string()),
-        locality: TitleSummaryLocality::UnattestedLoopback,
-        managed_install_present: false,
-        model_ready: false,
-        last_error: Some("managed runtime is not installed".to_string()),
-        next_retry_after: Some(std::time::Duration::from_secs(9)),
-        next_refresh_after: None,
-        timeout: Some(std::time::Duration::from_secs(42)),
-        proxy_mode: Some(crate::app_config::TitleSummaryProxyMode::Direct),
-        ca_file: None,
-    };
-    {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-            unreachable!();
-        };
-        state.navigate(SettingsRoute::WindowTabs);
-        assert!(state.replace_title_summary_health(health.clone()));
-        assert!(!state.replace_title_summary_health(health));
-    }
-
-    let cx = view_cx();
-    let compiled = runtime
-        .render(instance, view, &cx)
-        .unwrap()
-        .compile(cx.viewport)
-        .unwrap();
-    let label = |key: &str| {
-        compiled
-            .semantic(&UiKey::new(format!("settings/smart-titles/health/{key}")))
-            .unwrap_or_else(|| panic!("missing Smart Titles health row {key}"))
-            .label
-            .clone()
-    };
-    assert!(label("state").contains("Needs attention"));
-    assert!(label("locality").contains("not proof of local-only"));
-    assert!(label("transport").contains("42s timeout"));
-    assert!(label("transport").contains("direct connection (forced)"));
-    assert!(label("transport").contains("TLS/CA not used"));
-    assert!(
-        label("readiness")
-            .contains("aterm-managed Ollama not installed (aterm does not download it)")
-    );
-    assert!(label("readiness").contains("model not confirmed yet"));
-    assert!(label("detail").contains("managed runtime is not installed"));
-    assert!(label("detail").contains("Error retry"));
-
-    {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-            unreachable!();
-        };
-        state.replace_title_summary_health(TitleSummaryHealth {
-            state: TitleSummaryRuntimeState::Ready,
-            provider: crate::app_config::TitleSummaryProvider::OpenAiCompatible,
-            model: Some("private-model".to_string()),
-            endpoint: Some("https://127.0.0.1:9443/v1/chat/completions".to_string()),
-            locality: TitleSummaryLocality::UnattestedLoopback,
-            managed_install_present: false,
-            model_ready: true,
-            last_error: None,
-            next_retry_after: None,
-            next_refresh_after: Some(std::time::Duration::from_secs(30)),
-            timeout: Some(std::time::Duration::from_secs(20)),
-            proxy_mode: Some(crate::app_config::TitleSummaryProxyMode::Direct),
-            ca_file: Some("/tmp/private-model-ca.pem".to_string()),
-        });
-    }
-    let openai = runtime
-        .render(instance, view, &cx)
-        .unwrap()
-        .compile(cx.viewport)
-        .unwrap();
-    let openai_transport = openai
-        .semantic(&UiKey::new("settings/smart-titles/health/transport"))
-        .unwrap()
-        .label
-        .clone();
-    assert!(openai_transport.contains("direct connection"));
-    assert!(openai_transport.contains("platform roots replaced"));
-    let openai_detail = openai
-        .semantic(&UiKey::new("settings/smart-titles/health/detail"))
-        .unwrap()
-        .label
-        .clone();
-    assert!(openai_detail.contains("Routine activity refresh"));
-
-    for (width, height) in [(320.0, 568.0), (568.0, 320.0)] {
-        let compact_cx = view_cx_at(width, height);
-        let compact = runtime
-            .render(instance, view, &compact_cx)
-            .unwrap()
-            .compile(compact_cx.viewport)
-            .unwrap();
-        let keys = if height <= 420.0 {
-            vec!["state", "summary"]
-        } else {
-            vec!["state", "locality", "transport", "readiness", "detail"]
-        };
-        for key in keys {
-            let node = compact
-                .semantic(&UiKey::new(format!("settings/smart-titles/health/{key}")))
-                .unwrap_or_else(|| panic!("{width}×{height} loses health row {key}"));
-            assert!(
-                node.rect.bottom() <= compact_cx.viewport.bottom() + 0.01,
-                "{width}×{height} clips health row {key}: {:?}",
-                node.rect
-            );
-        }
-    }
-}
-
-#[test]
-fn smart_title_health_never_infers_locality_and_invalidates_on_authority_change() {
-    let mut state = SettingsViewState::new(&Config::default());
-    state.navigate(SettingsRoute::WindowTabs);
-    state.common.last_focus = Some(UiKey::new(format!(
-        "settings/control/{}",
-        prefs::EDIT_TITLE_SUMMARY_PROVIDER
-    )));
-    let cx = view_cx();
-    let unavailable = settings_tree(
-        &state,
-        &UpdateState::from_status(1, "0.1.0", None, false).projection(),
-        &PackagesState::unobserved().projection(),
-        &MessagesState::empty(),
-        &cx,
-    )
-    .compile(cx.viewport)
-    .unwrap();
-    assert!(
-        unavailable
-            .semantic(&UiKey::new("settings/smart-titles/health/state"))
-            .expect("unavailable headline")
-            .label
-            .contains("Status unavailable")
-    );
-    assert!(
-        unavailable
-            .semantic(&UiKey::new("settings/smart-titles/health/locality"))
-            .is_none(),
-        "no runtime status: the headline says so once, and no locality is inferred"
-    );
-
-    state.replace_title_summary_health(TitleSummaryHealth {
-        state: TitleSummaryRuntimeState::Error,
-        provider: crate::app_config::TitleSummaryProvider::OpenAiCompatible,
-        model: Some("private-model".to_string()),
-        endpoint: None,
-        locality: TitleSummaryLocality::Remote,
-        managed_install_present: false,
-        model_ready: false,
-        last_error: Some("OpenAI-compatible provider requires an endpoint".to_string()),
-        next_retry_after: None,
-        next_refresh_after: None,
-        timeout: Some(std::time::Duration::from_secs(20)),
-        proxy_mode: Some(crate::app_config::TitleSummaryProxyMode::Environment),
-        ca_file: None,
-    });
-    let missing_endpoint = settings_tree(
-        &state,
-        &UpdateState::from_status(1, "0.1.0", None, false).projection(),
-        &PackagesState::unobserved().projection(),
-        &MessagesState::empty(),
-        &cx,
-    )
-    .compile(cx.viewport)
-    .unwrap();
-    assert!(
-        missing_endpoint
-            .semantic(&UiKey::new("settings/smart-titles/health/locality"))
-            .expect("missing-endpoint locality status")
-            .label
-            .contains("no terminal context was sent")
-    );
-    assert!(
-        missing_endpoint
-            .semantic(&UiKey::new("settings/smart-titles/health/transport"))
-            .expect("missing-endpoint transport status")
-            .label
-            .contains("environment proxy + NO_PROXY")
-    );
-
-    state.replace_title_summary_health(TitleSummaryHealth {
-        state: TitleSummaryRuntimeState::Builtin,
-        provider: crate::app_config::TitleSummaryProvider::Builtin,
-        model: None,
-        endpoint: None,
-        locality: TitleSummaryLocality::NotApplicable,
-        managed_install_present: false,
-        model_ready: false,
-        last_error: None,
-        next_retry_after: None,
-        next_refresh_after: None,
-        timeout: None,
-        proxy_mode: None,
-        ca_file: None,
-    });
-    let service = VersionedConfigService::new(
-        "title_summary_provider = \"openai-compatible\"\n\
-         title_summary_endpoint = \"https://models.example.test/v1/chat/completions\"\n\
-         title_summary_allow_remote = true\n"
-            .to_string(),
-    )
-    .unwrap();
-    state.replace_snapshot(&service.snapshot()).unwrap();
-    assert!(
-        state.title_summary_health.is_none(),
-        "a provider-authority change must retire stale locality/readiness"
-    );
-}
-
-#[test]
-fn maximum_text_scale_keeps_smart_title_health_and_a_control_whole() {
-    at_each_text_scale(
-        &[2.0],
-        "Smart Titles Dynamic Type test",
-        maximum_text_scale_keeps_smart_title_health_and_a_control_whole_at_scale,
-    );
-}
-
-/// [`maximum_text_scale_keeps_smart_title_health_and_a_control_whole`] at 2.0× ([`at_each_text_scale`]).
-fn maximum_text_scale_keeps_smart_title_health_and_a_control_whole_at_scale(_scale: f32) {
-    let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-        unreachable!()
-    };
-    state.navigate(SettingsRoute::WindowTabs);
-    state.replace_title_summary_health(TitleSummaryHealth {
-        state: TitleSummaryRuntimeState::Builtin,
-        provider: crate::app_config::TitleSummaryProvider::Builtin,
-        model: None,
-        endpoint: None,
-        locality: TitleSummaryLocality::NotApplicable,
-        managed_install_present: false,
-        model_ready: true,
-        last_error: None,
-        next_retry_after: None,
-        next_refresh_after: Some(std::time::Duration::from_secs(15)),
-        timeout: None,
-        proxy_mode: None,
-        ca_file: None,
-    });
-
-    for (width, height) in [(568.0, 320.0), (320.0, 420.0), (320.0, 568.0)] {
-        let cx = view_cx_at(width, height);
-        let compiled = runtime
-            .render(instance, view, &cx)
-            .unwrap()
-            .compile(cx.viewport)
-            .unwrap();
-        compiled.validate_parity().unwrap();
-        let health = compiled
-            .semantic(&UiKey::new("settings/smart-titles/health"))
-            .expect("Smart Titles health remains visible");
-        let health_paint = compiled
-            .paint
-            .iter()
-            .find(|paint| paint.key == health.key)
-            .expect("Smart Titles health has authored paint geometry");
-        assert_eq!(
-            health_paint.rect, health.rect,
-            "{width}×{height} partially clips Smart Titles health"
-        );
-        assert!(
-            health.rect.bottom() <= height + 0.01,
-            "{width}×{height} clips Smart Titles health: {:?}",
-            health.rect
-        );
-        let controls = compiled
-            .semantics
-            .iter()
-            .filter(|node| node.key.as_str().starts_with("settings/control/"))
-            .collect::<Vec<_>>();
-        assert!(
-            !controls.is_empty(),
-            "{width}×{height} must retain a real Window & Tabs control"
-        );
-        for control in controls {
-            let paint = compiled
-                .paint
-                .iter()
-                .find(|paint| paint.key == control.key)
-                .unwrap_or_else(|| panic!("{} has paint geometry", control.key.as_str()));
-            let hit = compiled
-                .hits
-                .iter()
-                .find(|hit| hit.key == control.key)
-                .unwrap_or_else(|| panic!("{} has hit geometry", control.key.as_str()));
-            assert_eq!(
-                paint.rect,
-                control.rect,
-                "{width}×{height} partially clips {}",
-                control.key.as_str()
-            );
-            assert_eq!(
-                hit.rect,
-                control.rect,
-                "{width}×{height} hit geometry diverges for {}",
-                control.key.as_str()
-            );
-            assert!(
-                control.rect.bottom() <= height + 0.01,
-                "{width}×{height} clips {}: {:?}",
-                control.key.as_str(),
-                control.rect
-            );
-        }
-    }
-}
-
-/// Settings' own runtime health card, as the Window page carries it.
-fn window_page_health() -> TitleSummaryHealth {
-    TitleSummaryHealth {
-        state: TitleSummaryRuntimeState::Builtin,
-        provider: crate::app_config::TitleSummaryProvider::Builtin,
-        model: None,
-        endpoint: None,
-        locality: TitleSummaryLocality::NotApplicable,
-        managed_install_present: false,
-        model_ready: true,
-        last_error: None,
-        next_retry_after: None,
-        next_refresh_after: Some(std::time::Duration::from_secs(15)),
-        timeout: None,
-        proxy_mode: None,
-        ca_file: None,
-    }
-}
-
 /// Every pager status a Settings page prints, as `(key, total)`: the results
 /// window's `"1–2 of 3"` and the section pager's `"Page 1 of 3"`. Parsed
 /// strictly — a label only counts when both sides are numbers — so this
@@ -6118,299 +7038,40 @@ fn pager_totals(compiled: &crate::native_ui::CompiledUi) -> Vec<(String, usize)>
         .collect()
 }
 
-/// Paint, hit target and semantics describe the same rectangle, inside the
-/// window. A page may hold a row back; it may not promise one it clips.
-fn assert_whole(
-    compiled: &crate::native_ui::CompiledUi,
-    key: &str,
-    height: f32,
-    hit: bool,
-    context: &str,
-) {
-    let node = compiled
-        .semantic(&UiKey::new(key))
-        .unwrap_or_else(|| panic!("{context}: {key} is missing"));
-    let paint = compiled
-        .paint
-        .iter()
-        .find(|paint| paint.key == node.key)
-        .unwrap_or_else(|| panic!("{context}: {key} has no painted geometry"));
-    assert_eq!(
-        paint.rect, node.rect,
-        "{context}: {key} is partially clipped"
-    );
-    if hit {
-        let region = compiled
-            .hits
-            .iter()
-            .find(|region| region.key == node.key)
-            .unwrap_or_else(|| panic!("{context}: {key} has no hit target"));
-        assert_eq!(
-            region.rect, node.rect,
-            "{context}: {key} hit geometry diverges"
-        );
-    }
-    assert!(
-        node.rect.bottom() <= height + 0.01,
-        "{context}: {key} falls outside the window: {:?}",
-        node.rect
-    );
+/// ONE BOUND PER LIST. Every Settings page bounds the scroll reducer with
+/// the bound its own list measured — the least first stop whose screen
+/// reaches the list's last stop — so the wheel, Page Down and the assistive
+/// tree stop exactly at a full last screen, never past it and never short
+/// of the last stop; and no page draws a pager.
+#[test]
+fn every_settings_list_bounds_the_reducer_at_its_last_full_screen() {
+    at_each_text_scale(&[1.0, 1.25, 2.0], "Dynamic Type list-bound rung", |scale| {
+        list_bound_sweep(scale, false)
+    });
 }
 
-/// THE SHIPPED DEFAULT WINDOW. 80×24 is a 744×420 app viewport, a compact
-/// host under the Smart Titles floor: the truthful runtime card and ONE
-/// whole native control, with `page_scroll` bounded by the Window page's
-/// three settings. That bound is a promise about what the page is holding
-/// back, so the page owes the window's pager — the pointer and assistive-
-/// technology escape hatch the shed ladder below the floor is forbidden to
-/// remove. Without it "Window top padding (px)" and "Restore session at
-/// launch" existed only behind an unsignposted wheel gesture: no Prev/Next,
-/// no range, nothing in the semantic tree to reach them with, and 195 px of
-/// bare page under the one row that was drawn.
-///
-/// The floor may still drop the escape hatch where the body it has left
-/// cannot seat one; the second half pins that exception against the pager's
-/// OWN height rather than a guess.
+/// THE EXHAUSTIVE SWEEP: the same cells with EVERY first stop walked, up to
+/// the eighth, which the default run samples (its first, one middle screen,
+/// its last). Ignored for its cost (about twice the default's CPU); run it
+/// when a Settings list's measure changes:
+/// `targo --unverified test -p aterm-gui --lib -- --ignored every_settings_list_bounds`.
 #[test]
-fn the_default_window_page_pages_the_settings_its_count_promises() {
+#[ignore = "every screen of every cell (~2x the default's CPU); the default run takes each cell's first, one middle and last screen"]
+fn every_settings_list_bounds_the_reducer_at_its_last_full_screen_on_every_scroll_page() {
+    at_each_text_scale(&[1.0, 1.25, 2.0], "Dynamic Type list-bound rung", |scale| {
+        list_bound_sweep(scale, true)
+    });
+}
+
+/// One Dynamic Type rung of the list-bound sweep: every route (and three
+/// global searches) at every viewport of the grid, each cell's recorded
+/// bound read against its own list. With `every_page` every first stop of a
+/// cell is rendered (up to the eighth); without, the FIRST, the LAST — the
+/// reducer's own bound — and ONE MIDDLE screen, which ROTATES across the
+/// cells (`1 + cell mod (limit - 1)`), so the grid reaches each middle
+/// screen there is, not one fixed screen a defect could step around.
+fn list_bound_sweep(scale: f32, every_page: bool) {
     let (mut runtime, instance, view) = setup();
-    {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-            unreachable!()
-        };
-        state.navigate(SettingsRoute::WindowTabs);
-        state.replace_title_summary_health(window_page_health());
-    }
-    let cx = view_cx_at(744.0, 420.0);
-    let compiled = compile_settings_view(&runtime, instance, view, &cx);
-    compiled.validate_parity().unwrap();
-    let context = "the default 744×420 Window page";
-    assert_eq!(
-        pager_totals(&compiled),
-        vec![("settings/results-range".to_string(), 3)],
-        "{context} must report the window its page-scroll bound promises"
-    );
-    assert_eq!(
-        compiled
-            .semantic(&UiKey::new("settings/results-range"))
-            .unwrap()
-            .label,
-        "1–1 of 3"
-    );
-    assert_whole(
-        &compiled,
-        "settings/smart-titles/health",
-        420.0,
-        false,
-        context,
-    );
-    assert_whole(
-        &compiled,
-        "settings/results-window/next",
-        420.0,
-        true,
-        context,
-    );
-    assert_whole(
-        &compiled,
-        "settings/control/window_padding",
-        420.0,
-        true,
-        context,
-    );
-    assert!(
-        compiled
-            .semantic(&UiKey::new("settings/results-window/next"))
-            .unwrap()
-            .state
-            .unwrap()
-            .enabled,
-        "{context}: Next reaches the settings this page holds back"
-    );
-
-    // The pager's own action, through the reducer the wheel and PageDown
-    // share: the bound it reads is the count the page recorded.
-    let mut reached = vec!["settings/control/window_padding".to_string()];
-    for (page, key) in [
-        (2, "settings/control/window_padding_top"),
-        (3, "settings/control/restore_session"),
-    ] {
-        runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: ActionId::new("settings/page-down"),
-                    value: None,
-                }),
-            )
-            .unwrap();
-        let compiled = compile_settings_view(&runtime, instance, view, &cx);
-        compiled.validate_parity().unwrap();
-        assert_eq!(
-            compiled
-                .semantic(&UiKey::new("settings/results-range"))
-                .unwrap()
-                .label,
-            format!("{page}–{page} of 3"),
-            "{context}: Next page {page}"
-        );
-        assert_whole(&compiled, key, 420.0, true, context);
-        assert_whole(
-            &compiled,
-            "settings/smart-titles/health",
-            420.0,
-            false,
-            context,
-        );
-        reached.push(key.to_string());
-    }
-    assert_eq!(
-        reached,
-        vec![
-            "settings/control/window_padding".to_string(),
-            "settings/control/window_padding_top".to_string(),
-            "settings/control/restore_session".to_string(),
-        ],
-        "every Window setting has a page of its own"
-    );
-
-    // THE EXCEPTION, MEASURED. A 744×240 host seats the card and one whole
-    // control with 36 px to spare — less than the pager's own 44 px and the
-    // page gap it would need. The floor keeps both pinned pieces and stays
-    // silent, and this is the only licence it has to.
-    {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-            unreachable!()
-        };
-        state.page_scroll = 0;
-    }
-    let cx = view_cx_at(744.0, 240.0);
-    let compiled = compile_settings_view(&runtime, instance, view, &cx);
-    compiled.validate_parity().unwrap();
-    let context = "the 744×240 Window floor";
-    assert_whole(
-        &compiled,
-        "settings/smart-titles/health",
-        240.0,
-        false,
-        context,
-    );
-    assert_whole(
-        &compiled,
-        "settings/control/window_padding",
-        240.0,
-        true,
-        context,
-    );
-    assert!(
-        pager_totals(&compiled).is_empty(),
-        "{context} has no room for a pager: {:?}",
-        pager_totals(&compiled)
-    );
-    let page = compiled
-        .semantic(&UiKey::new("settings/page/window-tabs"))
-        .expect("the Window page");
-    let lowest = compiled
-        .paint
-        .iter()
-        .filter(|paint| paint.key != page.key && page.rect.contains(paint.rect.x, paint.rect.y))
-        .map(|paint| paint.rect.bottom())
-        .fold(page.rect.y, f32::max);
-    let free = page.rect.bottom() - lowest;
-    assert!(
-        free < page_navigation_height()
-            + settings_page_gap(
-                {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
-                        unreachable!()
-                    };
-                    state
-                },
-                SettingsWidth::Compact,
-                cx.viewport,
-            ),
-        "{context} dropped the escape hatch with {free} px of body left"
-    );
-}
-
-/// ONE COUNT PER PAGE. A Settings page bounds the page-scroll reducer with
-/// the number of slices IT indexes, and prints that same number in its
-/// pager — so Prev/Next, the wheel, PageDown and the assistive tree can
-/// never disagree with the label about how many results exist. Three
-/// renderers used to read one speculative count computed by their caller:
-/// a portrait fit test decided the slice count for the side-by-side
-/// landscape page, which indexes its renderer demonstration as a slice of
-/// its own, and every short-landscape search page stopped one result short
-/// of the total it printed ("7–7 of 8", with result 8 on no page at all).
-///
-/// The sweep is route-independent and reads the printed label, not the
-/// arithmetic, so it cannot re-derive the bug it is checking for.
-#[test]
-fn every_settings_page_bounds_the_reducer_with_the_count_its_pager_reports() {
-    at_each_text_scale(
-        &[1.0, 1.25, 2.0],
-        "Dynamic Type pager-count rung",
-        |scale| pager_count_sweep(scale, false),
-    );
-}
-
-/// THE EXHAUSTIVE SWEEP: the same cells with EVERY scroll page walked, up to
-/// the eighth (the sweep's reach before it was sampled; the default's last
-/// page goes deeper in a cell with more), which the default run samples
-/// (its first, one middle page, its last). Ignored
-/// for its cost — about twice the default's CPU (4,771 renders against
-/// 2,506 at 1.0×, measured 2026-10-01); it is also the check of
-/// the assumption the sample leans on (that a cell's bound and printed
-/// totals do not differ between its pages, [`pager_count_sweep`]). Run it
-/// when a Settings renderer's slice count or a pager's label changes:
-/// `targo --unverified test -p aterm-gui --lib -- --ignored every_settings_page_bounds`.
-#[test]
-#[ignore = "every scroll page of every cell (~2x the default's CPU); the default run takes each cell's first, one middle and last page"]
-fn every_settings_page_bounds_the_reducer_with_the_count_its_pager_reports_on_every_scroll_page() {
-    at_each_text_scale(
-        &[1.0, 1.25, 2.0],
-        "Dynamic Type pager-count rung",
-        |scale| pager_count_sweep(scale, true),
-    );
-}
-
-/// One Dynamic Type rung of the pager-count sweep: every route (and three
-/// global searches) at every viewport of the grid, each cell's pagers read
-/// against the bound the reducer recorded. With `every_page` every scroll
-/// page of a cell is rendered (up to the eighth); without, the FIRST, the
-/// LAST — the reducer's own bound, where "7–7 of 8" sat — and ONE MIDDLE
-/// page, which ROTATES across the cells (`1 + cell mod (limit - 1)`, so the
-/// grid's cells between them reach each middle page there is, not one fixed
-/// page that a defect could step around).
-///
-/// A cell records its bound on every render and the sample leans on that:
-/// measured 2026-09-30 over the 14,650 renders of the 3,240 cells, a cell's
-/// limit never differs from one page to the next, nor do its printed
-/// totals — except that in 168 of them (Terminal, Keyboard & Input, Window
-/// & Tabs, the "padding" search and others) page 0 draws a card and no
-/// pager at all, which the later pages, the last included, always do. That
-/// is an ASSUMPTION the sample cannot see a violation of on the pages it
-/// skips; the every-page test is the check of it.
-///
-/// Each defect the sample guards turns it red, measured by putting it into
-/// production (temporary hooks, not committed): 2026-09-30, the bound
-/// recorded one too high by each of the eight renderers that record one
-/// (landscape, compact-floor and portrait field pages, About, Update, both
-/// Packages pages, Top) and a total printed one too high by each of the
-/// three pager formats; 2026-10-01, a bound one too high on ONE middle page
-/// only, for each of pages 1 to 14 (the deepest a cell goes). A sample of
-/// the first and last page alone cannot see one: the rotation puts each
-/// middle page in front of at least two cells (page 14) and mostly many
-/// more (page 3: 56).
-fn pager_count_sweep(scale: f32, every_page: bool) {
-    let (mut runtime, instance, view) = setup();
-    {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-            unreachable!()
-        };
-        state.replace_title_summary_health(window_page_health());
-    }
     // Every width class, both sides of the compact/persistent-navigation
     // boundary, and heights from the window minimum (164×98,
     // `app_window.rs`) through the short-landscape band, the shipped
@@ -6457,17 +7118,22 @@ fn pager_count_sweep(scale: f32, every_page: bool) {
                             unreachable!()
                         };
                         let limit = state.result_page_limit.get();
-                        for (key, total) in pager_totals(&compiled) {
-                            assert_eq!(
-                                limit,
-                                Some(total.saturating_sub(1)),
-                                "{scale}× {} {width}×{height} page {page}: {key} names \
-                                 {total} results while the reducer stops at {limit:?}",
+                        assert!(pager_totals(&compiled).is_empty(), "no page has a pager");
+                        if let Some(plan) = state.scroll_plan() {
+                            let context = format!(
+                                "{scale}× {} {width}×{height} screen {page}",
                                 if query.is_empty() {
                                     route.path()
                                 } else {
                                     "search"
                                 }
+                            );
+                            assert_eq!(limit, Some(plan.limit()), "{context}: one bound");
+                            let last = plan.limit();
+                            assert_eq!(plan.view(last).end, plan.len(), "{context}");
+                            assert!(
+                                last == 0 || plan.view(last - 1).end < plan.len(),
+                                "{context}: the last screen is full"
                             );
                         }
                         match limit {
@@ -6505,9 +7171,9 @@ fn apply_real_config_patch(
             .iter()
             .map(|edit| ConfigKeyEdit {
                 key: edit.key.clone(),
-                expected: match &edit.expected {
-                    ExpectedConfigValue::Any => ExpectedValue::Any,
-                    ExpectedConfigValue::Exact(value) => ExpectedValue::Exact(value.clone()),
+                expected: {
+                    let ExpectedConfigValue::Exact(value) = &edit.expected;
+                    ExpectedValue::Exact(value.clone())
                 },
                 value: edit.value.clone(),
             })
@@ -6684,7 +7350,6 @@ fn unrelated_two_view_publication_preserves_visible_blurred_draft_across_routes(
             index,
             field,
             false,
-            false,
             SettingsWidth::Wide,
         )]),
     )
@@ -6708,7 +7373,7 @@ fn unrelated_two_view_publication_preserves_visible_blurred_draft_across_routes(
             )))
             .unwrap()
             .label
-            .contains("Unsaved Draft")
+            .contains("Unsaved draft")
     );
     let presentation = runtime.presentation(instance, first).unwrap();
     assert!(presentation.indicators.dirty);
@@ -7049,10 +7714,15 @@ fn real_settings_draft_close_lifecycle_conforms_to_derived_model() {
             .unwrap()
             .compile(cx.viewport)
             .unwrap();
+        // Recovery is a way back to the draft (Review, or Cancel while the
+        // discard asks to confirm) beside Discard.
         let recovery_visible = i64::from(
-            compiled
+            (compiled
                 .semantic(&UiKey::new("settings/drafts/review"))
                 .is_some()
+                || compiled
+                    .semantic(&UiKey::new("settings/drafts/discard-cancel"))
+                    .is_some())
                 && compiled
                     .semantic(&UiKey::new("settings/drafts/discard-all"))
                     .is_some(),
@@ -7286,9 +7956,12 @@ fn route_activation_keeps_focus_on_a_surviving_visible_control() {
     let sheet = compile_settings_view(&runtime, instance, view, &compact_cx);
     let sheet_close_key = UiKey::new("settings/compact-navigation-close");
     assert!(sheet.focus_order.contains(&sheet_close_key));
+    // The sheet opens with the keyboard on the page it came from, where the
+    // grid's arrow keys work at once.
+    let sheet_current_key = UiKey::new("settings/categories/appearance");
     assert!(
         sheet
-            .semantic(&sheet_close_key)
+            .semantic(&sheet_current_key)
             .and_then(|node| node.state)
             .is_some_and(|state| state.focused && state.focus_visible)
     );
@@ -7383,7 +8056,8 @@ fn cmd_z_falls_back_to_last_config_patch_when_no_text_field_owns_undo() {
     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
         panic!("Settings view");
     };
-    state.last_undo = Some(41);
+    state.feedback = Some("Color theme set to Nord".to_string());
+    state.last_undo = Some(UndoOffer::showing(41, "Color theme set to Nord"));
     state.common.last_focus = Some(UiKey::new("settings/page/appearance"));
 
     let outcome = runtime
@@ -7544,7 +8218,7 @@ fn pointer_activation_opens_choice_surface_then_selection_patches() {
             instance,
             view,
             AppEvent::Action(ActionInvocation {
-                id: ActionId::new(format!("settings/set/{}", crate::prefs::EDIT_CURSOR_STYLE)),
+                id: ActionId::new(format!("settings/set/{}", prefs::EDIT_MOTION)),
                 value: None,
             }),
         )
@@ -7559,22 +8233,22 @@ fn pointer_activation_opens_choice_surface_then_selection_patches() {
     let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
         panic!("Settings view");
     };
-    assert_eq!(
-        state
-            .choice_picker
-            .as_ref()
-            .map(|picker| picker.key.as_str()),
-        Some(crate::prefs::EDIT_CURSOR_STYLE)
-    );
+    let picker = state
+        .choice_picker
+        .as_ref()
+        .expect("a choice too wide for segments opens the picker");
+    assert_eq!(picker.key, prefs::EDIT_MOTION);
+    let index = picker
+        .options
+        .iter()
+        .position(|option| option.value.is_some())
+        .expect("an option other than the default");
     let outcome = runtime
         .dispatch(
             instance,
             view,
             AppEvent::Action(ActionInvocation {
-                id: ActionId::new(format!(
-                    "settings/choice/{}/1",
-                    crate::prefs::EDIT_CURSOR_STYLE
-                )),
+                id: ActionId::new(format!("settings/choice/{}/{index}", prefs::EDIT_MOTION)),
                 value: None,
             }),
         )
@@ -7584,15 +8258,14 @@ fn pointer_activation_opens_choice_surface_then_selection_patches() {
         _ => None,
     });
     let edit = edit.expect("choice activation emits a durable patch");
-    assert_eq!(edit.key, crate::prefs::EDIT_CURSOR_STYLE);
+    assert_eq!(edit.key, prefs::EDIT_MOTION);
     assert!(
         edit.value
             .as_deref()
-            .is_some_and(|value| crate::prefs::CURSOR_STYLES.contains(&value))
+            .is_some_and(|value| prefs::MOTION_MODES.contains(&value))
     );
-    let ExpectedConfigValue::Exact(expected) = &edit.expected else {
-        panic!("choice edit carries the UI-observed value");
-    };
+    // The choice edit carries the UI-observed value.
+    let ExpectedConfigValue::Exact(expected) = &edit.expected;
     assert_ne!(&edit.value, expected);
 }
 
@@ -7606,7 +8279,7 @@ fn choice_fields_use_a_native_chevron_without_polluting_the_label() {
         seed: Some("Nord".to_string()),
         placeholder: "Nord".to_string(),
     };
-    let row = setting_row(&state, 0, &field, false, false, SettingsWidth::Wide);
+    let row = setting_row(&state, 0, &field, false, SettingsWidth::Wide);
     let UiContent::Button(control) = &row.children[1].content else {
         panic!("theme choice is a button control");
     };
@@ -7615,6 +8288,167 @@ fn choice_fields_use_a_native_chevron_without_polluting_the_label() {
     assert_eq!(control.spec.visual_label.as_deref(), Some("Nord"));
     assert_eq!(control.spec.trailing_icon, Some(ButtonIcon::ChevronDown));
     assert!(!control.spec.visual_label.as_deref().unwrap().ends_with('v'));
+}
+
+/// A Follow-system pair reads on the theme control as the theme each side
+/// draws, for eyes and for assistive technology alike, never as its raw
+/// `dark:…,light:…` text.
+#[test]
+fn a_theme_pair_reads_as_its_two_themes_on_the_control() {
+    let state = SettingsViewState::new(&Config::default());
+    let control = |seed: &str| {
+        let field = EditField {
+            label: "Theme",
+            key: prefs::EDIT_THEME,
+            kind: EditKind::Theme,
+            seed: Some(seed.to_string()),
+            placeholder: seed.to_string(),
+        };
+        let row = setting_row(&state, 0, &field, false, SettingsWidth::Wide);
+        let UiContent::Button(control) = &row.children[1].content else {
+            panic!("theme choice is a button control");
+        };
+        control.clone()
+    };
+    let mut fitted = Vec::new();
+    for (seed, dark, light) in [
+        (
+            "dark:Aterm Night,light:Aterm Day",
+            "Aterm Night",
+            "Aterm Day",
+        ),
+        // A side the value leaves out reads as the runtime draws it.
+        ("dark:Aterm Night", "Aterm Night", "Aterm Day"),
+        (
+            "dark:Harbor Dusk,light:Default Light",
+            "Harbor Dusk",
+            "Default Light",
+        ),
+        // Short enough to show whole.
+        ("dark:Nord,light:Day", "Nord", "Day"),
+    ] {
+        let control = control(seed);
+        let visual = control.spec.visual_label.clone().expect("visual label");
+        for shown in [visual.as_str(), control.spec.label.as_str()] {
+            assert!(
+                !shown.contains("dark:") && !shown.contains("light:"),
+                "{shown}"
+            );
+            let at = |name: &str| {
+                shown
+                    .find(name)
+                    .unwrap_or_else(|| panic!("{name} in {shown}"))
+            };
+            assert!(at(dark) < at(light), "dark first: {shown}");
+        }
+        // The accessible label says the whole of it; the painted one drops
+        // only the "follows system" tail, and only when the whole of it does
+        // not fit the control.
+        let full = prefs::theme_pair_label(seed).expect("a pair");
+        let short = prefs::theme_pair_short_label(seed).expect("a pair");
+        assert!(
+            control.spec.label.ends_with(&full),
+            "{}",
+            control.spec.label
+        );
+        let room = regular_choice_control_width() - 52.0;
+        let fits = crate::native_ui::native_button_label_width(&full) <= room;
+        fitted.push(fits);
+        assert_eq!(visual, if fits { full.clone() } else { short }, "{seed}");
+        // The control's value is the words it shows, never the config token.
+        assert_eq!(control.value, SemanticValue::Text(full.clone()));
+    }
+    assert!(
+        fitted.contains(&true) && fitted.contains(&false),
+        "both the whole and the shortened label are exercised: {fitted:?}"
+    );
+    // Negative control: a plain name is not a pair and reads as itself.
+    assert_eq!(prefs::theme_pair_label("Aterm Night"), None);
+    assert_eq!(prefs::theme_pair_short_label("Aterm Night"), None);
+    assert_eq!(
+        control("Aterm Night").spec.visual_label.as_deref(),
+        Some("Aterm Night")
+    );
+    // A split that draws one theme on both sides does not change with the OS,
+    // so it reads as that one name, painted and spoken alike.
+    let same = "dark:Aterm Day,light:Aterm Day";
+    assert_eq!(prefs::theme_pair_label(same).as_deref(), Some("Aterm Day"));
+    assert_eq!(
+        prefs::theme_pair_short_label(same).as_deref(),
+        Some("Aterm Day")
+    );
+    let control = control(same);
+    assert_eq!(control.spec.visual_label.as_deref(), Some("Aterm Day"));
+    assert_eq!(control.value, SemanticValue::Text("Aterm Day".to_string()));
+}
+
+/// A pick while `theme` is unset (which follows the OS) is made on the shown
+/// side's slot, so it writes a pair that keeps following the OS with only
+/// that side changed; over a plain name it writes the plain name.
+#[test]
+fn a_theme_picked_over_an_unset_theme_keeps_following_the_os() {
+    let pick = |source: &str| {
+        let service = VersionedConfigService::new(source.to_string()).unwrap();
+        let (mut runtime, instance, view) = setup();
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            panic!("Settings view");
+        };
+        **state = SettingsViewState::from_snapshot(&service.snapshot()).expect("snapshot");
+        state.theme_preview_side = Some(aterm_types::Appearance::Light);
+        let action = |id: String| {
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(id),
+                value: None,
+            })
+        };
+        runtime
+            .dispatch(
+                instance,
+                view,
+                action(format!("settings/set/{}", prefs::EDIT_THEME)),
+            )
+            .unwrap();
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            panic!("Settings view");
+        };
+        let picker = state.choice_picker.as_ref().expect("theme picker");
+        // An unset theme follows the system, so its row is the shown side's
+        // slot; a plain name has the whole-theme picker.
+        assert_eq!(
+            picker.slot,
+            source.is_empty().then_some(aterm_types::Appearance::Light),
+            "{source:?}: the picker for this theme"
+        );
+        let index = picker
+            .options
+            .iter()
+            .position(|option| option.value.as_deref() == Some("Aterm Day"))
+            .expect("Aterm Day row");
+        let saved = runtime
+            .dispatch(
+                instance,
+                view,
+                action(format!("settings/choice/{}/{index}", prefs::EDIT_THEME)),
+            )
+            .unwrap();
+        saved
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                AppEffect::ConfigPatch { patch, .. } => patch.edits.first().cloned(),
+                _ => None,
+            })
+            .and_then(|edit| edit.value)
+            .expect("one theme write")
+    };
+    let written = pick("");
+    assert_eq!(written, "dark:Default,light:Aterm Day");
+    assert_eq!(
+        prefs::theme_mode(Some(&written)),
+        prefs::ThemeMode::FollowSystem
+    );
+    // Negative control: over a plain name the pick is the plain name.
+    assert_eq!(pick("theme = \"Dracula\"\n"), "Aterm Day");
 }
 
 #[test]
@@ -7649,7 +8483,38 @@ fn explicit_choice_offers_the_true_default_and_opens_on_current_value() {
         panic!("Settings view");
     };
     let picker = state.choice_picker.as_ref().expect("theme picker");
-    assert_eq!(picker.options[0].label, "Use default  ·  Default");
+    // ONE reset, the Follow system row: choosing it removes the override
+    // (SEL-18), so an unset theme follows the OS. The Default row writes
+    // `theme = "Default"`, which stays dark on a light OS, so it is not the
+    // reset, and no generic "Use default" row sits beside them.
+    assert_eq!(
+        picker.options[0].theme.as_ref().map(|theme| theme.section),
+        Some(ThemeSection::System)
+    );
+    assert_eq!(picker.options[0].value, None, "Follow system is the reset");
+    let resets = picker
+        .options
+        .iter()
+        .filter(|option| option.value.is_none() && option.disabled_reason().is_none())
+        .count();
+    assert_eq!(resets, 1, "a single reset row");
+    assert!(
+        !picker
+            .options
+            .iter()
+            .any(|option| option.label.starts_with("Use default"))
+    );
+    let default_row = picker
+        .options
+        .iter()
+        .find(|option| {
+            option
+                .theme
+                .as_ref()
+                .is_some_and(|theme| theme.id.eq_ignore_ascii_case("Default"))
+        })
+        .expect("a Default row");
+    assert_eq!(default_row.value.as_deref(), Some("Default"));
     assert_eq!(picker_candidate(state, prefs::EDIT_THEME), Some("Nord"));
     let expected_focus = format!("settings/choice/{}/{}", prefs::EDIT_THEME, picker.selected);
     assert_eq!(
@@ -7683,7 +8548,6 @@ fn raw_present_empty_choice_selects_reset_instead_of_materializing_a_placeholder
             true,
             false,
             &effective_default_for_field(key),
-            &state.assets.themes,
         );
         assert_eq!(picker.selected, 0, "{key}: reset row is selected");
         assert_eq!(
@@ -7693,44 +8557,27 @@ fn raw_present_empty_choice_selects_reset_instead_of_materializing_a_placeholder
     }
 }
 
+/// The effects switch alone authors the style the list checks: an old
+/// `cursor_trail = false` is Off, `true` the default, and an empty style the
+/// default too.
 #[test]
-fn legacy_trail_master_is_authored_picker_state_but_empty_style_alone_is_reset() {
-    for (text, expected) in [
-        ("cursor_trail = false\n", Some("off")),
-        // The master alone authors the DEFAULT style — read from the single
-        // definition, so flipping the shipped companion cannot leave this
-        // pinning a dead spelling.
+fn legacy_trail_master_and_empty_style_read_as_the_saved_cursor_style() {
+    for (text, saved) in [
+        ("cursor_trail = false\n", "off"),
+        ("cursor_trail = true\n", prefs::DEFAULT_CURSOR_TRAIL_STYLE),
         (
-            "cursor_trail = true\n",
-            Some(prefs::DEFAULT_CURSOR_TRAIL_STYLE),
+            "cursor_trail_style = \"\"\n",
+            prefs::DEFAULT_CURSOR_TRAIL_STYLE,
         ),
-        ("cursor_trail_style = \"\"\n", None),
+        (
+            "cursor_trail = false\ncursor_trail_style = \"fire\"\n",
+            "off",
+        ),
+        ("cursor_trail_style = \"nyan\"\n", "rainbow kitty flying"),
     ] {
         let service = VersionedConfigService::new(text.to_string()).unwrap();
         let state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
-        let field = state
-            .legacy
-            .fields
-            .iter()
-            .find(|field| field.key == prefs::EDIT_CURSOR_TRAIL_STYLE)
-            .expect("trail style field");
-        let current_is_authored =
-            field.seed.is_some() || state.raw_values.contains_key(prefs::EDIT_CURSOR_TRAIL);
-        let picker = ChoicePicker::new(
-            prefs::EDIT_CURSOR_TRAIL_STYLE,
-            choices_for_field(field, &state.legacy.trail_pack_ids, &state.assets.themes)
-                .expect("trail choices"),
-            &top_authored_trail_value(&state),
-            state.is_explicit(prefs::EDIT_CURSOR_TRAIL_STYLE),
-            current_is_authored,
-            &effective_default_for_field(prefs::EDIT_CURSOR_TRAIL_STYLE),
-            &state.assets.themes,
-        );
-        assert_eq!(
-            picker.options[picker.selected].value.as_deref(),
-            expected,
-            "{text:?}",
-        );
+        assert_eq!(saved_cursor_style(&state), saved, "{text:?}");
     }
 }
 
@@ -7802,8 +8649,8 @@ fn dynamic_theme_ending_in_default_opens_highlights_previews_and_saves_exactly()
     assert_eq!(picker.options[picker.selected].value.as_deref(), Some(name));
     assert_eq!(picker_candidate(state, prefs::EDIT_THEME), Some(name));
     assert_eq!(
-        picker.options[picker.selected].terminal_theme,
-        Some(PreviewTerminalTheme::from_scheme(&scheme)),
+        preview_terminal_theme(state, true),
+        PreviewTerminalTheme::from_scheme(&scheme),
     );
     let selected = picker.selected;
 
@@ -7828,198 +8675,2130 @@ fn dynamic_theme_ending_in_default_opens_highlights_previews_and_saves_exactly()
     );
 }
 
-/// THE CURSOR KITTY PAGE IS ITS SHOWCASE CARD. Retiring the wake dial left
-/// the page with no ordinary registry row at all, and that is correct: the
-/// companion picker is the reason the page exists (`cursor_kitty_card`),
-/// and the only other key filed here — `cursor_nyan_sprite` — is a
-/// filesystem-backed asset source Manual owns. This pins the shape so the
-/// page can never quietly become empty: the section holds exactly those two
-/// keys, neither paints an ordinary row, and the card paints.
-///
-/// AND THE CARD IS WIRED, NOT DECORATIVE (owner ask, 2026-08-10: "fix the
-/// settings and add a page for this"). `cursor_trail_style` is a TOP SETTING,
-/// so `settings_field_is_visible` keeps every ordinary category page from
-/// drawing it — which is exactly why this page owns the row through its
-/// showcase card. The tail proves the SAVE rather than the pixels: activating
-/// the card's control emits the same one atomic `ConfigPatch` the Top Settings
-/// trail card does, carrying the style AND the `cursor_trail` master, so a
-/// chosen cat can never land behind an off switch. A test that only asserted
-/// the row renders would pass for a control wired to nothing — the defect
-/// commit 9adbc571 was written to end.
-#[test]
-fn the_cursor_kitty_page_is_its_showcase_card() {
-    let filed = prefs::VISUAL_PREVIEW_KEYS
-        .iter()
-        .copied()
-        .filter(|key| prefs::section_of(key) == prefs::Section::CursorKitty)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        filed,
-        vec![
-            prefs::EDIT_CURSOR_TRAIL_STYLE,
-            prefs::EDIT_CURSOR_NYAN_SPRITE
-        ],
-        "the cat's page holds the companion picker and the kitty art, and nothing else"
-    );
-    assert_eq!(
-        SettingsRoute::CursorKitty.section(),
-        Some(prefs::Section::CursorKitty),
-        "the route and the section must agree or the page paints empty"
-    );
-    for key in filed {
-        assert!(
-            !settings_field_is_visible(key, false, false),
-            "{key} paints no ordinary row: the card owns this page"
-        );
-    }
-
+/// Settings with `toml` saved, on the Cursor Styles page.
+fn cursor_styles_runtime(
+    toml: &str,
+) -> (
+    NativeRuntime,
+    crate::native_app::AppInstanceId,
+    crate::native_app::ViewId,
+) {
+    let service = VersionedConfigService::new(toml.to_string()).unwrap();
     let (mut runtime, instance, view) = setup();
     {
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
             unreachable!();
         };
-        state.navigate(SettingsRoute::CursorKitty);
+        **state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
     }
-    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_024.0, 768.0));
-    assert!(
-        compiled
-            .semantic(&UiKey::new(format!(
-                "settings/control/{}",
-                prefs::EDIT_CURSOR_TRAIL_STYLE
-            )))
-            .is_some(),
-        "the companion picker is what makes this page non-empty"
-    );
-
-    let outcome = runtime
+    runtime
         .dispatch(
             instance,
             view,
             AppEvent::Action(ActionInvocation {
-                id: ActionId::new(format!("settings/set/{}", prefs::EDIT_CURSOR_TRAIL_STYLE)),
-                value: Some(SemanticInput::Text(
-                    prefs::DEFAULT_CURSOR_TRAIL_STYLE.to_string(),
-                )),
+                id: route_action(SettingsRoute::CursorStyles),
+                value: None,
             }),
         )
         .unwrap();
-    let patch = emitted_config_patch(&outcome);
-    let written = |key: &str| -> Option<String> {
-        patch
-            .edits
-            .iter()
-            .find(|edit| edit.key == key)
-            .unwrap_or_else(|| panic!("{key} is missing from the Cursor Kitty page's patch"))
-            .value
-            .clone()
+    (runtime, instance, view)
+}
+
+fn config_patches(outcome: &crate::native_app::DispatchOutcome) -> Vec<ConfigPatch> {
+    outcome
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            AppEffect::ConfigPatch { patch, .. } => Some(patch.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// THE CURSOR STYLES LIST (owner ask: "a page with a list of the working
+/// ones where selecting each one shows a preview in the working theme").
+/// Every listed style is a row of the page's one list. Pointing at a row or
+/// moving the keyboard to it changes only the preview — no write, and the
+/// check stays on the saved style. Choosing one sends one patch, and the
+/// list stays where it was.
+#[test]
+fn cursor_style_rows_preview_unsaved_and_save_in_one_patch() {
+    let (mut runtime, instance, view) = cursor_styles_runtime("");
+    let cx = view_cx_at(1_024.0, 768.0);
+    compile_settings_view(&runtime, instance, view, &cx);
+    let preview_style = |runtime: &NativeRuntime| {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        renderer_preview_spec(
+            state,
+            100,
+            crate::native_app::ViewMotionCx::default(),
+            13.0,
+            1.0,
+        )
+        .unwrap()
+        .cursor
+        .trail_style
     };
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        let plan = state.scroll_plan().expect("the page is one list");
+        let listed = listed_cursor_styles(state);
+        for style in &listed {
+            let key = UiKey::new(cursor_style_row_key(&style.value));
+            assert!(plan.stop_of(&key).is_some(), "{} is a row", style.name);
+            assert_eq!(
+                cursor_style_for_row(state, key.as_str()),
+                Some(style.value.clone())
+            );
+        }
+        assert_eq!(
+            listed.first().map(|style| style.value.as_str()),
+            Some("off"),
+            "Off opens the list"
+        );
+        assert_eq!(saved_cursor_style(state), prefs::DEFAULT_CURSOR_TRAIL_STYLE);
+    }
     assert_eq!(
-        written(prefs::EDIT_CURSOR_TRAIL_STYLE).as_deref(),
-        Some(prefs::DEFAULT_CURSOR_TRAIL_STYLE),
-        "the chosen companion is what gets written"
+        preview_style(&runtime),
+        PreviewTrailStyle::from_resolution(
+            prefs::DEFAULT_CURSOR_TRAIL_STYLE,
+            crate::app_config::resolve_trail_style(
+                prefs::DEFAULT_CURSOR_TRAIL_STYLE,
+                &crate::app_config::TrailPackCatalog::default(),
+            ),
+        )
     );
+
+    // The keyboard on a row previews it, and writes nothing.
+    let comet = UiKey::new(cursor_style_row_key("comet"));
+    let focused = runtime
+        .dispatch(instance, view, AppEvent::FocusChanged(Some(comet.clone())))
+        .unwrap();
+    assert!(
+        config_patches(&focused).is_empty(),
+        "trying a style writes nothing"
+    );
+    assert_eq!(preview_style(&runtime), PreviewTrailStyle::Comet);
+    // The pointer over another row wins over the keyboard, and writes nothing.
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.common.hovered = Some(UiKey::new(cursor_style_row_key("fire")));
+    }
+    assert_eq!(preview_style(&runtime), PreviewTrailStyle::Fire);
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    let selected = |key: &str| {
+        compiled
+            .semantic(&UiKey::new(key))
+            .and_then(|node| node.state)
+            .is_some_and(|state| state.selected)
+    };
+    let comet_row = cursor_style_row_key("comet");
+    assert!(
+        compiled.semantic(&UiKey::new(comet_row.as_str())).is_some(),
+        "the keyboard's row is on glass"
+    );
+    assert!(
+        !selected(&comet_row),
+        "the check stays on the saved style while others are tried"
+    );
+    // A screen reader hears one selectable row: its name, then what it draws.
+    let comet = compiled.semantic(&UiKey::new(comet_row.as_str())).unwrap();
+    assert_eq!(comet.role, SemanticRole::Button);
+    assert_eq!(comet.label, "Comet");
+    assert!(
+        comet
+            .description
+            .as_deref()
+            .is_some_and(|text| text.contains("comet"))
+    );
+    for part in ["name", "description"] {
+        assert!(
+            compiled
+                .semantic(&UiKey::new(format!("{comet_row}/{part}")))
+                .is_none(),
+            "the painted {part} is not a second stop"
+        );
+    }
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        assert_eq!(saved_cursor_style(state), prefs::DEFAULT_CURSOR_TRAIL_STYLE);
+    }
+    // Off the list, the preview is the saved style again.
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.common.hovered = None;
+        state.common.last_focus = None;
+    }
+    assert_ne!(preview_style(&runtime), PreviewTrailStyle::Comet);
+
+    // Choosing a row lower in the list: one patch, the list stays put.
+    for _ in 0..8 {
+        runtime
+            .dispatch(instance, view, AppEvent::StepFocus(1))
+            .unwrap();
+        compile_settings_view(&runtime, instance, view, &cx);
+    }
+    // Where the last render put the list: the first stop it showed.
+    let first_shown = |runtime: &NativeRuntime| {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        state.scroll_shown().expect("the page is one list").1.start
+    };
+    let row = {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        let row = state
+            .common
+            .last_focus
+            .clone()
+            .expect("the keyboard is in the list");
+        assert!(
+            row.as_str().starts_with("settings/cursor-style/"),
+            "{row:?}"
+        );
+        row
+    };
+    let scroll_before = first_shown(&runtime);
+    let chosen = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(row.as_str()),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let patches = config_patches(&chosen);
+    assert_eq!(patches.len(), 1, "one choice, one patch");
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!();
+    };
+    let style = cursor_style_for_row(state, row.as_str()).unwrap();
     assert_eq!(
-        written(prefs::EDIT_CURSOR_TRAIL).as_deref(),
-        Some("true"),
-        "choosing a cat arms the trail master in the SAME patch"
+        patches[0].edits[0].key,
+        prefs::EDIT_CURSOR_TRAIL_STYLE,
+        "the style is the patch's first edit"
+    );
+    assert_eq!(patches[0].edits[0].value.as_deref(), Some(style.as_str()));
+    assert_eq!(
+        state.route,
+        SettingsRoute::CursorStyles,
+        "the list stays open"
+    );
+    assert!(state.choice_picker.is_none());
+    assert_eq!(state.common.last_focus.as_ref(), Some(&row));
+    compile_settings_view(&runtime, instance, view, &cx);
+    assert_eq!(
+        first_shown(&runtime),
+        scroll_before,
+        "the list does not jump"
     );
 }
 
+/// ONE STYLE, ONE KEY. Choosing a style writes `cursor_trail = true` only
+/// where the effects switch is off; Off writes the style alone, so the
+/// switch keeps gating the momentum glow; and an old `cursor_trail = false`
+/// still means no trail.
 #[test]
-fn fresh_top_pickers_show_each_effective_default_once_without_a_reset_row() {
-    let themes = crate::app_config::ThemeCatalog::default();
-    let cases = [
+fn choosing_a_style_writes_the_effects_switch_only_where_it_is_off() {
+    let choose = |toml: &str, style: &str| {
+        let (mut runtime, instance, view) = cursor_styles_runtime(toml);
+        compile_settings_view(&runtime, instance, view, &view_cx_at(1_024.0, 768.0));
+        let outcome = runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(cursor_style_row_key(style)),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        config_patches(&outcome)
+            .into_iter()
+            .flat_map(|patch| patch.edits)
+            .filter(|edit| {
+                let ExpectedConfigValue::Exact(expected) = &edit.expected;
+                edit.value != *expected
+            })
+            .map(|edit| (edit.key, edit.value))
+            .collect::<Vec<_>>()
+    };
+    let style = |value: &str| {
         (
-            prefs::EDIT_THEME,
-            settings_theme_options(&themes),
-            "Default",
+            prefs::EDIT_CURSOR_TRAIL_STYLE.to_string(),
+            Some(value.to_string()),
+        )
+    };
+    // The effects switch's canonical ON: no key where the platform default
+    // draws, `true` only where it does not.
+    let switch_on = (
+        prefs::EDIT_CURSOR_TRAIL.to_string(),
+        (!crate::app_config::DEFAULT_DECORATIVE_EFFECTS).then(|| "true".to_string()),
+    );
+    assert_eq!(
+        choose("cursor_trail = true\n", "comet"),
+        if crate::app_config::DEFAULT_DECORATIVE_EFFECTS {
+            vec![style("comet"), switch_on.clone()]
+        } else {
+            vec![style("comet")]
+        },
+        "a redundant true is cleaned up where the default draws"
+    );
+    assert_eq!(
+        choose("cursor_trail = false\n", "comet"),
+        vec![style("comet"), switch_on.clone()],
+        "the effects switch comes on where it was off"
+    );
+    assert_eq!(
+        choose("", "comet"),
+        if crate::app_config::DEFAULT_DECORATIVE_EFFECTS {
+            vec![style("comet")]
+        } else {
+            vec![style("comet"), switch_on.clone()]
+        },
+        "an unset switch is written only where its default is off"
+    );
+    assert_eq!(
+        choose("cursor_trail_style = \"comet\"\n", "off"),
+        vec![style("off")]
+    );
+    assert_eq!(
+        choose(
+            "cursor_trail_style = \"comet\"\n",
+            prefs::DEFAULT_CURSOR_TRAIL_STYLE
         ),
-        (
-            prefs::EDIT_WINDOW_THEME,
-            prefs::WINDOW_THEMES
-                .iter()
-                .map(|value| (*value).to_string())
-                .collect(),
-            "auto",
+        vec![(prefs::EDIT_CURSOR_TRAIL_STYLE.to_string(), None)],
+        "the default style is written as no key"
+    );
+    assert!(
+        choose("cursor_trail_style = \"comet\"\n", "comet").is_empty(),
+        "the saved style writes nothing"
+    );
+    // An Off that Serious Mode or the effects switch forces is checked, but
+    // choosing it still saves Off over the style aterm.toml names.
+    for toml in [
+        "serious_mode = true\ncursor_trail_style = \"comet\"\n",
+        "cursor_trail = false\ncursor_trail_style = \"comet\"\n",
+    ] {
+        assert_eq!(choose(toml, "off"), vec![style("off")], "{toml}");
+    }
+    assert!(
+        choose(
+            "cursor_trail = false\ncursor_trail_style = \"off\"\n",
+            "off"
+        )
+        .is_empty()
+    );
+    // A spelling aterm does not know draws the default; choosing the default
+    // repairs it.
+    assert_eq!(
+        choose(
+            "cursor_trail_style = \"not-a-style\"\n",
+            prefs::DEFAULT_CURSOR_TRAIL_STYLE
         ),
-        (
-            prefs::EDIT_CURSOR_TRAIL_STYLE,
-            prefs::CURSOR_TRAIL_STYLES
-                .iter()
-                .map(|value| (*value).to_string())
-                .collect(),
-            prefs::DEFAULT_CURSOR_TRAIL_STYLE,
-        ),
-    ];
-    for (key, options, effective_default) in cases {
-        let picker = ChoicePicker::new(
-            key,
-            options,
-            effective_default,
-            false,
-            false,
-            effective_default,
-            &themes,
+        vec![(prefs::EDIT_CURSOR_TRAIL_STYLE.to_string(), None)]
+    );
+
+    let legacy_off = SettingsViewState::new(
+        &aterm_toml::from_str::<Config>("cursor_trail = false\ncursor_trail_style = \"comet\"\n")
+            .unwrap(),
+    );
+    assert_eq!(
+        saved_cursor_style(&legacy_off),
+        "off",
+        "an old switch-off still reads Off"
+    );
+}
+
+/// Escape on the list puts the preview back on the saved style.
+#[test]
+fn escape_returns_the_cursor_style_preview_to_the_saved_style() {
+    let (mut runtime, instance, view) = cursor_styles_runtime("cursor_trail_style = \"laser\"\n");
+    compile_settings_view(&runtime, instance, view, &view_cx_at(1_024.0, 768.0));
+    let trying = UiKey::new(cursor_style_row_key("water"));
+    runtime
+        .dispatch(instance, view, AppEvent::FocusChanged(Some(trying)))
+        .unwrap();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        assert_eq!(cursor_style_candidate(state).as_deref(), Some("water"));
+    }
+    runtime
+        .dispatch(instance, view, AppEvent::TextInput(TextInputEvent::Cancel))
+        .unwrap();
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!();
+    };
+    assert_eq!(
+        state.route,
+        SettingsRoute::CursorStyles,
+        "Escape stays on the page"
+    );
+    assert_eq!(cursor_style_candidate(state).as_deref(), Some("laser"));
+    assert_eq!(
+        state.common.last_focus.as_ref().map(UiKey::as_str),
+        Some(cursor_style_row_key("laser").as_str())
+    );
+}
+
+/// A short window still lands on a list: the preview gives up height so the
+/// first style row shows under the shape, at the default window and at the
+/// common short landscape one.
+#[test]
+fn cursor_styles_land_with_a_list_in_view_at_common_sizes() {
+    // 150×48 and 167×36: the preview yields toward its floor so the page
+    // lands on a list — Off and the first two styles at least — not a single
+    // row. The shipped 102×29 window lands on Off and the first style in the
+    // room it keeps with a bar up, the next style peeking in the bar's room;
+    // the 80×24 one, whose preview is at the least it still demonstrates at
+    // (its prompt row, caret and companion), lands on Off with the first
+    // style drawn whole in the bar's room.
+    for (width, height, landed) in [
+        (584.0, 348.0, 2),
+        (738.0, 418.0, 2),
+        (1_074.0, 684.0, 3),
+        (1_193.0, 516.0, 3),
+    ] {
+        let (runtime, instance, view) = cursor_styles_runtime("");
+        // The host hands the preview a prepared font, which sizes its rows.
+        let mut cx = view_cx_at(width, height);
+        cx.semantic_font = Some(
+            crate::tray_raster::prepared_semantic_font_for_direct_view_test(
+                &crate::widget::SemanticFontCandidate::default(),
+            ),
         );
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        let context = format!("{width}×{height}");
+        let preview = compiled
+            .semantic(&UiKey::new("settings/preview/cursor-styles"))
+            .unwrap_or_else(|| panic!("{context}: the preview"));
+        let least = compiled
+            .paint
+            .iter()
+            .find_map(|paint| match &paint.content {
+                UiContent::SettingsPreview(spec)
+                    if paint.key.as_str() == "settings/preview/cursor-styles" =>
+                {
+                    Some(spec.minimum_height(48.0))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{context}: the preview's spec"));
         assert!(
-            picker.options.iter().all(|option| option.value.is_some()),
-            "{key}: an unset setting has nothing to reset"
+            preview.rect.height >= least.min(64.0) - 0.01,
+            "{context}: {:?} under its least {least}",
+            preview.rect
         );
-        assert_eq!(
-            picker.options[picker.selected].value.as_deref(),
-            Some(effective_default),
-            "{key}: the effective default remains selected"
-        );
-        assert_eq!(
-            picker
-                .options
-                .iter()
-                .filter(|option| option.value.as_deref() == Some(effective_default))
-                .count(),
-            1,
-            "{key}: the effective default appears once"
+        let list = compiled
+            .semantic(&UiKey::new("settings/list"))
+            .unwrap_or_else(|| panic!("{context}: the list"))
+            .rect;
+        for value in ["off", prefs::DEFAULT_CURSOR_TRAIL_STYLE, "rainbow dog pet"]
+            .into_iter()
+            .take(landed)
+        {
+            let row = compiled
+                .semantic(&UiKey::new(cursor_style_row_key(value)))
+                .unwrap_or_else(|| panic!("{context}: {value} is not on landing"));
+            assert!(
+                row.rect.y >= list.y - 0.01 && row.rect.bottom() <= list.bottom() + 0.01,
+                "{context}: {value}"
+            );
+        }
+    }
+}
+
+/// SERIOUS MODE STAYS SAID WHILE STYLES ARE TRIED: the note that Serious Mode
+/// is on and that choosing a style turns it off is pinned above the list, so
+/// arrowing through the styles (each previewed as if chosen) never scrolls
+/// it away — at the 80×24 window and the shipped 102×29 one.
+#[test]
+fn the_serious_mode_note_stays_in_view_while_styles_are_tried() {
+    for (width, height) in [(584.0, 348.0), (738.0, 418.0)] {
+        let (mut runtime, instance, view) = cursor_styles_runtime("serious_mode = true\n");
+        let mut cx = view_cx_at(width, height);
+        cx.motion.serious = true;
+        let context = format!("{width}×{height}");
+        for (step, value) in [
+            "off",
+            prefs::DEFAULT_CURSOR_TRAIL_STYLE,
+            "rainbow dog pet",
+            "rainbow kitty flying",
+            "phaser",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::FocusChanged(Some(UiKey::new(cursor_style_row_key(value)))),
+                )
+                .unwrap();
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let status = compiled
+                .semantic(&UiKey::new("settings/cursor-styles/status"))
+                .unwrap_or_else(|| panic!("{context} step {step}: the Serious Mode note"));
+            assert!(status.label.contains("Serious Mode"), "{context}");
+            let list = compiled
+                .semantic(&UiKey::new("settings/list"))
+                .unwrap_or_else(|| panic!("{context}: the list"))
+                .rect;
+            assert!(
+                status.rect.bottom() <= list.y + 0.01 && status.rect.y >= 0.0,
+                "{context} step {step}: the note is pinned above the list: {:?} / {list:?}",
+                status.rect
+            );
+        }
+    }
+}
+
+/// The page opens with the saved style's row in view, checked, however it
+/// is reached, and the keyboard stays where it was.
+#[test]
+fn cursor_styles_open_on_the_saved_style() {
+    for (width, height) in [(738.0, 418.0), (1_200.0, 513.0)] {
+        let (runtime, instance, view) = cursor_styles_runtime("cursor_trail_style = \"water\"\n");
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+        let context = format!("{width}×{height}");
+        let water = compiled
+            .semantic(&UiKey::new(cursor_style_row_key("water")))
+            .unwrap_or_else(|| panic!("{context}: the saved style is in view"));
+        assert!(water.state.is_some_and(|state| state.selected), "{context}");
+        assert!(water.rect.bottom() <= height + 0.01, "{context}");
+        let preview = compiled
+            .semantic(&UiKey::new("settings/preview/cursor-styles"))
+            .unwrap();
+        assert!(preview.rect.height >= 64.0, "{context}");
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        assert!(
+            state
+                .common
+                .last_focus
+                .as_ref()
+                .is_none_or(|focus| !focus.as_str().starts_with("settings/cursor-style/")),
+            "{context}: opening the page moves no keyboard"
         );
     }
 }
 
+/// The page opens on the saved style when it is reached from another page,
+/// where navigation leaves the keyboard on the sidebar, not on the list (a
+/// sidebar item, the "More styles" link, a menu): that focus move must not
+/// take the saved style's row out of view.
 #[test]
-fn paging_choices_focuses_a_visible_preview_candidate() {
+fn cursor_styles_open_on_the_saved_style_from_another_page() {
+    let (mut runtime, instance, view) = cursor_styles_runtime("cursor_trail_style = \"water\"\n");
+    let cx = view_cx_at(1_200.0, 513.0);
+    let go = |runtime: &mut NativeRuntime, route: SettingsRoute| {
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: route_action(route),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        compile_settings_view(runtime, instance, view, &cx)
+    };
+    compile_settings_view(&runtime, instance, view, &cx);
+    go(&mut runtime, SettingsRoute::Sound);
+    let compiled = go(&mut runtime, SettingsRoute::CursorStyles);
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!();
+    };
+    assert_eq!(
+        state.common.last_focus.as_ref().map(UiKey::as_str),
+        Some("settings/nav/cursor-styles"),
+        "the keyboard is on the sidebar"
+    );
+    let list = compiled
+        .semantic(&UiKey::new("settings/list"))
+        .unwrap()
+        .rect;
+    let water = compiled
+        .semantic(&UiKey::new(cursor_style_row_key("water")))
+        .expect("the saved style is in view");
+    assert!(water.state.is_some_and(|state| state.selected));
+    assert!(water.rect.bottom() <= list.bottom() + 0.01);
+}
+
+/// Off leads the list, so the way back to no trail is never screens away,
+/// and its words say what the terminal draws after choosing it: the typing
+/// glow still lights the cursor while it is on — on a dark theme; on a
+/// light one it has no halo, so a block cursor only tints and a bar stays
+/// plain.
+#[test]
+fn off_leads_the_cursor_styles_and_says_what_it_draws() {
+    let off_description = |toml: &str| {
+        let service = VersionedConfigService::new(toml.to_string()).unwrap();
+        let state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+        // A dark system: the default theme follows it.
+        state.presented_motion.set(crate::native_app::ViewMotionCx {
+            system_dark: true,
+            ..crate::native_app::ViewMotionCx::default()
+        });
+        let listed = listed_cursor_styles(&state);
+        assert_eq!(
+            listed.first().map(|style| style.value.as_str()),
+            Some("off")
+        );
+        listed[0].description.clone()
+    };
+    assert_eq!(off_description(""), OFF_GLOW_DESCRIPTION);
+    assert_eq!(
+        off_description("cursor_momentum_glow = false\n"),
+        OFF_PLAIN_DESCRIPTION
+    );
+    assert_eq!(
+        off_description("cursor_trail = false\n"),
+        OFF_PLAIN_DESCRIPTION
+    );
+    // Serious Mode keeps the glow off, and choosing Off leaves it on.
+    assert_eq!(
+        off_description("serious_mode = true\n"),
+        OFF_PLAIN_DESCRIPTION
+    );
+    assert_eq!(
+        off_description("theme = \"GitHub Light\"\n"),
+        OFF_TINT_DESCRIPTION
+    );
+    assert_eq!(
+        off_description("theme = \"GitHub Light\"\ncursor_style = \"bar\"\n"),
+        OFF_PLAIN_DESCRIPTION
+    );
+    assert_eq!(
+        off_description("cursor_style = \"bar\"\n"),
+        OFF_GLOW_DESCRIPTION,
+        "a dark theme's halo shows around a bar too"
+    );
+}
+
+/// A style that looks like another listed one in a dark or a light theme is
+/// not listed, but stays a working value: it shows, checked, while saved.
+#[test]
+fn look_alike_styles_are_listed_only_while_saved() {
+    for unlisted in ["classic mono", "rainbow kitty flat"] {
+        let listed = |toml: &str| {
+            let service = VersionedConfigService::new(toml.to_string()).unwrap();
+            let state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+            listed_cursor_styles(&state)
+                .iter()
+                .any(|style| style.value == unlisted)
+        };
+        assert!(!listed(""), "{unlisted} is not offered");
+        assert!(
+            listed(&format!("cursor_trail_style = \"{unlisted}\"\n")),
+            "{unlisted} shows while it is saved"
+        );
+    }
+}
+
+/// A LOOK-ALIKE ROW NEVER VANISHES UNDER THE POINTER: with Flat rainbow saved
+/// the Cursor Styles list shows it; choosing Phaser (the saved style moves
+/// on) keeps Flat rainbow's row, and Phaser's, exactly where they were until
+/// the page closes, so the way back stays on the page. Opened again, the
+/// list offers only the styles it lists.
+#[test]
+fn a_look_alike_row_stays_until_the_page_closes() {
+    let mut service =
+        VersionedConfigService::new("cursor_trail_style = \"rainbow kitty flat\"\n".to_string())
+            .unwrap();
+    let (mut runtime, instance, view) = setup();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        **state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+    }
+    let go = |runtime: &mut NativeRuntime, route: SettingsRoute| {
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: route_action(route),
+                    value: None,
+                }),
+            )
+            .unwrap();
+    };
+    go(&mut runtime, SettingsRoute::CursorStyles);
+    let cx = view_cx_at(1_200.0, 1_400.0);
+    let rect = |runtime: &NativeRuntime, value: &str| {
+        compile_settings_view(runtime, instance, view, &cx)
+            .semantic(&UiKey::new(cursor_style_row_key(value)))
+            .map(|node| node.rect)
+    };
+    let flat = rect(&runtime, "rainbow kitty flat").expect("Flat rainbow shows while saved");
+    let phaser = rect(&runtime, "phaser").expect("Phaser is listed");
+    let snapshot = service
+        .replace_external("cursor_trail_style = \"phaser\"\n".to_string())
+        .unwrap();
+    runtime
+        .dispatch(instance, view, AppEvent::ConfigChanged(snapshot))
+        .unwrap();
+    assert_eq!(
+        rect(&runtime, "rainbow kitty flat"),
+        Some(flat),
+        "the row stays while the page is open"
+    );
+    assert_eq!(
+        rect(&runtime, "phaser"),
+        Some(phaser),
+        "the chosen row does not move"
+    );
+    go(&mut runtime, SettingsRoute::Home);
+    go(&mut runtime, SettingsRoute::CursorStyles);
+    assert_eq!(
+        rect(&runtime, "rainbow kitty flat"),
+        None,
+        "opened again, the list offers what it lists"
+    );
+}
+
+/// Page Down and Page Up take the keyboard with the list: the highlighted
+/// row (and so the preview) is on the new screen, and the next Down steps on
+/// from there instead of jumping the list back.
+#[test]
+fn page_keys_move_the_cursor_style_highlight_with_the_list() {
+    let (mut runtime, instance, view) = cursor_styles_runtime("");
+    let cx = view_cx_at(738.0, 418.0);
+    compile_settings_view(&runtime, instance, view, &cx);
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::FocusChanged(Some(UiKey::new(cursor_style_row_key("rainbow dog pet")))),
+        )
+        .unwrap();
+    compile_settings_view(&runtime, instance, view, &cx);
+    for _ in 0..2 {
+        runtime
+            .dispatch(instance, view, AppEvent::ScrollPage(1))
+            .unwrap();
+        compile_settings_view(&runtime, instance, view, &cx);
+    }
+    let (focus, shown) = {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        let focus = state.common.last_focus.clone().expect("a highlighted row");
+        let (plan, shown) = state.scroll_shown().expect("the page is one list");
+        let stop = plan.stop_of(&focus).expect("the highlight is in the list");
+        assert!(shown.contains(&stop), "the highlight is on the new screen");
+        assert_eq!(
+            cursor_style_candidate(state),
+            cursor_style_for_row(state, focus.as_str()),
+            "the preview follows the highlight"
+        );
+        (focus, shown)
+    };
+    assert_ne!(focus.as_str(), cursor_style_row_key("rainbow dog pet"));
+    runtime
+        .dispatch(instance, view, AppEvent::StepFocus(1))
+        .unwrap();
+    compile_settings_view(&runtime, instance, view, &cx);
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!();
+    };
+    let (_, after) = state.scroll_shown().unwrap();
+    assert!(
+        after.start >= shown.start,
+        "Down steps on; the list does not jump back"
+    );
+}
+
+/// Home and End take the highlight, and so the preview, with the list: Home
+/// to Off at the list's top, End to the last control of the bottom screen
+/// (a tuning slider, so the preview shows the saved style again); the next
+/// arrow steps on from there instead of jumping back to the row left behind.
+#[test]
+fn home_and_end_move_the_cursor_style_highlight_with_the_list() {
+    let (mut runtime, instance, view) = cursor_styles_runtime("");
+    let cx = view_cx_at(738.0, 418.0);
+    compile_settings_view(&runtime, instance, view, &cx);
+    let comet = UiKey::new(cursor_style_row_key("comet"));
+    runtime
+        .dispatch(instance, view, AppEvent::FocusChanged(Some(comet.clone())))
+        .unwrap();
+    compile_settings_view(&runtime, instance, view, &cx);
+    let edge = |runtime: &mut NativeRuntime, home: bool| {
+        let event = if home {
+            TextInputEvent::Home { extend: false }
+        } else {
+            TextInputEvent::End { extend: false }
+        };
+        runtime
+            .dispatch(instance, view, AppEvent::TextInput(event))
+            .unwrap();
+        compile_settings_view(runtime, instance, view, &cx);
+    };
+    edge(&mut runtime, true);
+    {
+        let state = messages_view_state(&runtime, view);
+        assert_eq!(
+            state.common.last_focus.as_ref().map(UiKey::as_str),
+            Some(cursor_style_row_key("off").as_str()),
+            "Home lands on Off"
+        );
+        assert_eq!(cursor_style_candidate(state).as_deref(), Some("off"));
+        assert!(state.common.focus_visible);
+    }
+    runtime
+        .dispatch(instance, view, AppEvent::StepFocus(1))
+        .unwrap();
+    compile_settings_view(&runtime, instance, view, &cx);
+    assert_eq!(
+        messages_view_state(&runtime, view)
+            .common
+            .last_focus
+            .as_ref()
+            .map(UiKey::as_str),
+        Some(cursor_style_row_key(prefs::DEFAULT_CURSOR_TRAIL_STYLE).as_str()),
+        "Down steps on from Off, not from the row Home left"
+    );
+    runtime
+        .dispatch(instance, view, AppEvent::FocusChanged(Some(comet.clone())))
+        .unwrap();
+    compile_settings_view(&runtime, instance, view, &cx);
+    edge(&mut runtime, false);
+    let state = messages_view_state(&runtime, view);
+    let (plan, shown) = state.scroll_shown().expect("the page is one list");
+    let focus = state
+        .common
+        .last_focus
+        .clone()
+        .expect("End keeps a highlight");
+    assert_eq!(shown.end, plan.len());
+    assert!(
+        plan.stop_of(&focus)
+            .is_some_and(|stop| shown.contains(&stop)),
+        "End's highlight is on the bottom screen"
+    );
+    assert_ne!(focus, comet);
+    assert_eq!(
+        cursor_style_candidate(state),
+        None,
+        "the preview no longer shows the row End left"
+    );
+}
+
+/// Home goes to the list's first row from a row the top screen already
+/// shows (150×48 shows Off over Rainbow dog), and the preview with it; End
+/// from there goes to the list's last control, which tries no style.
+#[test]
+fn home_and_end_reach_the_list_ends_from_a_row_on_screen() {
+    let (mut runtime, instance, view) = cursor_styles_runtime("");
+    let cx = view_cx_at(1_074.0, 684.0);
+    compile_settings_view(&runtime, instance, view, &cx);
+    let dog = UiKey::new(cursor_style_row_key("rainbow dog pet"));
+    runtime
+        .dispatch(instance, view, AppEvent::FocusChanged(Some(dog)))
+        .unwrap();
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    let off = UiKey::new(cursor_style_row_key("off"));
+    assert!(
+        compiled.semantic(&off).is_some(),
+        "Off is on the screen Home starts from"
+    );
+    for (event, home) in [
+        (TextInputEvent::Home { extend: false }, true),
+        (TextInputEvent::End { extend: false }, false),
+    ] {
+        runtime
+            .dispatch(instance, view, AppEvent::TextInput(event))
+            .unwrap();
+        compile_settings_view(&runtime, instance, view, &cx);
+        let state = messages_view_state(&runtime, view);
+        let plan = state.scroll_plan().expect("the page is one list");
+        let mut controls = plan.controls().map(|(_, key)| key.clone());
+        let edge = if home {
+            controls.next()
+        } else {
+            controls.last()
+        };
+        assert_eq!(state.common.last_focus, edge, "home={home}");
+        assert!(state.common.focus_visible);
+        assert_eq!(
+            cursor_style_candidate(state).as_deref(),
+            home.then_some("off"),
+            "home={home}: the preview follows"
+        );
+    }
+}
+
+/// THE PREVIEW NEVER JUMPS: choosing a style brings up its status bar, which
+/// takes its room from the list, never from the preview, so the preview
+/// keeps its height and the chosen row stays where it was under the pointer
+/// — at every common size, and when the choice turns Serious Mode off (the
+/// note it retires keeps its place).
+#[test]
+fn choosing_a_style_keeps_the_preview_and_the_row_in_place() {
+    for (source, width, height) in [
+        ("", 584.0, 348.0),
+        ("", 738.0, 418.0),
+        ("", 1_074.0, 684.0),
+        ("", 1_193.0, 516.0),
+        ("serious_mode = true\n", 1_193.0, 516.0),
+        ("serious_mode = true\n", 1_074.0, 684.0),
+    ] {
+        let context = format!("{width}×{height} {source:?}");
+        let mut lab = modified::Lab::new(source);
+        lab.state_mut().navigate(SettingsRoute::CursorStyles);
+        let before = lab.compile(width, height);
+        let chosen = before
+            .semantics
+            .iter()
+            .find(|node| {
+                node.key.as_str().starts_with("settings/cursor-style/")
+                    && node.state.is_some_and(|state| !state.selected)
+            })
+            .map(|node| node.key.clone())
+            .unwrap_or_else(|| panic!("{context}: a style to choose on landing"));
+        lab.dispatch(AppEvent::FocusChanged(Some(chosen.clone())));
+        let before = lab.compile(width, height);
+        let rect = |compiled: &crate::native_ui::CompiledUi, key: &str| {
+            compiled
+                .semantic(&UiKey::new(key))
+                .unwrap_or_else(|| panic!("{context}: {key}"))
+                .rect
+        };
+        lab.commit(chosen.as_str(), None);
+        let after = lab.compile(width, height);
+        assert!(
+            after.semantic(&UiKey::new("settings/undo")).is_some(),
+            "{context}: the choice's bar is up"
+        );
+        assert_eq!(
+            rect(&before, "settings/preview/cursor-styles"),
+            rect(&after, "settings/preview/cursor-styles"),
+            "{context}: the preview keeps its place and height"
+        );
+        assert_eq!(
+            rect(&before, chosen.as_str()),
+            rect(&after, chosen.as_str()),
+            "{context}: the chosen row stays under the pointer"
+        );
+    }
+}
+
+/// The Serious Mode note a choice retires keeps its place and height, now
+/// saying what changed, until the page is left.
+#[test]
+fn the_serious_mode_note_a_choice_retires_keeps_its_place_until_the_page_is_left() {
+    let mut lab = modified::Lab::new("serious_mode = true\n");
+    lab.state_mut().navigate(SettingsRoute::CursorStyles);
+    let note = UiKey::new("settings/cursor-styles/status");
+    let before = lab.compile(1_074.0, 684.0);
+    let was = before.semantic(&note).expect("the note leads the list");
+    assert!(was.label.starts_with("Serious Mode is on"), "{}", was.label);
+    // A style on the landing screen, so the list need not scroll to it.
+    let dog = cursor_style_row_key("rainbow dog pet");
+    assert!(before.semantic(&UiKey::new(dog.as_str())).is_some());
+    lab.commit(&dog, None);
+    let after = lab.compile(1_074.0, 684.0);
+    let now = after.semantic(&note).expect("the note keeps its place");
+    assert_ne!(now.label, was.label, "it no longer says Serious Mode is on");
+    assert_eq!(now.rect, was.rect);
+    lab.state_mut().navigate(SettingsRoute::Appearance);
+    let _ = lab.compile(1_074.0, 684.0);
+    lab.state_mut().navigate(SettingsRoute::CursorStyles);
+    let back = lab.compile(1_074.0, 684.0);
+    assert!(back.semantic(&note).is_none(), "a new visit has no note");
+}
+
+/// Choosing a style in Serious Mode says what changed: the style, and that
+/// Serious Mode is off — the other effects it pinned off stay as they were
+/// and are not counted as changes.
+#[test]
+fn a_style_chosen_in_serious_mode_names_itself_and_serious_mode() {
+    // The default style is already the saved one, so its row writes nothing
+    // of its own; the words still name it.
+    for (style, name) in [
+        ("comet", "Comet"),
+        (prefs::DEFAULT_CURSOR_TRAIL_STYLE, "Rainbow kitty"),
+    ] {
+        let (mut runtime, instance, view) = cursor_styles_runtime("serious_mode = true\n");
+        let cx = view_cx_at(1_024.0, 768.0);
+        compile_settings_view(&runtime, instance, view, &cx);
+        let chosen = runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(cursor_style_row_key(style)),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let operation = chosen
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                AppEffect::ConfigPatch { reply, .. } => Some(reply.operation),
+                _ => None,
+            })
+            .expect("the choice is one patch");
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::ConfigPatchFinished {
+                    operation,
+                    outcome: ConfigPatchOutcome::Applied {
+                        revision: 2,
+                        undo: Some(11),
+                    },
+                },
+            )
+            .unwrap();
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        let feedback = state.feedback.as_deref().unwrap_or_default();
+        assert!(
+            feedback.starts_with(&format!("Cursor style set to {name} · Serious Mode off")),
+            "{style}: {feedback}"
+        );
+        assert!(!feedback.contains("Changed"), "{feedback}");
+        let undo = state.undo_offer().expect("Undo is offered");
+        assert!(undo.undone.contains("Serious Mode: On"), "{}", undo.undone);
+    }
+}
+
+/// An Undo whose change was overwritten from outside (a hand edit, `ctl
+/// settings set`) goes, with its status: it could only be refused. A change
+/// to another key leaves it, and the page's own publication never takes it.
+#[test]
+fn an_overwritten_undo_leaves_with_its_status() {
+    let mut service = VersionedConfigService::new(String::new()).unwrap();
+    let (mut runtime, instance, view) = setup();
+    runtime
+        .dispatch(instance, view, AppEvent::ConfigChanged(service.snapshot()))
+        .unwrap();
+    let requested = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(format!("settings/set/{}", prefs::EDIT_CURSOR_BLINK)),
+                value: Some(SemanticInput::Bool(false)),
+            }),
+        )
+        .unwrap();
+    let operation = requested
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            AppEffect::ConfigPatch { reply, .. } => Some(reply.operation),
+            _ => None,
+        })
+        .expect("one patch");
+    let publish = |service: &mut VersionedConfigService, key: &str, value: &str| {
+        let base_revision = service.snapshot().revision;
+        match service.patch(ConfigPatchRequest {
+            base_revision,
+            edits: vec![ConfigKeyEdit {
+                key: key.to_string(),
+                expected: ExpectedValue::Any,
+                value: Some(value.to_string()),
+            }],
+        }) {
+            ConfigPatchResult::Applied { snapshot, .. } => snapshot,
+            other => panic!("fixture patch failed: {other:?}"),
+        }
+    };
+    // The page's own save publishes the offer's revision.
+    let own = publish(&mut service, prefs::EDIT_CURSOR_BLINK, "false");
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::ConfigPatchFinished {
+                operation,
+                outcome: ConfigPatchOutcome::Applied {
+                    revision: own.revision,
+                    undo: Some(5),
+                },
+            },
+        )
+        .unwrap();
+    runtime
+        .dispatch(instance, view, AppEvent::ConfigChanged(own))
+        .unwrap();
+    let offered = |runtime: &NativeRuntime| {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        (state.undo_offer().is_some(), state.feedback.clone())
+    };
+    assert!(offered(&runtime).0, "the page's own save keeps its Undo");
+    // Another key changing elsewhere leaves it.
+    let other = publish(&mut service, prefs::EDIT_THEME, "\"Nord\"");
+    runtime
+        .dispatch(instance, view, AppEvent::ConfigChanged(other))
+        .unwrap();
+    assert!(offered(&runtime).0, "an unrelated change keeps the Undo");
+    // Its own key overwritten elsewhere takes it, and the status says what
+    // happened instead of the change it no longer describes.
+    let overwritten = publish(&mut service, prefs::EDIT_CURSOR_BLINK, "true");
+    runtime
+        .dispatch(instance, view, AppEvent::ConfigChanged(overwritten))
+        .unwrap();
+    assert_eq!(
+        offered(&runtime),
+        (
+            false,
+            Some("Cursor blink was changed in aterm.toml".to_string())
+        )
+    );
+}
+
+/// The tuning sliders read with their units, as Modified's defaults do:
+/// milliseconds, cells, Bloom strength as a percentage and Bloom size as a
+/// multiple.
+#[test]
+fn tuning_sliders_read_with_their_units() {
+    let service = VersionedConfigService::new(
+        "cursor_trail_ms = 300\ncursor_trail_length = 30\ncursor_trail_radius = 0.8\ncursor_trail_bloom_strength = 1.2\ncursor_trail_bloom_radius = 2.5\n".to_string(),
+    )
+    .unwrap();
+    let state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+    for (key, reading) in [
+        (prefs::EDIT_CURSOR_TRAIL_MS, "300 ms"),
+        (prefs::EDIT_CURSOR_TRAIL_LENGTH, "30 cells"),
+        (prefs::EDIT_CURSOR_TRAIL_RADIUS, "0.8 cells"),
+        (prefs::EDIT_CURSOR_TRAIL_BLOOM_STRENGTH, "120%"),
+        (prefs::EDIT_CURSOR_TRAIL_BLOOM_RADIUS, "2.5\u{00d7}"),
+    ] {
+        let index = state.field_index_of(key).unwrap();
+        let field = &state.legacy.fields[index];
+        let row = setting_row(&state, index, field, false, SettingsWidth::Wide);
+        let compiled = UiTree::new(row)
+            .compile(LogicalRect::new(0.0, 0.0, 720.0, 80.0))
+            .unwrap();
+        let control = UiKey::new(format!("settings/control/{key}"));
+        let readout = compiled
+            .paint
+            .iter()
+            .find_map(|node| match &node.content {
+                UiContent::Slider(slider) if node.key == control => {
+                    Some(slider.spec.display_value.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{key} paints a slider"));
+        assert_eq!(readout, reading, "{key}");
+    }
+    assert_eq!(
+        default_value_label(prefs::EDIT_CURSOR_TRAIL_MS),
+        Some("260 ms")
+    );
+    assert_eq!(
+        default_value_label(prefs::EDIT_CURSOR_TRAIL_BLOOM_STRENGTH),
+        Some("85%")
+    );
+}
+
+/// The trail colour rows name the default the saved style really draws:
+/// Laser keeps its own violet, every other style follows the cursor colour.
+#[test]
+fn trail_colour_rows_name_the_style_s_real_default() {
+    let placeholder = |toml: &str, key: &str| {
+        let service = VersionedConfigService::new(toml.to_string()).unwrap();
+        let state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+        state.field_by_key(key).unwrap().placeholder.clone()
+    };
+    let laser = "cursor_trail_style = \"laser\"\n";
+    assert_eq!(
+        placeholder(laser, prefs::EDIT_CURSOR_TRAIL_COLOR),
+        "Violet (default)"
+    );
+    assert_eq!(
+        placeholder(laser, prefs::EDIT_CURSOR_TRAIL_ACCENT),
+        "Brighter violet (default)"
+    );
+    for style in ["comet", "beam", "sparkle", "phaser"] {
+        let toml = format!("cursor_trail_style = \"{style}\"\n");
+        assert_eq!(
+            placeholder(&toml, prefs::EDIT_CURSOR_TRAIL_COLOR),
+            "Cursor color (default)",
+            "{style}"
+        );
+    }
+}
+
+/// Every style the Cursor Styles page lists is found by its name, and the
+/// result opens the page on that style's row. The cursor's shape is found by
+/// its options' names.
+#[test]
+fn search_finds_every_listed_style_and_the_cursor_shape() {
+    let state = SettingsViewState::new(&Config::default());
+    for entry in CURSOR_STYLE_ENTRIES
+        .iter()
+        .filter(|entry| entry.listed && entry.group != CursorStyleGroup::Off)
+    {
+        let query = entry.name.to_ascii_lowercase();
+        let hit = search_page_hits(&state, &query)
+            .into_iter()
+            .find(|hit| hit.route == SettingsRoute::CursorStyles)
+            .unwrap_or_else(|| panic!("{query:?} finds Cursor Styles"));
+        assert_eq!(
+            hit.focus,
+            Some(cursor_style_row_key(entry.value)),
+            "{query}"
+        );
+    }
+    // An unlisted look-alike is on the page, and found, while it is saved.
+    let classic_mono = |toml: &str| {
+        let service = VersionedConfigService::new(toml.to_string()).unwrap();
+        let state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+        search_page_hits(&state, "classic mono")
+            .into_iter()
+            .find(|hit| hit.route == SettingsRoute::CursorStyles)
+            .and_then(|hit| hit.focus)
+    };
+    assert_eq!(classic_mono(""), None);
+    assert_eq!(
+        classic_mono("cursor_trail_style = \"classic mono\"\n"),
+        Some(cursor_style_row_key("classic mono"))
+    );
+    let shape = state.field_by_key(prefs::EDIT_CURSOR_STYLE).unwrap();
+    let mut scratch = String::new();
+    for query in ["block", "bar cursor", "beam", "cursor shape"] {
+        assert!(
+            field_match_score_in(
+                shape,
+                query,
+                &mut scratch,
+                &crate::app_config::ThemeCatalog::default()
+            )
+            .is_some(),
+            "{query:?} finds Cursor shape"
+        );
+    }
+    assert_eq!(prefs::section_of(prefs::EDIT_CURSOR_STYLE), Section::Cursor);
+}
+
+/// The pointer resting on one row must not hold the preview once the keyboard
+/// moves: Up and Down preview the row they land on, as Tab does.
+#[test]
+fn the_keyboard_takes_the_cursor_style_preview_from_a_resting_pointer() {
+    let (mut runtime, instance, view) = cursor_styles_runtime("cursor_trail_style = \"comet\"\n");
+    let cx = view_cx_at(1_024.0, 768.0);
+    compile_settings_view(&runtime, instance, view, &cx);
+    let candidate = |runtime: &NativeRuntime| {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        cursor_style_candidate(state)
+    };
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::FocusChanged(Some(UiKey::new(cursor_style_row_key("comet")))),
+        )
+        .unwrap();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.common.hovered = Some(UiKey::new(cursor_style_row_key("fire")));
+    }
+    assert_eq!(candidate(&runtime).as_deref(), Some("fire"), "the pointer");
+    compile_settings_view(&runtime, instance, view, &cx);
+    runtime
+        .dispatch(instance, view, AppEvent::StepFocus(1))
+        .unwrap();
+    let landed = {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        let focus = state.common.last_focus.clone().unwrap();
+        cursor_style_for_row(state, focus.as_str()).expect("Down lands on a style row")
+    };
+    assert_ne!(landed, "comet");
+    assert_eq!(candidate(&runtime), Some(landed), "the keyboard's row");
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.common.hovered = Some(UiKey::new(cursor_style_row_key("fire")));
+    }
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::FocusChanged(Some(UiKey::new(cursor_style_row_key("water")))),
+        )
+        .unwrap();
+    assert_eq!(candidate(&runtime).as_deref(), Some("water"), "Tab's row");
+}
+
+/// "No modified settings." is Modified's to say: no other page, the cursor
+/// styles' among them, ends on it.
+#[test]
+fn only_modified_says_it_has_no_modified_settings() {
+    for route in SettingsRoute::ALL
+        .into_iter()
+        .filter(|route| !matches!(route, SettingsRoute::Modified | SettingsRoute::Manual))
+    {
+        let (mut runtime, instance, view) = setup();
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: route_action(route),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_024.0, 768.0));
+        assert!(
+            compiled.semantic(&UiKey::new("settings/empty")).is_none(),
+            "{} says it has no modified settings",
+            route.label()
+        );
+    }
+}
+
+/// THE PAGE THAT WAS CURSOR KITTY keeps its old address.
+#[test]
+fn the_cursor_kitty_address_opens_cursor_styles() {
+    assert_eq!(
+        SettingsRoute::from_path("/cursor-kitty"),
+        Some(SettingsRoute::CursorStyles)
+    );
+    assert_eq!(SettingsRoute::CursorStyles.path(), "/cursor-styles");
+    assert_eq!(
+        SettingsRoute::from_path("/cursor-styles"),
+        Some(SettingsRoute::CursorStyles)
+    );
+}
+
+/// THE STYLE'S OWN TUNING. A knob the saved style never reads says which
+/// style ignores it; one it reads carries no such note.
+#[test]
+fn tuning_a_style_does_not_read_says_so() {
+    let note = |toml: &str, key: &str| {
+        let state = SettingsViewState::new(&aterm_toml::from_str::<Config>(toml).unwrap());
+        setting_effect_projection(
+            &state,
+            None,
+            key,
+            SettingsAvailability::for_state(&state),
+            crate::native_app::ViewMotionCx::default(),
+        )
+        .notes
+        .into_iter()
+        .map(|note| note.visual)
+        .collect::<Vec<_>>()
+    };
+    let on = "cursor_trail = true\n";
+    assert_eq!(
+        note(on, prefs::EDIT_CURSOR_TRAIL_LENGTH),
+        vec!["Inactive: not used by Rainbow kitty".to_string()]
+    );
+    assert!(
+        note(
+            &format!("{on}cursor_trail_style = \"comet\"\n"),
+            prefs::EDIT_CURSOR_TRAIL_LENGTH
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        note(
+            &format!("{on}cursor_trail_style = \"fire\"\n"),
+            prefs::EDIT_CURSOR_TRAIL_COLOR
+        ),
+        vec!["Inactive: not used by Fire".to_string()]
+    );
+    assert!(note(on, prefs::EDIT_CURSOR_TRAIL_INTENSITY).is_empty());
+
+    // An unset bloom size is a slider at the saved style's own default.
+    for (style, default) in [
+        ("rainbow kitty pet", Config::RAINBOW_KITTY_BLOOM_RADIUS),
+        ("fire", Config::CURSOR_TRAIL_BLOOM_RADIUS_DEFAULT),
+    ] {
+        let state = SettingsViewState::new(
+            &aterm_toml::from_str::<Config>(&format!("cursor_trail_style = {style:?}\n")).unwrap(),
+        );
+        let field = state
+            .field_by_key(prefs::EDIT_CURSOR_TRAIL_BLOOM_RADIUS)
+            .unwrap();
+        assert_eq!(
+            numeric_slider_value_for_state(&state, field).map(|(value, _)| value),
+            Some(f32_as_shown(default)),
+            "{style}"
+        );
+    }
+}
+
+/// The Sound page's Music effects switch is an ordinary row there: set in
+/// aterm.toml it paints `· Changed` and offers Reset, as every other row on
+/// the page does. Top Settings keeps its direct form: the bare name, no
+/// Reset.
+#[test]
+fn the_sound_page_s_music_effects_row_paints_its_notes_and_offers_reset() {
+    let painted_label = |compiled: &crate::native_ui::CompiledUi| {
+        compiled
+            .paint
+            .iter()
+            .find_map(|node| match &node.content {
+                UiContent::Text(text) if text.text.starts_with("Music effects") => {
+                    Some(text.text.clone())
+                }
+                _ => None,
+            })
+            .expect("the Music effects label is painted")
+    };
+    for (route, offers) in [(SettingsRoute::Sound, true), (SettingsRoute::Home, false)] {
+        let service = VersionedConfigService::new("trail_sounds = false\n".to_string()).unwrap();
+        let (mut runtime, instance, view) = setup();
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            **state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+        }
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: route_action(route),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_074.0, 900.0));
+        let reset = compiled
+            .semantic(&UiKey::new(format!(
+                "settings/reset/{}",
+                prefs::EDIT_TRAIL_SOUNDS
+            )))
+            .is_some();
+        assert_eq!(reset, offers, "{route:?}: Reset");
+        assert_eq!(
+            painted_label(&compiled).contains("Changed"),
+            offers,
+            "{route:?}: {}",
+            painted_label(&compiled)
+        );
+    }
+}
+
+/// THE SOUND PAGE'S ROWS say what silences them: the typing sound and the
+/// output streak's pip answer to Music effects like every synth voice, and
+/// the pip to the output streak too. Music effects itself does not claim
+/// silence while the trail is off: only the typing notes need the trail.
+#[test]
+fn sound_rows_name_the_switch_that_silences_them() {
+    let notes = |toml: &str, key: &str| {
+        let service = VersionedConfigService::new(toml.to_string()).unwrap();
+        let state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+        setting_effect_projection(
+            &state,
+            None,
+            key,
+            SettingsAvailability::for_state(&state),
+            crate::native_app::ViewMotionCx::default(),
+        )
+        .notes
+        .into_iter()
+        .map(|note| note.visual)
+        .collect::<Vec<_>>()
+    };
+    let music_off = "trail_sounds = false\n";
+    for key in [
+        prefs::EDIT_TRAIL_SOUND_STYLE,
+        prefs::EDIT_OUTPUT_STREAK_SOUND,
+    ] {
+        assert_eq!(
+            notes(music_off, key),
+            vec!["Inactive: Music effects Off".to_string()],
+            "{key}"
+        );
+        assert!(notes("", key).is_empty(), "negative control: {key}");
+    }
+    assert_eq!(
+        notes(
+            "[output_streak]\nenabled = false\n",
+            prefs::EDIT_OUTPUT_STREAK_SOUND
+        ),
+        vec!["Inactive: Output streak Off".to_string()],
+        "the pip names the switch that silences it, a real row"
+    );
+    // An unsaved Off of that switch counts too; with it On, nothing.
+    let draft = |value: &str| {
+        projected_effect(
+            "",
+            &[(prefs::EDIT_OUTPUT_STREAK_ENABLED, value)],
+            prefs::EDIT_OUTPUT_STREAK_SOUND,
+            audited_availability(),
+            crate::native_app::ViewMotionCx::default(),
+        )
+    };
+    assert!(effect_note_contains(&draft("false"), "Output streak Off"));
+    assert!(!effect_note_contains(&draft("true"), "Output streak"));
+    assert!(native_advanced_key(prefs::EDIT_OUTPUT_STREAK_SOUND));
+    assert_eq!(
+        prefs::section_of(prefs::EDIT_OUTPUT_STREAK_SOUND),
+        Section::Sound
+    );
+    // The switch is a row of its own, in Appearance's Effects box.
+    assert!(native_advanced_key(prefs::EDIT_OUTPUT_STREAK_ENABLED));
+    assert_eq!(
+        prefs::section_of(prefs::EDIT_OUTPUT_STREAK_ENABLED),
+        Section::Appearance
+    );
+    assert_eq!(
+        prefs::group_of(prefs::EDIT_OUTPUT_STREAK_ENABLED),
+        ("Effects", 5)
+    );
+
+    let trail_off = "cursor_trail_style = \"off\"\n";
+    assert!(notes(trail_off, prefs::EDIT_TRAIL_SOUNDS).is_empty());
+    let state = SettingsViewState::new(&aterm_toml::from_str::<Config>(trail_off).unwrap());
+    let motion = crate::native_app::ViewMotionCx {
+        focused: true,
+        ..crate::native_app::ViewMotionCx::default()
+    };
+    let status = top_music_suppression_reason_for_output(&state, motion, true)
+        .unwrap()
+        .full();
+    assert!(!status.contains("currently silent"), "{status}");
+    assert!(status.contains("other sounds still play"), "{status}");
+}
+
+/// THE DEFAULT IS ONE ROW. A picker never lists it twice ("Use default"
+/// beside the same value): the option that is the default says so, is the
+/// saved one while the key is unset, and choosing it removes the key. Only a
+/// default the list does not offer gets a row of its own, and a saved value
+/// the list does not offer is named in the picker's spelling.
+#[test]
+fn pickers_list_the_default_once_and_name_what_they_do_not_offer() {
+    let themes = crate::app_config::ThemeCatalog::default();
+    let labels = |picker: &ChoicePicker| {
+        picker
+            .options
+            .iter()
+            .map(|option| option.label.clone())
+            .collect::<Vec<_>>()
+    };
+    let window_themes = || {
+        prefs::WINDOW_THEMES
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>()
+    };
+    for (current, explicit, selected) in [("auto", false, 0), ("light", true, 1)] {
+        let picker = ChoicePicker::new(
+            prefs::EDIT_WINDOW_THEME,
+            window_themes(),
+            current,
+            explicit,
+            explicit,
+            "auto",
+        );
+        assert_eq!(labels(&picker), ["Match macOS (default)", "Light", "Dark"]);
+        assert_eq!(picker.options[0].value, None, "the default removes the key");
+        assert_eq!(picker.selected, selected, "{current}");
+    }
+
+    let picker = ChoicePicker::new(
+        prefs::EDIT_PREDICTIVE_ECHO,
+        ["off".to_string(), "adaptive".to_string()],
+        "always",
+        true,
+        true,
+        "adaptive",
+    );
+    assert_eq!(
+        labels(&picker),
+        ["Off", "Adaptive (default)", "Always (current)"]
+    );
+    assert_eq!(
+        picker.options[picker.selected].value.as_deref(),
+        Some("always")
+    );
+
+    let picker = ChoicePicker::new(
+        prefs::EDIT_BACKGROUND_MATERIAL,
+        ["hud".to_string(), "sidebar".to_string()],
+        "hud",
+        true,
+        true,
+        "none",
+    );
+    // Named by how they look, never by the platform's material names.
+    let (hud, sidebar) = if cfg!(windows) {
+        ("Frosted glass", "Tinted desktop color")
+    } else {
+        ("Dark frosted glass", "Frosted glass")
+    };
+    assert_eq!(labels(&picker), ["Use default (No blur)", hud, sidebar]);
+    assert_eq!(picker.options[0].value, None);
+    assert_eq!(picker.selected, 1);
+    assert_eq!(picker_saved_label(&picker), hud);
+    // The reset row paints what the default is wherever its tile holds it,
+    // and keeps saying so in a narrow tile (the name shortens, the note
+    // stays): never a bare "Use default".
+    let painted = |option: &ChoiceOption, width: f32| {
+        choice_option_button(option, width, false)
+            .visual_label
+            .unwrap_or_default()
+    };
+    assert_eq!(painted(&picker.options[0], 300.0), "Use default (No blur)");
+    let narrow_width = crate::native_ui::native_button_label_width("No blur (default)");
+    assert_eq!(
+        painted(&picker.options[0], narrow_width),
+        "No blur (default)"
+    );
+    let window = ChoicePicker::new(
+        prefs::EDIT_WINDOW_THEME,
+        ["auto".to_string(), "light".to_string(), "dark".to_string()],
+        "auto",
+        false,
+        false,
+        "auto",
+    );
+    assert_eq!(
+        painted(&window.options[0], 300.0),
+        format!(
+            "{} (default)",
+            setting_choice_label(prefs::EDIT_WINDOW_THEME, "auto")
+        )
+    );
+    let narrow = painted(&window.options[0], 100.0);
+    assert!(
+        narrow.ends_with(" (default)") && narrow.contains('\u{2026}'),
+        "{narrow}"
+    );
+    let picker = ChoicePicker::new(
+        prefs::EDIT_BACKGROUND_MATERIAL,
+        ["hud".to_string(), "sidebar".to_string()],
+        "none",
+        true,
+        true,
+        "none",
+    );
+    assert_eq!(picker.selected, 0);
+    assert_eq!(
+        picker_saved_label(&picker),
+        "No blur",
+        "Cancel keeps No blur"
+    );
+
+    // A default whose placeholder explains itself ("auto (follows live macOS
+    // Reduce Motion)", "off (default font)") is still the option it names.
+    assert_eq!(effective_default_for_field(prefs::EDIT_MOTION), "auto");
+    assert_eq!(effective_default_for_field(prefs::EDIT_DISPLAY_FONT), "off");
+    let state = SettingsViewState::new(&Config::default());
+    let field = state.field_by_key(prefs::EDIT_DISPLAY_FONT).unwrap();
+    let picker = ChoicePicker::new(
+        prefs::EDIT_DISPLAY_FONT,
+        choices_for_field(field, &[], &themes).unwrap(),
+        "chunky",
+        true,
+        true,
+        &effective_default_for_field(prefs::EDIT_DISPLAY_FONT),
+    );
+    assert_eq!(labels(&picker)[0], "Off (default)");
+    assert_eq!(picker.options[0].value, None);
+    assert_eq!(
+        picker.options.len(),
+        prefs::DISPLAY_FONT_OPTIONS.len(),
+        "no second default row"
+    );
+    let picker = ChoicePicker::new(
+        prefs::EDIT_MOTION,
+        prefs::MOTION_MODES.iter().map(|mode| (*mode).to_string()),
+        "full",
+        true,
+        true,
+        &effective_default_for_field(prefs::EDIT_MOTION),
+    );
+    assert_eq!(
+        labels(&picker),
+        ["Automatic (default)", "Always animate", "Reduce motion"]
+    );
+}
+
+/// A picker's title reads "Choose cursor trail", and a label that opens on a
+/// name keeps it.
+#[test]
+fn picker_titles_are_sentence_case_and_keep_names() {
+    assert_eq!(choice_picker_title("Cursor trail"), "Choose cursor trail");
+    assert_eq!(choice_picker_title("Motion"), "Choose motion");
+    assert_eq!(
+        choice_picker_title("Universal Control on this Mac"),
+        "Choose Universal Control on this Mac"
+    );
+    assert_eq!(
+        choice_picker_title("Alt/Option as Meta"),
+        "Choose Alt/Option as Meta"
+    );
+}
+
+/// THE KEYBOARD IN AN OPEN PICKER: the arrows move the highlight, and the
+/// preview follows it, with nothing saved; Escape and Cancel close it with
+/// nothing saved and the saved value back in the preview.
+#[test]
+fn picker_arrow_keys_move_the_highlight_and_cancel_saves_nothing() {
+    // One theme always, so the Color theme control opens the whole picker.
+    let (mut runtime, instance, view) = theme_pair_runtime("theme = \"Default\"\n", true);
+    let cx = view_cx();
+    let open = |runtime: &mut NativeRuntime| {
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(format!("settings/set/{}", prefs::EDIT_THEME)),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let _ = compile_settings_view(runtime, instance, view, &cx);
+    };
+    let highlighted = |runtime: &NativeRuntime| {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        let picker = state.choice_picker.as_ref().expect("open picker");
+        let index = state
+            .common
+            .last_focus
+            .as_ref()
+            .and_then(|focus| picker.option_index(focus))
+            .expect("the keyboard is on an option");
+        (
+            index,
+            picker.columns.get(),
+            picker_candidate(state, prefs::EDIT_THEME).map(str::to_string),
+            state.common.focus_visible,
+        )
+    };
+    let press = |runtime: &mut NativeRuntime, event: AppEvent| {
+        let outcome = runtime.dispatch(instance, view, event).unwrap();
+        assert!(
+            !outcome
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, AppEffect::ConfigPatch { .. })),
+            "moving the highlight saves nothing"
+        );
+    };
+
+    open(&mut runtime);
+    let (start, columns, _, _) = highlighted(&runtime);
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!();
+    };
+    assert_eq!(
+        start,
+        state.choice_picker.as_ref().unwrap().selected,
+        "the picker opens on the saved theme"
+    );
+    assert!(columns >= 2);
+    press(&mut runtime, AppEvent::StepFocus(1));
+    let (down, _, candidate, visible) = highlighted(&runtime);
+    assert_eq!(down, start + columns, "Down moves one row");
+    assert!(visible, "the keyboard's highlight wears the focus ring");
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!();
+    };
+    let expected = state.choice_picker.as_ref().unwrap().options[down]
+        .value
+        .clone();
+    assert_eq!(candidate, expected, "the preview follows the highlight");
+    press(
+        &mut runtime,
+        AppEvent::TextInput(TextInputEvent::Right { extend: false }),
+    );
+    assert_eq!(
+        highlighted(&runtime).0,
+        start + columns + 1,
+        "Right moves one option"
+    );
+    press(
+        &mut runtime,
+        AppEvent::TextInput(TextInputEvent::Left { extend: false }),
+    );
+    press(&mut runtime, AppEvent::StepFocus(-1));
+    assert_eq!(highlighted(&runtime).0, start, "Left and Up move back");
+    // The wheel moves it too, and stops at the last option.
+    press(&mut runtime, AppEvent::ScrollLines(10_000));
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!();
+    };
+    let last = state.choice_picker.as_ref().unwrap().options.len() - 1;
+    assert_eq!(highlighted(&runtime).0, last, "End reaches the last option");
+
+    // Escape: closed, nothing saved, the saved theme previewed again.
+    press(&mut runtime, AppEvent::TextInput(TextInputEvent::Cancel));
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!();
+    };
+    assert!(state.choice_picker.is_none());
+    assert_eq!(
+        state.raw_value(prefs::EDIT_THEME).as_deref(),
+        Some("Default")
+    );
+    assert_eq!(picker_candidate(state, prefs::EDIT_THEME), None);
+
+    // Cancel does the same, from wherever the highlight was.
+    open(&mut runtime);
+    press(&mut runtime, AppEvent::ScrollLines(1));
+    press(
+        &mut runtime,
+        AppEvent::Action(ActionInvocation {
+            id: ActionId::new("settings/choice-close"),
+            value: None,
+        }),
+    );
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!();
+    };
+    assert!(state.choice_picker.is_none());
+    assert_eq!(
+        state.raw_value(prefs::EDIT_THEME).as_deref(),
+        Some("Default")
+    );
+    assert_eq!(
+        state.common.last_focus.as_ref().map(UiKey::as_str),
+        Some(format!("settings/control/{}", prefs::EDIT_THEME).as_str()),
+        "the keyboard returns to the control that opened the picker"
+    );
+}
+
+/// THE PICKER IS SIZED TO THE ROOM UNDER THE PREVIEW. At 1200x820 every
+/// theme — its sections, filter and footer with it — is on glass at once,
+/// and the card ends at its last row: no blank band, and no tile wider than
+/// its column. (The 150x48 window scrolls it: a theme tile carries its
+/// swatches, and four sections no longer fit 684 points.)
+#[test]
+fn top_pickers_show_every_option_where_they_fit() {
+    let cx = view_cx_at(1_200.0, 820.0);
+    {
+        let key = prefs::EDIT_THEME;
+        let (mut runtime, instance, view) = setup();
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(format!("settings/set/{key}")),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert_zero_top_paint(&compiled, key);
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        let picker = state.choice_picker.as_ref().unwrap();
+        let prefix = format!("settings/choice/{key}/");
+        let tiles = compiled
+            .hits
+            .iter()
+            .filter(|hit| hit.key.as_str().starts_with(&prefix))
+            .collect::<Vec<_>>();
+        assert_eq!(tiles.len(), picker.options.len(), "{key}: every option");
+        assert!(
+            compiled
+                .semantic(&UiKey::new(format!("settings/choice-scroll/{key}")))
+                .is_none(),
+            "{key}: nothing to scroll"
+        );
+        assert!(
+            tiles
+                .iter()
+                .all(|tile| (tile.rect.width - tiles[0].rect.width).abs() < 0.5),
+            "{key}: every tile keeps its column's width"
+        );
+        let card = compiled
+            .semantic(&UiKey::new(format!("settings/choice-picker/{key}")))
+            .unwrap();
+        // Its last row is the footer's (the themes folder, Import…).
+        let last_row = compiled
+            .hits
+            .iter()
+            .filter(|hit| {
+                hit.rect.x >= card.rect.x - 0.5
+                    && hit.rect.y >= card.rect.y - 0.5
+                    && hit.rect.bottom() <= card.rect.bottom() + 0.5
+            })
+            .map(|hit| hit.rect.bottom())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            compiled
+                .semantic(&UiKey::new(format!("settings/themes/footer/{key}")))
+                .is_some(),
+            "{key}: the footer is on glass"
+        );
+        assert!(
+            card.rect.bottom() - last_row <= 12.5,
+            "{key}: the card ends at its last row, not {:.1}pt below it",
+            card.rect.bottom() - last_row
+        );
+    }
+}
+
+/// THE DEFAULT 80x24 WINDOW (744x420) and the shorter 584x348 one: the open
+/// theme picker on Top Settings scrolls instead of clipping. Nothing in it
+/// is cut, a thumb says there is more, and the keyboard reaches every option.
+#[test]
+fn compact_pickers_scroll_instead_of_clipping_at_the_default_window() {
+    for (width, height) in [(738.0, 418.0), (584.0, 348.0)] {
+        let cx = view_cx_at(width, height);
+        {
+            let route = SettingsRoute::Home;
+            let (mut runtime, instance, view) = setup();
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: route_action(route),
+                        value: None,
+                    }),
+                )
+                .unwrap();
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: ActionId::new(format!("settings/set/{}", prefs::EDIT_THEME)),
+                        value: None,
+                    }),
+                )
+                .unwrap();
+            let key = prefs::EDIT_THEME;
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let context = format!("{route:?} at {width}x{height}");
+            assert!(
+                compiled
+                    .semantic(&UiKey::new(format!("settings/choice-scroll/{key}")))
+                    .is_some(),
+                "{context}: the list says it scrolls"
+            );
+            walk_open_choice_picker(&mut runtime, instance, view, &cx, key, |compiled, index| {
+                let context = format!("{context} option {index}");
+                assert_zero_top_paint(compiled, &context);
+                assert_picker_descendants_contained(compiled, key, &context);
+                for hit in &compiled.hits {
+                    let paint = compiled.paint.iter().find(|node| node.key == hit.key);
+                    assert!(
+                        paint.is_some_and(|paint| paint.rect == hit.rect),
+                        "{context}: {:?} is clipped",
+                        hit.key
+                    );
+                }
+            });
+        }
+    }
+}
+
+/// A SHORT CHOICE IS ITS ROW. Two or three options that fit are segments in
+/// the row, one click to save, instead of a full-page picker: the saved
+/// segment keeps the setting's own key and action (focus, automation and
+/// introspection find it where they always did), the others save their
+/// option, the default one by removing the key, and Left/Right move between
+/// them. A saved value the segments do not offer keeps the picker.
+#[test]
+fn short_choices_are_segments_that_save_in_one_click() {
     let (mut runtime, instance, view) = setup();
     runtime
         .dispatch(
             instance,
             view,
             AppEvent::Action(ActionInvocation {
-                id: ActionId::new(format!("settings/set/{}", prefs::EDIT_THEME)),
+                id: route_action(SettingsRoute::Terminal),
                 value: None,
             }),
         )
         .unwrap();
+    let cx = view_cx();
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    assert_zero_top_paint(&compiled, "Terminal");
+    let label = |key: &str| {
+        compiled
+            .semantic(&UiKey::new(key))
+            .unwrap_or_else(|| panic!("missing {key}"))
+            .label
+            .clone()
+    };
+    assert_eq!(
+        label(&format!("settings/control/{}", prefs::EDIT_BIDI)),
+        "Bidirectional text: Auto"
+    );
+    assert_eq!(
+        label(&format!("settings/segment/{}/1", prefs::EDIT_BIDI)),
+        "Bidirectional text: Off"
+    );
+    assert!(
+        label(&format!(
+            "settings/segment/{}/1",
+            prefs::EDIT_AMBIGUOUS_WIDTH
+        ))
+        .contains(": Wide")
+    );
+    let saved = compiled
+        .semantic(&UiKey::new(format!(
+            "settings/control/{}",
+            prefs::EDIT_AMBIGUOUS_WIDTH
+        )))
+        .unwrap();
+    assert_eq!(
+        saved.action.as_ref().map(ActionId::as_str),
+        Some(format!("settings/set/{}", prefs::EDIT_AMBIGUOUS_WIDTH).as_str())
+    );
+    // The saved segment speaks the words it shows, never the config token.
+    assert_eq!(
+        saved.value,
+        SemanticValue::Text("Narrow (default)".to_string())
+    );
+
+    // The saved segment opens nothing and writes nothing.
+    let outcome = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(format!("settings/set/{}", prefs::EDIT_AMBIGUOUS_WIDTH)),
+                value: None,
+            }),
+        )
+        .unwrap();
+    assert!(outcome.effects.is_empty());
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!();
+    };
+    assert!(state.choice_picker.is_none(), "no page-wide picker");
+
+    // Right moves to the next segment; activating it saves its option.
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::TextInput(TextInputEvent::Right { extend: false }),
+        )
+        .unwrap();
+    let wide = format!("settings/segment/{}/1", prefs::EDIT_AMBIGUOUS_WIDTH);
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!();
+    };
+    assert_eq!(
+        state.common.last_focus.as_ref().map(UiKey::as_str),
+        Some(wide.as_str())
+    );
+    let outcome = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(wide.clone()),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let patch = emitted_config_patch(&outcome);
+    assert_eq!(patch.edits.len(), 1);
+    assert_eq!(patch.edits[0].key, prefs::EDIT_AMBIGUOUS_WIDTH);
+    assert_eq!(patch.edits[0].value.as_deref(), Some("wide"));
+
+    // Once saved, Wide is the control, and the keyboard follows it there.
+    replace_settings_source(
+        &mut runtime,
+        view,
+        "ambiguous_width = \"wide\"\n".to_string(),
+    );
+    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        unreachable!();
+    };
+    state.navigate(SettingsRoute::Terminal);
+    state.common.last_focus = Some(UiKey::new(wide));
+    state.reseat_segment_focus();
+    assert_eq!(
+        state.common.last_focus.as_ref().map(UiKey::as_str),
+        Some(format!("settings/control/{}", prefs::EDIT_AMBIGUOUS_WIDTH).as_str())
+    );
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    let narrow = compiled
+        .semantic(&UiKey::new(format!(
+            "settings/segment/{}/0",
+            prefs::EDIT_AMBIGUOUS_WIDTH
+        )))
+        .expect("Narrow is now the other segment");
+    let outcome = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: narrow.action.clone().unwrap(),
+                value: None,
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        emitted_config_patch(&outcome).edits[0].value,
+        None,
+        "the default segment removes the key"
+    );
+
+    // A saved value the segments do not offer keeps the picker that names it.
+    let (mut runtime, instance, view) = setup();
+    replace_settings_source(
+        &mut runtime,
+        view,
+        "predictive_echo = \"always\"\n".to_string(),
+    );
     runtime
         .dispatch(
             instance,
             view,
             AppEvent::Action(ActionInvocation {
-                id: ActionId::new("settings/choice-page-next"),
+                id: ActionId::new(format!("settings/set/{}", prefs::EDIT_PREDICTIVE_ECHO)),
                 value: None,
             }),
         )
         .unwrap();
     let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
-        panic!("Settings view");
+        unreachable!();
     };
-    let picker = state.choice_picker.as_ref().expect("theme picker");
-    assert_eq!(picker.offset.get(), ChoicePicker::PAGE_SIZE);
-    let expected_focus = format!(
-        "settings/choice/{}/{}",
-        prefs::EDIT_THEME,
-        picker.offset.get()
-    );
-    assert_eq!(
-        state.common.last_focus.as_ref().map(UiKey::as_str),
-        Some(expected_focus.as_str())
-    );
-    assert!(picker_candidate(state, prefs::EDIT_THEME).is_some());
+    let picker = state
+        .choice_picker
+        .as_ref()
+        .expect("the picker names the value");
+    assert_eq!(picker.options[picker.selected].label, "Always (current)");
 }
 
 #[test]
@@ -8035,7 +10814,6 @@ fn theme_focus_previews_before_commit_and_unset_font_uses_host_size() {
             }),
         )
         .unwrap();
-    let host_theme = aterm_render::Theme::default();
     let before = {
         let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
             panic!("Settings view");
@@ -8046,7 +10824,6 @@ fn theme_focus_previews_before_commit_and_unset_font_uses_host_size() {
             crate::native_app::ViewMotionCx::default(),
             12.0,
             1.0,
-            host_theme,
         )
         .expect("appearance preview")
     };
@@ -8071,15 +10848,12 @@ fn theme_focus_previews_before_commit_and_unset_font_uses_host_size() {
     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
         panic!("Settings view");
     };
-    let picker = state.choice_picker.as_mut().expect("theme picker");
+    let picker = state.choice_picker.as_ref().expect("theme picker");
     let nord = picker
         .options
         .iter()
         .position(|option| option.value.as_deref() == Some("Nord"))
         .expect("Nord built-in");
-    picker
-        .offset
-        .set((nord / ChoicePicker::PAGE_SIZE) * ChoicePicker::PAGE_SIZE);
     state.common.last_focus = Some(UiKey::new(format!(
         "settings/choice/{}/{nord}",
         prefs::EDIT_THEME
@@ -8090,7 +10864,6 @@ fn theme_focus_previews_before_commit_and_unset_font_uses_host_size() {
         crate::native_app::ViewMotionCx::default(),
         12.0,
         1.0,
-        host_theme,
     )
     .expect("candidate preview");
     let nord = aterm_types::scheme::builtin("Nord").expect("Nord scheme");
@@ -8109,7 +10882,6 @@ fn theme_focus_previews_before_commit_and_unset_font_uses_host_size() {
         crate::native_app::ViewMotionCx::default(),
         8.0,
         1.0,
-        host_theme,
     )
     .expect("typography preview");
     assert_eq!(host_sized.font_px, 8.0);
@@ -8118,7 +10890,6 @@ fn theme_focus_previews_before_commit_and_unset_font_uses_host_size() {
 #[test]
 fn top_choice_picker_pointer_hover_previews_without_persisting() {
     let (mut runtime, instance, view) = setup();
-    let host_theme = aterm_render::Theme::default();
     let before = {
         let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
             panic!("Settings view");
@@ -8130,7 +10901,6 @@ fn top_choice_picker_pointer_hover_previews_without_persisting() {
             crate::native_app::ViewMotionCx::default(),
             13.0,
             1.0,
-            host_theme,
             None,
         )
         .unwrap()
@@ -8160,8 +10930,7 @@ fn top_choice_picker_pointer_hover_previews_without_persisting() {
         .iter()
         .position(|option| option.value.as_deref() == Some("Nord"))
         .unwrap();
-    let page_size = picker.page_size.get();
-    picker.offset.set((nord / page_size) * page_size);
+    picker.scroll_to(picker.position_of(nord));
     state.common.last_focus = Some(UiKey::new(format!(
         "settings/choice/{}/{}",
         prefs::EDIT_THEME,
@@ -8179,7 +10948,6 @@ fn top_choice_picker_pointer_hover_previews_without_persisting() {
         crate::native_app::ViewMotionCx::default(),
         13.0,
         1.0,
-        host_theme,
         None,
     )
     .unwrap();
@@ -8213,7 +10981,6 @@ fn top_choice_picker_pointer_hover_previews_without_persisting() {
 #[test]
 fn top_window_appearance_picker_previews_the_focused_os_choice() {
     let (mut runtime, instance, view) = setup();
-    let host_theme = aterm_render::Theme::default();
     let motion = crate::native_app::ViewMotionCx {
         system_dark: false,
         ..crate::native_app::ViewMotionCx::default()
@@ -8229,7 +10996,6 @@ fn top_window_appearance_picker_previews_the_focused_os_choice() {
             motion,
             13.0,
             1.0,
-            host_theme,
             None,
         )
         .unwrap()
@@ -8253,8 +11019,7 @@ fn top_window_appearance_picker_previews_the_focused_os_choice() {
         .iter()
         .position(|option| option.value.as_deref() == Some("dark"))
         .unwrap();
-    let page_size = picker.page_size.get();
-    picker.offset.set((dark / page_size) * page_size);
+    picker.scroll_to(picker.position_of(dark));
     state.common.last_focus = Some(UiKey::new(format!(
         "settings/choice/{}/{dark}",
         prefs::EDIT_WINDOW_THEME
@@ -8266,7 +11031,6 @@ fn top_window_appearance_picker_previews_the_focused_os_choice() {
         motion,
         13.0,
         1.0,
-        host_theme,
         None,
     )
     .unwrap();
@@ -8302,22 +11066,16 @@ fn page_subtitles_fit_compact_and_minimum_medium_content_measure() {
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     let mut copies = SettingsRoute::ALL
         .into_iter()
-        .filter(|route| route.section().is_some())
-        .map(|route| settings_fields_subtitle(route, SettingsWidth::Compact, false, false))
+        .map(route_subtitle)
         .filter(|copy| !copy.is_empty())
         .collect::<Vec<_>>();
     copies.extend([
-        settings_fields_subtitle(
-            SettingsRoute::Appearance,
-            SettingsWidth::Compact,
-            true,
-            false,
-        ),
-        settings_fields_subtitle(SettingsRoute::Modified, SettingsWidth::Compact, false, true),
-        update_page_subtitle(SettingsWidth::Compact, true),
-        update_page_subtitle(SettingsWidth::Compact, false),
-        packages_page_subtitle(SettingsWidth::Compact),
-        messages_page_subtitle(SettingsWidth::Compact),
+        settings_fields_subtitle(SettingsRoute::Appearance, true, false),
+        settings_fields_subtitle(SettingsRoute::Modified, false, true),
+        update_page_subtitle(true),
+        update_page_subtitle(false),
+        packages_page_subtitle(),
+        messages_page_subtitle(),
     ]);
     for copy in copies {
         let measured = crate::tray_raster::ui_text_width(copy, 13.0);
@@ -8327,24 +11085,12 @@ fn page_subtitles_fit_compact_and_minimum_medium_content_measure() {
         );
     }
 
-    let mut medium_copies = SettingsRoute::ALL
-        .into_iter()
-        .filter(|route| route.section().is_some())
-        .map(|route| settings_fields_subtitle(route, SettingsWidth::Medium, false, false))
-        .filter(|copy| !copy.is_empty())
-        .collect::<Vec<_>>();
+    let mut medium_copies = vec![];
     medium_copies.extend([
-        settings_fields_subtitle(
-            SettingsRoute::Appearance,
-            SettingsWidth::Medium,
-            true,
-            false,
-        ),
-        settings_fields_subtitle(SettingsRoute::Modified, SettingsWidth::Medium, false, true),
-        update_page_subtitle(SettingsWidth::Medium, true),
-        update_page_subtitle(SettingsWidth::Medium, false),
-        packages_page_subtitle(SettingsWidth::Medium),
-        messages_page_subtitle(SettingsWidth::Medium),
+        update_page_subtitle(true),
+        update_page_subtitle(false),
+        packages_page_subtitle(),
+        messages_page_subtitle(),
     ]);
     for copy in medium_copies {
         let measured = crate::tray_raster::ui_text_width(copy, 13.0);
@@ -8614,7 +11360,7 @@ fn packages_route_renders_status_actions_switches_and_programs() {
     }
     let tray = compiled.tray(aterm_render::Theme::default(), 13.0);
     for (key, visible_label) in [
-        (prefs::EDIT_PACKAGES_ENABLED, "Automatic updates"),
+        (prefs::EDIT_PACKAGES_ENABLED, "Keep ALab tools up to date"),
         (prefs::EDIT_PACKAGES_AUTO_INSTALL, "Install ALab tools"),
     ] {
         assert_eq!(
@@ -8751,6 +11497,7 @@ fn the_packages_rail_entry_wears_the_badge_while_a_failure_is_named() {
         let compiled = compile_settings_view(runtime, instance, view, &cx);
         SettingsRoute::ALL
             .into_iter()
+            .filter(|route| route.on_rail())
             .map(|route| {
                 let key = UiKey::new(format!("settings/nav{}", route.path()));
                 let value = compiled
@@ -9102,42 +11849,15 @@ fn packages_page_semantics(
         state.navigate(SettingsRoute::Packages);
     }
     let mut out = Vec::new();
-    for page in 0..6 {
-        {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                unreachable!();
-            };
-            state.page_scroll = page;
-        }
-        let compiled = compile_settings_view(runtime, instance, view, cx);
+    each_screen(runtime, instance, view, cx, |compiled, _| {
         out.extend(
             compiled
                 .semantics
                 .iter()
                 .map(|n| (n.key.as_str().to_string(), n.label.clone())),
         );
-    }
+    });
     out
-}
-
-/// Whole cards packed in order into pages the content holds: a card joins the page
-/// before it while it fits, and a card taller than a page has one of its own.
-#[test]
-fn package_cards_pack_into_pages_in_order() {
-    assert_eq!(
-        pack_card_pages(&[100.0, 100.0, 100.0], 400.0, 10.0),
-        vec![0..3]
-    );
-    assert_eq!(
-        pack_card_pages(&[200.0, 150.0, 300.0, 120.0], 400.0, 12.0),
-        vec![0..2, 2..3, 3..4]
-    );
-    assert_eq!(
-        pack_card_pages(&[500.0, 100.0, 100.0], 400.0, 12.0),
-        vec![0..1, 1..3],
-        "an over-tall card has a page of its own"
-    );
-    assert!(pack_card_pages(&[], 400.0, 12.0).is_empty());
 }
 
 /// THE PROGRAM LIST SAYS EACH ROW'S FACTS (Phase 4): version and source, when it was
@@ -9259,8 +11979,8 @@ fn a_program_rows_accessible_value_is_atpkgs_own_state() {
         ay.ends_with(&format!("\n{}", atpkg::state::managed(1971, 44))),
         "{ay}"
     );
-    // The short-landscape compact page, whose rows are atomic label/value pairs, says the
-    // same in its value column.
+    // The short-landscape list, where the Programs card splits between its
+    // rows, says the same on the row's own screen.
     let (mut runtime, instance, view) = setup();
     assert!(runtime.replace_settings_packages(packages_state_with_activity(0), 2));
     {
@@ -9271,20 +11991,12 @@ fn a_program_rows_accessible_value_is_atpkgs_own_state() {
     }
     let cx = view_cx_at(568.0, 320.0);
     let mut value = None;
-    for page in 0..64 {
-        {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                unreachable!();
-            };
-            state.page_scroll = page;
+    each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
+        if let Some(node) = compiled.semantic(&UiKey::new("packages/programs/ay")) {
+            value.get_or_insert_with(|| node.label.clone());
         }
-        let compiled = compile_settings_view(&runtime, instance, view, &cx);
-        if let Some(node) = compiled.semantic(&UiKey::new("packages/programs/ay/value")) {
-            value = Some(node.label.clone());
-            break;
-        }
-    }
-    let value = value.expect("the atomic compact page has the ay row's value");
+    });
+    let value = value.expect("the short-landscape list reaches the ay row");
     assert!(
         value.starts_with("ay  \u{b7}  build 1971  \u{b7}  up to date")
             && value.ends_with(&format!("\n{}", atpkg::state::managed(1971, 44))),
@@ -9450,6 +12162,159 @@ fn software_update_links_to_its_messages() {
     }
 }
 
+/// Text & Fonts' display-face switches end where the page's other controls
+/// end (before Reset's place, which every row keeps), and each face's name
+/// sits on its switch's centre line.
+#[test]
+fn display_face_switches_line_up_with_the_pages_controls() {
+    for (width, height) in [(738.0, 418.0), (1_074.0, 684.0)] {
+        let (mut runtime, instance, view) = setup();
+        let cx = view_cx_at(width, height);
+        let mut font_right = None;
+        let mut face = None;
+        for page in 0..24 {
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!();
+                };
+                state.navigate(SettingsRoute::TextFonts);
+                state.page_scroll = page;
+            }
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let rect = |key: &str| {
+                compiled
+                    .paint
+                    .iter()
+                    .find(|node| node.key.as_str() == key && !node.peek)
+                    .map(|node| node.rect)
+            };
+            if let Some(rect) = rect("settings/control/font_family") {
+                font_right.get_or_insert(rect.right());
+            }
+            if let (Some(switch), Some(label)) = (
+                rect("settings/display-face/chunky"),
+                rect("settings/display-face/label/chunky"),
+            ) {
+                face.get_or_insert((switch, label));
+            }
+            if font_right.is_some() && face.is_some() {
+                break;
+            }
+        }
+        let font_right = font_right.expect("the font family control");
+        let (switch, label) = face.expect("the Chunky face row");
+        assert!(
+            (switch.right() - font_right).abs() < 0.5,
+            "{width}x{height}: face switch ends at {}, font family at {font_right}",
+            switch.right()
+        );
+        let centre = |rect: LogicalRect| rect.y + rect.height / 2.0;
+        assert!(
+            (centre(switch) - centre(label)).abs() < 0.5,
+            "{width}x{height}: name {label:?} centred on its switch {switch:?}"
+        );
+    }
+}
+
+/// At 80x24 the Playful effects card keeps its note on the screen that shows
+/// its switches: the one place that says Sparkle words means swear words and
+/// Keyword kitties a cat. The note rides beside the title when the card would
+/// otherwise drop it for room.
+#[test]
+fn compact_top_settings_keeps_the_playful_effects_note() {
+    let (mut runtime, instance, view) = setup();
+    let cx = view_cx_at(584.0, 348.0);
+    let mut shown = false;
+    for page in 0..12 {
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::Home);
+            state.page_scroll = page;
+        }
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        let painted = |key: &str| {
+            compiled
+                .paint
+                .iter()
+                .any(|node| node.key.as_str() == key && !node.peek)
+        };
+        if !painted(&format!("settings/control/{SPARKLE_WORDS_KEY}")) {
+            continue;
+        }
+        shown = true;
+        let note = compiled
+            .paint
+            .iter()
+            .filter(|node| !node.peek)
+            .filter_map(|node| match &node.content {
+                UiContent::Text(spec) => Some(spec.text.as_str()),
+                _ => None,
+            })
+            .find(|text| text.contains("Swear words"));
+        assert!(
+            note.is_some(),
+            "page {page}: no note says what Sparkle words does"
+        );
+        assert!(
+            painted(&format!("settings/control/{KEYWORD_KITTIES_KEY}")),
+            "page {page}: the note and both toy switches share a screen"
+        );
+        for line in compiled.paint_audit_lines() {
+            if line.contains("settings/top/playful-effects") {
+                assert!(
+                    !line.contains("overflow=true") && !line.contains("clip-truncated=true"),
+                    "{line}"
+                );
+            }
+        }
+    }
+    assert!(shown, "the Playful effects switches show on some screen");
+}
+
+/// At the shipped 102x29 window (738x420) the status card holds its action
+/// and the Settings ▸ Messages link side by side: the card with them fits the
+/// list's room, so neither is split out to a stop of its own (the next screen
+/// used to open on a lone "Messages →").
+#[test]
+fn software_update_keeps_its_buttons_in_the_status_card_at_the_default_window() {
+    let (mut runtime, instance, view) = setup();
+    assert!(runtime.replace_settings_packages(packages_state_with_activity(9), 2));
+    let cx = view_cx_at(738.0, 420.0);
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.navigate(SettingsRoute::SoftwareUpdate);
+    }
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    let rect = |key: &str| {
+        compiled
+            .paint
+            .iter()
+            .find(|node| node.key.as_str() == key)
+            .map(|node| node.rect)
+            .unwrap_or_else(|| panic!("{key} is on the first screen"))
+    };
+    let hero = rect("updates/hero");
+    let action = rect("updates/install-now");
+    let link = rect("updates/messages");
+    for (key, inner) in [("updates/install-now", action), ("updates/messages", link)] {
+        assert!(
+            inner.x >= hero.x
+                && inner.y >= hero.y
+                && inner.right() <= hero.right() + 0.01
+                && inner.bottom() <= hero.bottom() + 0.01,
+            "{key} {inner:?} lies inside the status card {hero:?}"
+        );
+    }
+    assert!(
+        (action.y - link.y).abs() < 0.5,
+        "one row: {action:?} {link:?}"
+    );
+}
+
 /// VISUAL CAPTURE of Settings ▸ Packages (Phase 4) — the wide page's card pages and
 /// the compact page's first sections — dumped as PNGs so the program facts, the one
 /// Automatic-updates switch and the Activity card can be read as PIXELS. Not a gate:
@@ -9528,9 +12393,9 @@ fn settings_packages_visual_capture() {
 /// Linux build, where the plain rows render the no-updater page (2026-09-24 review).
 #[test]
 fn the_update_card_carries_both_switches_and_their_labels_fit() {
-    let macos = update_automatic_caption(SettingsWidth::Wide, true, false);
+    let macos = update_automatic_caption(SettingsWidth::Wide, true, false, true);
     assert!(
-        macos.contains("turn the install switch off to install only when you press"),
+        macos.contains("turn Install updates off to install only when you press"),
         "the macOS caption names the install switch: {macos}"
     );
     assert!(!macos.contains("turn it off"), "{macos}");
@@ -9553,27 +12418,17 @@ fn the_update_card_carries_both_switches_and_their_labels_fit() {
     let checks = UiKey::new(format!("settings/control/{}", prefs::EDIT_UPDATE_ENABLED));
     let install = UiKey::new("settings/control/update.auto_apply");
     let mut revision = 1;
-    let wide = ["Auto-check updates", "Auto-install updates"];
-    let verbs = ["Check", "Install"];
-    let whole = [
-        "Check for updates automatically",
-        "Install updates automatically",
-    ];
-    for (variant, cx, pair, running, linux) in [
-        ("wide", view_cx_at(1_200.0, 820.0), wide, true, false),
-        ("medium", view_cx_at(849.0, 513.0), verbs, true, false),
-        ("medium-off", view_cx_at(849.0, 513.0), verbs, false, false),
-        ("compact", view_cx_at(600.0, 820.0), whole, true, false),
-        ("linux-wide", view_cx_at(1_200.0, 820.0), wide, true, true),
-        ("linux-medium", view_cx_at(849.0, 513.0), verbs, true, true),
-        (
-            "linux-medium-off",
-            view_cx_at(849.0, 513.0),
-            verbs,
-            false,
-            true,
-        ),
-        ("linux-compact", view_cx_at(600.0, 820.0), whole, true, true),
+    // Each window holds the whole card on one screen (the medium page lists it
+    // under the status card); the written phase below pages the shipped sizes.
+    for (variant, cx, running, linux) in [
+        ("wide", view_cx_at(1_200.0, 820.0), true, false),
+        ("medium", view_cx_at(849.0, 760.0), true, false),
+        ("medium-off", view_cx_at(849.0, 760.0), false, false),
+        ("compact", view_cx_at(600.0, 820.0), true, false),
+        ("linux-wide", view_cx_at(1_200.0, 820.0), true, true),
+        ("linux-medium", view_cx_at(849.0, 760.0), true, true),
+        ("linux-medium-off", view_cx_at(849.0, 760.0), false, true),
+        ("linux-compact", view_cx_at(600.0, 820.0), true, true),
     ] {
         revision += 1;
         let mut status = update_status(false);
@@ -9595,6 +12450,12 @@ fn the_update_card_carries_both_switches_and_their_labels_fit() {
                 revision,
             )
         );
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.page_scroll = 0;
+        }
         let compiled = compile_settings_view(&runtime, instance, view, &cx);
         let headline = compiled
             .semantic(&UiKey::new("updates/headline"))
@@ -9608,6 +12469,9 @@ fn the_update_card_carries_both_switches_and_their_labels_fit() {
             },
             "{variant}"
         );
+        // The switches' card: beside the status where it fits, else listed under it.
+        let compiled = screen_showing(&mut runtime, instance, view, &cx, "updates/automatic")
+            .unwrap_or_else(|| panic!("{variant}: the card is listed"));
         if !linux && cfg!(target_os = "macos") {
             // The macOS caption NAMES the switch that makes installing manual: after
             // a plural "Updates", "turn it off" could only mean the check switch,
@@ -9619,7 +12483,7 @@ fn the_update_card_carries_both_switches_and_their_labels_fit() {
             if variant == "wide" {
                 assert_eq!(
                     caption.as_deref(),
-                    Some(update_automatic_caption(SettingsWidth::Wide, true, false).as_str()),
+                    Some(update_automatic_caption(SettingsWidth::Wide, true, false, true).as_str()),
                     "{variant}: the wide card paints the whole sentence"
                 );
             }
@@ -9645,7 +12509,7 @@ fn the_update_card_carries_both_switches_and_their_labels_fit() {
         }
         let card = compiled
             .semantic(&UiKey::new("updates/automatic"))
-            .unwrap_or_else(|| panic!("{variant}: the card is on the first page"))
+            .expect("the card's screen")
             .rect;
         let mut tops = Vec::new();
         let mut painted_pair = Vec::new();
@@ -9678,32 +12542,19 @@ fn the_update_card_carries_both_switches_and_their_labels_fit() {
             painted_pair.push(text.text.clone());
         }
         assert!(tops[0] < tops[1], "{variant}: checking comes first");
-        // Which wording fits is the UI face's to decide, so the exact pair is pinned
-        // where the face is known; everywhere the pair is one rung, and the heading is
-        // there exactly when that rung is the verbs alone.
-        let rung = UPDATE_SWITCH_LABELS
-            .iter()
-            .position(|rung| rung.as_slice() == painted_pair.as_slice())
-            .unwrap_or_else(|| panic!("{variant}: one wording for the pair: {painted_pair:?}"));
-        if cfg!(target_os = "macos") {
-            assert_eq!(painted_pair, pair, "{variant}");
-        }
+        assert_eq!(
+            painted_pair, UPDATE_SWITCH_LABELS,
+            "{variant}: one wording at every width"
+        );
         let title = compiled
             .paint
             .iter()
             .find(|node| node.key.as_str() == "updates/automatic/title");
-        if rung == UPDATE_SWITCH_LABELS.len() - 1 {
-            assert!(
-                matches!(title.map(|node| &node.content),
-                    Some(UiContent::Text(text)) if text.text == "Automatic updates"),
-                "{variant}: the verbs alone come under the card's heading"
-            );
-        } else {
-            assert!(
-                title.is_none(),
-                "{variant}: a wording that says it all needs no heading"
-            );
-        }
+        assert!(
+            matches!(title.map(|node| &node.content),
+                Some(UiContent::Text(text)) if text.text == "AUTOMATIC UPDATES"),
+            "{variant}: the card's caption says what the two switches have in common"
+        );
         assert!(
             compiled
                 .semantic(&checks)
@@ -9727,6 +12578,111 @@ fn the_update_card_carries_both_switches_and_their_labels_fit() {
             overflowing.join("\n")
         );
     }
+    // WRITTEN — one switch or both, the state anyone who turned one off is in —
+    // each switch keeps the SAME words, says Changed, is never cut off at any
+    // window size, and the two switches stay in one column (the unwritten one
+    // keeps an empty slot where Reset would be). NEGATIVE CONTROL: the unwritten
+    // switch says no Changed.
+    revision += 1;
+    assert!(
+        runtime.replace_settings_update(
+            UpdateState::from_status(1, "0.1.0", Some(&update_status(false)), false)
+                .with_automatic_checks(true, true),
+            revision,
+        )
+    );
+    for (source, written) in [
+        (
+            "[update]\nenabled = false\nauto_apply = false\n",
+            [true, true],
+        ),
+        ("[update]\nauto_apply = false\n", [false, true]),
+        ("[update]\nenabled = false\n", [true, false]),
+    ] {
+        replace_settings_source(&mut runtime, view, source.to_string());
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: route_action(SettingsRoute::SoftwareUpdate),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        for (size, cx) in [
+            ("150x48", view_cx_at(1_074.0, 684.0)),
+            ("167x36", view_cx_at(1_193.0, 516.0)),
+            ("120x36", view_cx_at(864.0, 516.0)),
+            ("220x60", view_cx_at(1_564.0, 854.0)),
+            ("102x29", view_cx_at(738.0, 420.0)),
+            ("80x24", view_cx_at(584.0, 350.0)),
+        ] {
+            let mut lefts = BTreeMap::new();
+            each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
+                for ((key, wording), written) in [&checks, &install]
+                    .into_iter()
+                    .zip(UPDATE_SWITCH_LABELS)
+                    .zip(written)
+                {
+                    let Some(switch) = compiled.semantic(key) else {
+                        continue;
+                    };
+                    lefts.insert(key.as_str().to_string(), switch.rect.x);
+                    let field_key = key.as_str().trim_start_matches("settings/control/");
+                    let painted = compiled
+                        .paint
+                        .iter()
+                        .find(|node| {
+                            node.key.as_str() == format!("settings/label/{field_key}/visual")
+                        })
+                        .map(|node| match &node.content {
+                            UiContent::Text(text) => text.text.clone(),
+                            other => panic!("{other:?}"),
+                        });
+                    let want = if written {
+                        format!("{wording}{CHANGED_TAG}")
+                    } else {
+                        wording.to_string()
+                    };
+                    assert_eq!(painted.as_deref(), Some(want.as_str()), "{source} {size}");
+                }
+                let cut = compiled
+                    .paint_audit_lines()
+                    .into_iter()
+                    .filter(|line| {
+                        line.contains("overflow=true")
+                            || line.contains("clip-truncated=true")
+                            || line.contains("clipped=true")
+                    })
+                    .filter(|line| {
+                        line.contains("key=\"settings/label/update.")
+                            || line.contains("key=\"settings/reset/update.")
+                            || line.contains("key=\"settings/control/update.")
+                    })
+                    .collect::<Vec<_>>();
+                assert!(cut.is_empty(), "{source} {size}:\n{}", cut.join("\n"));
+            });
+            assert_eq!(lefts.len(), 2, "{source} {size}: both switches are listed");
+            let mut x = lefts.values();
+            assert_eq!(
+                x.next(),
+                x.next(),
+                "{source} {size}: the switches share one column"
+            );
+        }
+    }
+    replace_settings_source(&mut runtime, view, String::new());
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: route_action(SettingsRoute::SoftwareUpdate),
+                value: None,
+            }),
+        )
+        .unwrap();
     if cfg!(target_os = "macos") {
         let compiled = compile_settings_view(&runtime, instance, view, &view_cx());
         let caption = compiled
@@ -9735,7 +12691,7 @@ fn the_update_card_carries_both_switches_and_their_labels_fit() {
         assert!(
             caption
                 .label
-                .starts_with("The check switch applies next launch."),
+                .starts_with("Check for updates applies next launch."),
             "{:?}",
             caption.label
         );
@@ -9774,17 +12730,17 @@ fn the_update_card_carries_both_switches_and_their_labels_fit() {
     ] {
         let field = state.field_by_key(key).unwrap();
         assert!(
-            field_match_score(field, query).is_some(),
+            field_match_score(field, query, &crate::app_config::ThemeCatalog::default()).is_some(),
             "{query} finds {key}"
         );
     }
 }
 
-/// A SHORT PHONE STILL SHOWS A SWITCH ON PAGE 1 (2026-09-23 review). With two switches
-/// the card no longer fits beside the status card at 600x560, and the whole card moved
-/// to page 2 — the status card alone on page 1 over ~370pt of nothing, the friction
-/// the pairing exists to avoid. The check half now rides with the status card and the
-/// install half, with the caption, takes page 2; a taller phone keeps the whole card.
+/// A SHORT PHONE STILL SHOWS A SWITCH ON THE FIRST SCREEN (2026-09-23 review): the
+/// status card alone over an empty screen is the friction the page exists to lose.
+/// The list lays the automatic-updates card out row by row, so the check switch
+/// shares the first screen with the status card at 600x560 and the install switch
+/// and the caption follow it; a taller phone shows the whole card at once.
 #[test]
 fn a_short_compact_page_pairs_the_status_card_with_the_check_switch() {
     let (mut runtime, instance, view) = setup_with_update(UpdateState::from_status(
@@ -9822,43 +12778,27 @@ fn a_short_compact_page_pairs_the_status_card_with_the_check_switch() {
     };
     let short = view_cx_at(600.0, 560.0);
     let first = page(&mut runtime, &short, 0);
-    assert!(
-        first
-            .semantic(&UiKey::new("updates/compact-status"))
-            .is_some(),
-        "page 1 pairs the status card with a switch card"
-    );
     assert!(first.semantic(&UiKey::new("updates/headline")).is_some());
     assert!(
         first.semantic(&checks).is_some(),
-        "the check switch is on page 1"
+        "the check switch is on the first screen"
     );
-    assert!(first.semantic(&install).is_none());
-    let second = page(&mut runtime, &short, 1);
-    assert!(
-        second.semantic(&install).is_some(),
-        "the install switch is on page 2"
-    );
-    assert!(
-        second
-            .semantic(&UiKey::new("updates/automatic-install"))
-            .is_some()
-    );
-    assert!(
-        second
-            .semantic(&UiKey::new("updates/automatic/caption"))
-            .is_some(),
-        "the caption rides with the install half"
+    let mut later = BTreeSet::new();
+    each_screen(&mut runtime, instance, view, &short, |compiled, _| {
+        for key in [install.as_str(), "updates/automatic/caption"] {
+            if compiled.semantic(&UiKey::new(key)).is_some() {
+                later.insert(key.to_string());
+            }
+        }
+    });
+    assert_eq!(
+        later.len(),
+        2,
+        "the install switch and the caption follow: {later:?}"
     );
     let tall = view_cx_at(600.0, 820.0);
     let whole = page(&mut runtime, &tall, 0);
     assert!(whole.semantic(&checks).is_some() && whole.semantic(&install).is_some());
-    assert!(
-        whole
-            .semantic(&UiKey::new("updates/automatic-install"))
-            .is_none(),
-        "a phone with room keeps the card whole"
-    );
 
     // AN ENROLLED LINUX COPY TOO, WHATEVER ITS DETAIL (2026-09-24 review). Its detail
     // runs longer — the Linux facts, and before them the timing sentence while
@@ -9896,15 +12836,12 @@ fn a_short_compact_page_pairs_the_status_card_with_the_check_switch() {
             };
             let first = page(&mut runtime, &short, 0);
             assert!(
-                first
-                    .semantic(&UiKey::new("updates/compact-status"))
-                    .is_some()
-                    && first.semantic(&checks).is_some(),
-                "{face:?} Linux {state}: the check switch is on page 1 beside the status card"
+                first.semantic(&checks).is_some(),
+                "{face:?} Linux {state}: the check switch shares the first screen with the status card"
             );
             let detail = first
                 .semantic(&UiKey::new("updates/detail"))
-                .expect("the detail is on page 1");
+                .expect("the detail is on the first screen");
             assert_eq!(
                 detail.label, full_detail,
                 "{face:?} Linux {state}: the painted lines are bounded, the value is whole"
@@ -9959,7 +12896,7 @@ fn packages_page_shows_one_live_switch_and_the_dormant_install_consent() {
         .unwrap();
     assert_eq!(switch.value, SemanticValue::Bool(false));
     assert!(
-        switch.label.starts_with("Automatic updates"),
+        switch.label.starts_with("Keep ALab tools up to date"),
         "{}",
         switch.label
     );
@@ -10069,7 +13006,8 @@ fn automatic_updates_reads_and_restores_auto_update() {
         .unwrap()
         .label;
     assert!(
-        status.contains("auto_update = false") && status.contains("Automatic updates on"),
+        status.contains("auto_update = false")
+            && status.contains("turning on Keep ALab tools up to date"),
         "the line names the key and the control that clears it: {status}"
     );
     {
@@ -10099,11 +13037,8 @@ fn automatic_updates_reads_and_restores_auto_update() {
         .collect();
     assert_eq!(
         written,
-        vec![(
-            prefs::EDIT_PACKAGES_ENABLED.to_string(),
-            Some("true".into())
-        )],
-        "one key written: the switch"
+        vec![(prefs::EDIT_PACKAGES_ENABLED.to_string(), None)],
+        "one key touched: the switch, removed since on is its default"
     );
     let (after, _) = apply_real_config_patch(&mut service, &patch);
     assert!(
@@ -10169,17 +13104,23 @@ fn a_retired_packages_spelling_is_named_resettable_and_reset_by_reset_all() {
             .unwrap_or_else(|| panic!("{key} is listed: {overrides:?}"))
     };
     let auto_update = row(prefs::RETIRED_PACKAGES_AUTO_UPDATE);
-    assert_eq!(auto_update.label, "Retired spelling of Automatic updates");
+    assert_eq!(
+        auto_update.label,
+        "Retired spelling of \u{201c}Keep ALab tools up to date\u{201d}"
+    );
     assert_eq!(
         auto_update.preview,
-        "Keeps Automatic updates off \u{b7} Open Manual\u{2026}"
+        "Keeps \u{201c}Keep ALab tools up to date\u{201d} off"
     );
     assert!(auto_update.known && auto_update.reset_safe);
     let seed = row(prefs::RETIRED_PACKAGES_SEED_INSTALL);
-    assert_eq!(seed.label, "Retired spelling of Install ALab tools");
+    assert_eq!(
+        seed.label,
+        "Retired spelling of \u{201c}Install ALab tools\u{201d}"
+    );
     assert_eq!(
         seed.preview,
-        "Read as Install ALab tools off \u{b7} Open Manual\u{2026}"
+        "Read as \u{201c}Install ALab tools\u{201d} off"
     );
     assert!(
         overrides
@@ -10195,7 +13136,7 @@ fn a_retired_packages_spelling_is_named_resettable_and_reset_by_reset_all() {
     ] {
         let field = state.field_by_key(key).unwrap();
         assert!(
-            field_match_score(field, query).is_some(),
+            field_match_score(field, query, &crate::app_config::ThemeCatalog::default()).is_some(),
             "{query} finds {key}"
         );
     }
@@ -10255,9 +13196,9 @@ fn a_retired_packages_spelling_is_named_resettable_and_reset_by_reset_all() {
     .unwrap();
     assert!(authored_manual_overrides(&beside).iter().any(|entry| {
         entry.key == prefs::RETIRED_PACKAGES_AUTO_UPDATE
-            && entry
-                .preview
-                .starts_with("No effect \u{2014} packages.enabled decides")
+            && entry.preview.starts_with(
+                "No effect \u{2014} \u{201c}Keep ALab tools up to date\u{201d} decides",
+            )
     }),);
 
     // Reset All takes the retired spelling with the fields, and Undo writes it back.
@@ -10324,7 +13265,7 @@ fn a_retired_packages_spelling_is_named_resettable_and_reset_by_reset_all() {
 
 /// A RETIRED `auto_update = false`'S WAY OUT IS READ WHOLE, AT EVERY WIDTH (review of the
 /// Phase 4 merge, 2026-09-23). The one-line Background service row cut the retired key's
-/// line at every width ("…(turning Automatic updates on r…", "…auto_update = false h…"),
+/// line at every width ("…(turning on Keep ALab tools up…", "…auto_update = false h…"),
 /// and atpkg's sentence rode the hero's one-line detail, which cut its remedy ("…remove
 /// it and se…"); the ordinary Off and On lines lost "Update Now still works" and the
 /// last full check (the hero's detail now) at the medium and compact widths. Now the
@@ -10390,7 +13331,19 @@ fn the_retired_switch_note_and_the_service_line_paint_whole_at_every_width() {
                 if let Some(semantic) = compiled.semantic(&UiKey::new("packages/retired-note")) {
                     note_semantic = Some(semantic.label.clone());
                 }
-                for line in compiled.paint_audit_lines() {
+                // The next stop peeking in under the screen is not yet shown.
+                let peek: std::collections::BTreeSet<&str> = compiled
+                    .paint
+                    .iter()
+                    .filter(|node| node.peek)
+                    .map(|node| node.key.as_str())
+                    .collect();
+                for line in compiled.paint_audit_lines().into_iter().filter(|line| {
+                    line.split("key=\"")
+                        .nth(1)
+                        .and_then(|rest| rest.split('"').next())
+                        .is_none_or(|key| !peek.contains(key))
+                }) {
                     if line.contains("paint-text key=\"packages/loop-status/value/line/") {
                         service.insert(line_index(&line), painted(&line));
                         audits.push(line);
@@ -10424,7 +13377,7 @@ fn the_retired_switch_note_and_the_service_line_paint_whole_at_every_width() {
             if retired {
                 assert!(
                     service.contains("auto_update = false")
-                        && service.contains("turning Automatic updates on removes it"),
+                        && service.contains("turning on Keep ALab tools up to date removes it"),
                     "{context}: {service}"
                 );
                 assert_eq!(note_semantic.as_deref(), Some(note.as_str()), "{context}");
@@ -10487,30 +13440,16 @@ fn a_long_activity_line_wraps_and_keeps_its_trouble() {
         );
     }
     let rows = packages_activity_rows(0, &packages, SettingsWidth::Compact);
-    let (node, _) = compact_packages_activity_line(rows[1].clone());
+    let row = rows[1].clone();
+    let node = packages_activity_row_node(row.key, row.text, row.trouble, 24.0);
     assert!(
-        matches!(&node.content, UiContent::Group(g)
-            if g.label.as_deref() == Some("Package activity, continued")),
-        "{:?}",
-        node.content
+        matches!(&node.content, UiContent::Text(t) if t.style == StyleRef::Danger),
+        "a continued trouble line keeps the danger colour"
     );
-    assert!(
-        matches!(&node.children[0].content, UiContent::Text(t) if t.style == StyleRef::Danger),
-        "trouble keeps the danger colour on the compact page"
-    );
-    let (node, _) = compact_packages_activity_line(rows[0].clone());
-    assert!(matches!(&node.content, UiContent::Group(g)
-        if g.label.as_deref() == Some("Package activity")));
 }
 
-/// The Security page's "This Mac" card exists only on macOS and only once the
-/// host's machine read has completed; it carries the measured lines, the
-/// "Apply now would" verdict, the last-change memory and the Apply now button
-/// (enabled exactly when the verdict says something is left to do); and it is
-/// absent from Modified and from a global search. On a short landscape window
-/// it is a slice of its own, never shed.
-/// THE OTHER DOOR THE PROMISE OFFERS. "Apply now" exists as a button on the card
-/// AND as a palette command; the command had no test at all, so its id, its title,
+/// THE OTHER DOOR THE PROMISE OFFERS. "Apply Now" exists as a button under the
+/// Universal Control row AND as a palette command; the command had no test at all, so its id, its title,
 /// its enabled bit and its absence off the Security route were free to drift.
 #[cfg(target_os = "macos")]
 #[test]
@@ -10557,8 +13496,8 @@ fn the_security_route_offers_the_machine_apply_command_in_the_palette() {
     assert_eq!(offered.title, "This Mac: Apply Machine Settings Now");
     assert!(offered.enabled, "something is left to apply");
 
-    // Nothing left to apply: still offered (the card is there), but disabled —
-    // the same bit the button reads, so the two doors never disagree.
+    // Nothing left to apply: still offered, but disabled — the same bit the
+    // button reads, so the two doors never disagree.
     assert!(runtime.replace_settings_packages(
         live_packages_state_with_machine(
             None,
@@ -10573,14 +13512,13 @@ fn the_security_route_offers_the_machine_apply_command_in_the_palette() {
     assert!(!settled.enabled, "nothing to apply ⇒ nothing to press");
 }
 
-/// THE PAGE LIMIT MUST COUNT EVERY SLICE THE RENDERER DRAWS. The landscape pager
-/// bounds `page_scroll` by `record_result_page_limit`, and that count omitted the
-/// macOS-access and This Mac cards — which the renderer DOES count as slices — so on
-/// a window that pages, the rows after them could not be reached: on Security, that
-/// is the two `[machine]` switches, the whole point of the card above them.
+/// THE SCROLL LIMIT MUST COUNT EVERY STOP THE RENDERER DRAWS. A list's bound came
+/// from a count that omitted the macOS-access card, so on a short window the
+/// rows after it could not be reached: on Security, that is the Universal
+/// Control row and the This Mac status under it.
 #[cfg(target_os = "macos")]
 #[test]
-fn the_landscape_pager_reaches_the_last_security_row_with_both_cards_present() {
+fn the_short_security_list_reaches_its_last_row_under_the_access_card() {
     use aterm_containment::FdaScope;
     use atpkg::machine::{HomePosture, UcPosture};
     let (mut runtime, instance, view) = setup();
@@ -10606,21 +13544,14 @@ fn the_landscape_pager_reaches_the_last_security_row_with_both_cards_present() {
         3,
     ));
     let cx = view_cx_at(624.0, 348.0);
-    // Page through with the PAGE-DOWN ACTION, not by writing `page_scroll`: the
-    // limit is what clamps that reducer, so a test that sets the field directly
-    // cannot see a limit that is too small.
+    // Scroll with PAGE DOWN, not by writing `page_scroll`: the limit is what
+    // clamps that reducer, so a test that sets the field directly cannot see a
+    // limit that is too small.
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for page in 0..64 {
         if page > 0 {
             runtime
-                .dispatch(
-                    instance,
-                    view,
-                    AppEvent::Action(ActionInvocation {
-                        id: ActionId::new("settings/page-down"),
-                        value: None,
-                    }),
-                )
+                .dispatch(instance, view, AppEvent::ScrollPage(1))
                 .unwrap();
         }
         let compiled = compile_settings_view(&runtime, instance, view, &cx);
@@ -10628,22 +13559,154 @@ fn the_landscape_pager_reaches_the_last_security_row_with_both_cards_present() {
         let rows: Vec<String> = compiled
             .semantics
             .iter()
-            .filter(|node| node.key.as_str().starts_with("settings/row/"))
+            .filter(|node| {
+                node.key.as_str().starts_with("settings/row/") || node.key.as_str() == MACHINE_APPLY
+            })
             .map(|node| node.key.as_str().to_string())
             .collect();
-        // No early break: the first pages are the two cards and carry no control
-        // row at all, which is exactly the shape that made the old limit too short.
+        // No early break: the first screens are the access card and carry no
+        // control row at all, which is exactly the shape that made the old limit
+        // too short.
         seen.extend(rows);
     }
     assert!(
         seen.iter()
             .any(|row| row.contains("machine.universal_control")),
-        "paging never reached machine.universal_control: {seen:?}"
+        "scrolling never reached machine.universal_control: {seen:?}"
+    );
+    assert!(
+        seen.contains(MACHINE_APPLY),
+        "scrolling never reached the Apply Now under it: {seen:?}"
     );
 }
 
+/// A copy with no package tool beside it: the report says so, and the
+/// machine read fails for the same reason, as the host's does.
+fn missing_tool_packages_state() -> PackagesState {
+    let mut service = crate::packages_screen::PackagesService::new();
+    let sequence = service.begin(None).unwrap();
+    let report = crate::packages_screen::PackagesStatusReport::from_parts(
+        false,
+        true,
+        String::new(),
+        None,
+        &[],
+    );
+    assert!(service.finish(
+        sequence,
+        crate::packages_screen::PackagesWorkerCompletion::refresh(report),
+    ));
+    let _ = service.replace_machine_state(Err(
+        "the package tool is not installed beside aterm".to_string()
+    ));
+    service.state(true, true, true)
+}
+
+/// PACKAGES SAYS A MISSING TOOL ONCE, AND KEEPS ITS VERBS IN ITS CARD: the
+/// status card says the package tool is missing, so no switch row repeats it;
+/// the Background service line is plain text, not a card that reads as a
+/// field; and the three verbs are ONE row of the hero (side by side wherever
+/// they fit at their own widths), so no screen holds a button apart from the
+/// card it belongs to, at the 80x24, 102x29 and 150x48 windows.
 #[test]
-fn the_security_page_paints_the_machine_card_only_on_macos_once_observed() {
+fn packages_says_a_missing_tool_once_and_keeps_its_verbs_in_its_card() {
+    let (mut runtime, instance, view) = setup();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.navigate(SettingsRoute::Packages);
+    }
+    assert!(runtime.replace_settings_packages(missing_tool_packages_state(), 2));
+    let verbs = [
+        "packages/check",
+        "packages/install-default",
+        "packages/uninstall-all",
+    ];
+    for (width, height) in [(584.0, 350.0), (738.0, 420.0), (1_074.0, 684.0)] {
+        let (mut labels, mut verbs_seen, mut service_seen) = (BTreeSet::new(), 0, false);
+        each_screen(
+            &mut runtime,
+            instance,
+            view,
+            &view_cx_at(width, height),
+            |compiled, top| {
+                for key in PACKAGES_PAGE_SWITCHES {
+                    let Some(label) = compiled
+                        .paint
+                        .iter()
+                        .find(|node| node.key.as_str() == format!("settings/label/{key}"))
+                    else {
+                        continue;
+                    };
+                    let UiContent::Text(text) = &label.content else {
+                        panic!("{key}: {:?}", label.content);
+                    };
+                    assert!(
+                        !text.text.contains("Package tool") && !text.text.contains("No effect"),
+                        "{key} at {width}x{height} repeats the status card: {}",
+                        text.text
+                    );
+                    labels.insert(key);
+                }
+                if let Some(service) = compiled
+                    .paint
+                    .iter()
+                    .find(|node| node.key.as_str() == "packages/loop-status")
+                {
+                    assert!(
+                        matches!(&service.content,
+                            UiContent::Group(spec) if spec.style == StyleRef::Plain),
+                        "the service line is text, not a card: {:?}",
+                        service.content
+                    );
+                    service_seen = true;
+                }
+                let shown = verbs
+                    .iter()
+                    .filter_map(|key| compiled.semantic(&UiKey::new(*key)))
+                    .collect::<Vec<_>>();
+                if !shown.is_empty() {
+                    assert_eq!(shown.len(), 3, "the verbs together at {width}x{height}");
+                    let hero = compiled
+                        .semantic(&UiKey::new("packages/hero"))
+                        .unwrap_or_else(|| panic!("the verbs' card ({width}x{height})"))
+                        .rect;
+                    for verb in &shown {
+                        assert!(
+                            verb.rect.y >= hero.y && verb.rect.bottom() <= hero.bottom() + 0.01,
+                            "{} inside the status card at {width}x{height}",
+                            verb.key.as_str()
+                        );
+                    }
+                    assert!(
+                        compiled
+                            .semantic(&UiKey::new("packages/headline"))
+                            .is_some(),
+                        "the verbs with the status they act on ({width}x{height}, screen {top})"
+                    );
+                    verbs_seen += 1;
+                }
+            },
+        );
+        assert_eq!(
+            labels.len(),
+            PACKAGES_PAGE_SWITCHES.len(),
+            "{width}x{height}"
+        );
+        assert!(verbs_seen > 0 && service_seen, "{width}x{height}");
+    }
+}
+
+/// THE "THIS MAC" STATUS LIVES IN ITS ROW'S GROUP. On macOS, once the host has
+/// read the Mac, Security's one "This Mac" group holds the Universal Control
+/// row and, under it, the measured state in a sentence; where there is
+/// something to apply, what Apply Now does with the button beside it at its own
+/// width; whatever is in the way. There is no second card, nothing before the
+/// read, nothing in Modified or a search, and in a copy without its package
+/// tool, whose row says it has no effect, only the one line that says why.
+#[test]
+fn the_security_page_shows_this_mac_under_its_row() {
     use atpkg::machine::{HomePosture, UcPosture};
     let (mut runtime, instance, view) = setup();
     {
@@ -10652,145 +13715,175 @@ fn the_security_page_paints_the_machine_card_only_on_macos_once_observed() {
         };
         state.navigate(SettingsRoute::Security);
     }
-    let cx = view_cx_at(1100.0, 760.0);
-    // Unobserved: no card on any platform — nothing invented.
+    let cx = view_cx_at(1100.0, 1400.0);
+    let row_key = format!("settings/control/{}", prefs::EDIT_MACHINE_UNIVERSAL_CONTROL);
+    // Unobserved: no status on any platform — nothing invented.
     assert!(runtime.replace_settings_packages(live_packages_state(None), 2));
     let compiled = compile_settings_view(&runtime, instance, view, &cx);
     compiled.validate_parity().unwrap();
     assert!(
-        compiled
-            .semantic(&UiKey::new("settings/machine/heading"))
-            .is_none(),
-        "no machine read yet ⇒ no card"
+        compiled.semantic(&UiKey::new("settings/machine")).is_none(),
+        "no machine read yet ⇒ no status"
     );
 
+    let seat = |runtime: &mut NativeRuntime, state: PackagesState, revision: u64| {
+        assert!(runtime.replace_settings_packages(state, revision));
+        let compiled = compile_settings_view(runtime, instance, view, &cx);
+        compiled.validate_parity().unwrap();
+        compiled
+    };
+    let text = |compiled: &crate::native_ui::CompiledUi, key: &str| {
+        compiled
+            .semantic(&UiKey::new(key))
+            .map(|node| node.label.clone())
+    };
+
     // Observed with something left to do.
-    assert!(runtime.replace_settings_packages(
+    let compiled = seat(
+        &mut runtime,
         live_packages_state_with_machine(
             None,
             Ok(machine_state_fixture(
                 UcPosture::Default,
-                HomePosture::Account
+                HomePosture::Account,
             )),
         ),
         3,
-    ));
-    let compiled = compile_settings_view(&runtime, instance, view, &cx);
-    compiled.validate_parity().unwrap();
-    let heading = compiled.semantic(&UiKey::new("settings/machine/heading"));
+    );
     assert_eq!(
-        heading.is_some(),
+        compiled.semantic(&UiKey::new("settings/machine")).is_some(),
         cfg!(target_os = "macos"),
-        "the card is a macOS host-settings surface"
+        "the status is a macOS host-settings surface"
     );
     if !cfg!(target_os = "macos") {
         return;
     }
-    let text = |key: &str| {
-        compiled
-            .semantic(&UiKey::new(key))
-            .unwrap_or_else(|| panic!("{key} is painted"))
-            .label
-            .clone()
-    };
-    assert_eq!(
-        text("settings/machine/universal-control"),
-        "Universal Control: at the OS default — the cursor roams to other Macs and iPads"
-    );
-    assert_eq!(
-        text("settings/machine/next"),
-        "Apply now would set: Universal Control off for this host"
-    );
-    assert_eq!(
-        text("settings/machine/last-applied"),
-        "No change recorded this launch"
-    );
     assert!(
         compiled
-            .semantic(&UiKey::new("settings/machine/debugger"))
-            .is_none(),
-        "no Debugger access row on this page ⇒ no line pointing at it"
+            .semantics
+            .iter()
+            .all(|node| !node.key.as_str().starts_with("settings/machine/heading")),
+        "one This Mac group, no second card"
     );
+    let row = compiled
+        .semantic(&UiKey::new(row_key.as_str()))
+        .unwrap()
+        .rect;
+    let status = compiled
+        .semantic(&UiKey::new("settings/machine"))
+        .unwrap()
+        .rect;
+    let group = compiled
+        .semantics
+        .iter()
+        .find(|node| {
+            node.key
+                .as_str()
+                .starts_with("settings/group//security/this-mac/")
+        })
+        .expect("the This Mac group")
+        .rect;
+    assert!(status.y >= row.bottom(), "under the row");
     assert!(
-        compiled
-            .semantic(&UiKey::new("settings/machine/home"))
-            .is_none(),
-        "nothing in the way ⇒ no reason line"
+        status.y >= group.y && status.bottom() <= group.bottom(),
+        "inside the row's group: {status:?} in {group:?}"
     );
-
+    assert_eq!(
+        text(&compiled, "settings/machine/universal-control").as_deref(),
+        Some("Universal Control is on: the pointer can move to other Macs and iPads.")
+    );
+    assert_eq!(
+        text(&compiled, "settings/machine/next").as_deref(),
+        Some(crate::packages_screen::MACHINE_APPLY_WOULD)
+    );
+    for quiet in [
+        "settings/machine/home",
+        "settings/machine/last-applied",
+        "settings/machine/debugger",
+    ] {
+        assert!(text(&compiled, quiet).is_none(), "{quiet}: nothing to say");
+    }
     let apply = compiled
         .semantic(&UiKey::new(MACHINE_APPLY))
-        .expect("Apply now is a hit target");
+        .expect("Apply Now is a hit target");
     assert!(apply.state.as_ref().is_some_and(|s| s.enabled));
+    assert!(
+        apply.rect.width < 160.0,
+        "Apply Now keeps its own width, not the row's: {:?}",
+        apply.rect
+    );
+    let next = compiled
+        .semantic(&UiKey::new("settings/machine/next"))
+        .unwrap()
+        .rect;
+    assert!(
+        apply.rect.x >= next.right() && apply.rect.y < next.bottom(),
+        "beside what it does"
+    );
 
-    // Nothing left: the verdict line says so and the button is disabled.
-    assert!(runtime.replace_settings_packages(
+    // Other package work running: the button stays where it was, greyed,
+    // so the row doesn't jump as that work comes and goes.
+    let compiled = seat(
+        &mut runtime,
+        live_packages_state_with_machine(
+            Some(crate::packages_screen::PackagesBusy::Check),
+            Ok(machine_state_fixture(
+                UcPosture::Default,
+                HomePosture::Account,
+            )),
+        ),
+        4,
+    );
+    let busy = compiled
+        .semantic(&UiKey::new(MACHINE_APPLY))
+        .expect("still offered while other work runs");
+    assert!(busy.state.as_ref().is_some_and(|s| !s.enabled));
+    assert_eq!(busy.rect, apply.rect, "in the same place");
+
+    // Nothing left: the sentence says the Mac's state and no button is offered.
+    let compiled = seat(
+        &mut runtime,
         live_packages_state_with_machine(
             None,
             Ok(machine_state_fixture(
                 UcPosture::Disabled,
-                HomePosture::Account
+                HomePosture::Account,
             )),
         ),
-        4,
-    ));
-    let compiled = compile_settings_view(&runtime, instance, view, &cx);
-    compiled.validate_parity().unwrap();
+        5,
+    );
     assert_eq!(
-        compiled
-            .semantic(&UiKey::new("settings/machine/universal-control"))
-            .unwrap()
-            .label,
-        "Universal Control: disabled on this Mac"
+        text(&compiled, "settings/machine/universal-control").as_deref(),
+        Some("Universal Control is off on this Mac.")
     );
-    assert!(
-        compiled
-            .semantic(&UiKey::new("settings/machine/next"))
-            .unwrap()
-            .label
-            .starts_with("Nothing to apply")
-    );
-    assert!(
-        compiled
-            .semantic(&UiKey::new(MACHINE_APPLY))
-            .unwrap()
-            .state
-            .as_ref()
-            .is_some_and(|s| !s.enabled)
-    );
+    assert!(compiled.semantic(&UiKey::new(MACHINE_APPLY)).is_none());
 
-    // A home mismatch names the reason and disables the button.
-    assert!(runtime.replace_settings_packages(
+    // A home mismatch names what is in the way, and offers nothing to press.
+    let compiled = seat(
+        &mut runtime,
         live_packages_state_with_machine(
             None,
             Ok(machine_state_fixture(
                 UcPosture::Default,
-                HomePosture::Mismatch
+                HomePosture::Mismatch,
             )),
         ),
-        5,
-    ));
-    let compiled = compile_settings_view(&runtime, instance, view, &cx);
-    compiled.validate_parity().unwrap();
-    assert!(
-        compiled
-            .semantic(&UiKey::new("settings/machine/home"))
-            .unwrap()
-            .label
-            .starts_with("Not applied here")
+        6,
     );
     assert!(
-        compiled
-            .semantic(&UiKey::new(MACHINE_APPLY))
-            .unwrap()
-            .state
-            .as_ref()
-            .is_some_and(|s| !s.enabled)
+        text(&compiled, "settings/machine/home")
+            .is_some_and(|reason| reason.starts_with("Not applied:")
+                && !reason.contains("HOME")
+                && !reason.contains("defaults")),
+        "{:?}",
+        text(&compiled, "settings/machine/home")
     );
+    assert!(compiled.semantic(&UiKey::new(MACHINE_APPLY)).is_none());
 
-    // A read error after a good record: the measured lines say they are prior,
-    // the reason line names the error, and Apply now is off.
-    assert!(runtime.replace_settings_packages(
+    // A read error after a good record: the sentence says it is the last
+    // reading, the reason line names the error, and nothing is offered.
+    let compiled = seat(
+        &mut runtime,
         live_packages_state_with_machine_reads(
             None,
             true,
@@ -10798,94 +13891,85 @@ fn the_security_page_paints_the_machine_card_only_on_macos_once_observed() {
             vec![
                 Ok(machine_state_fixture(
                     UcPosture::Default,
-                    HomePosture::Account
+                    HomePosture::Account,
                 )),
                 Err("atpkg machine printed no state".to_string()),
             ],
         ),
-        6,
-    ));
-    let compiled = compile_settings_view(&runtime, instance, view, &cx);
-    compiled.validate_parity().unwrap();
-    assert!(
-        compiled
-            .semantic(&UiKey::new("settings/machine/universal-control"))
-            .unwrap()
-            .label
-            .ends_with("(from the last successful read)")
+        7,
     );
     assert!(
-        compiled
-            .semantic(&UiKey::new("settings/machine/home"))
-            .unwrap()
-            .label
-            .starts_with("Could not read the machine state")
+        text(&compiled, "settings/machine/universal-control")
+            .is_some_and(|line| line.ends_with("(as last read).")),
     );
     assert!(
-        compiled
-            .semantic(&UiKey::new(MACHINE_APPLY))
-            .unwrap()
-            .state
-            .as_ref()
-            .is_some_and(|s| !s.enabled)
+        text(&compiled, "settings/machine/home")
+            .is_some_and(|reason| reason.starts_with("Couldn\u{2019}t read this Mac"))
+    );
+    assert!(compiled.semantic(&UiKey::new(MACHINE_APPLY)).is_none());
+
+    // No package tool: the row says, short beside its segments, that it does
+    // nothing here, and the one This Mac line under it says why — nothing is
+    // read, and there is nothing to apply.
+    let compiled = seat(&mut runtime, missing_tool_packages_state(), 8);
+    assert_eq!(
+        text(&compiled, "settings/machine/universal-control").as_deref(),
+        Some(MACHINE_TOOL_MISSING)
+    );
+    for key in [
+        MACHINE_APPLY,
+        "settings/machine/refreshing",
+        "settings/machine/home",
+        "settings/machine/saved",
+    ] {
+        assert!(compiled.semantic(&UiKey::new(key)).is_none(), "{key}");
+    }
+    assert!(
+        text(
+            &compiled,
+            &format!("settings/label/{}", prefs::EDIT_MACHINE_UNIVERSAL_CONTROL)
+        )
+        .is_some_and(|label| label.contains("No effect here")),
     );
 
-    // Modified and a global search never carry the card.
-    {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-            unreachable!();
-        };
-        state.navigate(SettingsRoute::Modified);
-    }
-    let compiled = compile_settings_view(&runtime, instance, view, &cx);
-    assert!(
-        compiled
-            .semantic(&UiKey::new("settings/machine/heading"))
-            .is_none()
+    // Modified and a global search never carry it.
+    let _ = seat(
+        &mut runtime,
+        live_packages_state_with_machine(
+            None,
+            Ok(machine_state_fixture(
+                UcPosture::Default,
+                HomePosture::Account,
+            )),
+        ),
+        9,
     );
-    {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-            unreachable!();
-        };
-        state.navigate(SettingsRoute::Security);
-        state.search = "universal".to_string();
+    for (route, search) in [
+        (SettingsRoute::Modified, ""),
+        (SettingsRoute::Security, "universal"),
+    ] {
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(route);
+            state.search = search.to_string();
+        }
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert!(
+            compiled.semantic(&UiKey::new("settings/machine")).is_none(),
+            "{route:?} {search:?}"
+        );
     }
-    let compiled = compile_settings_view(&runtime, instance, view, &cx);
-    assert!(
-        compiled
-            .semantic(&UiKey::new("settings/machine/heading"))
-            .is_none(),
-        "a search lists rows, not the card"
-    );
 
-    // Short landscape (624x348 takes the landscape pager): page 0 is the card.
+    // With the macOS access block drawn above, the status points at its
+    // Debugger access row.
     {
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
             unreachable!();
         };
         state.search.clear();
-        state.page_scroll = 0;
-    }
-    let landscape = view_cx_at(624.0, 348.0);
-    let compiled = compile_settings_view(&runtime, instance, view, &landscape);
-    compiled.validate_parity().unwrap();
-    assert!(
-        compiled
-            .semantic(&UiKey::new("settings/machine/heading"))
-            .is_some(),
-        "the landscape pager keeps the card as its own slice"
-    );
-    assert!(
-        compiled.semantic(&UiKey::new(MACHINE_APPLY)).is_some(),
-        "and Apply now is a hit target there"
-    );
-
-    // With the macOS access block drawn above it, the card points at the
-    // Debugger access row in that block.
-    {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-            unreachable!();
-        };
+        state.navigate(SettingsRoute::Security);
         state.replace_macos_access(debugger_access(debugger_facts(
             aterm_containment::consent::DebuggerMode::Disabled,
             aterm_containment::consent::DebuggerMember::Admin,
@@ -10900,16 +13984,7 @@ fn the_security_page_paints_the_machine_card_only_on_macos_once_observed() {
             .is_some(),
         "the Debugger access row is drawn"
     );
-    assert_eq!(
-        with_row
-            .semantic(&UiKey::new("settings/machine/debugger"))
-            .map(|node| node.label.clone())
-            .as_deref(),
-        Some(
-            "Machine-wide, like Debugger access above, but applied automatically; Debugger \
-             access is changed only by you."
-        )
-    );
+    assert!(text(&with_row, "settings/machine/debugger").is_some());
 }
 
 /// `machine/apply` goes through the same reducer as every package verb: refused
@@ -10964,12 +14039,12 @@ fn machine_apply_gates_dispatch_and_finish() {
     assert!(no_effect(&refused));
     if cfg!(target_os = "macos") {
         assert!(
-            feedback(&runtime).contains("machine state is still being read"),
+            feedback(&runtime).contains("settings are still being read"),
             "{}",
             feedback(&runtime)
         );
     } else {
-        assert!(feedback(&runtime).contains("macOS host settings"));
+        assert!(feedback(&runtime).contains("for macOS"));
         return;
     }
 
@@ -11006,7 +14081,7 @@ fn machine_apply_gates_dispatch_and_finish() {
     let refused = runtime.dispatch(instance, view, apply()).unwrap();
     assert!(no_effect(&refused));
     assert!(
-        feedback(&runtime).starts_with("Not applied here"),
+        feedback(&runtime).starts_with("Not applied:"),
         "{}",
         feedback(&runtime)
     );
@@ -11140,7 +14215,7 @@ fn machine_apply_dispatches_with_the_manager_off() {
             assert_eq!(feedback, "Applying the machine settings…");
         } else {
             assert!(!dispatched);
-            assert!(feedback.contains("macOS host settings"), "{feedback}");
+            assert!(feedback.contains("for macOS"), "{feedback}");
             continue;
         }
         if !manager_enabled {
@@ -11391,7 +14466,7 @@ fn packages_long_reason_rows_put_the_fix_first_and_keep_short_states_stable() {
             "{width:?}"
         );
         assert!(!lines[0].continuation);
-        assert_eq!(packages_program_row_count(&short, width), 1);
+        assert_eq!(packages_program_lines(&short, width).len(), 1);
     }
 
     // The incident: the state leaves the row, and the fix is the first line under it.
@@ -11443,7 +14518,7 @@ fn packages_long_reason_rows_put_the_fix_first_and_keep_short_states_stable() {
             format!("fix: {fix_clause}"),
             "{width:?}: nothing of the fix is cut"
         );
-        assert_eq!(packages_program_row_count(&long, width), lines.len());
+        assert_eq!(packages_program_lines(&long, width).len(), lines.len());
     }
 
     // Painted, every continuation line fits its box at the compact and the wide
@@ -11571,7 +14646,7 @@ fn packages_rows_are_one_list_with_no_install_controls() {
         "a retired spelling rides verbatim"
     );
     assert_eq!(
-        packages_program_row_count(&projection, SettingsWidth::Wide),
+        packages_program_lines(&projection, SettingsWidth::Wide).len(),
         lines.len()
     );
 }
@@ -11726,12 +14801,7 @@ fn visual_preview_matrix_covers_four_viewports_at_three_text_scales_at_scale(sca
             _ => panic!("Settings view state"),
         };
         cx.semantic_font = state
-            .preview_font_candidate(
-                cx.animation_phase_ms,
-                cx.motion,
-                cx.terminal_font_px,
-                cx.terminal_theme,
-            )
+            .preview_font_candidate(cx.animation_phase_ms, cx.motion, cx.terminal_font_px)
             .map(|candidate| crate::tray_raster::prepare_semantic_font(&candidate));
         runtime
             .render(instance, view, &cx)
@@ -11784,7 +14854,6 @@ fn visual_preview_matrix_covers_four_viewports_at_three_text_scales_at_scale(sca
         SettingsRoute::Appearance,
         SettingsRoute::TextFonts,
         SettingsRoute::CursorMotion,
-        SettingsRoute::WindowTabs,
     ];
     for (width, height) in viewports {
         for route in routes {
@@ -11797,138 +14866,176 @@ fn visual_preview_matrix_covers_four_viewports_at_three_text_scales_at_scale(sca
             let context = format!("{} {width}×{height} at {scale}×", route.label());
             assert_whole(&compiled, width, height, &context);
             let preview_key = UiKey::new(format!("settings/preview{}", route.path()));
-            let preview = compiled
-                .semantic(&preview_key)
-                .unwrap_or_else(|| panic!("{context}: live preview is visible"));
             let expected_height =
                 renderer_preview_height(SettingsWidth::for_viewport_at_scale(width, scale));
-            if route == SettingsRoute::TextFonts {
+            // In a short window or at large type, where even one whole
+            // specimen row and the list's tallest stop cannot share a screen,
+            // the preview yields altogether rather than showing its header
+            // over a sliver.
+            let preview = compiled.semantic(&preview_key);
+            if preview.is_none() {
                 assert!(
-                    preview.rect.height >= expected_height,
-                    "{context}: typography keeps its minimum"
-                );
-                assert!(
-                    preview.rect.bottom() <= height + 0.01,
-                    "{context}: whole specimen card"
-                );
-                let paint = compiled
-                    .paint
-                    .iter()
-                    .find(|paint| paint.key == preview_key)
-                    .unwrap();
-                let UiContent::SettingsPreview(spec) = &paint.content else {
-                    unreachable!()
-                };
-                let mut prims = Vec::new();
-                spec.paint(
-                    &mut prims,
-                    paint.rect,
-                    aterm_render::Theme::default(),
-                    crate::settings::Roles::from_theme(aterm_render::Theme::default()),
-                );
-                let (y, specimen) = prims
-                    .iter()
-                    .find_map(|prim| match prim {
-                        crate::widget::DrawPrim::TerminalSpecimen { y, spec, .. } => {
-                            Some((*y, spec))
-                        }
-                        _ => None,
-                    })
-                    .expect("typography paints complete specimen rows");
-                if width == 624.0 && height == 404.0 && scale == 1.0 {
-                    assert_eq!(
-                        specimen.input.rows, 5,
-                        "the default desktop viewport shows the complete typography sample"
-                    );
-                }
-                let pill_y = prims
-                    .iter()
-                    .find_map(|prim| match prim {
-                        crate::widget::DrawPrim::Panel { y, radius, .. } if *radius == 6.0 => {
-                            Some(*y)
-                        }
-                        _ => None,
-                    })
-                    .expect("separate status band");
-                for dpi in [1.0, 1.25, 2.0, 3.0] {
-                    let variations = specimen
-                        .variations
-                        .iter()
-                        .map(|v| (v.tag, v.value()))
-                        .collect::<Vec<_>>();
-                    let row_h = specimen
-                        .prepared_font
-                        .specimen_cell_height(
-                            specimen.font_px * dpi,
-                            specimen.line_height,
-                            &variations,
-                        )
-                        .unwrap() as f32
-                        / dpi;
-                    assert!(
-                        y + specimen.input.rows as f32 * row_h <= pill_y - 4.0,
-                        "{context} at {dpi}dpi: specimen rows never meet the status badge"
-                    );
-                }
-            } else {
-                assert!(
-                    (preview.rect.height - expected_height).abs() < 0.01,
-                    "{context}: preview height is {:?}, expected {expected_height}",
-                    preview.rect,
+                    scale > 1.25 || height < 400.0,
+                    "{context}: live preview is visible"
                 );
             }
-
-            if height <= 420.0 {
-                let navigation = compiled
-                    .semantic(&UiKey::new("settings/results-window"))
-                    .expect("short landscape discloses the next virtual slice");
-                assert!(navigation.rect.bottom() <= height + 0.01, "{context}");
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                    unreachable!()
-                };
-                state.page_scroll = 1;
-                let controls = compile(&runtime, instance, view, width, height);
-                let scrolled_context = format!("{context}, settings slice");
-                assert_whole(&controls, width, height, &scrolled_context);
-                assert!(
-                    controls.semantic(&preview_key).is_none(),
-                    "{scrolled_context}: preview yielded its bounded slice"
-                );
-                assert!(
-                    controls
-                        .semantics
+            if let Some(preview) = preview {
+                if route == SettingsRoute::TextFonts && preview.rect.height >= expected_height {
+                    // A specimen with its full minimum paints whole rows clear
+                    // of its status band; a shorter one (a pinned specimen
+                    // yielding toward its one-row floor) shows what fits.
+                    assert!(
+                        preview.rect.bottom() <= height + 0.01,
+                        "{context}: whole specimen card"
+                    );
+                    let paint = compiled
+                        .paint
                         .iter()
-                        .any(|node| node.key.as_str().starts_with("settings/control/")),
-                    "{scrolled_context}: the first real control is reachable"
-                );
-
-                if (scale - 2.0).abs() < f32::EPSILON {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        .find(|paint| paint.key == preview_key)
+                        .unwrap();
+                    let UiContent::SettingsPreview(spec) = &paint.content else {
                         unreachable!()
                     };
-                    let section = route.section().expect("preview route has a section");
-                    let mut fields = state
-                        .legacy
-                        .fields
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, field)| prefs::section_of(field.key) == section)
-                        .filter(|(_, field)| settings_field_is_visible(field.key, false, false))
-                        .collect::<Vec<_>>();
-                    fields.sort_by_key(|(index, field)| (prefs::group_of(field.key).1, *index));
-                    let last_key = fields.last().expect("preview route has fields").1.key;
-                    state.page_scroll = fields.len();
-                    let final_window = compile(&runtime, instance, view, width, height);
-                    let final_context = format!("{context}, final settings slice");
-                    assert_whole(&final_window, width, height, &final_context);
-                    assert!(
-                        final_window
-                            .semantic(&UiKey::new(format!("settings/control/{last_key}")))
-                            .is_some(),
-                        "{final_context}: last field {last_key} is reachable"
+                    let mut prims = Vec::new();
+                    spec.paint(
+                        &mut prims,
+                        paint.rect,
+                        aterm_render::Theme::default(),
+                        crate::settings::Roles::from_theme(aterm_render::Theme::default()),
                     );
+                    let (y, specimen) = prims
+                        .iter()
+                        .find_map(|prim| match prim {
+                            crate::widget::DrawPrim::TerminalSpecimen { y, spec, .. } => {
+                                Some((*y, spec))
+                            }
+                            _ => None,
+                        })
+                        .expect("typography paints complete specimen rows");
+                    if width == 624.0 && height == 404.0 && scale == 1.0 {
+                        // The pinned specimen shares the window with the list
+                        // under it, never a screen of its own.
+                        assert!(
+                            specimen.input.rows >= 2,
+                            "a short desktop window still shows whole specimen rows"
+                        );
+                    }
+                    let pill_y = prims
+                        .iter()
+                        .find_map(|prim| match prim {
+                            crate::widget::DrawPrim::Panel { y, radius, .. } if *radius == 6.0 => {
+                                Some(*y)
+                            }
+                            _ => None,
+                        })
+                        // A font that is ready has no status pill: its rows
+                        // stop clear of the body's bottom inset instead.
+                        .unwrap_or(paint.rect.bottom() - 10.0);
+                    for dpi in [1.0, 1.25, 2.0, 3.0] {
+                        let variations = specimen
+                            .variations
+                            .iter()
+                            .map(|v| (v.tag, v.value()))
+                            .collect::<Vec<_>>();
+                        let row_h = specimen
+                            .prepared_font
+                            .specimen_cell_height(
+                                specimen.font_px * dpi,
+                                specimen.line_height,
+                                &variations,
+                            )
+                            .unwrap() as f32
+                            / dpi;
+                        assert!(
+                            y + specimen.input.rows as f32 * row_h <= pill_y - 4.0,
+                            "{context} at {dpi}dpi: specimen rows never meet the status badge"
+                        );
+                    }
+                } else {
+                    // The pinned preview yields height toward its floor (one
+                    // whole specimen row at the authored size) before the
+                    // list under it loses its first two stops, and never
+                    // under it.
+                    let floor = compiled
+                        .paint
+                        .iter()
+                        .find_map(|paint| match &paint.content {
+                            UiContent::SettingsPreview(spec) if paint.key == preview_key => {
+                                Some(spec.minimum_height(48.0))
+                            }
+                            _ => None,
+                        })
+                        .expect("the preview paints a specimen");
+                    assert!(
+                        preview.rect.height >= floor - 0.01,
+                        "{context}: preview height is {:?}, floor {floor}",
+                        preview.rect,
+                    );
+                    if route != SettingsRoute::TextFonts {
+                        assert!(
+                            preview.rect.height <= expected_height + 0.01,
+                            "{context}: preview height is {:?}, natural {expected_height}",
+                            preview.rect,
+                        );
+                    }
                 }
             }
+
+            // The preview is never a screen of its own: the first screen
+            // holds a real control, every screen keeps the preview pinned,
+            // and the list reaches the route's last field whole.
+            assert!(
+                compiled.semantics.iter().any(|node| {
+                    node.parent
+                        .as_ref()
+                        .is_some_and(|parent| parent.as_str() == "settings/list")
+                }),
+                "{context}: the first screen holds more than the preview"
+            );
+            let section = route.section().expect("preview route has a section");
+            let last_key = {
+                let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+                    unreachable!()
+                };
+                let mut fields = state
+                    .legacy
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, field)| prefs::section_of(field.key) == section)
+                    .filter(|(_, field)| settings_field_is_visible(field.key, false, false))
+                    .filter(|(_, field)| {
+                        !(route == SettingsRoute::TextFonts
+                            && field.key == prefs::EDIT_DISPLAY_FONT)
+                    })
+                    .collect::<Vec<_>>();
+                fields.sort_by_key(|(index, field)| (prefs::group_of(field.key).1, *index));
+                fields.last().expect("preview route has fields").1.key
+            };
+            let last_control = UiKey::new(format!("settings/control/{last_key}"));
+            let mut screen_cx = view_cx_at(width, height);
+            screen_cx.semantic_font = {
+                let state = match runtime.view_state(view) {
+                    Some(AppViewState::Settings(state)) => state,
+                    _ => panic!("Settings view state"),
+                };
+                state
+                    .preview_font_candidate(
+                        screen_cx.animation_phase_ms,
+                        screen_cx.motion,
+                        screen_cx.terminal_font_px,
+                    )
+                    .map(|candidate| crate::tray_raster::prepare_semantic_font(&candidate))
+            };
+            let mut reached_last = false;
+            let screens = each_screen(&mut runtime, instance, view, &screen_cx, |screen, top| {
+                assert_whole(screen, width, height, &format!("{context}, screen {top}"));
+                reached_last |= screen.semantic(&last_control).is_some();
+            });
+            assert!(
+                reached_last,
+                "{context}: last field {last_key} is reachable in {screens} screens"
+            );
         }
 
         let (mut runtime, instance, view) = setup();
@@ -11940,10 +15047,19 @@ fn visual_preview_matrix_covers_four_viewports_at_three_text_scales_at_scale(sca
         let searched = compile(&runtime, instance, view, width, height);
         let context = format!("font search {width}×{height} at {scale}×");
         assert_whole(&searched, width, height, &context);
+        // The contextual preview is pinned, or (in a short window or at
+        // large type, where it and a whole result cannot share a screen)
+        // the results are.
         assert!(
             searched
                 .semantic(&UiKey::new("settings/preview/search"))
-                .is_some(),
+                .is_some()
+                || ((scale > 1.25 || height < 400.0)
+                    && searched.semantics.iter().any(|node| {
+                        node.parent
+                            .as_ref()
+                            .is_some_and(|parent| parent.as_str() == "settings/list")
+                    })),
             "{context}: global search retains the matching contextual preview"
         );
         assert!(
@@ -11990,38 +15106,20 @@ fn maximum_native_text_scale_keeps_a_phone_page_reachable_and_unclipped_at_scale
     let preview = compiled
         .semantic(&UiKey::new("settings/preview/appearance"))
         .expect("the live demonstration remains present at maximum text scale");
-    assert_eq!(
-        preview.rect.height,
-        renderer_preview_height(SettingsWidth::Compact)
+    assert!(
+        preview.rect.height >= 48.0 - 0.01
+            && preview.rect.height <= renderer_preview_height(SettingsWidth::Compact) + 0.01,
+        "the pinned preview yields toward its floor: {:?}",
+        preview.rect
     );
     assert!(preview.rect.bottom() <= cx.viewport.bottom() + 0.01);
     compiled
         .semantic(&UiKey::new("settings/page/appearance"))
         .expect("the Appearance page group remains reachable when its optional heading sheds");
-    let controls = compiled
-        .semantics
-        .iter()
-        .filter(|node| node.key.as_str().starts_with("settings/control/"))
-        .collect::<Vec<_>>();
-    // The first 2× phone slice may devote its whole body to the live
-    // demonstration. Any control that does fit must remain whole; the
-    // enabled semantic Next control below proves the rest are reachable.
-    for control in controls {
-        assert!(
-            control.rect.height >= 64.0,
-            "{} {:?}",
-            control.key.as_str(),
-            control.rect
-        );
-        assert!(control.rect.bottom() <= cx.viewport.bottom() + 0.01);
-    }
-    let next = compiled
-        .semantic(&UiKey::new("settings/results-window/next"))
-        .expect("omitted 2× controls remain reachable");
-    assert!(next.state.unwrap().enabled);
-    assert!(next.rect.bottom() <= cx.viewport.bottom() + 0.01);
-
+    // Every screen's controls stay whole at their 2× allocation, and the
+    // list reaches the rest.
     for route in [
+        SettingsRoute::Appearance,
         SettingsRoute::Home,
         SettingsRoute::About,
         SettingsRoute::SoftwareUpdate,
@@ -12036,41 +15134,23 @@ fn maximum_native_text_scale_keeps_a_phone_page_reachable_and_unclipped_at_scale
                 }),
             )
             .unwrap();
-        for _ in 0..SettingsRoute::ALL.len() {
-            let page = runtime
-                .render(instance, view, &cx)
-                .unwrap()
-                .compile(cx.viewport)
-                .unwrap();
+        each_screen(&mut runtime, instance, view, &cx, |page, top| {
             page.validate_parity().unwrap();
             for hit in &page.hits {
+                if hit.key.as_str().starts_with("settings/compact-navigation")
+                    || hit.key.as_str() == "settings/search"
+                {
+                    continue;
+                }
                 assert!(
                     hit.rect.height >= 64.0,
-                    "{} shrank below its 2× control allocation on {route:?}: {:?}",
+                    "{} shrank below its 2× control allocation on {route:?} screen {top}: {:?}",
                     hit.key.as_str(),
                     hit.rect
                 );
                 assert!(hit.rect.bottom() <= cx.viewport.bottom() + 0.01);
             }
-            let Some(next) = page
-                .hits
-                .iter()
-                .find(|hit| hit.key.as_str().ends_with("/pagination/next"))
-                .map(|hit| hit.action.clone())
-            else {
-                break;
-            };
-            runtime
-                .dispatch(
-                    instance,
-                    view,
-                    AppEvent::Action(ActionInvocation {
-                        id: next,
-                        value: None,
-                    }),
-                )
-                .unwrap();
-        }
+        });
     }
     runtime
         .dispatch(
@@ -12106,25 +15186,51 @@ fn maximum_native_text_scale_keeps_a_phone_page_reachable_and_unclipped_at_scale
         .expect("2× Top theme picker");
     assert!(surface.rect.bottom() <= cx.viewport.bottom() + 0.01);
     let option_prefix = format!("settings/choice/{}/", prefs::EDIT_THEME);
+    let options = picker
+        .hits
+        .iter()
+        .filter(|hit| hit.key.as_str().starts_with(&option_prefix))
+        .collect::<Vec<_>>();
+    assert!(!options.is_empty(), "the 2× picker seats a whole option");
+    for hit in options.into_iter().chain(
+        picker
+            .hits
+            .iter()
+            .filter(|hit| hit.key.as_str() == "settings/choice-close"),
+    ) {
+        assert!(hit.rect.height >= 64.0, "{}", hit.key.as_str());
+        assert!(hit.rect.bottom() <= cx.viewport.bottom() + 0.01);
+    }
+    assert!(
+        picker
+            .semantic(&UiKey::new("settings/choice-close"))
+            .is_some(),
+        "2× picker retains Cancel"
+    );
+
+    // A long name with no short form is shortened to fit beside Cancel.
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(format!("settings/set/{}", prefs::EDIT_BACKGROUND_MATERIAL)),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let picker = compile_settings_view(&runtime, instance, view, &cx);
+    assert_zero_top_paint(&picker, "2× Background material picker");
     assert_eq!(
         picker
-            .semantics
-            .iter()
-            .filter(|node| node.key.as_str().starts_with(&option_prefix))
-            .count(),
-        ChoicePicker::MAX_TEXT_PAGE_SIZE
+            .semantic(&UiKey::new(format!(
+                "settings/choice-header/{}",
+                prefs::EDIT_BACKGROUND_MATERIAL
+            )))
+            .map(|header| header.label.as_str()),
+        Some("Choose background material"),
+        "the header keeps the whole instruction"
     );
-    for key in [
-        "settings/choice-close",
-        "settings/choice-page-prev",
-        "settings/choice-page-next",
-    ] {
-        let node = picker
-            .semantic(&UiKey::new(key))
-            .unwrap_or_else(|| panic!("2× picker retains {key}"));
-        assert!(node.rect.height >= 64.0);
-        assert!(node.rect.bottom() <= cx.viewport.bottom() + 0.01);
-    }
 }
 
 #[test]
@@ -12155,7 +15261,9 @@ fn appearance_uses_a_bounded_semantic_renderer_preview_at_every_width() {
     let SemanticValue::Text(value) = &preview.value else {
         panic!("preview exposes truthful semantic context");
     };
-    assert!(value.contains("Color theme sample"));
+    // The Appearance page draws the configured theme, not a card sample.
+    assert!(value.starts_with("Color theme: "), "{value}");
+    assert!(!value.contains("sample"), "{value}");
     assert!(!value.contains("CursorGlow"));
     assert!(!value.contains("tone-map"));
     assert!(
@@ -12174,81 +15282,6 @@ fn appearance_uses_a_bounded_semantic_renderer_preview_at_every_width() {
             .semantic(&UiKey::new("settings/preview/appearance"))
             .is_some(),
         "responsive widths retain the same semantic demonstration"
-    );
-}
-
-#[test]
-fn window_preview_consumes_the_real_smart_title_controls() {
-    let config = Config {
-        descriptive_titles: Some(false),
-        tab_title_format: Some(crate::app_config::TitleFormat::DescriptionTitle),
-        window_title_format: Some(crate::app_config::TitleFormat::Description),
-        ..Config::default()
-    };
-    let mut state = SettingsViewState::new(&config);
-    state.navigate(SettingsRoute::WindowTabs);
-    state.common.last_focus = Some(UiKey::new(format!(
-        "settings/control/{}",
-        prefs::EDIT_TAB_TITLE_FORMAT
-    )));
-    let spec = renderer_preview_spec(
-        &state,
-        0,
-        crate::native_app::ViewMotionCx::default(),
-        14.0,
-        1.0,
-        aterm_render::Theme::default(),
-    )
-    .expect("Window & Tabs has a renderer preview");
-    assert_eq!(spec.scene, PreviewScene::WindowTabs);
-    assert!(!spec.window_tabs.generate_activity);
-    assert_eq!(spec.window_tabs.tab_title_format, "description-title");
-    assert_eq!(spec.window_tabs.window_title_format, "description");
-    assert_eq!(
-        spec.animation(),
-        crate::settings_preview::PreviewAnimation::None
-    );
-    let semantics = spec.audit_value();
-    assert!(semantics.contains("Activity fallback `running tests` is off"));
-    assert!(semantics.contains("tab format description-title"));
-    assert!(semantics.contains("window format description"));
-    assert!(semantics.contains("no live provider-health claim"));
-}
-
-#[test]
-fn window_preview_provider_off_disables_activity_semantics_and_pixels() {
-    let preview = |provider| {
-        let config = Config {
-            descriptive_titles: Some(true),
-            title_summary_provider: Some(provider),
-            ..Config::default()
-        };
-        let mut state = SettingsViewState::new(&config);
-        state.navigate(SettingsRoute::WindowTabs);
-        renderer_preview_spec(
-            &state,
-            0,
-            crate::native_app::ViewMotionCx::default(),
-            14.0,
-            1.0,
-            aterm_render::Theme::default(),
-        )
-        .expect("Window & Tabs has a renderer preview")
-    };
-
-    let enabled = preview(crate::app_config::TitleSummaryProvider::Builtin);
-    let disabled = preview(crate::app_config::TitleSummaryProvider::Off);
-    assert!(enabled.window_tabs.generate_activity);
-    assert!(!disabled.window_tabs.generate_activity);
-    assert!(
-        disabled
-            .audit_value()
-            .contains("Activity fallback `running tests` is off")
-    );
-    assert_ne!(
-        compile_preview_for_pixels(enabled).1,
-        compile_preview_for_pixels(disabled).1,
-        "provider=off must visibly remove the generated Activity fallback"
     );
 }
 
@@ -12276,14 +15309,17 @@ fn wide_appearance_stacks_preview_before_complete_controls() {
     let preview = compiled
         .semantic(&UiKey::new("settings/preview/appearance"))
         .unwrap();
-    let range = compiled
-        .semantic(&UiKey::new("settings/results-range"))
-        .unwrap();
-    assert!(preview.rect.bottom() < range.rect.y);
+    let first_control = compiled
+        .semantics
+        .iter()
+        .filter(|node| setting_control_key(node.key.as_str()))
+        .map(|node| node.rect.y)
+        .fold(f32::INFINITY, f32::min);
+    assert!(preview.rect.bottom() < first_control);
     let visible_controls = compiled
         .semantics
         .iter()
-        .filter(|node| node.key.as_str().starts_with("settings/control/"))
+        .filter(|node| setting_control_key(node.key.as_str()))
         .count();
     assert!(
         visible_controls >= 3,
@@ -12305,107 +15341,43 @@ fn about_and_updates_use_top_aligned_responsive_dashboards() {
             }),
         )
         .unwrap();
-    let about = runtime
-        .render(instance, view, &wide)
-        .unwrap()
-        .compile(wide.viewport)
-        .unwrap();
-    let hero = about.semantic(&UiKey::new("about/hero")).unwrap();
-    // WHETHER THIS VIEWPORT STACKS OR PAGES IS THE CONTENT'S DECISION, and
-    // it sits right on the line: hero 238 + gap 12 + card 346 = 596 against
-    // 594 of content. TWO POINTS. It stacked until `about_fields` learned to
-    // name the running copy and, when a second install exists, the other one
-    // — 64pt of new facts. The page concedes by paging.
-    //
-    // `hero.rect.y <= 40` and "details sit below the hero" together say ONE
-    // thing: this viewport does not paginate. That was an arithmetic
-    // coincidence, not a contract, and pinning it meant the test reported a
-    // missing node the moment the facts outgrew it. Assert instead what the
-    // page still owes: the hero opens its section, the details are whole and
-    // inside the viewport, and they follow the hero when the two do share a
-    // page.
-    let details_bottom = if let Some(details) = about.semantic(&UiKey::new("about/details")) {
-        assert!(
-            hero.rect.y <= 40.0,
-            "an unpaged About starts at the page rhythm"
-        );
-        assert!(
-            details.rect.y > hero.rect.bottom(),
-            "details follow the hero"
-        );
-        details.rect.bottom()
-    } else {
-        let next = about
-            .hits
-            .iter()
-            .find(|hit| hit.key.as_str() == "about/pagination/next")
-            .expect("a paged About exports a semantic Next");
-        let action = next.action.clone();
-        // The rhythm claim, without an arithmetic bound to keep in step with
-        // the pager. The hero is the FIRST CONTENT of its section: nothing
-        // but the pagination chrome may sit above it. That is what
-        // "About starts at the page rhythm" means, and unlike a `y <= 40`
-        // it stays true whether or not a pager is present.
-        let chrome = |key: &str| key.starts_with("about/pagination") || key == "about/range";
-        for node in about
+    // About opens on its hero, right under the page heading; every fact is
+    // reached by scrolling, whole and inside the window, whatever the facts
+    // this copy has.
+    let mut hero_top = None;
+    let mut facts = BTreeSet::new();
+    each_screen(&mut runtime, instance, view, &wide, |compiled, top| {
+        if top == 0 {
+            let hero = compiled.semantic(&UiKey::new("about/hero")).unwrap();
+            let heading = compiled
+                .semantic(&UiKey::new("settings/page-heading/about"))
+                .expect("About names itself");
+            assert!(hero.rect.y > heading.rect.bottom());
+            for node in compiled
+                .semantics
+                .iter()
+                .filter(|node| node.key.as_str().starts_with("about/"))
+                .filter(|node| !node.key.as_str().starts_with("about/list"))
+            {
+                assert!(
+                    node.rect.y >= hero.rect.y,
+                    "{} starts above the hero",
+                    node.key.as_str()
+                );
+            }
+            hero_top = Some(hero.rect.y);
+        }
+        for node in compiled
             .semantics
             .iter()
-            .filter(|node| node.key.as_str().starts_with("about/"))
-            .filter(|node| !chrome(node.key.as_str()))
+            .filter(|node| node.key.as_str().contains("/row/"))
         {
-            assert!(
-                node.rect.y >= hero.rect.y,
-                "{} starts above the hero at {} vs {} — the hero must open its \
-                 section, with only the pager above it",
-                node.key.as_str(),
-                node.rect.y,
-                hero.rect.y,
-            );
+            assert!(node.rect.bottom() <= wide.viewport.bottom() + 0.01);
+            facts.insert(node.key.as_str().to_string());
         }
-        runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: action,
-                    value: None,
-                }),
-            )
-            .unwrap();
-        let paged = runtime
-            .render(instance, view, &wide)
-            .unwrap()
-            .compile(wide.viewport)
-            .unwrap();
-        let bottom = paged
-            .semantic(&UiKey::new("about/details"))
-            .expect("the details card is on the next About page")
-            .rect
-            .bottom();
-        // Back to the first section the way we left it — page UP, the
-        // inverse of the page-down above. Re-dispatching the About route
-        // does NOT rewind `page_scroll`, so the compact assertions further
-        // down would have started on section two.
-        let previous = paged
-            .hits
-            .iter()
-            .find(|hit| hit.key.as_str() == "about/pagination/previous")
-            .expect("the second About section exports a semantic Previous");
-        let back = previous.action.clone();
-        assert_eq!(back.as_str(), "settings/page-up");
-        runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: back,
-                    value: None,
-                }),
-            )
-            .unwrap();
-        bottom
-    };
-    assert!(details_bottom <= wide.viewport.bottom());
+    });
+    assert!(hero_top.is_some());
+    assert!(facts.contains("about/provenance/row/version"), "{facts:?}");
 
     let tall = view_cx_at(1_424.0, 900.0);
     let tall_about = runtime
@@ -12420,42 +15392,26 @@ fn about_and_updates_use_top_aligned_responsive_dashboards() {
         "About carries facts about this copy, not design principles"
     );
 
+    // A compact About lists the hero first, then the build facts, each
+    // reached whole by scrolling.
     let compact_about_cx = view_cx_at(474.0, 658.0);
-    let compact_hero = runtime
-        .render(instance, view, &compact_about_cx)
-        .unwrap()
-        .compile(compact_about_cx.viewport)
-        .unwrap();
-    assert!(compact_hero.semantic(&UiKey::new("about/hero")).is_some());
-    assert!(
-        compact_hero
-            .semantic(&UiKey::new("about/provenance"))
-            .is_none()
+    let mut compact_keys = BTreeSet::new();
+    each_screen(
+        &mut runtime,
+        instance,
+        view,
+        &compact_about_cx,
+        |compiled, top| {
+            if top == 0 {
+                assert!(compiled.semantic(&UiKey::new("about/hero")).is_some());
+            }
+            if let Some(node) = compiled.semantic(&UiKey::new("about/provenance")) {
+                assert!(node.rect.bottom() <= compact_about_cx.viewport.bottom() + 0.01);
+                compact_keys.insert("about/provenance");
+            }
+        },
     );
-    runtime
-        .dispatch(instance, view, AppEvent::ScrollLines(1))
-        .unwrap();
-    let compact_build = runtime
-        .render(instance, view, &compact_about_cx)
-        .unwrap()
-        .compile(compact_about_cx.viewport)
-        .unwrap();
-    let build = compact_build
-        .semantic(&UiKey::new("about/provenance"))
-        .unwrap();
-    assert!(build.rect.bottom() <= compact_about_cx.viewport.bottom());
-    runtime
-        .dispatch(instance, view, AppEvent::ScrollLines(1))
-        .unwrap();
-    let compact_support = runtime
-        .render(instance, view, &compact_about_cx)
-        .unwrap()
-        .compile(compact_about_cx.viewport)
-        .unwrap();
-    let support = compact_support
-        .semantic(&UiKey::new("about/support"))
-        .unwrap();
-    assert!(support.rect.bottom() <= compact_about_cx.viewport.bottom());
+    assert_eq!(compact_keys.len(), 1, "{compact_keys:?}");
 
     runtime
         .dispatch(
@@ -12472,27 +15428,18 @@ fn about_and_updates_use_top_aligned_responsive_dashboards() {
         .unwrap()
         .compile(wide.viewport)
         .unwrap();
-    // Desktop Update is the status card beside the automatic-updates
-    // switch, with the release notes beneath — the whole page, unpaginated,
-    // on an ordinary window. The three-row service card that used to own
-    // that right-hand slot and the "How aterm updates" explainer below it
-    // are retired at every width.
+    // Desktop Update is the status card beside the switches' card where both
+    // hold their words whole (else the switches' card under it), with the
+    // release notes beneath, each reached whole — and on a tall window the
+    // whole page at once.
     let status = updates.semantic(&UiKey::new("updates/hero")).unwrap();
     let automatic = updates.semantic(&UiKey::new("updates/automatic")).unwrap();
-    let notes = updates
-        .semantic(&UiKey::new("updates/release-notes-card"))
-        .unwrap();
-    assert!(status.rect.right() < automatic.rect.x);
-    assert_eq!(status.rect.y, automatic.rect.y);
-    assert_eq!(status.rect.bottom(), automatic.rect.bottom());
-    assert!(notes.rect.y >= status.rect.bottom());
-    assert!(notes.rect.bottom() <= wide.viewport.bottom());
-    assert!(
-        updates
-            .semantic(&UiKey::new("updates/pagination"))
-            .is_none(),
-        "an ordinary desktop window shows the whole Update page at once"
-    );
+    if (status.rect.y - automatic.rect.y).abs() < 0.01 {
+        assert!(status.rect.right() < automatic.rect.x);
+        assert_eq!(status.rect.bottom(), automatic.rect.bottom());
+    } else {
+        assert!(automatic.rect.y >= status.rect.bottom());
+    }
     // The switch is the real config control, not a lookalike.
     assert!(
         updates
@@ -12500,7 +15447,37 @@ fn about_and_updates_use_top_aligned_responsive_dashboards() {
             .is_some(),
         "the automatic-updates switch is bound to the update.auto_apply leaf"
     );
+    let mut notes = None;
+    each_screen(&mut runtime, instance, view, &wide, |compiled, _| {
+        if let Some(node) = compiled.semantic(&UiKey::new("updates/release-notes-card")) {
+            notes.get_or_insert(node.rect);
+        }
+    });
+    let notes = notes.expect("the notes are reached");
+    assert!(notes.bottom() <= wide.viewport.bottom());
+    // No notes yet: the card holds its one placeholder line and is sized to
+    // it, not a section-tall box around a sentence.
+    assert!(notes.height < 100.0, "a one-line notes card: {notes:?}");
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.page_scroll = 0;
+    }
+    let tall = view_cx_at(1_424.0, 960.0);
+    let tall_updates = runtime
+        .render(instance, view, &tall)
+        .unwrap()
+        .compile(tall.viewport)
+        .unwrap();
+    assert!(
+        !list_scrolls(&tall_updates, "updates/list"),
+        "a tall desktop window shows the whole Update page at once"
+    );
 
+    // Both controls share the first narrow screen with the status, so
+    // nobody scrolls past an empty screen to reach a switch; the notes
+    // are reached whole by scrolling.
     let compact = view_cx_at(600.0, 820.0);
     let compact_updates = runtime
         .render(instance, view, &compact)
@@ -12511,30 +15488,92 @@ fn about_and_updates_use_top_aligned_responsive_dashboards() {
         .semantic(&UiKey::new("updates/hero"))
         .unwrap();
     assert!(compact_status.rect.bottom() <= compact.viewport.bottom());
-    // Both controls are small enough to share the first narrow page, so
-    // nobody has to page past an empty screen to reach the switch.
-    let compact_automatic = compact_updates
-        .semantic(&UiKey::new("updates/automatic"))
-        .unwrap();
-    assert!(compact_automatic.rect.y >= compact_status.rect.bottom());
-    assert!(compact_automatic.rect.bottom() <= compact.viewport.bottom());
-    // Whatever does not fit stays reachable whole.
+    let check = compact_updates
+        .semantic(&UiKey::new(format!(
+            "settings/control/{}",
+            prefs::EDIT_UPDATE_ENABLED
+        )))
+        .expect("the check switch is on the first screen");
+    assert!(check.rect.y >= compact_status.rect.bottom());
+    assert!(check.rect.bottom() <= compact.viewport.bottom());
+    let mut notes = None;
+    each_screen(&mut runtime, instance, view, &compact, |compiled, _| {
+        if let Some(node) = compiled.semantic(&UiKey::new("updates/release-notes-card")) {
+            notes.get_or_insert(node.rect);
+        }
+    });
+    assert!(notes.expect("the notes are reached").bottom() <= compact.viewport.bottom());
+}
+
+/// ABOUT'S ONE TAGLINE AND WHOLE FACTS: the hero paints the build
+/// information's `tagline` row — the sentence Copy Build Information copies —
+/// and each build fact is ONE block of the card, its wrapped lines inside it,
+/// so a list that lays the card out fact by fact never parts a fact from its
+/// own continuation.
+#[test]
+fn about_paints_the_copied_tagline_and_lists_each_fact_whole() {
+    let (mut runtime, instance, view) = setup();
     runtime
-        .dispatch(instance, view, AppEvent::ScrollLines(1))
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: route_action(SettingsRoute::About),
+                value: None,
+            }),
+        )
         .unwrap();
-    let compact_next = runtime
-        .render(instance, view, &compact)
-        .unwrap()
-        .compile(compact.viewport)
-        .unwrap();
-    let compact_notes = compact_next
-        .semantic(&UiKey::new("updates/release-notes-card"))
-        .unwrap();
-    assert!(compact_notes.rect.bottom() <= compact.viewport.bottom());
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 900.0));
+    let tagline = compiled
+        .paint
+        .iter()
+        .find(|node| node.key.as_str() == "about/tagline")
+        .map(|node| match &node.content {
+            UiContent::Text(text) => text.text.clone(),
+            other => panic!("{other:?}"),
+        });
+    assert_eq!(tagline.as_deref(), Some(crate::build_info::TAGLINE));
+    assert!(
+        crate::about::provenance_text()
+            .contains(&format!("tagline: {}\n", crate::build_info::TAGLINE)),
+        "the copied block says the same sentence"
+    );
+    for (width, height) in [(1_200.0, 900.0), (474.0, 900.0), (320.0, 900.0)] {
+        let mut blocks = 0;
+        each_screen(
+            &mut runtime,
+            instance,
+            view,
+            &view_cx_at(width, height),
+            |compiled, _| {
+                // A fact the list's edge cuts is its peek: a picture, not a
+                // block to read.
+                for line in compiled.paint.iter().filter(|node| {
+                    !node.peek && node.key.as_str().starts_with("about/provenance/value/")
+                }) {
+                    let fact = line.key.as_str()["about/provenance/value/".len()..]
+                        .split('/')
+                        .next()
+                        .unwrap_or_default();
+                    let block = compiled
+                        .semantic(&UiKey::new(format!("about/provenance/row/{fact}")))
+                        .unwrap_or_else(|| panic!("{fact}'s block ({width})"));
+                    assert!(
+                        line.rect.y >= block.rect.y - 0.01
+                            && line.rect.bottom() <= block.rect.bottom() + 0.01,
+                        "{} inside its fact's block at {width}",
+                        line.key.as_str()
+                    );
+                    blocks += 1;
+                }
+            },
+        );
+        assert!(blocks > 0, "facts are listed at {width}");
+    }
 }
 
 #[test]
-fn ordinary_medium_about_pages_complete_build_and_support_metadata() {
+fn ordinary_medium_about_pages_complete_build_metadata() {
     let (mut runtime, instance, view) = setup();
     runtime
         .dispatch(
@@ -12560,57 +15599,16 @@ fn ordinary_medium_about_pages_complete_build_and_support_metadata() {
         .unwrap();
     hero.validate_parity().unwrap();
     assert!(hero.semantic(&UiKey::new("about/hero")).is_some());
-    assert!(hero.semantic(&UiKey::new("about/details")).is_none());
     for key in ["about/copy-build-info", "about/open-site"] {
         let node = hero.semantic(&UiKey::new(key)).unwrap();
         assert!(node.rect.bottom() <= cx.viewport.bottom() + 0.01);
     }
-    let next = hero
-        .hits
-        .iter()
-        .find(|hit| hit.key.as_str() == "about/pagination/next")
-        .expect("About exports a visible semantic Next action");
-    assert_eq!(next.action.as_str(), "settings/page-down");
-    runtime
-        .dispatch(
-            instance,
-            view,
-            AppEvent::Action(ActionInvocation {
-                id: next.action.clone(),
-                value: None,
-            }),
-        )
-        .unwrap();
-
-    let details = runtime
-        .render(instance, view, &cx)
-        .unwrap()
-        .compile(cx.viewport)
-        .unwrap();
-    details.validate_parity().unwrap();
-    let details_card = details.semantic(&UiKey::new("about/details")).unwrap();
-    assert!(details_card.rect.bottom() <= cx.viewport.bottom() + 0.01);
-    // WALK EVERY SECTION. The provenance facts no longer all live on one
-    // page: when the card cannot fit the section budget the medium path
-    // chunks them across further sections, exactly as compact About does.
-    // So the contract is "every fact is reachable at its full height on
-    // SOME page", not "every fact is on page two" — and collecting them
-    // this way is strictly stronger, because a fact that silently vanished
-    // from every page now fails here instead of passing on a machine that
-    // happens not to have it.
+    // EVERY FACT IS REACHABLE AT ITS FULL HEIGHT ON SOME SCREEN. The list
+    // lays the metadata out fact by fact, so a card taller than the room
+    // scrolls between its facts instead of squeezing its last row; walking
+    // every screen also fails a fact that silently vanished.
     let mut seen: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-    for page in 0..8usize {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-            unreachable!();
-        };
-        state.page_scroll = page;
-        let Ok(tree) = runtime
-            .render(instance, view, &cx)
-            .unwrap()
-            .compile(cx.viewport)
-        else {
-            break;
-        };
+    each_screen(&mut runtime, instance, view, &cx, |tree, top| {
         tree.validate_parity().unwrap();
         for (label, _) in crate::build_info::about_fields() {
             if matches!(label, "tagline" | "author" | "company" | "site") {
@@ -12618,33 +15616,14 @@ fn ordinary_medium_about_pages_complete_build_and_support_metadata() {
             }
             let key = format!("about/provenance/row/{}", key_fragment(label));
             if let Some(node) = tree.semantic(&UiKey::new(key.clone())) {
-                seen.insert(key, node.rect.height);
-                // Every rendered row must also sit inside the viewport.
-                let node = tree
-                    .semantic(&UiKey::new(format!(
-                        "about/provenance/row/{}",
-                        key_fragment(label)
-                    )))
-                    .unwrap();
                 assert!(
                     node.rect.bottom() <= cx.viewport.bottom() + 0.01,
-                    "About row {label} on page {page} extends past the viewport"
+                    "About row {label} on screen {top} extends past the viewport"
                 );
+                seen.insert(key, node.rect.height);
             }
         }
-        let key = format!("about/support/row/{}", key_fragment("Website"));
-        if let Some(node) = tree.semantic(&UiKey::new(key.clone())) {
-            seen.insert(key, node.rect.height);
-            assert!(
-                node.rect.bottom() <= cx.viewport.bottom() + 0.01,
-                "Support row Website on page {page} extends past the viewport"
-            );
-        }
-    }
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-        unreachable!();
-    };
-    state.page_scroll = 1;
+    });
     let provenance = crate::build_info::about_fields()
         .into_iter()
         .filter(|(key, _)| !matches!(*key, "tagline" | "author" | "company" | "site"));
@@ -12653,43 +15632,20 @@ fn ordinary_medium_about_pages_complete_build_and_support_metadata() {
         let height = seen
             .get(&key)
             .copied()
-            .unwrap_or_else(|| panic!("missing complete Medium metadata {key} on every page"));
-
-        // Names the row, because this loop walks KEYS THAT VARY BY MACHINE:
-        // `about_fields` appends `running` and, when a second install
-        // exists, `another copy`. A bare `assert!` here reports only
-        // "assertion failed" for a row the reader cannot identify and may
-        // not even have.
+            .unwrap_or_else(|| panic!("missing complete Medium metadata {key} on every screen"));
+        // Names the row: `about_fields` appends `running` and, when a second
+        // install exists, `another copy`, so the keys vary by machine.
         assert!(
             height >= 28.0,
-            "About row {key} collapsed to {:.1}pt (rows are 28pt at a 32pt \
-             pitch). The card is laid out at a FIXED height with FIXED rows, \
-             so a card taller than its section pushes the whole deficit into \
-             the last row rather than clipping — chunk the facts instead.",
-            height,
+            "About row {key} collapsed to {height:.1}pt (rows are 28pt at a 32pt pitch)",
         );
     }
-    let key = format!("about/support/row/{}", key_fragment("Website"));
-    let height = seen
-        .get(&key)
-        .copied()
-        .unwrap_or_else(|| panic!("missing complete Medium support metadata {key} on every page"));
-    assert!(
-        height >= 28.0,
-        "Support row {key} collapsed to {height:.1}pt (rows are 28pt)"
-    );
-    let previous = details
-        .hits
-        .iter()
-        .find(|hit| hit.key.as_str() == "about/pagination/previous")
-        .expect("second About section exports semantic Previous");
-    assert_eq!(previous.action.as_str(), "settings/page-up");
 }
 
 /// Where a Linux-layout test takes its UI face from ([`linux_layout_cx`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LinuxLayoutFace {
-    /// The host's own UI face — Helvetica Neue on the Mac that runs the gate.
+    /// The host's own UI face — Helvetica Neue on a Mac.
     Host,
     /// The Linux ladder's first readable pair (Noto Sans, else DejaVu Sans): the
     /// host's Linux font tree, or the directory `ATERM_TEST_LINUX_UI_FONTS` names.
@@ -12715,11 +15671,11 @@ fn linux_layout_cx(face: LinuxLayoutFace, width: f32, height: f32) -> Option<Vie
     Some(cx)
 }
 
-/// THE LIVE LINUX UPDATE PAGE, ON EVERY HOST AND IN LINUX'S OWN FACES (2026-09-24
-/// review). This test was compiled on Linux alone, so the Mac that runs the gate never
-/// saw it, and every other check of the Linux card measured in Helvetica Neue — while
-/// in Noto Sans, the Linux UI face, the merged caption wrapped to seven lines and ran
-/// the medium workbench's two cards 13pt past their section. Now it runs everywhere,
+/// THE LIVE LINUX UPDATE PAGE, ON EVERY HOST AND IN LINUX'S OWN FACES. This test was
+/// compiled on Linux alone, so a Mac's test run never saw it, and every other check
+/// of the Linux card measured in Helvetica Neue — while in Noto Sans, the Linux UI
+/// face, the merged caption wrapped to seven lines and ran the medium workbench's
+/// two cards 13pt past their section. Now it runs everywhere,
 /// in the host's face, in the Linux ladder's where this host can read it, and with
 /// no UI face at all: an enrolled copy idle (automatic checks on, off, and saved the
 /// other way), with a download, needing attention, and awaiting its startup trial,
@@ -12867,9 +15823,9 @@ fn linux_update_status_settings_preserves_manual_authority_and_effective_policy(
     }
 }
 
-/// Every page of the Software Update route in a `width`×`height` window, first to
-/// last: the pager's Next pressed until it disables. A fresh runtime per walk, so the
-/// walk starts on page 1 and measures in the host's face.
+/// Every screen of the Software Update route in a `width`×`height` window, top to
+/// the last one its list scrolls to. A fresh runtime per walk, so it measures in
+/// the host's face.
 fn update_route_pages(
     update: UpdateState,
     width: f32,
@@ -12887,38 +15843,11 @@ fn update_route_pages(
         )
         .unwrap();
     let cx = view_cx_at(width, height);
-    let mut pages = Vec::new();
-    loop {
-        let compiled = compile_settings_view(&runtime, instance, view, &cx);
-        let next = compiled
-            .semantic(&UiKey::new("updates/pagination/next"))
-            .and_then(|node| node.state)
-            .is_some_and(|state| state.enabled)
-            .then(|| {
-                compiled
-                    .hits
-                    .iter()
-                    .find(|hit| hit.key.as_str() == "updates/pagination/next")
-                    .map(|hit| hit.action.clone())
-            })
-            .flatten();
-        pages.push(compiled);
-        let Some(action) = next else {
-            break;
-        };
-        runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: action,
-                    value: None,
-                }),
-            )
-            .unwrap();
-        assert!(pages.len() < 64, "bounded Update page traversal");
-    }
-    pages
+    let mut screens = Vec::new();
+    each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
+        screens.push(compiled.clone());
+    });
+    screens
 }
 
 /// The text a compiled page PAINTS (not its semantic labels, which keep complete
@@ -13106,14 +16035,14 @@ fn a_linux_short_landscape_page_paints_a_failed_checks_cause() {
         "the Linux detail carries the cause"
     );
 
-    // The pager: the cause takes a section of its own.
+    // The short landscape list: the cause takes a stop of its own.
     let pages = update_route_pages(failed_check(), 568.0, 320.0);
     let painted = pages.iter().flat_map(painted_texts).collect::<Vec<_>>();
     assert!(
         painted
             .iter()
             .any(|text| text.starts_with("linux-update:") && text.contains("503")),
-        "some page of the short-landscape pager paints the failed check's cause: \
+        "some screen of the short-landscape list paints the failed check's cause: \
          {painted:?}"
     );
     for (index, page) in pages.iter().enumerate() {
@@ -13317,6 +16246,118 @@ fn off_macos_update_page_names_the_real_lane_and_disables_the_switch() {
     }
 }
 
+/// SOFTWARE UPDATE NAMES ITSELF ONCE: under the page heading the status card
+/// carries no "Software Update" caption of its own (the 102x29 and 80x24
+/// windows painted it twice); only a window too short for the page heading
+/// (`compact_page_omits_heading`) lets the card name the page, in the caption
+/// case every card caption is painted in.
+#[test]
+fn software_update_names_itself_once() {
+    let (mut runtime, instance, view) = setup();
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: route_action(SettingsRoute::SoftwareUpdate),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let title = |compiled: &crate::native_ui::CompiledUi| {
+        compiled
+            .paint
+            .iter()
+            .find(|node| node.key.as_str() == "updates/title")
+            .map(|node| match &node.content {
+                UiContent::Text(text) => text.text.clone(),
+                other => panic!("{other:?}"),
+            })
+    };
+    for (width, height) in [(738.0, 420.0), (584.0, 350.0), (1_074.0, 684.0)] {
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/page-heading/software-update"))
+                .is_some(),
+            "{width}x{height}: the page heading"
+        );
+        assert_eq!(title(&compiled), None, "{width}x{height}");
+    }
+    let short = view_cx_at(584.0, 210.0);
+    let compiled = compile_settings_view(&runtime, instance, view, &short);
+    assert!(
+        compiled
+            .semantic(&UiKey::new("settings/page-heading/software-update"))
+            .is_none(),
+        "a window too short for the heading"
+    );
+    assert!(
+        title(&compiled).is_some_and(|text| text == text.to_uppercase() && !text.is_empty()),
+        "{:?}",
+        title(&compiled)
+    );
+}
+
+/// A SEARCH SAYS WHOLE WHAT THE UPDATE SWITCHES DO IN A COPY THAT CAN'T UPDATE:
+/// with both switches written (Changed, Reset) in a copy that can't replace
+/// itself, each search result paints its name, Changed and its note without
+/// cutting any of it off, at every desktop window — searched from a form page,
+/// whose 720pt column stops growing at 150 columns, so "No e…" was painted at
+/// all three.
+#[test]
+fn a_search_paints_the_update_switches_notes_whole() {
+    let mut status = update_status(false);
+    status.installable = false;
+    let (mut runtime, instance, view) =
+        setup_with_update(UpdateState::from_status(1, "0.1.0", Some(&status), false));
+    replace_settings_source(
+        &mut runtime,
+        view,
+        "[update]\nenabled = false\nauto_apply = false\n".to_string(),
+    );
+    for (id, value) in [
+        (route_action(SettingsRoute::Security), None),
+        (
+            ActionId::new("settings/search"),
+            Some(SemanticInput::Text("automatically".to_string())),
+        ),
+    ] {
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation { id, value }),
+            )
+            .unwrap();
+    }
+    for (width, height) in [(1_074.0, 684.0), (1_193.0, 516.0), (1_564.0, 854.0)] {
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+        for key in [prefs::EDIT_UPDATE_ENABLED, "update.auto_apply"] {
+            let painted = compiled
+                .paint
+                .iter()
+                .find(|node| node.key.as_str() == format!("settings/label/{key}/visual"))
+                .map(|node| match &node.content {
+                    UiContent::Text(text) => text.text.clone(),
+                    other => panic!("{other:?}"),
+                })
+                .unwrap_or_else(|| panic!("{key} is a result at {width}x{height}"));
+            assert!(
+                painted.contains(CHANGED_TAG.trim_start()) && painted.contains("No effect"),
+                "{key} at {width}x{height}: {painted}"
+            );
+        }
+        let cut = compiled
+            .paint_audit_lines()
+            .into_iter()
+            .filter(|line| line.contains("key=\"settings/label/update."))
+            .filter(|line| line.contains("overflow=true") || line.contains("clip-truncated=true"))
+            .collect::<Vec<_>>();
+        assert!(cut.is_empty(), "{width}x{height}:\n{}", cut.join("\n"));
+    }
+}
+
 /// A HEALTHY UPDATE PAGE (2026-09-23 audit, SB-07/SB-21): "You're up to date." over
 /// "aterm 0.1.0" and when it last checked — no build number (About has it) and no
 /// updater decision sentence, whose cadence detail stays in `aterm ctl update status`
@@ -13408,8 +16449,11 @@ fn the_notes_card_says_newest_only_after_a_check() {
     );
 }
 
+/// The medium page's status card, the switches' card and the notes, each
+/// reached whole: the switches' card stacks under the status there, the 38%
+/// column being too narrow for a written switch's name beside it.
 #[test]
-fn ordinary_medium_staged_update_pages_workbench_and_notes() {
+fn ordinary_medium_staged_update_lists_both_cards_and_notes() {
     let status = update_status(true);
     let (mut runtime, instance, view) =
         setup_with_update(UpdateState::from_status(1, "0.1.0", Some(&status), false));
@@ -13431,24 +16475,19 @@ fn ordinary_medium_staged_update_pages_workbench_and_notes() {
     // fit all 14 labeled routes intentionally select compact navigation.
     let cx = view_cx_at(849.0, 513.0);
     let mut seen = BTreeSet::new();
-    for section in 0..2 {
-        let compiled = runtime
-            .render(instance, view, &cx)
-            .unwrap()
-            .compile(cx.viewport)
-            .unwrap();
+    each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
         compiled.validate_parity().unwrap();
         assert!(
             compiled
                 .semantic(&UiKey::new("settings/page-heading/software-update"))
                 .is_some(),
-            "every paged update section retains its route identity"
+            "every screen of the update list keeps its route identity"
         );
         for node in &compiled.semantics {
             if node.key.as_str().starts_with("updates/") {
                 assert!(
                     node.rect.bottom() <= cx.viewport.bottom() + 0.01,
-                    "{} clips at 849x460: {:?}",
+                    "{} clips at 849x513: {:?}",
                     node.key.as_str(),
                     node.rect
                 );
@@ -13456,9 +16495,8 @@ fn ordinary_medium_staged_update_pages_workbench_and_notes() {
             }
         }
         for (key, minimum_height) in [
-            ("updates/workbench", 220.0),
+            ("updates/hero", 120.0),
             ("updates/actions", 36.0),
-            ("updates/release-notes-card", 210.0),
             ("updates/outcome", 24.0),
         ] {
             if let Some(node) = compiled.semantic(&UiKey::new(key)) {
@@ -13469,40 +16507,16 @@ fn ordinary_medium_staged_update_pages_workbench_and_notes() {
                 );
             }
         }
-        if section == 0 {
-            let next = compiled
-                .hits
-                .iter()
-                .find(|hit| hit.key.as_str() == "updates/pagination/next")
-                .expect("staged update exports semantic Next");
-            assert_eq!(next.action.as_str(), "settings/page-down");
-            runtime
-                .dispatch(
-                    instance,
-                    view,
-                    AppEvent::Action(ActionInvocation {
-                        id: next.action.clone(),
-                        value: None,
-                    }),
-                )
-                .unwrap();
-        } else if section < 1 {
-            // Wheel/keyboard and the visible Next control reduce to the
-            // same bounded page_scroll state.
-            runtime
-                .dispatch(instance, view, AppEvent::ScrollLines(1))
-                .unwrap();
-        }
-    }
+    });
     for key in [
-        "updates/workbench",
+        "updates/hero",
         "updates/install-now",
         "updates/headline",
         "updates/automatic",
         "updates/release-notes",
         "updates/outcome",
     ] {
-        assert!(seen.contains(key), "missing paged Medium update node {key}");
+        assert!(seen.contains(key), "missing Medium update node {key}");
     }
 }
 
@@ -13544,7 +16558,25 @@ fn desktop_terminal_route_has_zero_paint_overflow_at_captured_viewport() {
         })
         .expect("ambiguous-width visual label is audited");
     assert!(visual.contains("overflow=false"), "{visual}");
-    assert!(visual.contains("New text only"), "{visual}");
+    // When the change applies is said in plain words on the row's second
+    // line, whole, never squeezed onto the label line.
+    let detail = compiled
+        .paint
+        .iter()
+        .filter(|node| {
+            node.key.as_str().starts_with(&format!(
+                "settings/detail/{}/line-",
+                prefs::EDIT_AMBIGUOUS_WIDTH
+            ))
+        })
+        .filter_map(|node| match &node.content {
+            UiContent::Text(spec) => Some(spec.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(detail.contains("Applies to new text only"), "{detail}");
+    assert!(!visual.contains("New text only"), "{visual}");
 
     let wrapper = compiled
         .paint
@@ -13616,29 +16648,18 @@ fn desktop_and_compact_update_pages_fit_wrapped_long_notes_and_outcome() {
             )
             .unwrap();
         let cx = view_cx_at(viewport_width, viewport_height);
-        let first = compile_settings_view(&runtime, instance, view, &cx);
-        let total = pager_total(&first, "updates/range");
-        assert!(total >= 4, "{variant}: workbench, note pages, outcome");
 
         let mut saw_notes = false;
-        let mut painted_notes = String::new();
+        // Each notes card's painted text, in the order the list reaches them:
+        // a card on two screens is read once.
+        let mut notes_cards: Vec<(UiKey, String)> = Vec::new();
         let mut saw_outcome = false;
         let mut painted_outcome = String::new();
         let mut outcome_line_keys = BTreeSet::new();
-        for page in 0..total {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                unreachable!();
-            };
-            state.page_scroll = page;
-            let compiled = compile_settings_view(&runtime, instance, view, &cx);
-            assert_zero_top_paint(&compiled, &format!("{variant} Update page {page}/{total}"));
-            assert_eq!(
-                compiled
-                    .semantic(&UiKey::new("updates/range"))
-                    .map(|node| node.label.as_str()),
-                Some(format!("Page {} of {total}", page + 1).as_str()),
-                "{variant}: atomic Update sections use page language",
-            );
+        let screens = each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+            assert_zero_top_paint(compiled, &format!("{variant} Update screen {top}"));
+            let mut screen_outcome = String::new();
+            let mut screen_lines = BTreeSet::new();
             for node in &compiled.paint {
                 if node.key.as_str().starts_with("updates/release-notes")
                     && let UiContent::RichText(spec) = &node.content
@@ -13648,13 +16669,15 @@ fn desktop_and_compact_update_pages_fit_wrapped_long_notes_and_outcome() {
                         spec.semantic_text, expected_notes,
                         "{variant}: responsive wrapping must not replace exact release-note semantics",
                     );
-                    painted_notes.push_str(&spec.text);
+                    if !notes_cards.iter().any(|(key, _)| *key == node.key) {
+                        notes_cards.push((node.key.clone(), spec.text.clone()));
+                    }
                 }
                 if node.key.as_str().starts_with("updates/outcome/line-")
                     && let UiContent::Text(spec) = &node.content
                 {
                     assert!(
-                        outcome_line_keys.insert(node.key.clone()),
+                        screen_lines.insert(node.key.clone()),
                         "{variant}: outcome lines need unique stable keys",
                     );
                     assert!(
@@ -13665,8 +16688,12 @@ fn desktop_and_compact_update_pages_fit_wrapped_long_notes_and_outcome() {
                         "{variant}: outcome line {:?} exceeds its authored rect",
                         node.key,
                     );
-                    painted_outcome.push_str(&spec.text);
+                    screen_outcome.push_str(&spec.text);
                 }
+            }
+            if !screen_lines.is_empty() && outcome_line_keys.is_empty() {
+                outcome_line_keys = screen_lines;
+                painted_outcome = screen_outcome;
             }
             if let Some(outcome) = compiled
                 .semantics
@@ -13676,12 +16703,14 @@ fn desktop_and_compact_update_pages_fit_wrapped_long_notes_and_outcome() {
                 saw_outcome = true;
                 assert_eq!(outcome.label, expected_outcome);
             }
-        }
-        assert!(saw_notes, "{variant}: release-note pages remain reachable");
+        });
+        assert!(screens >= 2, "{variant}: long notes scroll");
+        let painted_notes: String = notes_cards.iter().map(|(_, text)| text.as_str()).collect();
+        assert!(saw_notes, "{variant}: release-note cards remain reachable");
         assert_eq!(
             without_whitespace(&painted_notes),
             without_whitespace(&expected_notes),
-            "{variant}: visual release-note pagination must not drop visible content",
+            "{variant}: the release-note cards must not drop visible content",
         );
         assert!(saw_outcome, "{variant}: the outcome remains reachable");
         assert!(
@@ -13849,34 +16878,15 @@ fn maximum_type_landscape_update_sections_are_complete_at_scale(_scale: f32) {
     };
     assert!(compact_page_budget(state, cx.viewport).side_by_side_pager);
 
-    let mut global_total = None;
-    let mut visited_pages = 0usize;
     let mut keys = BTreeSet::new();
-    let mut saw_outcome = 0usize;
-    loop {
-        let compiled = compile_settings_view(&runtime, instance, view, &cx);
-        let total = pager_total(&compiled, "updates/range");
-        assert_eq!(*global_total.get_or_insert(total), total);
-        let context = format!("2x landscape Update page {visited_pages}/{total}");
+    let mut saw_outcome = false;
+    each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+        let context = format!("2x landscape Update screen {top}");
         compiled
             .validate_parity()
             .unwrap_or_else(|error| panic!("{context}: {error:?}"));
-        assert_short_landscape_geometry(&compiled, 2.0, &context);
-        assert_accessible_pager(
-            &compiled,
-            "updates/pagination",
-            visited_pages,
-            total,
-            &context,
-        );
-        assert_eq!(
-            compiled
-                .semantic(&UiKey::new("updates/range"))
-                .map(|node| node.label.as_str()),
-            Some(format!("Page {} of {total}", visited_pages + 1).as_str()),
-            "{context}: exact page identity",
-        );
-        assert_zero_top_paint(&compiled, &context);
+        assert_short_landscape_geometry(compiled, 2.0, &context);
+        assert_zero_top_paint(compiled, &context);
 
         if let Some(hero) = compiled.semantic(&UiKey::new("updates/hero")) {
             assert_eq!(hero.role, SemanticRole::Status, "{context}: hero is Status");
@@ -13886,14 +16896,14 @@ fn maximum_type_landscape_update_sections_are_complete_at_scale(_scale: f32) {
                 hero.label,
             );
         }
-        // Whichever slice it lands on, the outcome keeps the EXACT ledger
+        // Whichever screen it lands on, the outcome keeps the EXACT ledger
         // string on its semantic node — the paint beside it is bounded.
         if let Some(outcome) = compiled.semantic(&UiKey::new("updates/outcome")) {
             assert_eq!(
                 outcome.label, expected_outcome,
                 "{context}: exact updater outcome retained",
             );
-            saw_outcome += 1;
+            saw_outcome = true;
         }
         keys.extend(
             compiled
@@ -13905,52 +16915,21 @@ fn maximum_type_landscape_update_sections_are_complete_at_scale(_scale: f32) {
                 })
                 .map(|node| node.key.as_str().to_string()),
         );
-
-        visited_pages += 1;
-        let next = compiled
-            .semantic(&UiKey::new("updates/pagination/next"))
-            .expect("accessible Update Next");
-        if !next.state.expect("pager state").enabled {
-            break;
-        }
-        let action = compiled
-            .hits
-            .iter()
-            .find(|hit| hit.key.as_str() == "updates/pagination/next")
-            .expect("enabled Update Next hit")
-            .action
-            .clone();
-        runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: action,
-                    value: None,
-                }),
-            )
-            .unwrap();
-        assert!(visited_pages < 64, "bounded Update page traversal");
-    }
-
-    assert_eq!(visited_pages, global_total.unwrap());
-    assert_eq!(
-        saw_outcome, 1,
-        "the outcome is surfaced on exactly one page"
-    );
-    // Both `[update]` switches, whole: here the card splits, one to a section.
+    });
+    assert!(saw_outcome, "the outcome is reachable");
+    // Both `[update]` switches, whole: the list lays the card out switch by
+    // switch.
     for key in [
         "updates/hero",
         "updates/install-now",
         "updates/automatic",
-        "updates/automatic-install",
         "settings/control/update.enabled",
         "settings/control/update.auto_apply",
         "updates/release-notes",
     ] {
         assert!(
             keys.contains(key),
-            "2x landscape Update page never reached {key}; saw {keys:?}",
+            "2x landscape Update never reached {key}; saw {keys:?}",
         );
     }
 }
@@ -13963,7 +16942,7 @@ fn maximum_type_landscape_update_sections_are_complete_at_scale(_scale: f32) {
 fn rail_sibling_pages_share_one_content_left_edge() {
     let (mut runtime, instance, view) = setup();
     let cx = view_cx_at(1_275.0, 828.0);
-    let mut heading_x = |route: SettingsRoute| {
+    let mut heading = |route: SettingsRoute| {
         runtime
             .dispatch(
                 instance,
@@ -13986,11 +16965,11 @@ fn rail_sibling_pages_share_one_content_left_edge() {
             })
             .unwrap_or_else(|| panic!("{route:?} paints a leading content node"))
             .rect
-            .x
     };
+    let mut heading_x = |route: SettingsRoute| heading(route).x;
     let home = heading_x(SettingsRoute::Home);
     for route in [
-        SettingsRoute::CursorKitty,
+        SettingsRoute::CursorStyles,
         SettingsRoute::Appearance,
         SettingsRoute::Terminal,
         SettingsRoute::SoftwareUpdate,
@@ -14000,6 +16979,21 @@ fn rail_sibling_pages_share_one_content_left_edge() {
         assert!(
             (x - home).abs() <= 0.5,
             "{route:?} content column starts at {x}, Home at {home}"
+        );
+    }
+    // The Look & Feel pages share one width too, so their cards do not jump
+    // as you move between them (Appearance was 1040pt, the others 720pt).
+    let appearance = heading(SettingsRoute::Appearance).width;
+    for route in [
+        SettingsRoute::Wallpaper,
+        SettingsRoute::TextFonts,
+        SettingsRoute::CursorStyles,
+        SettingsRoute::TabColor,
+    ] {
+        let width = heading(route).width;
+        assert!(
+            (width - appearance).abs() <= 0.5,
+            "{route:?} content is {width}pt wide, Appearance {appearance}pt"
         );
     }
 }
@@ -14050,13 +17044,24 @@ fn long_noncode_metadata_values_wrap_at_separators_not_mid_token() {
         lines.len() + 1,
         "card height buys exactly the painted lines"
     );
-    let chunks = chunk_metadata_rows(&rows, lines.len(), width);
+}
+
+/// The build time reads on the reader's clock, as Messages' times do; UTC,
+/// and saying so, only before the host has published a clock.
+#[test]
+fn about_build_time_reads_on_the_readers_clock() {
+    let built = "2025-09-21T15:53:20Z";
+    let clock = MessagesState {
+        now_unix_ms: 1_758_470_000_000,
+        utc_offset_s: -7 * 3600,
+        ..MessagesState::empty()
+    };
+    assert_eq!(about_fact_value("built", built, &clock), "Today 8:53:20 AM");
     assert_eq!(
-        chunks.len(),
-        2,
-        "chunking spends the wrapped fact's real line budget"
+        about_fact_value("built", built, &MessagesState::empty()),
+        "2025-09-21 15:53 UTC"
     );
-    assert_eq!(chunks[0].len(), 1);
+    assert_eq!(about_fact_value("arch", "aarch64", &clock), "aarch64");
 }
 
 #[test]
@@ -14158,57 +17163,62 @@ fn about_metadata_values_fit_responsive_rects_and_keep_full_semantics() {
 
     for viewport_width in [474.0, 760.0, 1_040.0, 1_160.0] {
         let width = SettingsWidth::for_viewport(viewport_width);
-        if width == SettingsWidth::Compact {
-            runtime
-                .dispatch(instance, view, AppEvent::ScrollLines(1))
-                .unwrap();
-        }
         let cx = view_cx_at(viewport_width, 658.0);
-        let compiled = runtime
-            .render(instance, view, &cx)
-            .unwrap()
-            .compile(cx.viewport)
-            .unwrap();
-        let expected_value_width = about_metadata_value_width(viewport_width, width);
-        let visible_rows = match width {
-            SettingsWidth::Compact | SettingsWidth::Wide => provenance.len(),
-            SettingsWidth::Medium => 4,
-        };
-
-        for (label, full_value) in provenance.iter().take(visible_rows) {
-            let fragment = key_fragment(label);
-            let row = compiled
-                .semantic(&UiKey::new(format!("about/provenance/row/{fragment}")))
-                .unwrap();
-            assert_eq!(row.label, format!("{label}: {full_value}"));
-
-            let visual_key = UiKey::new(format!("about/provenance/value/{fragment}"));
-            assert!(
-                compiled.semantic(&visual_key).is_none(),
-                "bounded metadata value is a paint-only copy"
-            );
-            let visual = compiled
-                .paint
-                .iter()
-                .find(|node| node.key == visual_key)
-                .unwrap();
-            assert!(
-                (visual.rect.width - expected_value_width).abs() <= 0.01,
-                "{viewport_width}px {label} rect {} != derived budget {expected_value_width}",
-                visual.rect.width,
-            );
-            let visual_text = match &visual.content {
-                UiContent::Text(spec) => spec.text.as_str(),
-                _ => panic!("metadata value visual must remain text"),
-            };
-            let measured =
-                metadata_value_text_width(visual_text, px, metadata_value_is_code(label));
-            assert!(
-                measured <= visual.rect.width - ABOUT_METADATA_TEXT_SAFETY + 0.01,
-                "{viewport_width}px {label} paints {measured}px into {}px",
-                visual.rect.width,
-            );
+        // One card, the page's width.
+        if let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) {
+            state.page_scroll = 0;
         }
+        let expected_value_width = about_metadata_value_width(viewport_width, width);
+        // Every fact, on whichever screen of the list carries it.
+        let mut checked = BTreeSet::new();
+        each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
+            for (label, full_value) in &provenance {
+                let fragment = key_fragment(label);
+                let Some(row) =
+                    compiled.semantic(&UiKey::new(format!("about/provenance/row/{fragment}")))
+                else {
+                    continue;
+                };
+                let full_value = about_fact_value(label, full_value, &MessagesState::empty());
+                assert_eq!(
+                    row.label,
+                    format!("{}: {full_value}", about_fact_label(label))
+                );
+
+                let visual_key = UiKey::new(format!("about/provenance/value/{fragment}"));
+                assert!(
+                    compiled.semantic(&visual_key).is_none(),
+                    "bounded metadata value is a paint-only copy"
+                );
+                let visual = compiled
+                    .paint
+                    .iter()
+                    .find(|node| node.key == visual_key)
+                    .unwrap();
+                assert!(
+                    (visual.rect.width - expected_value_width).abs() <= 0.01,
+                    "{viewport_width}px {label} rect {} != derived budget {expected_value_width}",
+                    visual.rect.width,
+                );
+                let visual_text = match &visual.content {
+                    UiContent::Text(spec) => spec.text.as_str(),
+                    _ => panic!("metadata value visual must remain text"),
+                };
+                let measured =
+                    metadata_value_text_width(visual_text, px, metadata_value_is_code(label));
+                assert!(
+                    measured <= visual.rect.width - ABOUT_METADATA_TEXT_SAFETY + 0.01,
+                    "{viewport_width}px {label} paints {measured}px into {}px",
+                    visual.rect.width,
+                );
+                checked.insert(fragment);
+            }
+        });
+        assert_eq!(
+            checked.len(),
+            provenance.len(),
+            "{viewport_width}px: {checked:?}"
+        );
     }
 }
 
@@ -14243,7 +17253,11 @@ fn local_settings_eliders_keep_combining_zwj_and_flag_graphemes_atomic() {
         let available =
             (crate::tray_raster::ui_text_width(&prefix, group_footnote_text_px()) + 1.0).max(48.0);
         let note = format!("{prefix} {}", cluster.repeat(40));
-        let lines = group_footnote_lines(&note, available);
+        let lines: Vec<String> =
+            crate::tray_raster::ui_text_wrap_ranges(&note, group_footnote_text_px(), available)
+                .into_iter()
+                .map(|range| note[range].to_string())
+                .collect();
         let first = format!("{prefix} ");
         assert_eq!(lines.first().map(String::as_str), Some(first.as_str()));
         assert_eq!(lines.concat(), note);
@@ -14289,12 +17303,14 @@ fn bounded_numeric_setting_is_a_real_slider_and_keyboard_steps_exactly() {
         .compile(cx.viewport)
         .unwrap();
     let key = UiKey::new(format!("settings/control/{}", prefs::EDIT_FONT_PX));
+    // The slider travels the sizes people read at; the keys and typed
+    // values keep the terminal's whole range.
     assert_eq!(
         compiled.semantic(&key).unwrap().value,
         SemanticValue::Number {
             value: 14.0,
-            minimum: 6.0,
-            maximum: 200.0,
+            minimum: 8.0,
+            maximum: 36.0,
         }
     );
     let slider = compiled
@@ -14312,7 +17328,7 @@ fn bounded_numeric_setting_is_a_real_slider_and_keyboard_steps_exactly() {
         })
         .expect("numeric field paints as slider");
     assert_eq!(slider.spec.step, 1.0);
-    assert_eq!(slider.spec.display_value, "14");
+    assert_eq!(slider.spec.display_value, "14 px");
 
     let outcome = runtime
         .dispatch(
@@ -14332,6 +17348,63 @@ fn bounded_numeric_setting_is_a_real_slider_and_keyboard_steps_exactly() {
     assert_eq!(normalize_slider_value(99.0, range).as_deref(), Some("99"));
     assert_eq!(normalize_slider_value(500.0, range).as_deref(), Some("200"));
     assert_eq!(normalize_slider_value(f64::NAN, range), None);
+    // A fractional step writes the step's decimals, never binary noise.
+    let line_height = prefs::range_of(prefs::EDIT_LINE_HEIGHT).expect("line height range");
+    for (value, text) in [(1.2, "1.2"), (1.7, "1.7"), (0.8, "0.8"), (2.0, "2")] {
+        assert_eq!(
+            normalize_slider_value(value, line_height).as_deref(),
+            Some(text)
+        );
+    }
+}
+
+/// A fractional-step slider saves the number it shows. Binary floats turned
+/// 6 × 0.05 into 0.30000000000000004, and that is what reached aterm.toml and
+/// the row's readout, from a drag, a semantic set and an arrow key alike.
+#[test]
+fn slider_writes_land_on_the_step_grid_without_float_noise() {
+    for (key, value, written) in [
+        (prefs::EDIT_FAINT_OPACITY, 0.3, "0.3"),
+        (prefs::EDIT_BACKGROUND_OPACITY, 0.7, "0.7"),
+        (prefs::EDIT_WALLPAPER_DIM, 0.85, "0.85"),
+        (prefs::EDIT_TRAIL_SOUND_VOLUME, 0.551, "0.55"),
+    ] {
+        let range = prefs::range_of(key).unwrap();
+        assert_eq!(
+            normalize_slider_value(value, range).as_deref(),
+            Some(written),
+            "{key}"
+        );
+    }
+
+    let (mut runtime, instance, view) = setup();
+    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        panic!("Settings view");
+    };
+    state.route = SettingsRoute::Appearance;
+    state
+        .legacy
+        .fields
+        .iter_mut()
+        .find(|field| field.key == prefs::EDIT_FAINT_OPACITY)
+        .expect("faint opacity field")
+        .seed = Some("0.85".to_string());
+    state.common.last_focus = Some(UiKey::new(format!(
+        "settings/control/{}",
+        prefs::EDIT_FAINT_OPACITY
+    )));
+    let outcome = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::TextInput(TextInputEvent::Right { extend: false }),
+        )
+        .unwrap();
+    let edit = outcome.effects.iter().find_map(|effect| match effect {
+        AppEffect::ConfigPatch { patch, .. } => patch.edits.first(),
+        _ => None,
+    });
+    assert_eq!(edit.and_then(|edit| edit.value.as_deref()), Some("0.9"));
 }
 
 #[test]
@@ -14342,8 +17415,9 @@ fn typography_sliders_cover_and_preview_the_full_runtime_domain() {
         ..Config::default()
     };
     let state = SettingsViewState::new(&config);
+    // A size set past the slider's usual 8–36 px widens its span to hold it.
     for (key, expected, minimum, maximum) in [
-        (prefs::EDIT_FONT_PX, 100.0, 6.0, 200.0),
+        (prefs::EDIT_FONT_PX, 100.0, 8.0, 100.0),
         (prefs::EDIT_FONT_WEIGHT, 950.0, 1.0, 1000.0),
     ] {
         let (index, field) = state
@@ -14358,7 +17432,6 @@ fn typography_sliders_cover_and_preview_the_full_runtime_domain() {
             &state,
             index,
             field,
-            false,
             false,
             SettingsWidth::Wide,
         ))
@@ -14383,7 +17456,6 @@ fn typography_sliders_cover_and_preview_the_full_runtime_domain() {
         crate::native_app::ViewMotionCx::default(),
         13.0,
         1.0,
-        aterm_render::Theme::default(),
         None,
     )
     .unwrap();
@@ -14433,16 +17505,9 @@ fn bounded_numeric_rows_disclose_configured_and_effective_without_rewriting_raw(
         );
         assert!(disclosure.semantic.contains(outcome));
 
-        let compiled = UiTree::new(setting_row(
-            &state,
-            index,
-            field,
-            true,
-            false,
-            SettingsWidth::Wide,
-        ))
-        .compile(LogicalRect::new(0.0, 0.0, 1_000.0, 90.0))
-        .unwrap();
+        let compiled = UiTree::new(setting_row(&state, index, field, true, SettingsWidth::Wide))
+            .compile(LogicalRect::new(0.0, 0.0, 1_000.0, 90.0))
+            .unwrap();
         let control = compiled
             .semantic(&UiKey::new(format!("settings/control/{key}")))
             .unwrap();
@@ -14549,20 +17614,14 @@ fn bounded_native_float_non_finite_values_keep_sliders_and_disclose() {
             assert!(
                 bounded_numeric_submission_error(field, Some(raw))
                     .unwrap()
-                    .contains("must be finite"),
+                    .contains("must be a number"),
                 "{key} {raw}"
             );
 
-            let compiled = UiTree::new(setting_row(
-                &state,
-                index,
-                field,
-                true,
-                false,
-                SettingsWidth::Wide,
-            ))
-            .compile(LogicalRect::new(0.0, 0.0, 1_100.0, 90.0))
-            .unwrap();
+            let compiled =
+                UiTree::new(setting_row(&state, index, field, true, SettingsWidth::Wide))
+                    .compile(LogicalRect::new(0.0, 0.0, 1_100.0, 90.0))
+                    .unwrap();
             let control = compiled
                 .semantic(&UiKey::new(format!("settings/control/{key}")))
                 .unwrap();
@@ -14584,6 +17643,15 @@ fn rejected_bounded_numeric_return_retains_exact_draft_and_focus() {
             unreachable!()
         };
         state.route = SettingsRoute::TextFonts;
+        // A bounded number typed into a text row (a placeholder that names
+        // no number keeps the row a field).
+        let field = state
+            .legacy
+            .fields
+            .iter_mut()
+            .find(|field| field.key == key)
+            .unwrap();
+        field.placeholder = "Automatic".to_string();
     }
     runtime
         .dispatch(
@@ -14620,32 +17688,110 @@ fn rejected_bounded_numeric_return_retains_exact_draft_and_focus() {
         state.common.last_focus.as_ref().map(UiKey::as_str),
         Some("settings/control/font_px")
     );
-    let feedback = state.feedback.as_deref().unwrap();
-    assert!(feedback.contains("between 6 to 200"));
-    assert!(feedback.contains("500 was not saved"));
+    assert_eq!(state.feedback.as_deref(), Some("Font size was not saved"));
+    let error = &state.field_errors[key];
+    assert_eq!(
+        error,
+        "Font size must be between 6 and 200; 500 was not saved"
+    );
+}
+
+/// An out-of-range size sent to the font size slider writes nothing, leaves
+/// no draft behind, keeps the row and its keyboard, says why, and leaves the
+/// specimen at the saved size in a card no taller than usual.
+#[test]
+fn an_out_of_range_font_size_keeps_the_row_and_the_specimen() {
+    let (mut runtime, instance, view) = setup();
+    replace_settings_source(&mut runtime, view, "font_px = 14\n".to_string());
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!()
+        };
+        state.navigate(SettingsRoute::TextFonts);
+    }
+    let key = prefs::EDIT_FONT_PX;
+    let rejected = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(format!("settings/set/{key}")),
+                value: Some(SemanticInput::Text("500".to_string())),
+            }),
+        )
+        .unwrap();
+    assert!(
+        rejected
+            .effects
+            .iter()
+            .all(|effect| !matches!(effect, AppEffect::ConfigPatch { .. }))
+    );
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!()
+    };
+    assert!(!state.field_inputs.contains_key(key), "no draft to recover");
+    assert_eq!(state.feedback.as_deref(), Some("Font size was not saved"));
+    assert_eq!(
+        state.field_errors.get(key).map(String::as_str),
+        Some("Font size must be between 6 and 200; 500 was not saved"),
+        "the reason sits under the row"
+    );
+    assert_eq!(
+        state.common.last_focus.as_ref().map(UiKey::as_str),
+        Some("settings/control/font_px")
+    );
+    let cx = view_cx_at(900.0, 600.0);
+    let compiled = runtime
+        .render(instance, view, &cx)
+        .unwrap()
+        .compile(cx.viewport)
+        .unwrap();
+    let row = compiled
+        .semantic(&UiKey::new("settings/control/font_px"))
+        .expect("the size row stays on the page");
+    assert!(row.rect.bottom() <= cx.viewport.height);
+    let preview = compiled
+        .semantic(&UiKey::new("settings/preview/text-fonts"))
+        .expect("the specimen stays");
+    assert!(preview.rect.height <= 2.0 * renderer_preview_height(SettingsWidth::Medium) + 0.01);
+    let spec = renderer_preview_spec_for_key_with_font(
+        state,
+        key,
+        0,
+        crate::native_app::ViewMotionCx::default(),
+        12.0,
+        1.0,
+        None,
+    )
+    .unwrap();
+    assert_eq!(spec.font_px, 14.0, "the specimen keeps the saved size");
+
+    // A draft the terminal would refuse, however it got there, never
+    // reaches the specimen.
+    let mut drafted = SettingsViewState::new(&Config {
+        font_px: Some(14.0),
+        ..Config::default()
+    });
+    drafted.field_inputs.insert(
+        key.to_string(),
+        crate::native_text_input::TextInputState::new("500".to_string()),
+    );
+    assert_eq!(preview_font_px(&drafted, 12.0), 14.0);
 }
 
 #[test]
 fn motion_auto_discloses_platform_behavior_when_explicit_or_implicit() {
-    assert_eq!(
-        motion_auto_visual_label("macos"),
-        "Auto · macOS Reduce Motion"
-    );
-    assert_eq!(
-        motion_auto_visual_label("windows"),
-        "Auto · Windows at attach"
-    );
-    assert_eq!(
-        motion_auto_visual_label("linux"),
-        "Auto · no OS motion source"
-    );
-
-    for config in [
-        Config::default(),
-        Config {
-            motion: Some("auto".to_string()),
-            ..Config::default()
-        },
+    // One word in the control, the picker and the accessible name; the
+    // platform's own behaviour rides the row's note and description.
+    for (config, shown) in [
+        (Config::default(), "Automatic (default)"),
+        (
+            Config {
+                motion: Some("auto".to_string()),
+                ..Config::default()
+            },
+            "Automatic",
+        ),
     ] {
         let state = SettingsViewState::new(&config);
         let (index, field) = state
@@ -14661,14 +17807,23 @@ fn motion_auto_discloses_platform_behavior_when_explicit_or_implicit() {
             index,
             field,
             false,
-            false,
             SettingsWidth::Wide,
         ))
         .compile(LogicalRect::new(0.0, 0.0, 900.0, 80.0))
         .unwrap();
         let key = UiKey::new(format!("settings/control/{}", prefs::EDIT_MOTION));
         let semantic = compiled.semantic(&key).unwrap();
-        assert!(semantic.label.contains(prefs::motion_auto_help()));
+        assert_eq!(semantic.label, format!("Motion: {shown}"));
+        let note = prefs::motion_auto_copy(std::env::consts::OS).0;
+        assert!(
+            semantic
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains(note)),
+            "{:?}",
+            semantic.description
+        );
+        assert!(!semantic.label.contains("motion=auto"));
         let visual = compiled
             .paint
             .iter()
@@ -14682,7 +17837,7 @@ fn motion_auto_discloses_platform_behavior_when_explicit_or_implicit() {
                 button.spec.visual_label.as_deref()
             })
             .unwrap();
-        assert_eq!(visual, motion_auto_visual_label(std::env::consts::OS));
+        assert_eq!(visual, shown);
     }
 }
 
@@ -14734,7 +17889,7 @@ fn color_override_has_a_truthful_swatch_and_source_context() {
             prefs::EDIT_FOREGROUND
         )))
         .unwrap();
-    assert!(label.label.contains("Override"), "{}", label.label);
+    assert!(label.label.contains("Changed"), "{}", label.label);
 }
 
 #[test]
@@ -15046,8 +18201,8 @@ fn compact_is_one_pane_and_medium_keeps_labeled_navigation() {
             .is_some()
     );
     assert!(
-        home.semantic(&UiKey::new("settings/top/pagination"))
-            .is_some()
+        home.semantic(&UiKey::new("settings/top/list")).is_some(),
+        "compact Top Settings lists its cards"
     );
 
     let medium = view_cx_at(800.0, 820.0);
@@ -15063,7 +18218,10 @@ fn compact_is_one_pane_and_medium_keeps_labeled_navigation() {
             .width,
         196.0
     );
-    for route in SettingsRoute::ALL {
+    for route in SettingsRoute::ALL
+        .into_iter()
+        .filter(|route| route.on_rail())
+    {
         let key = UiKey::new(format!("settings/nav{}", route.path()));
         let button = rail
             .paint
@@ -15114,7 +18272,10 @@ fn compact_is_one_pane_and_medium_keeps_labeled_navigation() {
         .unwrap()
         .compile(wide.viewport)
         .unwrap();
-    for route in SettingsRoute::ALL {
+    for route in SettingsRoute::ALL
+        .into_iter()
+        .filter(|route| route.on_rail())
+    {
         let key = UiKey::new(format!("settings/nav{}", route.path()));
         let button = wide_rail
             .paint
@@ -15157,13 +18318,16 @@ fn short_wide_sidebar_keeps_every_route_whole_and_selected_route_visible() {
     let navigation = compiled
         .semantic(&UiKey::new("settings/navigation"))
         .expect("wide settings sidebar");
-    for route in SettingsRoute::ALL {
+    for route in SettingsRoute::ALL
+        .into_iter()
+        .filter(|route| route.on_rail())
+    {
         let key = UiKey::new(format!("settings/nav{}", route.path()));
         let route_node = compiled
             .semantic(&key)
             .unwrap_or_else(|| panic!("{} remains visible", route.label()));
         assert!(
-            route_node.rect.height >= 24.0,
+            route_node.rect.height >= dense_navigation_route_floor(1.0) - 0.01,
             "{} is clipped to {:?}",
             route.label(),
             route_node.rect
@@ -15175,6 +18339,50 @@ fn short_wide_sidebar_keeps_every_route_whole_and_selected_route_visible() {
             .find(|hit| hit.key == key)
             .expect("visible route has a hit target");
         assert_eq!(hit.rect, route_node.rect);
+    }
+}
+
+/// The rail names its groups at every height it is drawn at, a short wide
+/// window (167×36's 516pt) included: a short rail sheds its "Settings" title
+/// first, and keeps the title only where its rows stay 24pt beside the
+/// headings.
+#[test]
+fn the_sidebar_names_its_groups_at_every_height() {
+    for (height, titled) in [
+        (686.0, true),
+        (900.0, true),
+        (576.0, true),
+        (516.0, false),
+        (513.0, false),
+    ] {
+        let (runtime, instance, view) = setup();
+        let compiled =
+            compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, height));
+        let navigation = compiled
+            .semantic(&UiKey::new("settings/navigation"))
+            .expect("a persistent sidebar");
+        for heading in ["look---feel", "workspace", "aterm"] {
+            assert!(
+                compiled
+                    .semantic(&UiKey::new(format!("settings/nav-label/{heading}")))
+                    .is_some(),
+                "{heading} at {height}"
+            );
+        }
+        assert_eq!(
+            compiled
+                .semantic(&UiKey::new("settings/navigation-title"))
+                .is_some(),
+            titled,
+            "the title at {height}"
+        );
+        let about = compiled
+            .semantic(&UiKey::new("settings/nav/about"))
+            .unwrap();
+        assert!(
+            about.rect.bottom() <= navigation.rect.bottom() + 0.01,
+            "{height}"
+        );
     }
 }
 
@@ -15200,7 +18408,10 @@ fn mutation_feedback_never_obscures_or_reflows_primary_navigation() {
         .expect("mutation feedback");
     assert!(feedback.rect.x >= navigation.rect.right());
     assert_eq!(navigation.rect.height, cx.viewport.height);
-    for route in SettingsRoute::ALL {
+    for route in SettingsRoute::ALL
+        .into_iter()
+        .filter(|route| route.on_rail())
+    {
         let key = UiKey::new(format!("settings/nav{}", route.path()));
         let route_node = compiled
             .semantic(&key)
@@ -15231,89 +18442,143 @@ fn compact_preview_and_form_share_the_available_space_without_clipping() {
     let controls = compiled
         .semantics
         .iter()
-        .filter(|node| node.key.as_str().starts_with("settings/control/"))
+        .filter(|node| setting_control_key(node.key.as_str()))
         .count();
     assert!(controls >= 1, "compact preview leaves a useful control");
     let preview = compiled
         .semantic(&UiKey::new("settings/preview/appearance"))
         .expect("compact keeps the live workbench");
     assert!(preview.rect.bottom() <= cx.viewport.bottom());
-    let range = compiled
-        .semantic(&UiKey::new("settings/results-range"))
-        .expect("visible range status");
-    // The Appearance roster total is derived from the live registry (the
-    // full-coverage settings batch grew it past the original 11), so the
-    // range status must agree with the real per-route field count.
-    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
-        unreachable!();
+    // The list under the preview reaches the whole registry roster.
+    let appearance_total = match runtime.view_state(view) {
+        Some(AppViewState::Settings(state)) => settings_field_result_count(state),
+        _ => unreachable!(),
     };
-    let appearance_total = settings_field_result_count(state);
-    assert!(
-        range
-            .label
-            .contains(&format!("1–{controls} of {appearance_total}")),
-        "range status {:?} disagrees with the registry roster ({appearance_total})",
-        range.label
-    );
-}
-
-#[test]
-fn compact_route_without_preview_admits_four_complete_rows() {
-    let (mut runtime, instance, view) = setup();
-    runtime
-        .dispatch(
-            instance,
-            view,
-            AppEvent::Action(ActionInvocation {
-                id: route_action(SettingsRoute::Terminal),
-                value: None,
-            }),
-        )
-        .unwrap();
-    let cx = view_cx_at(474.0, 658.0);
-    let compiled = runtime
-        .render(instance, view, &cx)
-        .unwrap()
-        .compile(cx.viewport)
-        .unwrap();
-    let controls = compiled
-        .semantics
-        .iter()
-        .filter(|node| node.key.as_str().starts_with("settings/control/"))
-        .count();
-    assert!(
-        controls >= 4,
-        "expected four complete compact Terminal controls, got {controls}: {:?}",
-        compiled
+    let mut reached = BTreeSet::new();
+    each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/preview/appearance"))
+                .is_some(),
+            "the preview stays pinned over every screen"
+        );
+        reached.extend(keys_with_prefix(compiled, "settings/control/"));
+        // The theme is its card's rows.
+        if compiled
             .semantics
             .iter()
-            .filter(|node| {
-                let key = node.key.as_str();
-                key.starts_with("settings/control/")
-                    || key.starts_with("settings/group/")
-                    || key.starts_with("settings/group-footnote/")
-                    || key.starts_with("settings/results-")
-                    || key == "settings/page-heading"
-                    || key == "settings/page-subtitle"
-            })
-            .map(|node| (node.key.as_str(), node.rect))
-            .collect::<Vec<_>>()
-    );
-    let range = compiled
-        .semantic(&UiKey::new("settings/results-range"))
-        .unwrap();
-    assert!(!range.label.is_empty());
-    for control in compiled
-        .semantics
-        .iter()
-        .filter(|node| node.key.as_str().starts_with("settings/control/"))
-    {
-        assert!(control.rect.bottom() <= cx.viewport.bottom());
+            .any(|node| theme_card_control_key(node.key.as_str()))
+        {
+            reached.insert(format!("settings/control/{}", prefs::EDIT_THEME));
+        }
+    });
+    assert_eq!(reached.len(), appearance_total, "{reached:?}");
+}
+
+/// A COMPACT PAGE'S FIRST SCREEN HOLDS THREE WHOLE ROWS AND THEIR NOTES, at
+/// the shipped 102x29 window (738x418) as at a tall narrow one: a one-line
+/// compact row is the Medium row it is built as (44pt, a 36pt control),
+/// never a taller touch-sized row, so the third setting's control and note
+/// are whole above the list's edge, and the fourth peeks in under them,
+/// with default values and with the two zero values the rows' notes explain.
+#[test]
+fn compact_route_without_preview_admits_three_complete_rows_and_their_notes() {
+    let whole = [
+        prefs::EDIT_SCROLLBACK,
+        prefs::EDIT_SEARCH_HISTORY_LINES,
+        prefs::EDIT_BIDI,
+    ];
+    for (width, height) in [(474.0_f32, 658.0_f32), (738.0, 418.0)] {
+        for source in ["", "scrollback_lines = 0\nsearch_history_lines = 0\n"] {
+            let snapshot = VersionedConfigService::new(source.to_string())
+                .unwrap()
+                .snapshot();
+            let mut state = SettingsViewState::from_snapshot(&snapshot).unwrap();
+            state.navigate(SettingsRoute::Terminal);
+            let cx = view_cx_at(width, height);
+            let compiled = settings_route_at(&state, &cx);
+            let at = format!("{width}x{height} {source:?}");
+            let list = compiled
+                .semantic(&UiKey::new("settings/list"))
+                .unwrap_or_else(|| panic!("{at}: the list"))
+                .rect;
+            let live = |key: &str| {
+                let control = format!("settings/control/{key}");
+                compiled.hits.iter().any(|hit| hit.key.as_str() == control)
+            };
+            for key in whole {
+                assert!(live(key), "{at}: {key}'s control is whole and live");
+                // The row's last painted line: its note, under the row.
+                let lines = format!("settings/detail/{key}/line-");
+                let note = compiled
+                    .paint
+                    .iter()
+                    .filter(|node| node.key.as_str().starts_with(&lines))
+                    .map(|node| node.rect.bottom())
+                    .fold(None, |most: Option<f32>, bottom| {
+                        Some(most.map_or(bottom, |most| most.max(bottom)))
+                    })
+                    .unwrap_or_else(|| panic!("{at}: {key} has its note under it"));
+                assert!(
+                    note <= list.bottom() + 0.5,
+                    "{at}: {key}'s note ends inside the list: {note} in {list:?}"
+                );
+            }
+            assert!(
+                !live(prefs::EDIT_AMBIGUOUS_WIDTH),
+                "{at}: the fourth row is the peek, not a live control"
+            );
+            // An ordinary page shows every row it has, so it states no count.
+            assert!(
+                compiled
+                    .semantic(&UiKey::new("settings/results-range"))
+                    .is_none()
+            );
+            for control in compiled
+                .semantics
+                .iter()
+                .filter(|node| node.key.as_str().starts_with("settings/control/"))
+            {
+                assert!(control.rect.bottom() <= cx.viewport.bottom());
+            }
+        }
     }
 }
 
+/// A ONE-LINE COMPACT ROW IS THE MEDIUM ROW IT IS BUILT AS: the same row and
+/// control height on the shipped 102x29 window as at 150x48.
 #[test]
-fn compact_switch_is_trailing_touch_sized_and_never_a_full_width_bar() {
+fn a_one_line_compact_row_is_as_tall_as_its_medium_row() {
+    let heights = |width: f32, height: f32| {
+        let mut state = SettingsViewState::new(&Config::default());
+        state.navigate(SettingsRoute::Terminal);
+        let compiled = settings_route_at(&state, &view_cx_at(width, height));
+        let key = prefs::EDIT_SCROLLBACK;
+        let row = compiled
+            .semantics
+            .iter()
+            .find(|node| {
+                node.key.as_str().starts_with("settings/row/")
+                    && node.key.as_str().ends_with(&format!("/{key}"))
+            })
+            .unwrap_or_else(|| panic!("{width}x{height}: the row"))
+            .rect
+            .height;
+        let control = compiled
+            .semantic(&UiKey::new(format!("settings/control/{key}")))
+            .unwrap_or_else(|| panic!("{width}x{height}: the control"))
+            .rect
+            .height;
+        (row, control)
+    };
+    let compact = heights(738.0, 418.0);
+    let medium = heights(1_074.0, 684.0);
+    assert_eq!(compact, medium, "102x29 against 150x48");
+    assert_eq!(medium, (44.0, 36.0), "at 1x text");
+}
+
+#[test]
+fn compact_switch_trails_its_row_and_is_never_a_full_width_bar() {
     for (viewport_width, viewport_height) in [(390.0, 568.0), (474.0, 658.0)] {
         let (mut runtime, instance, view) = setup();
         runtime
@@ -15334,21 +18599,48 @@ fn compact_switch_is_trailing_touch_sized_and_never_a_full_width_bar() {
             .unwrap();
         let key = UiKey::new(format!("settings/control/{}", prefs::EDIT_CURSOR_BLINK));
         let control = compiled.semantic(&key).expect("visible compact switch");
-        let controls = compiled
-            .semantic(&UiKey::new(format!(
-                "settings/controls/{}",
-                prefs::EDIT_CURSOR_BLINK
-            )))
+        // A stacked row's control band, or the row a one-line row lays its
+        // label and switch out in.
+        let band = compiled.semantic(&UiKey::new(format!(
+            "settings/controls/{}",
+            prefs::EDIT_CURSOR_BLINK
+        )));
+        let stacked = band.is_some();
+        let controls = band
+            .or_else(|| {
+                compiled.semantics.iter().find(|node| {
+                    node.key.as_str().starts_with("settings/row/")
+                        && node
+                            .key
+                            .as_str()
+                            .ends_with(&format!("/{}", prefs::EDIT_CURSOR_BLINK))
+                })
+            })
             .expect("full compact control band");
         assert!(
             (control.rect.width - 104.0).abs() < 0.01,
             "switch width is {:?}",
             control.rect
         );
-        assert!(control.rect.height >= 44.0, "switch is touch-sized");
+        if stacked {
+            // A stacked switch has its band to itself and is touch-sized.
+            assert!(control.rect.height >= 44.0, "switch is touch-sized");
+        } else {
+            // A one-line row's switch is its Medium row's control.
+            assert!(
+                (control.rect.height - (controls.rect.height - 8.0)).abs() < 0.01
+                    && control.rect.height >= 28.0,
+                "switch fills its one-line row: control={:?}, row={:?}",
+                control.rect,
+                controls.rect
+            );
+        }
         assert!(control.rect.width < controls.rect.width * 0.5);
+        // A stacked switch trails its control band; a one-line row's
+        // switch trails the row ahead of the place its Reset keeps.
+        let trailing = controls.rect.right() - control.rect.right();
         assert!(
-            (control.rect.right() - controls.rect.right()).abs() < 0.01,
+            trailing.abs() < 0.01 || (trailing - (reset_slot_width() + 12.0)).abs() < 0.01,
             "switch trails its row: control={:?}, row={:?}",
             control.rect,
             controls.rect
@@ -15382,17 +18674,17 @@ fn compact_switch_is_trailing_touch_sized_and_never_a_full_width_bar() {
 }
 
 #[test]
-fn compact_choice_picker_keeps_options_done_and_pagination_wholly_reachable() {
+fn compact_choice_picker_keeps_every_option_and_cancel_wholly_reachable() {
     for (viewport_width, viewport_height) in [
         // The ordinary 35-column Retina phone-width host presents an
-        // exact 286.5-point semantic viewport. Keep it in the oracle so
-        // page status copy cannot be squeezed by its sibling buttons.
+        // exact 286.5-point semantic viewport.
         (286.5, 558.0),
         (320.0, 568.0),
         (390.0, 568.0),
         (474.0, 658.0),
     ] {
-        let (mut runtime, instance, view) = setup();
+        // One theme always: the Color theme control opens the whole picker.
+        let (mut runtime, instance, view) = theme_pair_runtime("theme = \"Default\"\n", true);
         let open = || ActionInvocation {
             id: ActionId::new(format!("settings/set/{}", prefs::EDIT_THEME)),
             value: None,
@@ -15401,118 +18693,15 @@ fn compact_choice_picker_keeps_options_done_and_pagination_wholly_reachable() {
             .dispatch(instance, view, AppEvent::Action(open()))
             .unwrap();
         let cx = view_cx_at(viewport_width, viewport_height);
-        let compiled = runtime
-            .render(instance, view, &cx)
-            .unwrap()
-            .compile(cx.viewport)
-            .unwrap();
-        let picker = compiled
-            .semantic(&UiKey::new(format!(
-                "settings/choice-picker/{}",
-                prefs::EDIT_THEME
-            )))
-            .expect("compact theme picker");
-        assert!(
-            picker.rect.x >= 0.0
-                && picker.rect.y >= 0.0
-                && picker.rect.right() <= viewport_width + 0.01
-                && picker.rect.bottom() <= viewport_height + 0.01,
-            "picker is whole at {viewport_width}x{viewport_height}: {:?}",
-            picker.rect
-        );
-
         let option_prefix = format!("settings/choice/{}/", prefs::EDIT_THEME);
-        let options = compiled
-            .semantics
-            .iter()
-            .filter(|node| node.key.as_str().starts_with(&option_prefix))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            options.len(),
-            ChoicePicker::preferred_page_size().min(3),
-            "compact pagination uses its current Dynamic Type budget"
-        );
-        for option in &options {
-            assert!(option.rect.height >= 44.0);
-            assert!(option.rect.width >= 140.0);
-            assert!(option.rect.x >= picker.rect.x);
-            assert!(option.rect.right() <= picker.rect.right() + 0.01);
-            assert!(option.rect.bottom() <= picker.rect.bottom() + 0.01);
-            let paint = compiled
-                .paint
-                .iter()
-                .find(|paint| paint.key == option.key)
-                .expect("choice is painted");
-            let hit = compiled
-                .hits
-                .iter()
-                .find(|hit| hit.key == option.key)
-                .expect("choice is activatable");
-            assert_eq!(paint.rect, option.rect, "choice is not clipped");
-            assert_eq!(hit.rect, option.rect, "choice hit is not clipped");
-        }
-        for (index, option) in options.iter().enumerate() {
-            for other in options.iter().skip(index + 1) {
-                assert!(
-                    option.rect.intersect(other.rect).is_none(),
-                    "choice text surfaces never overlap: {:?} and {:?}",
-                    option.rect,
-                    other.rect
-                );
-            }
-        }
-
-        let control = |key: &str| {
-            compiled
-                .semantic(&UiKey::new(key))
-                .unwrap_or_else(|| panic!("missing {key}"))
-        };
-        for key in [
-            "settings/choice-close",
-            "settings/choice-page-prev",
-            "settings/choice-page-next",
-        ] {
-            let node = control(key);
-            assert!(node.rect.height >= 44.0, "{key} is touch-sized");
-            assert!(node.rect.bottom() <= picker.rect.bottom() + 0.01);
-            assert!(node.rect.bottom() <= viewport_height + 0.01);
-        }
-        let page_label = control(&format!("settings/choice-page-label/{}", prefs::EDIT_THEME));
-        let page_copy = "Page 1 of 7";
-        let page_copy_width = crate::tray_raster::ui_text_width(page_copy, 13.0);
-        assert!(
-            page_label.rect.width + 0.01 >= page_copy_width,
-            "{viewport_width}px picker clips {page_copy:?}: {:.1}px available, {page_copy_width:.1}px required",
-            page_label.rect.width,
-        );
-        let close_action = compiled
-            .hits
-            .iter()
-            .find(|hit| hit.key.as_str() == "settings/choice-close")
-            .expect("Done is activatable")
-            .action
-            .clone();
-        let next_action = compiled
-            .hits
-            .iter()
-            .find(|hit| hit.key.as_str() == "settings/choice-page-next")
-            .expect("Next is activatable")
-            .action
-            .clone();
-        assert!(
-            compiled
-                .hits
-                .iter()
-                .all(|hit| hit.key.as_str() != "settings/choice-page-prev"),
-            "disabled Previous does not claim a hit"
-        );
-
+        let context = format!("{viewport_width}x{viewport_height}");
+        // Cancel closes it and hands the keyboard back to the control.
         runtime
             .dispatch(
                 instance,
                 view,
                 AppEvent::Action(ActionInvocation {
-                    id: close_action,
+                    id: ActionId::new("settings/choice-close"),
                     value: None,
                 }),
             )
@@ -15520,55 +18709,96 @@ fn compact_choice_picker_keeps_options_done_and_pagination_wholly_reachable() {
         let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
             panic!("Settings view");
         };
-        assert!(state.choice_picker.is_none(), "Done closes the picker");
+        assert!(state.choice_picker.is_none(), "Cancel closes the picker");
         let theme_control = UiKey::new(format!("settings/control/{}", prefs::EDIT_THEME));
         assert_eq!(state.common.last_focus.as_ref(), Some(&theme_control));
         let closed = compile_settings_view(&runtime, instance, view, &cx);
         assert!(
             closed.focus_order.contains(&theme_control),
-            "Done returns focus to the setting that opened the picker"
+            "Cancel returns focus to the setting that opened the picker"
         );
-
         runtime
             .dispatch(instance, view, AppEvent::Action(open()))
             .unwrap();
-        runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: next_action,
-                    value: None,
-                }),
-            )
-            .unwrap();
-        let compiled = runtime
-            .render(instance, view, &cx)
-            .unwrap()
-            .compile(cx.viewport)
-            .unwrap();
-        let first_next_key = UiKey::new(format!(
-            "settings/choice/{}/{}",
+        walk_open_choice_picker(
+            &mut runtime,
+            instance,
+            view,
+            &cx,
             prefs::EDIT_THEME,
-            ChoicePicker::PAGE_SIZE
-        ));
-        let first_next = compiled
+            |compiled, index| {
+                let picker = compiled
+                    .semantic(&UiKey::new(format!(
+                        "settings/choice-picker/{}",
+                        prefs::EDIT_THEME
+                    )))
+                    .expect("compact theme picker");
+                assert!(
+                    picker.rect.x >= 0.0
+                        && picker.rect.y >= 0.0
+                        && picker.rect.right() <= viewport_width + 0.01
+                        && picker.rect.bottom() <= viewport_height + 0.01,
+                    "picker is whole at {context} on option {index}: {:?}",
+                    picker.rect
+                );
+                let options = compiled
+                    .semantics
+                    .iter()
+                    .filter(|node| node.key.as_str().starts_with(&option_prefix))
+                    .collect::<Vec<_>>();
+                assert!(!options.is_empty());
+                for option in &options {
+                    assert!(option.rect.height >= 44.0);
+                    assert!(option.rect.width >= 140.0, "{context}: {:?}", option.rect);
+                    assert!(option.rect.x >= picker.rect.x);
+                    assert!(option.rect.right() <= picker.rect.right() + 0.01);
+                    assert!(option.rect.bottom() <= picker.rect.bottom() + 0.01);
+                    let paint = compiled
+                        .paint
+                        .iter()
+                        .find(|paint| paint.key == option.key)
+                        .expect("choice is painted");
+                    let hit = compiled
+                        .hits
+                        .iter()
+                        .find(|hit| hit.key == option.key)
+                        .expect("choice is activatable");
+                    assert_eq!(paint.rect, option.rect, "choice is not clipped");
+                    assert_eq!(hit.rect, option.rect, "choice hit is not clipped");
+                }
+                for (index, option) in options.iter().enumerate() {
+                    for other in options.iter().skip(index + 1) {
+                        assert!(
+                            option.rect.intersect(other.rect).is_none(),
+                            "choices never overlap: {:?} and {:?}",
+                            option.rect,
+                            other.rect
+                        );
+                    }
+                }
+                let cancel = compiled
+                    .semantic(&UiKey::new("settings/choice-close"))
+                    .expect("Cancel");
+                assert!(cancel.rect.height >= 44.0, "Cancel is touch-sized");
+                assert!(cancel.rect.bottom() <= picker.rect.bottom() + 0.01);
+            },
+        );
+
+        // The last option, reached by the keyboard, saves when activated.
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        let last = compiled
             .hits
             .iter()
-            .find(|hit| hit.key == first_next_key)
-            .expect("next page is visible and activatable");
-        assert!(
-            compiled
-                .hits
-                .iter()
-                .any(|hit| hit.key.as_str() == "settings/choice-page-prev")
-        );
+            .rfind(|hit| hit.key.as_str().starts_with(&option_prefix))
+            .expect("an option on glass")
+            .action
+            .clone();
         let outcome = runtime
             .dispatch(
                 instance,
                 view,
                 AppEvent::Action(ActionInvocation {
-                    id: first_next.action.clone(),
+                    id: last,
                     value: None,
                 }),
             )
@@ -15582,7 +18812,7 @@ fn compact_choice_picker_keeps_options_done_and_pagination_wholly_reachable() {
 }
 
 #[test]
-fn compact_special_routes_semantically_page_to_every_action_and_value() {
+fn compact_special_routes_scroll_to_every_action_and_value() {
     for viewport_width in [320.0, 390.0] {
         let cx = view_cx_at(viewport_width, 568.0);
 
@@ -15598,22 +18828,7 @@ fn compact_special_routes_semantically_page_to_every_action_and_value() {
             )
             .unwrap();
         let mut about_keys = BTreeSet::new();
-        // The section count is the pager's own, never a hard-coded guess: the
-        // About rows (build, signature, claimant copies) vary by machine.
-        let about_sections = pager_total(
-            &runtime
-                .render(instance, view, &cx)
-                .unwrap()
-                .compile(cx.viewport)
-                .unwrap(),
-            "about/range",
-        );
-        for section in 0..about_sections {
-            let compiled = runtime
-                .render(instance, view, &cx)
-                .unwrap()
-                .compile(cx.viewport)
-                .unwrap();
+        each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
             compiled.validate_parity().unwrap();
             for node in &compiled.semantics {
                 if node.key.as_str().starts_with("about/") {
@@ -15626,26 +18841,7 @@ fn compact_special_routes_semantically_page_to_every_action_and_value() {
                     about_keys.insert(node.key.as_str().to_string());
                 }
             }
-            if section + 1 < about_sections {
-                let next = compiled
-                    .hits
-                    .iter()
-                    .find(|hit| hit.key.as_str() == "about/pagination/next")
-                    .expect("About exposes a semantic Next action")
-                    .action
-                    .clone();
-                runtime
-                    .dispatch(
-                        instance,
-                        view,
-                        AppEvent::Action(ActionInvocation {
-                            id: next,
-                            value: None,
-                        }),
-                    )
-                    .unwrap();
-            }
-        }
+        });
         for key in [
             "about/copy-build-info",
             "about/open-site",
@@ -15657,7 +18853,6 @@ fn compact_special_routes_semantically_page_to_every_action_and_value() {
             "about/provenance/row/arch",
             "about/provenance/row/compiler",
             "about/provenance/row/signature",
-            "about/support",
         ] {
             assert!(
                 about_keys.contains(key),
@@ -15679,16 +18874,7 @@ fn compact_special_routes_semantically_page_to_every_action_and_value() {
             )
             .unwrap();
         let mut update_keys = BTreeSet::new();
-        let update_sections = pager_total(
-            &compile_settings_view(&runtime, instance, view, &cx),
-            "updates/range",
-        );
-        for section in 0..update_sections {
-            let compiled = runtime
-                .render(instance, view, &cx)
-                .unwrap()
-                .compile(cx.viewport)
-                .unwrap();
+        each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
             compiled.validate_parity().unwrap();
             for node in &compiled.semantics {
                 // The Update route also hosts one shared config control
@@ -15707,26 +18893,7 @@ fn compact_special_routes_semantically_page_to_every_action_and_value() {
                     update_keys.insert(node.key.as_str().to_string());
                 }
             }
-            if section + 1 < update_sections {
-                let next = compiled
-                    .hits
-                    .iter()
-                    .find(|hit| hit.key.as_str() == "updates/pagination/next")
-                    .expect("Updates exposes a semantic Next action")
-                    .action
-                    .clone();
-                runtime
-                    .dispatch(
-                        instance,
-                        view,
-                        AppEvent::Action(ActionInvocation {
-                            id: next,
-                            value: None,
-                        }),
-                    )
-                    .unwrap();
-            }
-        }
+        });
         for key in [
             "updates/install-now",
             "updates/headline",
@@ -15797,16 +18964,89 @@ fn compact_special_routes_semantically_page_to_every_action_and_value() {
 }
 
 #[test]
-fn short_landscape_audit_reaches_every_compact_slice_with_feedback() {
+fn short_landscape_audit_reaches_every_control_with_feedback() {
     at_each_text_scale(
         &[1.0, 1.5, 2.0],
         "short-landscape audit",
-        short_landscape_audit_reaches_every_compact_slice_with_feedback_at_scale,
+        short_landscape_audit_reaches_every_control_with_feedback_at_scale,
     );
 }
 
-/// One rung of [`short_landscape_audit_reaches_every_compact_slice_with_feedback`] ([`at_each_text_scale`]).
-fn short_landscape_audit_reaches_every_compact_slice_with_feedback_at_scale(scale: f32) {
+/// Every screen of the list the view shows now, from its top to the last
+/// one it scrolls to: compiled at each first stop in turn.
+fn each_screen(
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    cx: &ViewCx<'_>,
+    mut each: impl FnMut(&crate::native_ui::CompiledUi, usize),
+) -> usize {
+    // Scrolling forgets a control kept in view, as the wheel does.
+    let set_top = |runtime: &mut NativeRuntime, top: usize| {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.page_scroll = top;
+        state.page_reveal = None;
+    };
+    set_top(runtime, 0);
+    let _ = compile_settings_view(runtime, instance, view, cx);
+    let limit = match runtime.view_state(view) {
+        Some(AppViewState::Settings(state)) => state.result_page_limit.get().unwrap_or(0),
+        _ => unreachable!(),
+    };
+    for top in 0..=limit {
+        set_top(runtime, top);
+        each(&compile_settings_view(runtime, instance, view, cx), top);
+    }
+    limit + 1
+}
+
+/// The first screen of the list that shows the node `key`, scrolled to as the
+/// wheel scrolls.
+fn screen_showing(
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    cx: &ViewCx<'_>,
+    key: &str,
+) -> Option<crate::native_ui::CompiledUi> {
+    let mut found = None;
+    let mut wanted = None;
+    each_screen(runtime, instance, view, cx, |compiled, top| {
+        if wanted.is_none() && compiled.semantic(&UiKey::new(key)).is_some() {
+            wanted = Some(top);
+        }
+    });
+    if let Some(top) = wanted {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.page_scroll = top;
+        state.page_reveal = None;
+        found = Some(compile_settings_view(runtime, instance, view, cx));
+    }
+    found
+}
+
+/// Whether the list `key` shows only part of itself (it paints its thumb).
+fn list_scrolls(compiled: &crate::native_ui::CompiledUi, key: &str) -> bool {
+    let thumb = UiKey::new(format!("{key}/thumb"));
+    compiled.paint.iter().any(|node| node.key == thumb)
+}
+
+/// The semantic keys under `prefix` that a compiled screen holds.
+fn keys_with_prefix(compiled: &crate::native_ui::CompiledUi, prefix: &str) -> Vec<String> {
+    compiled
+        .semantics
+        .iter()
+        .filter(|node| node.key.as_str().starts_with(prefix))
+        .map(|node| node.key.as_str().to_string())
+        .collect()
+}
+
+/// One rung of [`short_landscape_audit_reaches_every_control_with_feedback`] ([`at_each_text_scale`]).
+fn short_landscape_audit_reaches_every_control_with_feedback_at_scale(scale: f32) {
     let cx = view_cx_at(568.0, 320.0);
 
     for feedback_present in [false, true] {
@@ -15817,8 +19057,8 @@ fn short_landscape_audit_reaches_every_compact_slice_with_feedback_at_scale(scal
             "without feedback"
         };
 
-        // The compact category sheet exposes every destination as one
-        // complete row beside an always-accessible pager.
+        // The compact category sheet lists every destination, whole, on
+        // some screen of its list.
         let (mut runtime, instance, view) = setup();
         {
             let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
@@ -15827,27 +19067,20 @@ fn short_landscape_audit_reaches_every_compact_slice_with_feedback_at_scale(scal
             state.compact_navigation = true;
             state.feedback = feedback.clone();
         }
-        for (page, route) in SettingsRoute::ALL.into_iter().enumerate() {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                unreachable!();
-            };
-            state.page_scroll = page;
-            let compiled = compile_settings_view(&runtime, instance, view, &cx);
-            let context = format!("categories {page} at {scale}× {variant}");
-            assert_short_landscape_geometry(&compiled, scale, &context);
+        let mut categories = BTreeSet::new();
+        each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+            let context = format!("categories {top} at {scale}× {variant}");
+            assert_short_landscape_geometry(compiled, scale, &context);
+            categories.extend(keys_with_prefix(compiled, "settings/categories/"));
+        });
+        for route in SettingsRoute::ALL
+            .into_iter()
+            .filter(|route| route.on_rail())
+        {
             assert!(
-                compiled
-                    .semantic(&UiKey::new(format!("settings/categories{}", route.path())))
-                    .is_some(),
-                "{context}: missing {}",
+                categories.contains(&format!("settings/categories{}", route.path())),
+                "categories at {scale}× {variant}: missing {}",
                 route.label()
-            );
-            assert_accessible_pager(
-                &compiled,
-                "settings/categories/pagination",
-                page,
-                SettingsRoute::ALL.len(),
-                &context,
             );
         }
 
@@ -15858,11 +19091,18 @@ fn short_landscape_audit_reaches_every_compact_slice_with_feedback_at_scale(scal
             SettingsRoute::Appearance,
             SettingsRoute::TextFonts,
             SettingsRoute::CursorMotion,
+            SettingsRoute::Sound,
             SettingsRoute::WindowTabs,
             SettingsRoute::KeyboardInput,
             SettingsRoute::Terminal,
             SettingsRoute::Security,
         ] {
+            // Cursor & Motion leads with the cursor style's link, and Sound
+            // with the Music effects switch.
+            let leading = usize::from(matches!(
+                route,
+                SettingsRoute::CursorMotion | SettingsRoute::Sound
+            ));
             let (mut runtime, instance, view) = setup();
             let (total, expected_controls) = {
                 let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
@@ -15880,7 +19120,8 @@ fn short_landscape_audit_reaches_every_compact_slice_with_feedback_at_scale(scal
                             .section()
                             .is_some_and(|section| prefs::section_of(field.key) == section)
                     })
-                    .count();
+                    .count()
+                    + leading;
                 (
                     expected_controls + usize::from(focused_preview_key(state).is_some()),
                     expected_controls,
@@ -15888,34 +19129,19 @@ fn short_landscape_audit_reaches_every_compact_slice_with_feedback_at_scale(scal
             };
             assert!(total >= expected_controls && total > 0, "{route:?}");
             let mut seen_controls = BTreeSet::new();
-            for page in 0..total {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                    unreachable!();
-                };
-                state.page_scroll = page;
-                let compiled = compile_settings_view(&runtime, instance, view, &cx);
-                let context = format!(
-                    "{} slice {page}/{total} at {scale}× {variant}",
-                    route.label()
-                );
-                assert_short_landscape_geometry(&compiled, scale, &context);
-                seen_controls.extend(
-                    compiled
-                        .semantics
-                        .iter()
-                        .filter(|node| node.key.as_str().starts_with("settings/control/"))
-                        .map(|node| node.key.as_str().to_string()),
-                );
-                if total > 1 {
-                    assert_accessible_pager(
-                        &compiled,
-                        "settings/results-window",
-                        page,
-                        total,
-                        &context,
-                    );
+            each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+                let context = format!("{} screen {top} at {scale}× {variant}", route.label());
+                assert_short_landscape_geometry(compiled, scale, &context);
+                seen_controls.extend(keys_with_prefix(compiled, "settings/control/"));
+                // The theme is its card's rows.
+                if compiled
+                    .semantics
+                    .iter()
+                    .any(|node| theme_card_control_key(node.key.as_str()))
+                {
+                    seen_controls.insert(format!("settings/control/{}", prefs::EDIT_THEME));
                 }
-            }
+            });
             assert_eq!(
                 seen_controls.len(),
                 expected_controls,
@@ -15944,61 +19170,48 @@ fn short_landscape_audit_reaches_every_compact_slice_with_feedback_at_scale(scal
             "{context}"
         );
 
-        // Top Settings: all six requested controls, and the three visual
-        // choices retain their live previews on their normal pages.
-        let top = [
-            (prefs::EDIT_THEME, Some("settings/top/theme/preview")),
-            (
-                prefs::EDIT_WINDOW_THEME,
-                Some("settings/top/system-appearance/preview"),
-            ),
-            (
-                prefs::EDIT_CURSOR_TRAIL_STYLE,
-                Some("settings/top/cursor-trail/preview"),
-            ),
-            (prefs::EDIT_TRAIL_SOUNDS, None),
-            (SPARKLE_WORDS_KEY, None),
-            (KEYWORD_KITTIES_KEY, None),
-        ];
+        // Top Settings: all six requested controls, and the theme and trail
+        // cards keep their live previews.
         let (mut runtime, instance, view) = setup();
-        for (page, (key, preview)) in top.into_iter().enumerate() {
+        {
             let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                 unreachable!();
             };
             state.navigate(SettingsRoute::Home);
             state.feedback = feedback.clone();
-            state.page_scroll = page;
-            let compiled = compile_settings_view(&runtime, instance, view, &cx);
-            let context = format!("Top Settings {key} at {scale}× {variant}");
-            assert_short_landscape_geometry(&compiled, scale, &context);
-            assert!(
-                compiled
-                    .semantic(&UiKey::new(format!("settings/control/{key}")))
-                    .is_some(),
-                "{context}: control"
-            );
-            if let Some(preview) = preview {
-                assert!(
-                    compiled.semantic(&UiKey::new(preview)).is_some(),
-                    "{context}"
-                );
-            }
-            assert_accessible_pager(
-                &compiled,
-                "settings/top/pagination",
-                page,
-                TOP_SETTING_SECTIONS,
-                &context,
-            );
         }
-
-        // Theme, macOS appearance, and trail browsing each keep every
-        // picker page, option, Done, and (when needed) Prev/Next reachable.
+        let mut top_keys = BTreeSet::new();
+        each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+            let context = format!("Top Settings screen {top} at {scale}× {variant}");
+            assert_short_landscape_geometry(compiled, scale, &context);
+            top_keys.extend(keys_with_prefix(compiled, "settings/"));
+        });
         for key in [
             prefs::EDIT_THEME,
             prefs::EDIT_WINDOW_THEME,
             prefs::EDIT_CURSOR_TRAIL_STYLE,
+            prefs::EDIT_TRAIL_SOUNDS,
+            SPARKLE_WORDS_KEY,
+            KEYWORD_KITTIES_KEY,
         ] {
+            assert!(
+                top_keys.contains(&top_control_key(key).0),
+                "Top Settings {key} at {scale}× {variant}"
+            );
+        }
+        for preview in [
+            "settings/top/theme/preview",
+            "settings/top/cursor-trail/preview",
+        ] {
+            assert!(
+                top_keys.contains(preview),
+                "Top Settings {preview} at {scale}× {variant}"
+            );
+        }
+
+        // Theme and macOS appearance browsing each keep every option, the
+        // live preview, and Cancel reachable.
+        for key in [prefs::EDIT_THEME, prefs::EDIT_WINDOW_THEME] {
             let (mut runtime, instance, view) = setup();
             runtime
                 .dispatch(
@@ -16010,35 +19223,15 @@ fn short_landscape_audit_reaches_every_compact_slice_with_feedback_at_scale(scal
                     }),
                 )
                 .unwrap();
-            let (pages, page_size, option_count) = {
+            {
                 let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                     unreachable!();
                 };
                 state.feedback = feedback.clone();
-                configure_choice_picker_for_width(state, SettingsWidth::Compact);
-                let picker = state.choice_picker.as_ref().unwrap();
-                (
-                    picker.options.len().div_ceil(picker.page_size.get()),
-                    picker.page_size.get(),
-                    picker.options.len(),
-                )
-            };
-            let mut seen_options = BTreeSet::new();
-            for page in 0..pages {
-                {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                        unreachable!();
-                    };
-                    let picker = state.choice_picker.as_mut().unwrap();
-                    picker.offset.set(page * page_size);
-                    state.common.last_focus = Some(UiKey::new(format!(
-                        "settings/choice/{key}/{}",
-                        picker.offset.get()
-                    )));
-                }
-                let compiled = compile_settings_view(&runtime, instance, view, &cx);
-                let context = format!("{key} picker {page}/{pages} at {scale}× {variant}");
-                assert_short_landscape_geometry(&compiled, scale, &context);
+            }
+            walk_open_choice_picker(&mut runtime, instance, view, &cx, key, |compiled, index| {
+                let context = format!("{key} picker option {index} at {scale}× {variant}");
+                assert_short_landscape_geometry(compiled, scale, &context);
                 assert!(
                     compiled
                         .semantic(&UiKey::new("settings/top/choice-preview"))
@@ -16055,35 +19248,9 @@ fn short_landscape_audit_reaches_every_compact_slice_with_feedback_at_scale(scal
                     compiled
                         .semantic(&UiKey::new("settings/choice-close"))
                         .is_some(),
-                    "{context}: Done"
+                    "{context}: Cancel"
                 );
-                seen_options.extend(
-                    compiled
-                        .semantics
-                        .iter()
-                        .filter(|node| {
-                            node.key
-                                .as_str()
-                                .starts_with(&format!("settings/choice/{key}/"))
-                        })
-                        .map(|node| node.key.as_str().to_string()),
-                );
-                if pages > 1 {
-                    let previous = compiled
-                        .semantic(&UiKey::new("settings/choice-page-prev"))
-                        .unwrap();
-                    let next = compiled
-                        .semantic(&UiKey::new("settings/choice-page-next"))
-                        .unwrap();
-                    assert_eq!(previous.state.unwrap().enabled, page > 0, "{context}");
-                    assert_eq!(next.state.unwrap().enabled, page + 1 < pages, "{context}");
-                }
-            }
-            assert_eq!(
-                seen_options.len(),
-                option_count,
-                "{key} at {scale}× {variant}"
-            );
+            });
         }
 
         // Modified includes both reset-safe known structures and unknown
@@ -16111,47 +19278,29 @@ fn short_landscape_audit_reaches_every_compact_slice_with_feedback_at_scale(scal
             }),
             overrides.len()
         );
-        for (page, authored) in overrides.iter().enumerate() {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                unreachable!();
-            };
-            state.page_scroll = page;
-            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        let mut modified_keys = BTreeSet::new();
+        each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+            let context = format!("Modified screen {top} at {scale}× {variant}");
+            assert_short_landscape_geometry(compiled, scale, &context);
+            modified_keys.extend(keys_with_prefix(compiled, "settings/modified/"));
+        });
+        for authored in &overrides {
+            let fragment = key_fragment(&authored.key);
             let context = format!("Modified {} at {scale}× {variant}", authored.key);
-            assert_short_landscape_geometry(&compiled, scale, &context);
             assert!(
-                compiled
-                    .semantic(&UiKey::new(format!(
-                        "settings/modified/manual/label/{}",
-                        key_fragment(&authored.key)
-                    )))
-                    .is_some(),
+                modified_keys.contains(&format!("settings/modified/manual/label/{fragment}")),
                 "{context}: label"
             );
             assert!(
-                compiled
-                    .semantic(&UiKey::new("settings/modified/manual/open"))
-                    .is_some(),
+                modified_keys.contains(&format!("settings/modified/manual/open/{fragment}")),
                 "{context}: Manual escape hatch"
             );
             if authored.reset_safe {
                 assert!(
-                    compiled
-                        .semantic(&UiKey::new(format!(
-                            "settings/modified/manual/reset/{}",
-                            key_fragment(&authored.key)
-                        )))
-                        .is_some(),
+                    modified_keys.contains(&format!("settings/modified/manual/reset/{fragment}")),
                     "{context}: exact Reset"
                 );
             }
-            assert_accessible_pager(
-                &compiled,
-                "settings/results-window",
-                page,
-                overrides.len(),
-                &context,
-            );
         }
 
         // About's page count changes with Dynamic Type, so read the actual
@@ -16164,26 +19313,12 @@ fn short_landscape_audit_reaches_every_compact_slice_with_feedback_at_scale(scal
             state.navigate(SettingsRoute::About);
             state.feedback = feedback.clone();
         }
-        let first = compile_settings_view(&runtime, instance, view, &cx);
-        let about_total = pager_total(&first, "about/range");
         let mut about_keys = BTreeSet::new();
-        for page in 0..about_total {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                unreachable!();
-            };
-            state.page_scroll = page;
-            let compiled = compile_settings_view(&runtime, instance, view, &cx);
-            let context = format!("About {page}/{about_total} at {scale}× {variant}");
-            assert_short_landscape_geometry(&compiled, scale, &context);
-            assert_accessible_pager(&compiled, "about/pagination", page, about_total, &context);
-            about_keys.extend(
-                compiled
-                    .semantics
-                    .iter()
-                    .filter(|node| node.key.as_str().starts_with("about/"))
-                    .map(|node| node.key.as_str().to_string()),
-            );
-        }
+        each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+            let context = format!("About screen {top} at {scale}× {variant}");
+            assert_short_landscape_geometry(compiled, scale, &context);
+            about_keys.extend(keys_with_prefix(compiled, "about/"));
+        });
         for key in [
             "about/copy-build-info",
             "about/open-site",
@@ -16194,7 +19329,6 @@ fn short_landscape_audit_reaches_every_compact_slice_with_feedback_at_scale(scal
             "about/provenance/row/arch",
             "about/provenance/row/compiler",
             "about/provenance/row/signature",
-            "about/support",
         ] {
             assert!(
                 about_keys.contains(key),
@@ -16217,38 +19351,12 @@ fn short_landscape_audit_reaches_every_compact_slice_with_feedback_at_scale(scal
                 state.navigate(SettingsRoute::SoftwareUpdate);
                 state.feedback = feedback.clone();
             }
-            // The page count is what the live pager reports; the authored
-            // `update_compact_sections` accounting must agree with it, which
-            // is the anti-divergence property worth pinning here.
-            let update_total = pager_total(
-                &compile_settings_view(&runtime, instance, view, &cx),
-                "updates/range",
-            );
             let mut keys = BTreeSet::new();
-            for page in 0..update_total {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                    unreachable!();
-                };
-                state.page_scroll = page;
-                let compiled = compile_settings_view(&runtime, instance, view, &cx);
-                let context =
-                    format!("Update staged={staged} {page}/{update_total} at {scale}× {variant}");
-                assert_short_landscape_geometry(&compiled, scale, &context);
-                assert_accessible_pager(
-                    &compiled,
-                    "updates/pagination",
-                    page,
-                    update_total,
-                    &context,
-                );
-                keys.extend(
-                    compiled
-                        .semantics
-                        .iter()
-                        .filter(|node| node.key.as_str().starts_with("updates/"))
-                        .map(|node| node.key.as_str().to_string()),
-                );
-            }
+            each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+                let context = format!("Update staged={staged} screen {top} at {scale}× {variant}");
+                assert_short_landscape_geometry(compiled, scale, &context);
+                keys.extend(keys_with_prefix(compiled, "updates/"));
+            });
             for key in [
                 "updates/hero",
                 "updates/install-now",
@@ -16270,11 +19378,9 @@ fn short_landscape_audit_reaches_every_compact_slice_with_feedback_at_scale(scal
             );
         }
 
-        // Packages uses the same stable atomic-page contract for status,
-        // both actions, all three maintenance switches, and every bounded program.
+        // Packages lists status, the actions, all three maintenance switches
+        // and every bounded program; a card taller than the room splits.
         let packages_state = live_packages_state(None);
-        let packages_total =
-            packages_compact_sections(&packages_state.projection(), SettingsWidth::Compact, 0);
         let (mut runtime, instance, view) = setup();
         assert!(runtime.replace_settings_packages(packages_state, 2));
         {
@@ -16285,21 +19391,9 @@ fn short_landscape_audit_reaches_every_compact_slice_with_feedback_at_scale(scal
             state.feedback = feedback;
         }
         let mut package_keys = BTreeSet::new();
-        for page in 0..packages_total {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                unreachable!();
-            };
-            state.page_scroll = page;
-            let compiled = compile_settings_view(&runtime, instance, view, &cx);
-            let context = format!("Packages {page}/{packages_total} at {scale}× {variant}");
-            assert_short_landscape_geometry(&compiled, scale, &context);
-            assert_accessible_pager(
-                &compiled,
-                "packages/pagination",
-                page,
-                packages_total,
-                &context,
-            );
+        each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+            let context = format!("Packages screen {top} at {scale}× {variant}");
+            assert_short_landscape_geometry(compiled, scale, &context);
             package_keys.extend(
                 compiled
                     .semantics
@@ -16311,7 +19405,7 @@ fn short_landscape_audit_reaches_every_compact_slice_with_feedback_at_scale(scal
                     })
                     .map(|node| node.key.as_str().to_string()),
             );
-        }
+        });
         for key in [
             "packages/hero",
             "packages/check",
@@ -16406,7 +19500,7 @@ fn numeric_slider_preserves_cursor_trail_default_and_both_endpoints() {
             Some(expected.to_string())
         );
     }
-    let row = setting_row(&state, 0, field, false, false, SettingsWidth::Compact);
+    let row = setting_row(&state, 0, field, false, SettingsWidth::Compact);
     let compiled = UiTree::new(row)
         .compile(LogicalRect::new(0.0, 0.0, 320.0, 72.0))
         .unwrap();
@@ -16433,11 +19527,11 @@ fn unset_text_setting_semantics_report_the_effective_default_while_paint_stays_q
         .legacy
         .fields
         .iter()
-        .find(|field| field.key == prefs::EDIT_FONT_FAMILY)
-        .expect("font family field");
+        .find(|field| field.key == prefs::EDIT_SHELL)
+        .expect("shell field");
     assert!(field.seed.is_none());
     assert!(!field.placeholder.is_empty());
-    let row = setting_row(&state, 0, field, false, false, SettingsWidth::Compact);
+    let row = setting_row(&state, 0, field, false, SettingsWidth::Compact);
     let compiled = UiTree::new(row)
         .compile(LogicalRect::new(0.0, 0.0, 390.0, 72.0))
         .unwrap();
@@ -16452,9 +19546,747 @@ fn unset_text_setting_semantics_report_the_effective_default_while_paint_stays_q
         .find(|node| node.key == key)
         .expect("paint text field");
     let UiContent::TextField(control) = &paint.content else {
-        panic!("font family is a text field")
+        panic!("the shell is a text field")
     };
     assert_eq!(control.spec.visual_value.as_deref(), Some(""));
+}
+
+/// The fonts a test machine "has": the pickers are built from this list, never
+/// from the fonts installed where the test runs.
+fn injected_font_families() -> Arc<aterm_render::font_catalog::MonospaceFamilies> {
+    Arc::new(aterm_render::font_catalog::MonospaceFamilies {
+        automatic: Some("SF Mono".to_string()),
+        automatic_has_ligatures: false,
+        bundled: vec!["Iosevka Term".to_string()],
+        installed: vec!["Menlo".to_string(), "Monaco".to_string()],
+        bold: vec!["Menlo Bold".to_string()],
+        italic: Vec::new(),
+        bold_italic: Vec::new(),
+        symbol: vec!["Apple Symbols".to_string()],
+        emoji: vec!["Apple Color Emoji".to_string()],
+    })
+}
+
+fn font_picker_labels(runtime: &NativeRuntime, view: crate::native_app::ViewId) -> Vec<String> {
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!()
+    };
+    let picker = state.choice_picker.as_ref().expect("a font picker is open");
+    // What the list shows: the options the typed filter leaves.
+    picker
+        .shown
+        .iter()
+        .map(|index| picker.options[*index].label.clone())
+        .collect()
+}
+
+fn settings_action(
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    id: &str,
+) -> crate::native_app::DispatchOutcome {
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(id),
+                value: None,
+            }),
+        )
+        .unwrap()
+}
+
+/// A font picker paints each row as it names it: Automatic says the face it
+/// draws and Other… says Other…, neither the generic "Use default" a reset
+/// row of another picker paints.
+#[test]
+fn a_font_picker_paints_its_automatic_and_other_rows_by_their_names() {
+    let (mut runtime, instance, view) = setup();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!()
+        };
+        state.navigate(SettingsRoute::TextFonts);
+        assert!(state.replace_font_families(injected_font_families()));
+    }
+    settings_action(
+        &mut runtime,
+        instance,
+        view,
+        "settings/font-picker/font_family",
+    );
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!()
+    };
+    let picker = state.choice_picker.as_ref().expect("a font picker is open");
+    assert!(picker.fonts);
+    let painted: Vec<String> = picker
+        .options
+        .iter()
+        .map(|option| {
+            choice_option_button(option, 400.0, picker.fonts)
+                .visual_label
+                .expect("a painted label")
+        })
+        .collect();
+    let named: Vec<String> = picker
+        .options
+        .iter()
+        .map(|option| option.label.clone())
+        .collect();
+    assert_eq!(painted, named);
+    // Another picker's reset row paints what its default is, never a bare
+    // "Use default".
+    let generic = ChoicePicker::new(
+        prefs::EDIT_WINDOW_THEME,
+        ["dark".to_string()],
+        "dark",
+        true,
+        true,
+        "auto",
+    );
+    let reset = generic
+        .options
+        .iter()
+        .find(|option| option.value.is_none())
+        .expect("a reset row");
+    let painted = choice_option_button(reset, 400.0, generic.fonts)
+        .visual_label
+        .expect("a painted label");
+    assert_ne!(painted, "Use default");
+    assert!(painted.contains("Match macOS"), "{painted}");
+}
+
+/// Font family is a list built from the host's installed fonts: Automatic
+/// naming the face drawn, the bundled faces, the installed monospace
+/// families, and Other…. Moving through it previews each family; choosing
+/// one saves it.
+#[test]
+fn the_font_family_picker_lists_installed_families_and_previews_each() {
+    let (mut runtime, instance, view) = setup();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!()
+        };
+        state.navigate(SettingsRoute::TextFonts);
+        assert!(state.replace_font_families(injected_font_families()));
+    }
+    // The row is the list's button, naming the automatic face.
+    let cx = view_cx_at(900.0, 700.0);
+    let compiled = runtime
+        .render(instance, view, &cx)
+        .unwrap()
+        .compile(cx.viewport)
+        .unwrap();
+    let row = compiled
+        .semantic(&UiKey::new("settings/control/font_family"))
+        .unwrap();
+    assert_eq!(row.role, SemanticRole::Button);
+    assert_eq!(
+        row.value,
+        SemanticValue::Text("Automatic (SF Mono)".to_string())
+    );
+
+    settings_action(
+        &mut runtime,
+        instance,
+        view,
+        "settings/font-picker/font_family",
+    );
+    assert_eq!(
+        font_picker_labels(&runtime, view),
+        [
+            "Automatic (SF Mono)",
+            "Iosevka Term",
+            "Menlo",
+            "Monaco",
+            "Other…"
+        ]
+    );
+    // Down twice: Menlo is highlighted and previewed, nothing written.
+    for _ in 0..2 {
+        let moved = runtime
+            .dispatch(instance, view, AppEvent::StepFocus(1))
+            .unwrap();
+        assert!(
+            moved
+                .effects
+                .iter()
+                .all(|effect| !matches!(effect, AppEffect::ConfigPatch { .. }))
+        );
+    }
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!()
+        };
+        assert_eq!(
+            preview_font_candidate(state).regular.as_deref(),
+            Some("Menlo")
+        );
+    }
+    let chosen = settings_action(
+        &mut runtime,
+        instance,
+        view,
+        "settings/choice/font_family/2",
+    );
+    let edit = chosen.effects.iter().find_map(|effect| match effect {
+        AppEffect::ConfigPatch { patch, .. } => patch.edits.first().cloned(),
+        _ => None,
+    });
+    assert_eq!(
+        edit.map(|edit| (edit.key, edit.value)),
+        Some(("font_family".to_string(), Some("Menlo".to_string())))
+    );
+}
+
+/// Typing into an open font picker narrows it as the resolvers compare names
+/// and previews the first match; Backspace widens it again. Other… opens the
+/// row for a typed name, which Return saves.
+#[test]
+fn the_font_picker_takes_typing_and_other_takes_a_name() {
+    let (mut runtime, instance, view) = setup();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!()
+        };
+        state.navigate(SettingsRoute::TextFonts);
+        state.replace_font_families(injected_font_families());
+    }
+    settings_action(
+        &mut runtime,
+        instance,
+        view,
+        "settings/font-picker/font_family",
+    );
+    for typed in ["m", "e", "n"] {
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::TextInput(TextInputEvent::Commit(typed.to_string())),
+            )
+            .unwrap();
+    }
+    assert_eq!(font_picker_labels(&runtime, view), ["Menlo", "Other…"]);
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!()
+        };
+        // Cancel still names what stays saved, though typing hid it.
+        assert_eq!(
+            picker_saved_label(state.choice_picker.as_ref().unwrap()),
+            "Automatic (SF Mono)"
+        );
+    }
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!()
+        };
+        assert_eq!(
+            preview_font_candidate(state).regular.as_deref(),
+            Some("Menlo")
+        );
+    }
+    for _ in 0..3 {
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::TextInput(TextInputEvent::Backspace),
+            )
+            .unwrap();
+    }
+    assert_eq!(font_picker_labels(&runtime, view).len(), 5);
+
+    // Other…: the row becomes its text field, and Return saves the name.
+    settings_action(
+        &mut runtime,
+        instance,
+        view,
+        "settings/choice/font_family/4",
+    );
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!()
+        };
+        assert!(state.choice_picker.is_none());
+        assert_eq!(
+            state.editing_field.as_deref(),
+            Some(prefs::EDIT_FONT_FAMILY)
+        );
+    }
+    let cx = view_cx_at(900.0, 700.0);
+    let compiled = runtime
+        .render(instance, view, &cx)
+        .unwrap()
+        .compile(cx.viewport)
+        .unwrap();
+    assert_eq!(
+        compiled
+            .semantic(&UiKey::new("settings/control/font_family"))
+            .unwrap()
+            .role,
+        SemanticRole::TextField
+    );
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::TextInput(TextInputEvent::Commit("Fira Code".to_string())),
+        )
+        .unwrap();
+    let saved = runtime
+        .dispatch(instance, view, AppEvent::TextInput(TextInputEvent::Submit))
+        .unwrap();
+    let edit = saved.effects.iter().find_map(|effect| match effect {
+        AppEffect::ConfigPatch { patch, .. } => patch.edits.first().cloned(),
+        _ => None,
+    });
+    assert_eq!(
+        edit.and_then(|edit| edit.value).as_deref(),
+        Some("Fira Code")
+    );
+}
+
+/// A name typed into the list's search that no listed font has carries into
+/// Other…'s field, ready to save.
+#[test]
+fn other_starts_from_the_name_typed_into_the_search() {
+    let (mut runtime, instance, view) = setup();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!()
+        };
+        state.navigate(SettingsRoute::TextFonts);
+        state.replace_font_families(injected_font_families());
+    }
+    settings_action(
+        &mut runtime,
+        instance,
+        view,
+        "settings/font-picker/font_family",
+    );
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::TextInput(TextInputEvent::Commit("Fira Code".to_string())),
+        )
+        .unwrap();
+    assert_eq!(font_picker_labels(&runtime, view), ["Other…"]);
+    let other = {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!()
+        };
+        state.choice_picker.as_ref().unwrap().shown[0]
+    };
+    settings_action(
+        &mut runtime,
+        instance,
+        view,
+        &format!("settings/choice/font_family/{other}"),
+    );
+    let saved = runtime
+        .dispatch(instance, view, AppEvent::TextInput(TextInputEvent::Submit))
+        .unwrap();
+    let edit = saved.effects.iter().find_map(|effect| match effect {
+        AppEffect::ConfigPatch { patch, .. } => patch.edits.first().cloned(),
+        _ => None,
+    });
+    assert_eq!(
+        edit.and_then(|edit| edit.value).as_deref(),
+        Some("Fira Code")
+    );
+}
+
+/// Typing on a font row's list button types a new name in place of the
+/// saved one, in the row's own text field; Return saves it. It never appends
+/// to the saved name.
+#[test]
+fn typing_on_a_font_row_replaces_its_name() {
+    let (mut runtime, instance, view) = setup();
+    replace_settings_source(
+        &mut runtime,
+        view,
+        "font_family = \"Courier\"\n".to_string(),
+    );
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!()
+        };
+        state.navigate(SettingsRoute::TextFonts);
+        state.replace_font_families(injected_font_families());
+    }
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::FocusChanged(Some(UiKey::new("settings/control/font_family"))),
+        )
+        .unwrap();
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::TextInput(TextInputEvent::Commit("Menlo".to_string())),
+        )
+        .unwrap();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!()
+        };
+        assert!(state.choice_picker.is_none());
+        assert_eq!(state.field_inputs[prefs::EDIT_FONT_FAMILY].value(), "Menlo");
+    }
+    let cx = view_cx_at(900.0, 700.0);
+    let compiled = runtime
+        .render(instance, view, &cx)
+        .unwrap()
+        .compile(cx.viewport)
+        .unwrap();
+    assert_eq!(
+        compiled
+            .semantic(&UiKey::new("settings/control/font_family"))
+            .unwrap()
+            .role,
+        SemanticRole::TextField
+    );
+    let saved = runtime
+        .dispatch(instance, view, AppEvent::TextInput(TextInputEvent::Submit))
+        .unwrap();
+    let edit = saved.effects.iter().find_map(|effect| match effect {
+        AppEffect::ConfigPatch { patch, .. } => patch.edits.first().cloned(),
+        _ => None,
+    });
+    assert_eq!(edit.and_then(|edit| edit.value).as_deref(), Some("Menlo"));
+}
+
+/// A font the terminal could not find is not "Applied": its row says Not
+/// found and is invalid, and the status line says what the terminal did.
+/// Saving another name clears it.
+#[test]
+fn an_unknown_font_name_is_marked_not_found_on_its_row() {
+    let mut state = SettingsViewState::new(&Config {
+        font_family: Some("NoSuchFontXYZ".to_string()),
+        ..Config::default()
+    });
+    state.feedback = Some("Applied · Undo available".to_string());
+    let refusal = crate::native_font_catalog::FontRefusal {
+        key: prefs::EDIT_FONT_FAMILY,
+        family: "NoSuchFontXYZ".to_string(),
+    };
+    assert!(state.replace_font_refusals(vec![refusal.clone()], true));
+    assert_eq!(
+        state.feedback.as_deref(),
+        Some("Font not found: \u{201c}NoSuchFontXYZ\u{201d}. The terminal keeps the font it had.")
+    );
+    let (index, field) = state
+        .legacy
+        .fields
+        .iter()
+        .enumerate()
+        .find(|(_, field)| field.key == prefs::EDIT_FONT_FAMILY)
+        .unwrap();
+    let compiled = UiTree::new(setting_row(
+        &state,
+        index,
+        field,
+        false,
+        SettingsWidth::Wide,
+    ))
+    .compile(LogicalRect::new(0.0, 0.0, 900.0, 80.0))
+    .unwrap();
+    let control = compiled
+        .semantic(&UiKey::new("settings/control/font_family"))
+        .unwrap();
+    assert!(
+        control.label.contains("is not installed"),
+        "{}",
+        control.label
+    );
+    assert!(control.state.is_some_and(|state| state.invalid));
+    let label = compiled
+        .semantic(&UiKey::new("settings/label/font_family"))
+        .unwrap();
+    assert!(label.label.contains("Not found"), "{}", label.label);
+
+    // The same refusal again announces nothing new; a row showing another
+    // name is not marked by an old refusal.
+    state.feedback = None;
+    assert!(!state.replace_font_refusals(vec![refusal.clone()], true));
+    assert!(state.feedback.is_none());
+    let other = SettingsViewState::new(&Config {
+        font_family: Some("Menlo".to_string()),
+        ..Config::default()
+    });
+    assert!(other.font_refusal(prefs::EDIT_FONT_FAMILY).is_none());
+
+    // Fixed outside Settings (a hand edit, a control verb): once the name is
+    // no longer refused, its line goes; a line put up since then stays.
+    let mut fixed = SettingsViewState::new(&Config {
+        font_family: Some("NoSuchFontXYZ".to_string()),
+        ..Config::default()
+    });
+    assert!(fixed.replace_font_refusals(vec![refusal.clone()], true));
+    assert!(
+        fixed
+            .feedback
+            .as_deref()
+            .is_some_and(|line| line.starts_with("Font not found"))
+    );
+    assert!(fixed.replace_font_refusals(Vec::new(), true));
+    assert_eq!(fixed.feedback, None, "the line went with the refusal");
+    assert!(fixed.replace_font_refusals(vec![refusal], true));
+    fixed.feedback = Some("Color theme set to Nord".to_string());
+    assert!(fixed.replace_font_refusals(Vec::new(), true));
+    assert_eq!(fixed.feedback.as_deref(), Some("Color theme set to Nord"));
+}
+
+/// "Three display faces are on" describes the saved mix: once the mix
+/// changes outside Settings, the line goes.
+#[test]
+fn the_full_display_face_line_goes_when_the_mix_changes_elsewhere() {
+    let mut service =
+        VersionedConfigService::new("display_font = \"chunky+pixel+engraved\"\n".to_string())
+            .unwrap();
+    let (mut runtime, instance, view) = setup();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            panic!("Settings view")
+        };
+        **state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+    }
+    runtime
+        .dispatch(instance, view, action("settings/display-face/bubble", None))
+        .unwrap();
+    let feedback = |runtime: &NativeRuntime| {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            panic!("Settings view")
+        };
+        state.feedback.clone()
+    };
+    assert_eq!(
+        feedback(&runtime).as_deref(),
+        Some("Three display faces are on, the most at once. Turn one off first.")
+    );
+    let unrelated = service
+        .replace_external(
+            "display_font = \"chunky+pixel+engraved\"\ntheme = \"Nord\"\n".to_string(),
+        )
+        .unwrap();
+    runtime
+        .dispatch(instance, view, AppEvent::ConfigChanged(unrelated))
+        .unwrap();
+    assert!(
+        feedback(&runtime).is_some(),
+        "another key's change leaves it"
+    );
+    let unset = service.replace_external(String::new()).unwrap();
+    runtime
+        .dispatch(instance, view, AppEvent::ConfigChanged(unset))
+        .unwrap();
+    assert_eq!(feedback(&runtime), None);
+}
+
+/// A display face outranks the font family: the specimen asks for the face
+/// the terminal draws and names it, and the Font family row says it waits.
+#[test]
+fn the_specimen_previews_the_display_face_the_terminal_draws() {
+    let state = SettingsViewState::new(&Config {
+        font_family: Some("Menlo".to_string()),
+        display_font: Some("chunky".to_string()),
+        ..Config::default()
+    });
+    assert_eq!(
+        preview_font_candidate(&state).regular.as_deref(),
+        Some("display:chunky")
+    );
+    let spec = renderer_preview_spec_for_key_with_font(
+        &state,
+        prefs::EDIT_FONT_FAMILY,
+        0,
+        crate::native_app::ViewMotionCx::default(),
+        12.0,
+        1.0,
+        None,
+    )
+    .unwrap();
+    assert!(
+        spec.semantic_value().contains("Chunky (display face)"),
+        "{}",
+        spec.semantic_value()
+    );
+    let (index, field) = state
+        .legacy
+        .fields
+        .iter()
+        .enumerate()
+        .find(|(_, field)| field.key == prefs::EDIT_FONT_FAMILY)
+        .unwrap();
+    let compiled = UiTree::new(setting_row(
+        &state,
+        index,
+        field,
+        false,
+        SettingsWidth::Wide,
+    ))
+    .compile(LogicalRect::new(0.0, 0.0, 900.0, 80.0))
+    .unwrap();
+    let label = compiled
+        .semantic(&UiKey::new("settings/label/font_family"))
+        .unwrap();
+    assert!(label.label.contains("display face on"), "{}", label.label);
+    // A mix asks for every face it draws.
+    let mixed = SettingsViewState::new(&Config {
+        display_font: Some("pixel+engraved".to_string()),
+        ..Config::default()
+    });
+    assert_eq!(
+        preview_font_candidate(&mixed).regular.as_deref(),
+        Some("display:pixel+engraved")
+    );
+}
+
+/// Ligatures on with the automatic font say they do nothing when that face
+/// has no programming ligatures (SF Mono); a chosen family takes the note
+/// away.
+#[test]
+fn ligatures_say_when_the_automatic_font_has_none() {
+    let ligatures_label = |state: &SettingsViewState| {
+        let (index, field) = state
+            .legacy
+            .fields
+            .iter()
+            .enumerate()
+            .find(|(_, field)| field.key == prefs::EDIT_LIGATURES)
+            .unwrap();
+        let compiled = UiTree::new(setting_row(state, index, field, false, SettingsWidth::Wide))
+            .compile(LogicalRect::new(0.0, 0.0, 900.0, 80.0))
+            .unwrap();
+        compiled
+            .semantic(&UiKey::new("settings/label/ligatures"))
+            .unwrap()
+            .label
+            .clone()
+    };
+    let mut automatic = SettingsViewState::new(&Config::default());
+    assert!(!ligatures_label(&automatic).contains("No effect"));
+    automatic.replace_font_families(injected_font_families());
+    assert!(
+        ligatures_label(&automatic).contains("No effect with SF Mono"),
+        "{}",
+        ligatures_label(&automatic)
+    );
+    let mut chosen = SettingsViewState::new(&Config {
+        font_family: Some("Iosevka Term".to_string()),
+        ..Config::default()
+    });
+    chosen.replace_font_families(injected_font_families());
+    assert!(!ligatures_label(&chosen).contains("No effect"));
+}
+
+/// With three display faces on, the fourth switch says why it cannot come on
+/// and stays reachable, and pressing it is refused with a message instead of
+/// turning the oldest face off unseen.
+#[test]
+fn a_fourth_display_face_is_refused_out_loud() {
+    let (mut runtime, instance, view) = setup();
+    replace_settings_source(
+        &mut runtime,
+        view,
+        "display_font = \"chunky+pixel+engraved\"\n".to_string(),
+    );
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!()
+        };
+        state.navigate(SettingsRoute::TextFonts);
+        let (card, _) = display_faces_card(
+            state,
+            SettingsWidth::Medium,
+            LogicalRect::new(0.0, 0.0, 900.0, 900.0),
+            SettingsRoute::TextFonts,
+        );
+        let compiled = UiTree::new(card)
+            .compile(LogicalRect::new(0.0, 0.0, 700.0, 900.0))
+            .unwrap();
+        let fourth = compiled
+            .semantic(&UiKey::new("settings/display-face/bubble"))
+            .unwrap();
+        assert!(fourth.state.is_some_and(|state| state.enabled));
+        assert!(
+            fourth
+                .description
+                .as_deref()
+                .is_some_and(|text| text.contains("turn one off")),
+            "{:?}",
+            fourth.description
+        );
+        let on = compiled
+            .semantic(&UiKey::new("settings/display-face/chunky"))
+            .unwrap();
+        assert!(on.state.is_some_and(|state| state.enabled));
+    }
+    let refused = settings_action(&mut runtime, instance, view, "settings/display-face/bubble");
+    assert!(
+        refused
+            .effects
+            .iter()
+            .all(|effect| !matches!(effect, AppEffect::ConfigPatch { .. }))
+    );
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!()
+    };
+    assert_eq!(
+        state.feedback.as_deref(),
+        Some("Three display faces are on, the most at once. Turn one off first.")
+    );
+}
+
+/// Each styled and fallback row lists the installed faces that suit it; a
+/// saved name that is none of them is listed as current. Without the host's
+/// list the family picker still offers Automatic, the bundled faces and
+/// Other….
+#[test]
+fn every_font_row_lists_the_faces_that_suit_it() {
+    let mut state = SettingsViewState::new(&Config {
+        font_family_bold: Some("Hand Set Bold".to_string()),
+        ..Config::default()
+    });
+    let labels = |state: &SettingsViewState, key: &str| {
+        font_choice_picker(state, key)
+            .options
+            .into_iter()
+            .map(|option| option.label)
+            .collect::<Vec<_>>()
+    };
+    let bundled = aterm_render::bundled::selectable_families().len();
+    assert_eq!(labels(&state, prefs::EDIT_FONT_FAMILY).len(), bundled + 2);
+    state.replace_font_families(injected_font_families());
+    assert_eq!(
+        labels(&state, prefs::EDIT_FONT_FAMILY_BOLD),
+        [
+            "Automatic",
+            "Menlo Bold",
+            "Hand Set Bold (current)",
+            "Other…"
+        ]
+    );
+    assert_eq!(
+        labels(&state, prefs::EDIT_EMOJI_FONT),
+        ["Automatic", "Apple Color Emoji", "Other…"]
+    );
+    assert_eq!(
+        labels(&state, prefs::EDIT_SYMBOL_FONT),
+        ["Automatic", "Apple Symbols", "Other…"]
+    );
+    assert_eq!(
+        font_choice_picker(&state, prefs::EDIT_FONT_FAMILY_BOLD).selected,
+        2
+    );
 }
 
 #[test]
@@ -16511,16 +20343,16 @@ fn update_check_command_and_reducer_share_enabled_state() {
 }
 
 #[test]
-fn medium_typography_pager_yields_showcases_and_reaches_every_field() {
+fn typography_list_pins_its_specimen_and_reaches_every_field() {
     at_each_text_scale(
         &[1.0],
         "typography page geometry",
-        medium_typography_pager_yields_showcases_and_reaches_every_field_at_scale,
+        typography_list_pins_its_specimen_and_reaches_every_field_at_scale,
     );
 }
 
-/// [`medium_typography_pager_yields_showcases_and_reaches_every_field`] at 1.0× ([`at_each_text_scale`]).
-fn medium_typography_pager_yields_showcases_and_reaches_every_field_at_scale(_scale: f32) {
+/// [`typography_list_pins_its_specimen_and_reaches_every_field`] at 1.0× ([`at_each_text_scale`]).
+fn typography_list_pins_its_specimen_and_reaches_every_field_at_scale(_scale: f32) {
     let mut renderer = aterm_render::Renderer::from_bytes(
         include_bytes!("../../aterm-render/tests/fixtures/jetbrains-mono.ttf"),
         36.0,
@@ -16529,7 +20361,15 @@ fn medium_typography_pager_yields_showcases_and_reaches_every_field_at_scale(_sc
     .unwrap();
     renderer.set_runtime_font_discovery(false);
     crate::tray_raster::install_settled_chrome_fonts_for_test(renderer);
-    for (width, height) in [(904.0, 600.0), (904.0, 579.0), (1280.0, 800.0)] {
+    // Medium and wide windows, the 80x24 launch window, and a short wide
+    // one whose height forces the compact layout.
+    for (width, height) in [
+        (904.0, 600.0),
+        (904.0, 579.0),
+        (1280.0, 800.0),
+        (580.0, 348.0),
+        (1600.0, 494.0),
+    ] {
         let (mut runtime, instance, view) = setup();
         replace_settings_source(&mut runtime, view, "font_px = 36\n".to_string());
         let expected: BTreeSet<String> = {
@@ -16555,85 +20395,88 @@ fn medium_typography_pager_yields_showcases_and_reaches_every_field_at_scale(_sc
                 &crate::widget::SemanticFontCandidate::default(),
             ),
         );
+        let faces: BTreeSet<String> = aterm_render::DISPLAY_FACES
+            .iter()
+            .map(|face| format!("settings/display-face/{}", face.id))
+            .collect();
+        // The specimen is pinned over every screen; every native field and
+        // every Display faces switch is reached whole.
         let mut seen = BTreeSet::new();
-        for page in 0..=expected.len() {
-            let compiled = runtime
-                .render(instance, view, &cx)
-                .unwrap()
-                .compile(cx.viewport)
-                .unwrap();
+        let mut seen_faces = BTreeSet::new();
+        each_screen(&mut runtime, instance, view, &cx, |compiled, _top| {
             compiled.validate_parity().unwrap();
-            let controls = compiled
-                .semantics
-                .iter()
-                .filter(|node| node.key.as_str().starts_with("settings/control/"))
-                .collect::<Vec<_>>();
-            if width == 904.0 {
-                if page == 0 {
-                    assert!(
-                        compiled
-                            .semantic(&UiKey::new("settings/preview/text-fonts"))
-                            .is_some()
-                    );
-                    assert!(
-                        compiled
-                            .semantic(&UiKey::new("settings/top/display-faces"))
-                            .is_some()
-                    );
-                    assert_eq!(
-                        compiled
-                            .semantic(&UiKey::new("settings/results-range"))
-                            .unwrap()
-                            .label,
-                        format!("1–1 of {}", expected.len() + 1),
-                        "the showcase is one real result, never the historical 1–0 window"
-                    );
-                } else {
-                    assert!(
-                        compiled
-                            .semantic(&UiKey::new("settings/preview/text-fonts"))
-                            .is_none()
-                    );
-                    assert!(
-                        compiled
-                            .semantic(&UiKey::new("settings/top/display-faces"))
-                            .is_none()
-                    );
-                    assert!(
-                        !controls.is_empty(),
-                        "Next must reach native fields at {width}x{height}"
-                    );
-                }
+            if let Some(preview) = compiled.semantic(&UiKey::new("settings/preview/text-fonts")) {
+                assert!(preview.rect.bottom() <= height + 0.01);
             }
-            for control in controls {
+            for control in compiled.semantics.iter().filter(|node| {
+                node.key.as_str().starts_with("settings/control/")
+                    || faces.contains(node.key.as_str())
+            }) {
                 assert!(control.rect.bottom() <= height + 0.01);
                 assert!(
                     compiled.hits.iter().any(|hit| hit.key == control.key),
                     "{} must remain actionable",
                     control.key.as_str()
                 );
-                seen.insert(control.key.as_str().to_string());
+                if faces.contains(control.key.as_str()) {
+                    seen_faces.insert(control.key.as_str().to_string());
+                } else {
+                    seen.insert(control.key.as_str().to_string());
+                }
             }
-            let Some(next) = compiled
-                .hits
-                .iter()
-                .find(|hit| hit.key.as_str() == "settings/results-window/next")
-                .map(|hit| hit.action.clone())
-            else {
-                break;
-            };
-            runtime
-                .dispatch(
-                    instance,
-                    view,
-                    AppEvent::Action(ActionInvocation {
-                        id: next,
-                        value: None,
-                    }),
-                )
-                .unwrap();
-        }
+        });
+        seen.retain(|key| expected.contains(key));
         assert_eq!(seen, expected, "all fields reachable at {width}x{height}");
+        assert_eq!(
+            seen_faces, faces,
+            "every display face reachable at {width}x{height}"
+        );
+    }
+}
+
+/// A SEARCH FOR AN AGENT FINDS ITS SWITCH FIRST: "claude" and "codex" each
+/// put Supervise <product> sessions at the top of the settings found,
+/// above the rows that only list the word as a synonym (a chime, the
+/// packages switch, the harness's other rows): the agent's word is the
+/// switch's own name (`prefs::own_name_of`), and on the same rung a hit on
+/// a row's own names ranks before a synonym's (`SearchRank`). Every
+/// supervisable agent, so a new one is held to it. NEGATIVE CONTROL: the
+/// synonym rows are still found, below it.
+#[test]
+fn a_search_for_an_agent_finds_its_switch_first() {
+    for agent in aterm_phase::Program::ALL
+        .into_iter()
+        .filter(|agent| agent.supervisable())
+    {
+        let (mut runtime, instance, view) = setup();
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new("settings/search"),
+                    value: Some(SemanticInput::Text(agent.name().to_string())),
+                }),
+            )
+            .unwrap();
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx());
+        let rows: Vec<&str> = compiled
+            .semantics
+            .iter()
+            .map(|node| node.key.as_str())
+            .filter(|key| key.starts_with("settings/row/"))
+            .collect();
+        let switch = format!("/harness.{}.enabled", agent.name());
+        assert!(
+            rows.first().is_some_and(|row| row.ends_with(&switch)),
+            "{}: {rows:?}",
+            agent.name()
+        );
+        assert!(
+            rows.iter().any(|row| row.ends_with("/packages.enabled")),
+            "{}: the synonym rows are still found: {rows:?}",
+            agent.name()
+        );
     }
 }
 
@@ -16660,8 +20503,7 @@ fn search_is_global_ranked_and_keeps_category_context() {
     // its own category heading — allow_osc52_query joined the ordinary
     // security policies when the GUI's clipboard callback learned to
     // answer authorized queries, so the Manual-handoff row this search
-    // used to produce for it (and the results-window paging that
-    // followed) no longer exists for this term.
+    // used to produce for it no longer exists for this term.
     assert!(
         first
             .semantic(&UiKey::new("settings/control/allow_osc52_query"))
@@ -16682,13 +20524,18 @@ fn search_is_global_ranked_and_keeps_category_context() {
             .semantic(&UiKey::new("settings/control/copy_on_select"))
             .is_some()
     );
+    // The page that holds the row, by its sidebar name, heads its group;
+    // the row itself keeps its plain name.
     let label = compiled
         .semantic(&UiKey::new("settings/label/copy_on_select"))
         .expect("globally matched input setting");
+    assert_eq!(label.label, "Copy on select");
     assert!(
-        label.label.contains("Input"),
-        "category context: {}",
-        label.label
+        compiled.semantics.iter().any(|node| node
+            .key
+            .as_str()
+            .starts_with("settings/group-heading/keyboard---input---clipboard/")),
+        "category context: the Keyboard & Input · Clipboard heading"
     );
     assert!(
         compiled
@@ -16721,7 +20568,7 @@ fn default_on_boolean_apply_and_reset_round_trip_through_real_config_service() {
             .semantic(&UiKey::new("settings/empty"))
             .unwrap()
             .label,
-        "No modified settings.",
+        "Settings you change appear here, each with a Reset.",
         "resolved default-on Boolean seeds are not raw overrides"
     );
 
@@ -16841,7 +20688,7 @@ fn indeterminate_config_publication_stays_unverified_until_snapshot_reconciliati
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
             panic!("Settings view");
         };
-        state.last_undo = Some(41);
+        state.last_undo = Some(UndoOffer::showing(41, "Cursor blink turned off"));
         let field = state
             .legacy
             .fields
@@ -16954,16 +20801,13 @@ fn indeterminate_config_publication_stays_unverified_until_snapshot_reconciliati
 #[test]
 fn reset_all_requires_an_explicit_confirmation_and_discloses_its_scope() {
     let (mut runtime, instance, view) = setup();
-    let expected_edits = match runtime.view_state(view) {
-        Some(AppViewState::Settings(state)) => state
-            .legacy
-            .fields
-            .iter()
-            .filter(|field| !prefs::manual_only_key(field.key))
-            .filter(|field| state.raw_values.contains_key(field.key))
-            .count(),
-        _ => panic!("Settings view"),
-    };
+    replace_settings_source(
+        &mut runtime,
+        view,
+        "theme = \"Nord\"\ncursor_blink = false\nkeybindings = { \"cmd+k\" = \"clear\" }\n"
+            .to_string(),
+    );
+    let expected_edits = 2;
 
     let ask = runtime
         .dispatch(
@@ -16991,12 +20835,13 @@ fn reset_all_requires_an_explicit_confirmation_and_discloses_its_scope() {
     let status = confirmation
         .semantic(&UiKey::new("settings/status"))
         .expect("scope disclosure");
-    assert_eq!(status.label, RESET_ALL_SCOPE);
+    assert_eq!(
+        status.label,
+        "Reset 2 settings to their defaults? Lists, maps, and other keys only in aterm.toml stay."
+    );
     for (key, preserved) in [
-        ("settings/status/visual", "Reset every setting?"),
-        ("settings/status/collections", "Lists and maps stay."),
-        ("settings/status/records", "Custom records stay."),
-        ("settings/status/unknown", "Other Manual overrides stay."),
+        ("settings/status/visual", "Reset 2 settings?"),
+        ("settings/status/kept", "Keys only in aterm.toml stay."),
     ] {
         assert!(
             confirmation.semantic(&UiKey::new(key)).is_none(),
@@ -17188,10 +21033,7 @@ auto_update = false
             "Reset All keeps the Manual override {key}: {patch:?}"
         );
     }
-    assert!(
-        RESET_ALL_SCOPE.ends_with("and other Manual overrides stay."),
-        "{RESET_ALL_SCOPE}"
-    );
+    assert!(reset_all_scope(1).ends_with("and other keys only in aterm.toml stay."));
 }
 
 #[test]
@@ -17318,45 +21160,20 @@ fn exact_phone_special_routes_have_zero_renderer_text_overflow_at_scale(scale: f
         );
     }
 
-    for route in [SettingsRoute::About] {
-        let (mut runtime, instance, view) = setup();
-        runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: route_action(route),
-                    value: None,
-                }),
-            )
-            .unwrap();
-        for page in 0..8 {
-            let compiled = runtime
-                .render(instance, view, &cx)
-                .unwrap()
-                .compile(cx.viewport)
-                .unwrap();
-            assert_fits(&compiled, &format!("{} page {}", route.label(), page + 1));
-            let Some(next) = compiled
-                .hits
-                .iter()
-                .find(|hit| hit.key.as_str() == "about/pagination/next")
-                .map(|hit| hit.action.clone())
-            else {
-                break;
-            };
-            runtime
-                .dispatch(
-                    instance,
-                    view,
-                    AppEvent::Action(ActionInvocation {
-                        id: next,
-                        value: None,
-                    }),
-                )
-                .unwrap();
-        }
-    }
+    let (mut runtime, instance, view) = setup();
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: route_action(SettingsRoute::About),
+                value: None,
+            }),
+        )
+        .unwrap();
+    each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+        assert_fits(compiled, &format!("About screen {top}"));
+    });
 
     for staged in [false, true] {
         let update = update_status(staged);
@@ -17372,35 +21189,12 @@ fn exact_phone_special_routes_have_zero_renderer_text_overflow_at_scale(scale: f
                 }),
             )
             .unwrap();
-        for page in 0..8 {
-            let compiled = runtime
-                .render(instance, view, &cx)
-                .unwrap()
-                .compile(cx.viewport)
-                .unwrap();
+        each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
             assert_fits(
-                &compiled,
-                &format!("Software Update staged={staged} page {}", page + 1),
+                compiled,
+                &format!("Software Update staged={staged} screen {top}"),
             );
-            let Some(next) = compiled
-                .hits
-                .iter()
-                .find(|hit| hit.key.as_str() == "updates/pagination/next")
-                .map(|hit| hit.action.clone())
-            else {
-                break;
-            };
-            runtime
-                .dispatch(
-                    instance,
-                    view,
-                    AppEvent::Action(ActionInvocation {
-                        id: next,
-                        value: None,
-                    }),
-                )
-                .unwrap();
-        }
+        });
     }
 }
 
@@ -17466,8 +21260,8 @@ fn text_edit_ownership_follows_exact_focus_click_and_navigation() {
             instance,
             view,
             AppEvent::Action(ActionInvocation {
-                id: ActionId::new("settings/page-down"),
-                value: None,
+                id: ActionId::new("settings/page-scroll"),
+                value: Some(SemanticInput::Number(0.0)),
             }),
         )
         .unwrap();
@@ -17476,7 +21270,7 @@ fn text_edit_ownership_follows_exact_focus_click_and_navigation() {
     };
     assert!(
         state.editing_field.is_none(),
-        "another clicked control blurs the field"
+        "another control's action blurs the field"
     );
 
     runtime
@@ -17613,20 +21407,23 @@ fn inline_preview_viewports_publish_exact_non_phantom_scroll_bounds() {
             first
                 .semantic(&UiKey::new("settings/preview/appearance"))
                 .is_some(),
-            "the renderer preview is inline at {}x{}",
+            "the renderer preview is pinned at {}x{}",
             cx.viewport.width,
             cx.viewport.height
         );
-        let (count, limit) = {
-            let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
-                unreachable!();
-            };
-            (
-                settings_field_result_count(state),
-                state.result_page_limit.get(),
-            )
+        // The bound is the least first stop whose screen reaches the last
+        // stop: that screen is full, and one stop earlier would not reach.
+        let (plan, limit) = {
+            let state = messages_view_state(&runtime, view);
+            let plan = state.scroll_plan().expect("a measured list");
+            (plan.clone(), state.result_page_limit.get())
         };
-        assert_eq!(limit, Some(count - 1));
+        assert_eq!(limit, Some(plan.limit()));
+        let limit = plan.limit();
+        assert_eq!(plan.view(limit).end, plan.len());
+        if limit > 0 {
+            assert!(plan.view(limit - 1).end < plan.len());
+        }
 
         runtime
             .dispatch(
@@ -17638,26 +21435,14 @@ fn inline_preview_viewports_publish_exact_non_phantom_scroll_bounds() {
                 }),
             )
             .unwrap();
-        let last = compile_settings_view(&runtime, instance, view, &cx);
-        let next = last
-            .semantic(&UiKey::new("settings/results-window/next"))
-            .expect("the final bounded window keeps semantic pagination");
-        assert!(!next.state.unwrap().enabled);
-        for event in [
-            AppEvent::ScrollLines(1),
-            AppEvent::Action(ActionInvocation {
-                id: ActionId::new("settings/page-down"),
-                value: None,
-            }),
-        ] {
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        for event in [AppEvent::ScrollLines(1), AppEvent::ScrollPage(1)] {
             runtime.dispatch(instance, view, event).unwrap();
-            let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
-                unreachable!();
-            };
+            let _ = compile_settings_view(&runtime, instance, view, &cx);
             assert_eq!(
-                state.page_scroll,
-                count - 1,
-                "inline preview admitted a phantom state at {}x{}",
+                messages_view_state(&runtime, view).page_scroll,
+                limit,
+                "the list scrolled past its last screen at {}x{}",
                 cx.viewport.width,
                 cx.viewport.height
             );
@@ -17666,7 +21451,7 @@ fn inline_preview_viewports_publish_exact_non_phantom_scroll_bounds() {
 }
 
 #[test]
-fn tall_special_pages_publish_zero_bound_and_never_enter_phantom_paging() {
+fn tall_special_pages_publish_zero_bound_and_never_scroll() {
     let cx = view_cx_at(1_200.0, 1_400.0);
     for route in [
         SettingsRoute::Home,
@@ -17692,19 +21477,16 @@ fn tall_special_pages_publish_zero_bound_and_never_enter_phantom_paging() {
         );
         assert!(
             compiled
-                .semantics
+                .paint
                 .iter()
-                .all(|node| !node.key.as_str().ends_with("/pagination")),
-            "{} must not manufacture a pager in the complete layout",
+                .all(|node| !node.key.as_str().ends_with("/thumb")),
+            "{} shows its whole list at once",
             route.label()
         );
 
         for event in [
             AppEvent::ScrollLines(1),
-            AppEvent::Action(ActionInvocation {
-                id: ActionId::new("settings/page-down"),
-                value: None,
-            }),
+            AppEvent::ScrollPage(1),
             AppEvent::Action(ActionInvocation {
                 id: ActionId::new("settings/page-scroll"),
                 value: Some(SemanticInput::Number(f64::MAX)),
@@ -17818,10 +21600,16 @@ fn scrolling_windows_rows_without_changing_stable_keys() {
             .unwrap()
             .semantics
             .into_iter()
-            .filter(|node| node.key.as_str().starts_with("settings/control/"))
+            .filter(|node| setting_control_key(node.key.as_str()))
             .map(|node| node.key)
             .collect::<Vec<_>>()
     };
+    // Lay the list out, then scroll past the page's pointer to Top Settings
+    // to its rows.
+    let _ = visible(&runtime);
+    runtime
+        .dispatch(instance, view, AppEvent::ScrollLines(1))
+        .unwrap();
     let before = visible(&runtime);
     assert!(before.len() > 2, "test requires a window, got {before:?}");
     runtime
@@ -17898,8 +21686,6 @@ fn clear_search_is_visible_touchable_and_resets_the_complete_query_state() {
         assert!(state.search.is_empty());
         assert!(state.search_input.value().is_empty());
         assert_eq!(state.search_input.selection().range(), 0..0);
-        assert!(!state.legacy.searching);
-        assert!(state.legacy.query.is_empty());
         assert_eq!(state.page_scroll, 0);
         assert_eq!(
             state.common.last_focus.as_ref().map(UiKey::as_str),
@@ -17946,8 +21732,16 @@ fn global_search_projects_a_search_results_page_and_tab_tooltip() {
     );
 }
 
-#[test]
-fn global_search_surfaces_manual_only_schema_matches_as_an_editor_result() {
+/// Search a fresh Settings view for `query` and compile it at `cx`.
+fn compile_search(
+    query: &str,
+    cx: &ViewCx<'_>,
+) -> (
+    NativeRuntime,
+    crate::native_app::AppInstanceId,
+    crate::native_app::ViewId,
+    crate::native_ui::CompiledUi,
+) {
     let (mut runtime, instance, view) = setup();
     runtime
         .dispatch(
@@ -17955,16 +21749,20 @@ fn global_search_surfaces_manual_only_schema_matches_as_an_editor_result() {
             view,
             AppEvent::Action(ActionInvocation {
                 id: ActionId::new("settings/search"),
-                value: Some(SemanticInput::Text("shell".to_string())),
+                value: Some(SemanticInput::Text(query.to_string())),
             }),
         )
         .unwrap();
+    let compiled = compile_settings_view(&runtime, instance, view, cx);
+    (runtime, instance, view, compiled)
+}
+
+/// Search's "Also in aterm.toml" card comes after every setting the search
+/// found, names the matching keys, and each opens the editor on its key.
+#[test]
+fn global_search_surfaces_manual_only_schema_matches_as_an_editor_result() {
     let cx = view_cx_at(1_080.0, 720.0);
-    let compiled = runtime
-        .render(instance, view, &cx)
-        .unwrap()
-        .compile(cx.viewport)
-        .unwrap();
+    let (mut runtime, instance, view, compiled) = compile_search("shell", &cx);
     compiled.validate_parity().unwrap();
     assert!(
         compiled
@@ -17975,8 +21773,7 @@ fn global_search_surfaces_manual_only_schema_matches_as_an_editor_result() {
     let detail = compiled
         .semantic(&UiKey::new("settings/search/manual-result/detail"))
         .unwrap();
-    assert!(detail.label.contains("config"));
-    assert!(detail.label.contains("Manual"));
+    assert_eq!(detail.label, "Also in aterm.toml:");
     assert!(
         compiled
             .semantics
@@ -17984,12 +21781,510 @@ fn global_search_surfaces_manual_only_schema_matches_as_an_editor_result() {
             .all(|node| !node.key.as_str().starts_with("settings/control/shell")),
         "search does not manufacture unaudited native shell controls"
     );
+    let first = manual_search_matching_keys(&SettingsViewState::new(&Config::default()), "shell")
+        [0]
+    .clone();
+    assert_eq!(first, "shell", "the key the query starts leads");
     let open = compiled
         .hits
         .iter()
-        .find(|hit| hit.key.as_str() == "settings/search/manual-result/open")
-        .expect("Manual search result is actionable");
-    assert_eq!(open.action.as_str(), "settings/manual/open-search");
+        .find(|hit| hit.key.as_str() == "settings/search/manual-result/key/0")
+        .expect("each listed key is actionable");
+    assert_eq!(open.action.as_str(), "settings/manual/open-match/0");
+    let handoff = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(open.action.as_str()),
+                value: None,
+            }),
+        )
+        .unwrap();
+    assert!(handoff.effects.iter().any(|effect| matches!(
+        effect,
+        AppEffect::OpenConfigEditor {
+            target: Some(ConfigEditorTarget::Key(key)),
+            ..
+        } if *key == first
+    )));
+}
+
+/// Native results lead and the aterm.toml card follows them; past its first
+/// few keys the card offers the rest, and lists every one when asked.
+#[test]
+fn search_lists_settings_before_aterm_toml_keys_and_every_key_on_request() {
+    let cx = view_cx_at(1_200.0, 3_000.0);
+    let (_, _, _, compiled) = compile_search("theme", &cx);
+    let position = |key: &str| {
+        compiled
+            .semantics
+            .iter()
+            .position(|node| node.key.as_str() == key)
+            .unwrap_or_else(|| panic!("{key}"))
+    };
+    assert!(
+        position(&theme_slot_action(aterm_types::Appearance::Dark))
+            < position("settings/search/manual-result"),
+        "the Color theme rows come before the aterm.toml card"
+    );
+
+    let state = SettingsViewState::new(&Config::default());
+    let keys = manual_search_matching_keys(&state, "window");
+    assert!(keys.len() > MANUAL_SEARCH_KEYS_SHOWN + 1, "{keys:?}");
+    let (mut runtime, instance, view, compiled) = compile_search("window", &cx);
+    let listed = |compiled: &crate::native_ui::CompiledUi| {
+        compiled
+            .semantics
+            .iter()
+            .filter(|node| {
+                node.key
+                    .as_str()
+                    .starts_with("settings/search/manual-result/key/")
+            })
+            .count()
+    };
+    assert_eq!(listed(&compiled), MANUAL_SEARCH_KEYS_SHOWN);
+    let more = compiled
+        .semantic(&UiKey::new("settings/search/manual-result/more"))
+        .expect("the rest are a click away");
+    assert!(
+        more.label
+            .starts_with(&format!("{} more", keys.len() - MANUAL_SEARCH_KEYS_SHOWN))
+    );
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new("settings/manual/more"),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    assert_eq!(listed(&compiled), keys.len());
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        panic!("Settings view");
+    };
+    assert_eq!(
+        state.common.last_focus.as_ref().map(UiKey::as_str),
+        Some(format!("settings/search/manual-result/key/{MANUAL_SEARCH_KEYS_SHOWN}").as_str()),
+        "the keyboard lands on the first key the button showed"
+    );
+    assert!(
+        compiled
+            .semantic(&UiKey::new("settings/search/manual-result/more"))
+            .is_none()
+    );
+
+    // One key past the few is listed, not hidden behind "1 more…".
+    let one_past: Vec<String> = (0..=MANUAL_SEARCH_KEYS_SHOWN)
+        .map(|n| format!("key_{n}"))
+        .collect();
+    let card = manual_search_result_node(&one_past, false, 600.0);
+    assert!(
+        card.children
+            .iter()
+            .all(|row| row.key.as_str() != "settings/search/manual-result/more")
+    );
+    assert_eq!(
+        card.children
+            .iter()
+            .filter(|row| row
+                .key
+                .as_str()
+                .starts_with("settings/search/manual-result/key/"))
+            .count(),
+        one_past.len()
+    );
+    // A known key goes by its name, its file spelling after it.
+    let card = manual_search_result_node(&["agents_auto_prime".to_string()], false, 900.0);
+    let row = card
+        .children
+        .iter()
+        .find(|row| row.key.as_str() == "settings/search/manual-result/key/0")
+        .expect("the key's row");
+    let UiContent::Button(control) = &row.content else {
+        panic!("a button")
+    };
+    let name = crate::native_config_language::config_schema_entry("agents_auto_prime")
+        .unwrap()
+        .label;
+    assert_eq!(
+        control.spec.visual_label.as_deref(),
+        Some(format!("{name} (agents_auto_prime)").as_str())
+    );
+    assert_eq!(control.spec.label, "Open aterm.toml at agents_auto_prime");
+}
+
+/// A name too long for its row (the longest one, in a narrow window) never
+/// costs the key: the row says the key, and the name follows under it in
+/// full, wrapped, with no ellipsis.
+#[test]
+fn a_long_manual_key_name_wraps_under_its_key() {
+    let (key, name) = crate::native_config_language::config_schema()
+        .iter()
+        .filter(|entry| entry.key.contains('.'))
+        .max_by_key(|entry| entry.label.chars().count())
+        .map(|entry| (entry.key, entry.label))
+        .expect("a schema key");
+    for text_width in [300.0, 340.0] {
+        let card = manual_search_result_node(&[key.to_string()], false, text_width);
+        let entry = card
+            .children
+            .iter()
+            .find(|row| row.key.as_str() == "settings/search/manual-result/entry/0")
+            .expect("the key's entry");
+        let button = entry
+            .children
+            .iter()
+            .find(|row| row.key.as_str() == "settings/search/manual-result/key/0")
+            .expect("the key's button");
+        let UiContent::Button(control) = &button.content else {
+            panic!("a button")
+        };
+        assert_eq!(control.spec.visual_label.as_deref(), Some(key));
+        assert_eq!(control.spec.label, format!("Open aterm.toml at {key}"));
+        let under = entry
+            .children
+            .iter()
+            .find(|row| row.key.as_str() == "settings/search/manual-result/name/0")
+            .expect("the name under the key");
+        let lines: Vec<&str> = under
+            .children
+            .iter()
+            .filter_map(|line| match &line.content {
+                UiContent::Text(spec) => Some(spec.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(lines.len() > 1, "{text_width}: wrapped: {lines:?}");
+        assert_eq!(
+            lines.join(" ").split_whitespace().collect::<Vec<_>>(),
+            name.split_whitespace().collect::<Vec<_>>(),
+            "{text_width}: the whole name"
+        );
+        assert!(lines.iter().all(|line| !line.contains('\u{2026}')));
+        assert_eq!(
+            card.layout.height,
+            Length::Fixed(28.0 + group_heading_label_height() + 6.0 + fixed_height(entry)),
+            "the card grows to hold the wrapped name"
+        );
+    }
+}
+
+/// A query of several words finds the setting every word names, and the
+/// words a person reaches for find the setting they mean.
+#[test]
+fn search_takes_every_word_and_the_words_people_use() {
+    let state = SettingsViewState::new(&Config::default());
+    let field = |key: &str| {
+        state
+            .field_by_key(key)
+            .unwrap_or_else(|| panic!("{key} is a registry row"))
+    };
+    for (query, key) in [
+        ("dark mode", prefs::EDIT_WINDOW_THEME),
+        ("light mode", prefs::EDIT_WINDOW_THEME),
+        ("follow system", prefs::EDIT_WINDOW_THEME),
+        // The theme row is the Follow system light/dark pair too.
+        ("follow system", prefs::EDIT_THEME),
+        ("light theme", prefs::EDIT_THEME),
+        ("dark theme", prefs::EDIT_THEME),
+        ("dark mode", prefs::EDIT_THEME),
+        ("light mode", prefs::EDIT_THEME),
+        ("theme pair", prefs::EDIT_THEME),
+        ("transparency", prefs::EDIT_BACKGROUND_OPACITY),
+        ("translucent", prefs::EDIT_BACKGROUND_OPACITY),
+        ("kitty", KEYWORD_KITTIES_KEY),
+        ("cat", KEYWORD_KITTIES_KEY),
+        ("swear", SPARKLE_WORDS_KEY),
+        ("profanity", SPARKLE_WORDS_KEY),
+        ("curse", SPARKLE_WORDS_KEY),
+        ("local echo", prefs::EDIT_PREDICTIVE_ECHO),
+        ("right-to-left", prefs::EDIT_BIDI),
+        ("unicode", prefs::EDIT_AMBIGUOUS_WIDTH),
+        ("check for updates", prefs::EDIT_UPDATE_ENABLED),
+        ("install updates", "update.auto_apply"),
+        ("heavy load", prefs::EDIT_EXPLAIN_HEAVY_LOAD),
+    ] {
+        assert!(
+            field_match_score(
+                field(key),
+                query,
+                &crate::app_config::ThemeCatalog::default()
+            )
+            .is_some(),
+            "{query:?} finds {key}"
+        );
+    }
+    assert!(
+        field_match_score(
+            field(prefs::EDIT_WINDOW_THEME),
+            "dark sky",
+            &crate::app_config::ThemeCatalog::default()
+        )
+        .is_none(),
+        "every word must match"
+    );
+    assert!(
+        field_match_score(
+            field(prefs::EDIT_THEME),
+            "dark sky",
+            &crate::app_config::ThemeCatalog::default()
+        )
+        .is_none(),
+        "every word must match the theme row too"
+    );
+}
+
+/// Search finds a page by its name or its words, and a control a page draws
+/// itself, which it opens the page on; such a key is not one only aterm.toml
+/// holds.
+#[test]
+fn search_returns_the_pages_that_draw_what_it_found() {
+    let state = SettingsViewState::new(&Config::default());
+    let hit = |query: &str, route: SettingsRoute| {
+        search_page_hits(&state, query)
+            .into_iter()
+            .find(|hit| hit.route == route)
+    };
+    for route in SettingsRoute::ALL {
+        assert!(
+            hit(&route.label().to_ascii_lowercase(), route).is_some(),
+            "{route:?} by its name"
+        );
+    }
+    for (query, route) in [
+        ("wallpaper", SettingsRoute::Wallpaper),
+        ("background image", SettingsRoute::Wallpaper),
+        ("tab color", SettingsRoute::TabColor),
+        ("active tab", SettingsRoute::TabColor),
+        ("padding", SettingsRoute::WindowTabs),
+        ("restore", SettingsRoute::WindowTabs),
+        ("automatic updates", SettingsRoute::SoftwareUpdate),
+        ("harness", SettingsRoute::Harness),
+    ] {
+        assert!(hit(query, route).is_some(), "{query:?} → {route:?}");
+    }
+    let pixel = hit("pixel", SettingsRoute::TextFonts).expect("the Display faces card");
+    assert_eq!(pixel.setting, Some("Display face"));
+    assert_eq!(pixel.focus.as_deref(), Some("settings/display-face/pixel"));
+    // A Top Setting is a row of its own in search, headed by the page it
+    // lives on, never a second result pointing at that row.
+    assert!(hit("theme", SettingsRoute::Home).is_none());
+    // Headed by a page and group that exist: Appearance's Theme group, and
+    // the Top Settings card the keyword toys are on.
+    assert_eq!(
+        search_group_caption(prefs::EDIT_THEME, "Theme"),
+        "Appearance · Theme"
+    );
+    assert_eq!(
+        search_group_caption(KEYWORD_KITTIES_KEY, "Sparkle words"),
+        "Top Settings · Playful effects"
+    );
+    assert_eq!(
+        search_group_caption(prefs::EDIT_ACTIVE_TAB_COLOR, "Tabs & panes"),
+        "Tab Color"
+    );
+    // The Appearance page by the words its subtitle leads with.
+    for query in ["theme", "dark", "light mode"] {
+        assert!(
+            hit(query, SettingsRoute::Appearance).is_some(),
+            "{query:?} → Appearance"
+        );
+    }
+    let page = hit("tab color", SettingsRoute::TabColor).unwrap();
+    assert_eq!(page.setting, None, "the page's own name wins a tie");
+    for (query, key) in [
+        ("wallpaper", prefs::EDIT_WALLPAPER),
+        ("tab color", prefs::EDIT_ACTIVE_TAB_COLOR),
+        ("display face", prefs::EDIT_DISPLAY_FONT),
+    ] {
+        assert!(
+            !manual_search_matching_keys(&state, query)
+                .iter()
+                .any(|found| found == key),
+            "{key} is a page result, not only aterm.toml's"
+        );
+    }
+    assert!(search_page_hits(&state, "zxqvbn").is_empty());
+}
+
+/// A page result opens its page with search cleared, on the control it
+/// named.
+#[test]
+fn a_page_result_opens_its_page_on_the_control_it_found() {
+    let cx = view_cx();
+    let (mut runtime, instance, view, compiled) = compile_search("pixel", &cx);
+    assert_eq!(
+        compiled
+            .semantic(&UiKey::new("settings/results-range"))
+            .unwrap()
+            .label,
+        "1 page"
+    );
+    let result = compiled
+        .hits
+        .iter()
+        .find(|hit| hit.key.as_str() == "settings/search/page/text-fonts")
+        .expect("the Text & Fonts result");
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(result.action.as_str()),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        panic!("Settings view");
+    };
+    assert_eq!(state.route, SettingsRoute::TextFonts);
+    assert!(state.search.is_empty());
+    let focus = UiKey::new("settings/display-face/pixel");
+    assert_eq!(state.common.last_focus.as_ref(), Some(&focus));
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    assert!(
+        compiled.semantic(&focus).is_some(),
+        "the Pixel switch is on screen"
+    );
+}
+
+/// The switches Software Update, Packages and Messages draw are search
+/// results under their page's name, and no ordinary page lists them.
+#[test]
+fn search_draws_the_switches_special_pages_hold() {
+    let cx = view_cx();
+    let heading = |compiled: &crate::native_ui::CompiledUi, prefix: &str| {
+        compiled
+            .semantics
+            .iter()
+            .any(|node| node.key.as_str().starts_with(prefix))
+    };
+    let (_, _, _, compiled) = compile_search("heavy load", &cx);
+    assert!(
+        compiled
+            .semantic(&UiKey::new(format!(
+                "settings/control/{}",
+                prefs::EDIT_EXPLAIN_HEAVY_LOAD
+            )))
+            .is_some()
+    );
+    assert!(heading(
+        &compiled,
+        "settings/group-heading/messages---heavy-load/"
+    ));
+    let (_, _, _, compiled) = compile_search("rerouted", &cx);
+    assert!(
+        compiled
+            .semantic(&UiKey::new(format!(
+                "settings/control/{}",
+                prefs::EDIT_REROUTE_ANNOUNCE
+            )))
+            .is_some()
+    );
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
+        let (_, _, _, compiled) = compile_search("check for updates", &cx);
+        assert!(
+            compiled
+                .semantic(&UiKey::new(format!(
+                    "settings/control/{}",
+                    prefs::EDIT_UPDATE_ENABLED
+                )))
+                .is_some()
+        );
+        assert!(heading(
+            &compiled,
+            "settings/group-heading/software-update---automatic-updates/"
+        ));
+        // aterm's own updater leads the ALab tools' switch that shares its
+        // words.
+        let (_, _, _, compiled) =
+            compile_search("automatic updates", &view_cx_at(1_200.0, 3_000.0));
+        let position = |key: &str| {
+            compiled
+                .semantics
+                .iter()
+                .position(|node| node.key.as_str() == format!("settings/control/{key}"))
+                .unwrap_or_else(|| panic!("{key}"))
+        };
+        assert!(position(prefs::EDIT_UPDATE_ENABLED) < position(prefs::EDIT_PACKAGES_ENABLED));
+    }
+    let (mut runtime, instance, view) = setup();
+    go_to_route(&mut runtime, instance, view, SettingsRoute::Terminal);
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    assert!(
+        compiled
+            .semantics
+            .iter()
+            .all(|node| !node.key.as_str().starts_with("settings/control/update.")),
+        "Terminal does not list the updater's switches"
+    );
+}
+
+/// A picker opened and closed leaves no preview over a search that found
+/// nothing.
+#[test]
+fn a_closed_picker_leaves_no_preview_over_an_empty_search() {
+    let (mut runtime, instance, view) = setup();
+    let cx = view_cx();
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    for (action, open) in [
+        (format!("settings/set/{}", prefs::EDIT_THEME), true),
+        ("settings/choice-close".to_string(), false),
+    ] {
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(action),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            panic!("Settings view");
+        };
+        assert_eq!(state.choice_picker.is_some(), open);
+    }
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        panic!("Settings view");
+    };
+    // No theme follows the system: the picker was its side's, and closing
+    // it leaves that slot focused.
+    assert!(
+        state
+            .common
+            .last_focus
+            .as_ref()
+            .is_some_and(|focus| focus.as_str().starts_with(THEME_SLOT_ACTION_PREFIX)),
+        "the closed picker leaves its control focused: {:?}",
+        state.common.last_focus
+    );
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new("settings/search"),
+                value: Some(SemanticInput::Text("zxqvbn".to_string())),
+            }),
+        )
+        .unwrap();
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    assert!(compiled.semantic(&UiKey::new("settings/empty")).is_some());
+    assert!(
+        compiled
+            .semantics
+            .iter()
+            .all(|node| !node.key.as_str().starts_with("settings/preview/")),
+        "no preview over no results"
+    );
 }
 
 #[test]
@@ -18020,20 +22315,12 @@ fn global_search_counts_authored_unknown_keys_and_labels_them_forward_compatible
         .unwrap()
         .compile(cx.viewport)
         .unwrap();
-    let detail = compiled
-        .semantic(&UiKey::new("settings/search/manual-result/detail"))
+    let listed = compiled
+        .semantic(&UiKey::new("settings/search/manual-result/key/0"))
         .expect("authored unknown key is discoverable through Manual search");
-    assert!(
-        detail
-            .label
-            .contains("1 Manual config key matches this search"),
-        "{}",
-        detail.label
-    );
-    assert!(
-        detail.label.contains("forward-compatible"),
-        "{}",
-        detail.label
+    assert_eq!(
+        listed.label,
+        "Open aterm.toml at future_renderer_experiment"
     );
     assert!(
         compiled
@@ -18045,7 +22332,7 @@ fn global_search_counts_authored_unknown_keys_and_labels_them_forward_compatible
 }
 
 #[test]
-fn short_landscape_search_pages_preview_before_a_whole_manual_editor_result() {
+fn short_landscape_search_lists_a_whole_manual_editor_result() {
     let (mut runtime, instance, view) = setup();
     runtime
         .dispatch(
@@ -18058,58 +22345,26 @@ fn short_landscape_search_pages_preview_before_a_whole_manual_editor_result() {
         )
         .unwrap();
     let cx = view_cx_at(568.0, 320.0);
-    let preview_page = runtime
-        .render(instance, view, &cx)
-        .unwrap()
-        .compile(cx.viewport)
-        .unwrap();
-    preview_page.validate_parity().unwrap();
-    assert!(
-        preview_page
-            .semantic(&UiKey::new("settings/preview/search"))
-            .is_some()
-    );
-    assert!(
-        preview_page
-            .semantic(&UiKey::new("settings/search/manual-result"))
-            .is_none(),
-        "the Manual card receives its own bounded slice"
-    );
-
-    runtime
-        .dispatch(
-            instance,
-            view,
-            AppEvent::Action(ActionInvocation {
-                id: ActionId::new("settings/page-down"),
-                value: None,
-            }),
-        )
-        .unwrap();
-    let manual_page = runtime
-        .render(instance, view, &cx)
-        .unwrap()
-        .compile(cx.viewport)
-        .unwrap();
-    manual_page.validate_parity().unwrap();
-    assert!(
-        manual_page
-            .semantic(&UiKey::new("settings/preview/search"))
-            .is_none()
-    );
-    let hit = manual_page
-        .hits
-        .iter()
-        .find(|hit| hit.key.as_str() == "settings/search/manual-result/open")
-        .expect("Manual editor result remains reachable");
-    let paint = manual_page
-        .paint
-        .iter()
-        .find(|paint| paint.key == hit.key)
-        .expect("Manual editor result remains painted");
-    assert_eq!(paint.rect, hit.rect);
-    assert!(hit.rect.height >= 44.0);
-    assert!(hit.rect.bottom() <= cx.viewport.bottom());
+    let mut manual = None;
+    each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
+        compiled.validate_parity().unwrap();
+        if let Some(hit) = compiled
+            .hits
+            .iter()
+            .find(|hit| hit.key.as_str() == "settings/search/manual-result/key/0")
+        {
+            let paint = compiled
+                .paint
+                .iter()
+                .find(|paint| paint.key == hit.key)
+                .expect("Manual editor result remains painted");
+            assert_eq!(paint.rect, hit.rect);
+            manual.get_or_insert(hit.rect);
+        }
+    });
+    let hit = manual.expect("Manual editor result remains reachable");
+    assert!(hit.height >= 44.0);
+    assert!(hit.bottom() <= cx.viewport.bottom());
 }
 
 #[test]
@@ -18167,7 +22422,6 @@ fn all_four_font_family_drafts_drive_one_preview_without_committing() {
         crate::native_app::ViewMotionCx::default(),
         13.0,
         1.0,
-        aterm_render::Theme::default(),
     )
     .expect("Typography preview");
     assert_eq!(
@@ -18225,7 +22479,6 @@ fn explicit_cursor_alias_keeps_the_canonical_preview_value() {
         crate::native_app::ViewMotionCx::default(),
         13.0,
         1.0,
-        aterm_render::Theme::default(),
     )
     .expect("cursor preview");
     assert_eq!(spec.cursor.style, PreviewCursorStyle::Bar);
@@ -18349,10 +22602,6 @@ fn blank_drafts_preview_reset_defaults_instead_of_stale_color_number_and_padding
     );
     assert_eq!(field_text(&color, prefs::EDIT_FOREGROUND, ""), "");
     assert_eq!(field_color(&color, prefs::EDIT_FOREGROUND), None);
-    let host = aterm_render::Theme {
-        fg: 0x00aa_bbcc,
-        ..aterm_render::Theme::default()
-    };
     let mut reset = SettingsViewState::new(&Config::default());
     reset.route = SettingsRoute::Appearance;
     let reset_fg = renderer_preview_spec(
@@ -18361,7 +22610,6 @@ fn blank_drafts_preview_reset_defaults_instead_of_stale_color_number_and_padding
         crate::native_app::ViewMotionCx::default(),
         13.0,
         1.0,
-        host,
     )
     .expect("default appearance preview")
     .terminal_theme
@@ -18373,7 +22621,6 @@ fn blank_drafts_preview_reset_defaults_instead_of_stale_color_number_and_padding
         crate::native_app::ViewMotionCx::default(),
         13.0,
         1.0,
-        host,
     )
     .expect("appearance preview");
     assert_eq!(
@@ -18393,7 +22640,6 @@ fn blank_drafts_preview_reset_defaults_instead_of_stale_color_number_and_padding
         crate::native_app::ViewMotionCx::default(),
         13.0,
         1.0,
-        host,
     )
     .expect("appearance preview after sibling focus");
     assert_eq!(
@@ -18418,7 +22664,6 @@ fn blank_drafts_preview_reset_defaults_instead_of_stale_color_number_and_padding
         crate::native_app::ViewMotionCx::default(),
         13.0,
         1.0,
-        host,
     )
     .expect("appearance preview with retained new draft");
     assert_eq!(
@@ -18443,7 +22688,6 @@ fn blank_drafts_preview_reset_defaults_instead_of_stale_color_number_and_padding
         crate::native_app::ViewMotionCx::default(),
         13.0,
         1.0,
-        aterm_render::Theme::default(),
     )
     .expect("typography preview");
     assert_eq!(typography.line_height, 1.0);
@@ -18715,7 +22959,7 @@ fn pending_config_disables_reset_and_undo_without_consuming_the_undo_token() {
         panic!("Settings view")
     };
     state.route = SettingsRoute::Modified;
-    state.last_undo = Some(77);
+    state.last_undo = Some(UndoOffer::showing(77, "Cursor blink turned off"));
     state
         .raw_values
         .insert(prefs::EDIT_CURSOR_BLINK.to_string(), "false".to_string());
@@ -18780,7 +23024,7 @@ fn pending_config_disables_reset_and_undo_without_consuming_the_undo_token() {
     let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
         panic!("Settings view")
     };
-    assert_eq!(state.last_undo, Some(77));
+    assert_eq!(state.last_undo.as_ref().map(|offer| offer.token), Some(77));
     assert_eq!(
         state.feedback.as_deref(),
         Some("Finish applying the current change before Undo.")
@@ -18808,17 +23052,16 @@ fn wide_motion_and_package_copy_has_zero_real_paint_overflow() {
     }
     let motion_compiled = motion_compiled.expect("Motion control is reachable");
     let motion_semantic = motion_compiled.semantic(&motion_key).unwrap();
-    // The OS's own accessibility setting has a DIFFERENT NAME per platform:
-    // macOS calls it "Reduce Motion", Windows calls it "Show animations in
-    // Windows". This assertion hardcoded the macOS wording, so it went red on
-    // Windows the moment the per-platform copy landed. Assert against the
-    // SHIPPED copy so the test tracks `prefs::motion_auto_copy` rather than
-    // drifting from it.
-    let (auto_value, auto_note) = prefs::motion_auto_copy(std::env::consts::OS);
+    // The OS's own accessibility setting has a DIFFERENT NAME per platform,
+    // so the assertion tracks the shipped `prefs::motion_auto_copy`.
+    let (auto_note, _) = prefs::motion_auto_copy(std::env::consts::OS);
     assert!(
-        motion_semantic.label.contains(auto_value) || motion_semantic.label.contains(auto_note),
-        "the Motion label must carry this platform's own motion copy, got {:?}",
-        motion_semantic.label
+        motion_semantic
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains(auto_note)),
+        "the Motion row must carry this platform's own motion copy, got {:?}",
+        motion_semantic.description
     );
     let motion_audit = motion_compiled
         .paint_audit_lines()
@@ -18845,11 +23088,10 @@ fn wide_motion_and_package_copy_has_zero_real_paint_overflow() {
         .expect("complete package consent semantics");
     // Phase 4: the switch is live — "takes effect at once", never "next launch".
     for expected in [
-        "Claude Code and Codex",
         "takes effect at once",
         "Remove ALab Tools",
         "several GB",
-        "next package check",
+        "next check",
     ] {
         assert!(consent.label.contains(expected), "{}", consent.label);
     }
@@ -18868,42 +23110,34 @@ fn wide_motion_and_package_copy_has_zero_real_paint_overflow() {
         consent_audit.join("\n")
     );
 
-    let compact_packages_state = live_packages_state(None);
-    let compact_total = packages_compact_sections(
-        &compact_packages_state.projection(),
-        SettingsWidth::Compact,
-        0,
-    );
     let (mut compact_runtime, compact_instance, compact_view) = setup();
-    assert!(compact_runtime.replace_settings_packages(compact_packages_state, 2));
+    assert!(compact_runtime.replace_settings_packages(live_packages_state(None), 2));
+    let Some(AppViewState::Settings(state)) = compact_runtime.view_state_mut(compact_view) else {
+        unreachable!();
+    };
+    state.navigate(SettingsRoute::Packages);
     let mut compact_consent = None;
     let compact_cx = view_cx_at(474.0, 658.0);
-    for page in 0..compact_total {
-        let Some(AppViewState::Settings(state)) = compact_runtime.view_state_mut(compact_view)
-        else {
-            unreachable!();
-        };
-        state.navigate(SettingsRoute::Packages);
-        state.page_scroll = page;
-        let compiled = compile_settings_view(
-            &compact_runtime,
-            compact_instance,
-            compact_view,
-            &compact_cx,
-        );
-        if compiled
-            .semantic(&UiKey::new("packages/consent-note"))
-            .is_some()
-        {
-            compact_consent = Some(compiled);
-            break;
-        }
-    }
+    each_screen(
+        &mut compact_runtime,
+        compact_instance,
+        compact_view,
+        &compact_cx,
+        |compiled, _| {
+            if compact_consent.is_none()
+                && compiled
+                    .semantic(&UiKey::new("packages/consent-note"))
+                    .is_some()
+            {
+                compact_consent = Some(compiled.clone());
+            }
+        },
+    );
     let compact_consent = compact_consent.expect("compact package consent page");
     let compact_semantic = compact_consent
         .semantic(&UiKey::new("packages/consent-note"))
         .unwrap();
-    for expected in ["takes effect at once", "next package check", "several GB"] {
+    for expected in ["takes effect at once", "next check", "several GB"] {
         assert!(
             compact_semantic.label.contains(expected),
             "{}",
@@ -18967,8 +23201,8 @@ fn open_choice_picker_reflows_across_live_dynamic_type_changes_at_scale(_scale: 
         unreachable!();
     };
     let picker = state.choice_picker.as_ref().unwrap();
-    assert_eq!(picker.page_size.get(), 3);
-    assert!(picker.visible_range().contains(&picker.selected));
+    let ordinary_window = picker.visible_cells().len();
+    assert!(picker.is_visible(picker.selected));
 
     install_scale(2.0);
     let maximum = compile_settings_view(&runtime, instance, view, &cx);
@@ -18977,8 +23211,11 @@ fn open_choice_picker_reflows_across_live_dynamic_type_changes_at_scale(_scale: 
         unreachable!();
     };
     let picker = state.choice_picker.as_ref().unwrap();
-    assert_eq!(picker.page_size.get(), 1);
-    assert!(picker.visible_range().contains(&picker.selected));
+    assert!(
+        picker.visible_cells().len() < ordinary_window,
+        "larger text seats fewer rows"
+    );
+    assert!(picker.is_visible(picker.selected));
 
     install_scale(1.0);
     let expanded = compile_settings_view(&runtime, instance, view, &cx);
@@ -18987,8 +23224,21 @@ fn open_choice_picker_reflows_across_live_dynamic_type_changes_at_scale(_scale: 
         unreachable!();
     };
     let picker = state.choice_picker.as_ref().unwrap();
-    assert_eq!(picker.page_size.get(), 3);
-    assert!(picker.visible_range().contains(&picker.selected));
+    assert_eq!(picker.visible_cells().len(), ordinary_window);
+    assert!(picker.is_visible(picker.selected));
+}
+
+/// A Top Settings key's control and the key its row and label go by: no
+/// theme follows the system, so the theme's first control is its Dark slot.
+fn top_control_key(key: &str) -> (String, &str) {
+    if key == prefs::EDIT_THEME {
+        (
+            theme_slot_action(aterm_types::Appearance::Dark),
+            "theme-slot/dark",
+        )
+    } else {
+        (format!("settings/control/{key}"), key)
+    }
 }
 
 #[test]
@@ -19006,7 +23256,7 @@ fn compact_top_status_cross_product_keeps_controls_and_recovery_actions_reachabl
 ) {
     const WARNING: &str = "aterm.toml reload rejected: repair the invalid authored value before automatic reload can resume.";
     const VARIANTS: [&str; 4] = ["watcher", "ordinary", "draft", "reset"];
-    const TOP_CONTROLS: [&str; TOP_SETTING_SECTIONS] = [
+    const TOP_CONTROLS: [&str; 6] = [
         prefs::EDIT_THEME,
         prefs::EDIT_WINDOW_THEME,
         prefs::EDIT_CURSOR_TRAIL_STYLE,
@@ -19014,13 +23264,9 @@ fn compact_top_status_cross_product_keeps_controls_and_recovery_actions_reachabl
         SPARKLE_WORDS_KEY,
         KEYWORD_KITTIES_KEY,
     ];
-    const TOP_PREVIEWS: [Option<&str>; TOP_SETTING_SECTIONS] = [
-        Some("settings/top/theme/preview"),
-        Some("settings/top/system-appearance/preview"),
-        Some("settings/top/cursor-trail/preview"),
-        None,
-        None,
-        None,
+    const TOP_PREVIEWS: [&str; 2] = [
+        "settings/top/theme/preview",
+        "settings/top/cursor-trail/preview",
     ];
     let configure = |state: &mut SettingsViewState, variant: &str| {
         state.config_watch_status = Some(WARNING.to_string());
@@ -19033,7 +23279,7 @@ fn compact_top_status_cross_product_keeps_controls_and_recovery_actions_reachabl
             "watcher" => {}
             "ordinary" => {
                 state.feedback = Some("Saved. Undo is available.".to_string());
-                state.last_undo = Some(7);
+                state.last_undo = Some(UndoOffer::showing(7, "Saved. Undo is available."));
             }
             "draft" => {
                 state.field_inputs.insert(
@@ -19118,25 +23364,50 @@ fn compact_top_status_cross_product_keeps_controls_and_recovery_actions_reachabl
         let mut cx = view_cx_at(viewport_width, viewport_height);
         cx.motion.serious = true;
         for variant in VARIANTS {
-            for (page, key) in TOP_CONTROLS.into_iter().enumerate() {
-                let (mut runtime, instance, view) = setup();
-                replace_settings_source(&mut runtime, view, "serious_mode = true\n".to_string());
+            let (mut runtime, instance, view) = setup();
+            replace_settings_source(&mut runtime, view, "serious_mode = true\n".to_string());
+            {
                 let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                     unreachable!();
                 };
                 configure(state, variant);
-                state.page_scroll = page;
-                let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            }
+            let mut seen = BTreeSet::new();
+            each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
                 let context = format!(
-                    "{variant} Top page {page} at {viewport_width}×{viewport_height} {scale}×"
+                    "{variant} Top screen {top} at {viewport_width}×{viewport_height} {scale}×"
                 );
-                assert_zero_top_paint(&compiled, &context);
-                assert_statuses(&compiled, variant, &context);
-                assert_material_hit(&compiled, &format!("settings/control/{key}"), &context);
-                if let Some(preview_key) = TOP_PREVIEWS[page] {
-                    let preview = compiled
-                        .semantic(&UiKey::new(preview_key))
-                        .unwrap_or_else(|| panic!("{context}: missing live preview"));
+                assert_zero_top_paint(compiled, &context);
+                assert_statuses(compiled, variant, &context);
+                for key in TOP_CONTROLS {
+                    let (control, key) = top_control_key(key);
+                    if compiled.semantic(&UiKey::new(control.as_str())).is_none() {
+                        continue;
+                    }
+                    assert_material_hit(compiled, &control, &context);
+                    seen.insert(control);
+                    // The cursor style's row is a link, not a setting row.
+                    if scale >= 2.0 && key != prefs::EDIT_CURSOR_TRAIL_STYLE {
+                        let label_key = UiKey::new(format!("settings/label/{key}"));
+                        assert!(
+                            compiled.semantic(&label_key).is_none(),
+                            "{context}: Top visual label duplicated semantics"
+                        );
+                        assert!(
+                            compiled.paint.iter().any(|node| node.key == label_key),
+                            "{context}: Top visual label must still paint"
+                        );
+                        assert!(compiled.semantics.iter().any(|node| {
+                            node.key.as_str().starts_with("settings/row/")
+                                && node.key.as_str().ends_with(&format!("/{key}"))
+                                && !node.label.is_empty()
+                        }));
+                    }
+                }
+                for preview_key in TOP_PREVIEWS {
+                    let Some(preview) = compiled.semantic(&UiKey::new(preview_key)) else {
+                        continue;
+                    };
                     assert!(
                         preview.rect.width > 0.0
                             && preview.rect.height > 0.0
@@ -19145,30 +23416,23 @@ fn compact_top_status_cross_product_keeps_controls_and_recovery_actions_reachabl
                         "{context}: preview escapes: {:?}",
                         preview.rect
                     );
+                    seen.insert(preview_key.to_string());
                 }
-                if scale >= 2.0 {
-                    let label_key = UiKey::new(format!("settings/label/{key}"));
-                    assert!(
-                        compiled.semantic(&label_key).is_none(),
-                        "{context}: Top visual label duplicated semantics"
-                    );
-                    assert!(
-                        compiled.paint.iter().any(|node| node.key == label_key),
-                        "{context}: Top visual label must still paint"
-                    );
-                    assert!(compiled.semantics.iter().any(|node| {
-                        node.key.as_str().starts_with("settings/row/")
-                            && node.key.as_str().ends_with(&format!("/{key}"))
-                            && !node.label.is_empty()
-                    }));
-                }
+            });
+            for key in TOP_CONTROLS {
+                assert!(
+                    seen.contains(&top_control_key(key).0),
+                    "{variant} at {viewport_width}×{viewport_height} {scale}×: {key} unreachable"
+                );
+            }
+            for preview_key in TOP_PREVIEWS {
+                assert!(
+                    seen.contains(preview_key),
+                    "{variant} at {viewport_width}×{viewport_height} {scale}×: {preview_key} unreachable"
+                );
             }
 
-            for key in [
-                prefs::EDIT_THEME,
-                prefs::EDIT_WINDOW_THEME,
-                prefs::EDIT_CURSOR_TRAIL_STYLE,
-            ] {
+            for key in [prefs::EDIT_THEME, prefs::EDIT_WINDOW_THEME] {
                 let (mut runtime, instance, view) = setup();
                 replace_settings_source(&mut runtime, view, "serious_mode = true\n".to_string());
                 runtime
@@ -19181,60 +23445,44 @@ fn compact_top_status_cross_product_keeps_controls_and_recovery_actions_reachabl
                         }),
                     )
                     .unwrap();
-                let (pages, page_size) = {
+                {
                     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                         unreachable!();
                     };
                     configure(state, variant);
-                    configure_choice_picker_for_width(state, SettingsWidth::Compact);
-                    let picker = state.choice_picker.as_ref().unwrap();
-                    (
-                        picker.options.len().div_ceil(picker.page_size.get()),
-                        picker.page_size.get(),
-                    )
-                };
-                for page in 0..pages {
-                    let offset = {
-                        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
-                        else {
-                            unreachable!();
-                        };
-                        let picker = state.choice_picker.as_mut().unwrap();
-                        picker.offset.set(page * page_size);
-                        picker.offset.get()
-                    };
-                    let compiled = compile_settings_view(&runtime, instance, view, &cx);
-                    let context = format!(
-                        "{variant} {key} picker {}/{pages} at {viewport_width}×{viewport_height} {scale}×",
-                        page + 1
-                    );
-                    assert_zero_top_paint(&compiled, &context);
-                    assert_statuses(&compiled, variant, &context);
-                    assert_picker_descendants_contained(&compiled, key, &context);
-                    assert_material_hit(&compiled, "settings/choice-close", &context);
-                    assert_material_hit(
-                        &compiled,
-                        &format!("settings/choice/{key}/{offset}"),
-                        &context,
-                    );
-                    if page > 0 {
-                        assert_material_hit(&compiled, "settings/choice-page-prev", &context);
-                    }
-                    if page + 1 < pages {
-                        assert_material_hit(&compiled, "settings/choice-page-next", &context);
-                    }
-                    let preview = compiled
-                        .semantic(&UiKey::new("settings/top/choice-preview"))
-                        .unwrap_or_else(|| panic!("{context}: missing picker preview"));
-                    assert!(
-                        preview.rect.width > 0.0
-                            && preview.rect.height > 0.0
-                            && preview.rect.right() <= compiled.bounds.right() + 0.01
-                            && preview.rect.bottom() <= compiled.bounds.bottom() + 0.01,
-                        "{context}: picker preview escapes: {:?}",
-                        preview.rect
-                    );
                 }
+                walk_open_choice_picker(
+                    &mut runtime,
+                    instance,
+                    view,
+                    &cx,
+                    key,
+                    |compiled, index| {
+                        let context = format!(
+                            "{variant} {key} picker option {index} at {viewport_width}×{viewport_height} {scale}×"
+                        );
+                        assert_zero_top_paint(compiled, &context);
+                        assert_statuses(compiled, variant, &context);
+                        assert_picker_descendants_contained(compiled, key, &context);
+                        assert_material_hit(compiled, "settings/choice-close", &context);
+                        assert_material_hit(
+                            compiled,
+                            &format!("settings/choice/{key}/{index}"),
+                            &context,
+                        );
+                        let preview = compiled
+                            .semantic(&UiKey::new("settings/top/choice-preview"))
+                            .unwrap_or_else(|| panic!("{context}: missing picker preview"));
+                        assert!(
+                            preview.rect.width > 0.0
+                                && preview.rect.height > 0.0
+                                && preview.rect.right() <= compiled.bounds.right() + 0.01
+                                && preview.rect.bottom() <= compiled.bounds.bottom() + 0.01,
+                            "{context}: picker preview escapes: {:?}",
+                            preview.rect
+                        );
+                    },
+                );
             }
         }
     }
@@ -19270,7 +23518,6 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
     let cases = [
         (
             prefs::EDIT_THEME,
-            0_usize,
             aterm_types::scheme::builtin_names()
                 .into_iter()
                 .map(str::to_string)
@@ -19278,7 +23525,6 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
         ),
         (
             prefs::EDIT_WINDOW_THEME,
-            1_usize,
             prefs::WINDOW_THEMES
                 .iter()
                 .map(|value| (*value).to_string())
@@ -19286,7 +23532,6 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
         ),
         (
             prefs::EDIT_CURSOR_TRAIL_STYLE,
-            2_usize,
             prefs::CURSOR_TRAIL_STYLES
                 .iter()
                 .map(|value| (*value).to_string())
@@ -19297,28 +23542,27 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
     for (viewport_width, viewport_height) in viewports.iter().copied() {
         let cx = view_cx_at(viewport_width, viewport_height);
 
-        // Every one of the six requested Top cards is a complete virtual
-        // page on responsive hosts. Audit all of them, not only the three
-        // preview-bearing choices.
+        // Every screen of the Top Settings list, not only the three
+        // preview-bearing cards.
         let (mut runtime, instance, view) = setup();
-        for page in 0..TOP_SETTING_SECTIONS {
+        {
             let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                 unreachable!();
             };
-            state.page_scroll = page;
             state.feedback = (viewport_height <= 320.0).then(|| "Saved".to_string());
-            let compiled = compile_settings_view(&runtime, instance, view, &cx);
-            assert_zero_top_paint(
-                &compiled,
-                &format!("default Top page {page} at {viewport_width}×{viewport_height} {scale}×"),
-            );
         }
+        each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+            assert_zero_top_paint(
+                compiled,
+                &format!("default Top screen {top} at {viewport_width}×{viewport_height} {scale}×"),
+            );
+        });
 
         // Commit every built-in value through the same authoritative
         // snapshot projection used after a real config save. The control
         // keeps the exact value in semantics while its visual label must
         // remain within the renderer's authored measure.
-        for (key, page, values) in &cases {
+        for (key, values) in &cases {
             for value in values {
                 let (mut runtime, instance, view) = setup();
                 // THE TRAIL CASE AUTHORS ITS MASTER. Top Settings presents the
@@ -19339,7 +23583,7 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
                 let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                     unreachable!();
                 };
-                state.page_scroll = *page;
+                state.page_reveal = Some(UiKey::new(format!("settings/control/{key}")));
                 state.feedback = (viewport_height <= 320.0).then(|| "Saved".to_string());
                 let compiled = compile_settings_view(&runtime, instance, view, &cx);
                 let context = format!(
@@ -19349,14 +23593,16 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
                 let control = compiled
                     .semantic(&UiKey::new(format!("settings/control/{key}")))
                     .unwrap_or_else(|| panic!("{context}: missing committed control"));
+                // The value in the words the control shows, never the config
+                // token; whole, never cut.
                 assert_eq!(
                     control.value,
-                    SemanticValue::Text(value.clone()),
+                    SemanticValue::Text(setting_choice_label(key, value)),
                     "{context}: complete semantic value"
                 );
                 assert!(
-                    control.label.contains(value),
-                    "{context}: complete semantic label {:?}",
+                    control.label.contains(&setting_choice_label(key, value)),
+                    "{context}: the semantic label names the value as shown {:?}",
                     control.label
                 );
             }
@@ -19364,8 +23610,12 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
 
         // One explicit committed value per picker gives the matrix its
         // reset candidate as well as every built-in. Walk every real page
-        // and prove all semantic labels survive the bounded visuals.
-        for (key, _, values) in &cases {
+        // and prove all semantic labels survive the bounded visuals. (The
+        // cursor style has no picker: its control opens Cursor Styles.)
+        for (key, values) in cases
+            .iter()
+            .filter(|(key, _)| *key != prefs::EDIT_CURSOR_TRAIL_STYLE)
+        {
             let current = values.first().expect("Top picker has choices");
             let (mut runtime, instance, view) = setup();
             replace_settings_source(&mut runtime, view, format!("{key} = {}\n", quote(current)));
@@ -19379,44 +23629,27 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
                     }),
                 )
                 .unwrap();
-            let (pages, page_size, expected_labels) = {
+            let expected_labels = {
                 let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                     unreachable!();
                 };
                 state.feedback = (viewport_height <= 320.0).then(|| "Saved".to_string());
-                configure_choice_picker_for_width(
-                    state,
-                    SettingsWidth::for_viewport(viewport_width),
-                );
-                let picker = state.choice_picker.as_ref().unwrap();
-                (
-                    picker.options.len().div_ceil(picker.page_size.get()),
-                    picker.page_size.get(),
-                    picker
-                        .options
-                        .iter()
-                        .map(|option| option.label.clone())
-                        .collect::<BTreeSet<_>>(),
-                )
+                state
+                    .choice_picker
+                    .as_ref()
+                    .unwrap()
+                    .options
+                    .iter()
+                    .map(|option| option.label.clone())
+                    .collect::<BTreeSet<_>>()
             };
             let mut seen_labels = BTreeSet::new();
-            for page in 0..pages {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                    unreachable!();
-                };
-                let picker = state.choice_picker.as_mut().unwrap();
-                picker.offset.set(page * page_size);
-                state.common.last_focus = Some(UiKey::new(format!(
-                    "settings/choice/{key}/{}",
-                    picker.offset.get()
-                )));
-                let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            walk_open_choice_picker(&mut runtime, instance, view, &cx, key, |compiled, index| {
                 let context = format!(
-                    "{key} picker {}/{pages} at {viewport_width}×{viewport_height} {scale}×",
-                    page + 1
+                    "{key} picker option {index} at {viewport_width}×{viewport_height} {scale}×"
                 );
-                assert_zero_top_paint(&compiled, &context);
-                assert_picker_descendants_contained(&compiled, key, &context);
+                assert_zero_top_paint(compiled, &context);
+                assert_picker_descendants_contained(compiled, key, &context);
                 seen_labels.extend(
                     compiled
                         .semantics
@@ -19428,7 +23661,7 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
                         })
                         .map(|node| node.label.clone()),
                 );
-            }
+            });
             assert_eq!(
                 seen_labels, expected_labels,
                 "complete {key} picker semantics"
@@ -19448,26 +23681,22 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
         cx.motion.serious = true;
         let (mut runtime, instance, view) = setup();
         replace_settings_source(&mut runtime, view, "serious_mode = true\n".to_string());
-        for page in 0..TOP_SETTING_SECTIONS {
+        {
             let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                 unreachable!();
             };
-            state.page_scroll = page;
             state.feedback = (viewport_height <= 320.0).then(|| "Saved".to_string());
-            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        }
+        each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
             let context =
-                format!("Serious Top page {page} at {viewport_width}×{viewport_height} {scale}×");
-            assert_zero_top_paint(&compiled, &context);
+                format!("Serious Top screen {top} at {viewport_width}×{viewport_height} {scale}×");
+            assert_zero_top_paint(compiled, &context);
             let disclosure = compiled
                 .semantic(&UiKey::new("settings/top/serious-mode"))
                 .unwrap_or_else(|| panic!("{context}: missing Serious Mode disclosure"));
             assert!(disclosure.label.contains("keeps every other effect off"));
-        }
-        for key in [
-            prefs::EDIT_THEME,
-            prefs::EDIT_WINDOW_THEME,
-            prefs::EDIT_CURSOR_TRAIL_STYLE,
-        ] {
+        });
+        for key in [prefs::EDIT_THEME, prefs::EDIT_WINDOW_THEME] {
             let (mut runtime, instance, view) = setup();
             replace_settings_source(&mut runtime, view, "serious_mode = true\n".to_string());
             runtime
@@ -19480,39 +23709,19 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
                     }),
                 )
                 .unwrap();
-            let (pages, page_size) = {
+            {
                 let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
                     unreachable!();
                 };
                 state.feedback = (viewport_height <= 320.0).then(|| "Saved".to_string());
-                configure_choice_picker_for_width(
-                    state,
-                    SettingsWidth::for_viewport(viewport_width),
-                );
-                let picker = state.choice_picker.as_ref().unwrap();
-                (
-                    picker.options.len().div_ceil(picker.page_size.get()),
-                    picker.page_size.get(),
-                )
-            };
-            for page in 0..pages {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                    unreachable!();
-                };
-                let picker = state.choice_picker.as_mut().unwrap();
-                picker.offset.set(page * page_size);
-                state.common.last_focus = Some(UiKey::new(format!(
-                    "settings/choice/{key}/{}",
-                    picker.offset.get()
-                )));
-                let compiled = compile_settings_view(&runtime, instance, view, &cx);
-                let context = format!(
-                    "Serious {key} picker {}/{pages} at {viewport_width}×{viewport_height} {scale}×",
-                    page + 1
-                );
-                assert_zero_top_paint(&compiled, &context);
-                assert_picker_descendants_contained(&compiled, key, &context);
             }
+            walk_open_choice_picker(&mut runtime, instance, view, &cx, key, |compiled, index| {
+                let context = format!(
+                    "Serious {key} picker option {index} at {viewport_width}×{viewport_height} {scale}×"
+                );
+                assert_zero_top_paint(compiled, &context);
+                assert_picker_descendants_contained(compiled, key, &context);
+            });
         }
     }
 
@@ -19520,16 +23729,7 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
     // so compile every authored status directly. The parent remains the
     // complete accessibility contract while the child is bounded visual
     // copy at the narrowest real card measure.
-    for reason in [
-        "Saved On for macOS; audio output is unavailable on this platform.",
-        "Saved Off; audio output is unavailable on this platform.",
-        "On, currently silent because Cursor trail is Off.",
-        "On, currently silent because trail sound volume is 0.",
-        "On, currently silent while this window is unfocused.",
-        "On, currently suppressed by Motion: Reduced.",
-        "On, currently suppressed by system Reduce Motion.",
-        "On, currently suppressed under heavy load.",
-    ] {
+    for reason in MusicStatus::ALL {
         let compiled = UiTree::new(top_music_suppression_node(reason))
             .compile(LogicalRect::new(0.0, 0.0, 234.5, page_subtitle_height()))
             .unwrap();
@@ -19540,7 +23740,7 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
                 .semantic(&UiKey::new("settings/top/music-effects/suppression"))
                 .unwrap()
                 .label,
-            reason
+            reason.full()
         );
     }
 
@@ -19584,8 +23784,25 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
             let status = compiled
                 .semantic(&UiKey::new("settings/draft-recovery/status"))
                 .unwrap();
-            assert!(status.label.contains("unsaved Settings draft"));
-            for key in ["settings/drafts/review", "settings/drafts/discard-all"] {
+            // Asked to confirm, the bar names the one draft and offers Cancel
+            // beside the destructive Discard; else it counts the drafts and
+            // offers Review beside Discard.
+            let (words, keys) = if confirmation {
+                (
+                    "Discard your unsaved Font family draft?",
+                    [
+                        "settings/drafts/discard-cancel",
+                        "settings/drafts/discard-all",
+                    ],
+                )
+            } else {
+                (
+                    "1 unsaved Settings draft.",
+                    ["settings/drafts/review", "settings/drafts/discard-all"],
+                )
+            };
+            assert!(status.label.contains(words), "{context}: {}", status.label);
+            for key in keys {
                 assert!(
                     compiled.semantic(&UiKey::new(key)).is_some(),
                     "{context}: {key}"
@@ -19606,7 +23823,7 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
                 .semantic(&UiKey::new("settings/status"))
                 .unwrap()
                 .label,
-            RESET_ALL_SCOPE
+            reset_all_scope(0)
         );
 
         let (mut runtime, instance, view) = setup();
@@ -19644,7 +23861,9 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
     // semantic value while proving their UTF-8 visual projection is clean.
     if scale >= 2.0 {
         let name = "Aurora 👩‍💻 Observatory — a deliberately very long personal color theme";
-        let scheme = aterm_types::scheme::builtin("Dracula").unwrap();
+        // A file whose own `name =` is its id: the picker shows it as written.
+        let mut scheme = aterm_types::scheme::builtin("Dracula").unwrap();
+        scheme.name = name.to_string();
         let themes = crate::app_config::ThemeCatalog::from_schemes([(name.to_string(), scheme)]);
         let (mut runtime, instance, view) = setup();
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
@@ -19693,8 +23912,7 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
                     .iter()
                     .position(|option| option.value.as_deref() == Some(name))
                     .unwrap();
-                let page_size = picker.page_size.get();
-                picker.offset.set((index / page_size) * page_size);
+                picker.scroll_to(picker.position_of(index));
                 state.common.last_focus = Some(UiKey::new(format!(
                     "settings/choice/{}/{index}",
                     prefs::EDIT_THEME
@@ -19747,7 +23965,6 @@ fn top_settings_is_default_native_page_with_requested_controls_and_previews() {
     assert_eq!(state.route, SettingsRoute::Home);
     assert_eq!(state.route.label(), "Top Settings");
     for key in [
-        prefs::EDIT_THEME,
         prefs::EDIT_WINDOW_THEME,
         prefs::EDIT_CURSOR_TRAIL_STYLE,
         prefs::EDIT_TRAIL_SOUNDS,
@@ -19758,6 +23975,18 @@ fn top_settings_is_default_native_page_with_requested_controls_and_previews() {
             compiled
                 .semantic(&UiKey::new(format!("settings/control/{key}")))
                 .is_some(),
+            "Top Settings exposes {key}"
+        );
+    }
+    // No theme follows the system: its card is the Dark and Light slots
+    // and the Follow system switch.
+    for key in [
+        theme_slot_action(aterm_types::Appearance::Dark),
+        theme_slot_action(aterm_types::Appearance::Light),
+        THEME_MODE_ACTION.to_string(),
+    ] {
+        assert!(
+            compiled.semantic(&UiKey::new(key.clone())).is_some(),
             "Top Settings exposes {key}"
         );
     }
@@ -19775,17 +24004,16 @@ fn top_settings_is_default_native_page_with_requested_controls_and_previews() {
         .compile(medium_cx.viewport)
         .unwrap();
     for key in [
-        prefs::EDIT_THEME,
-        prefs::EDIT_WINDOW_THEME,
-        prefs::EDIT_CURSOR_TRAIL_STYLE,
-        prefs::EDIT_TRAIL_SOUNDS,
-        SPARKLE_WORDS_KEY,
-        KEYWORD_KITTIES_KEY,
+        format!("settings/control/{}", prefs::EDIT_WINDOW_THEME),
+        format!("settings/control/{}", prefs::EDIT_CURSOR_TRAIL_STYLE),
+        format!("settings/control/{}", prefs::EDIT_TRAIL_SOUNDS),
+        format!("settings/control/{SPARKLE_WORDS_KEY}"),
+        format!("settings/control/{KEYWORD_KITTIES_KEY}"),
+        theme_slot_action(aterm_types::Appearance::Dark),
+        THEME_MODE_ACTION.to_string(),
     ] {
         assert!(
-            medium
-                .semantic(&UiKey::new(format!("settings/control/{key}")))
-                .is_some(),
+            medium.semantic(&UiKey::new(key.clone())).is_some(),
             "ordinary macOS-sized Top Settings exposes {key}"
         );
     }
@@ -19822,7 +24050,9 @@ fn compact_category_sheet_reaches_every_settings_route() {
         )
         .unwrap();
 
+    // The wheel walks the list a row at a time to its last screen.
     let mut seen = BTreeSet::new();
+    let mut first_screen = None;
     for _ in 0..SettingsRoute::ALL.len() {
         let compiled = runtime
             .render(instance, view, &cx)
@@ -19835,7 +24065,11 @@ fn compact_category_sheet_reaches_every_settings_route() {
                 .semantic(&UiKey::new("settings/navigation"))
                 .is_none()
         );
-        for route in SettingsRoute::ALL {
+        let mut shown = 0;
+        for route in SettingsRoute::ALL
+            .into_iter()
+            .filter(|route| route.on_rail())
+        {
             let key = UiKey::new(format!("settings/categories{}", route.path()));
             if let Some(node) = compiled.semantic(&key) {
                 assert!(node.rect.bottom() <= cx.viewport.bottom() + 0.01);
@@ -19846,28 +24080,19 @@ fn compact_category_sheet_reaches_every_settings_route() {
                     .expect("visible category has a native hit target");
                 assert_eq!(hit.action, route_action(route));
                 seen.insert(route.path());
+                shown += 1;
             }
         }
-        let Some(next) = compiled
-            .hits
-            .iter()
-            .find(|hit| hit.action.as_str() == "settings/page-down")
-            .map(|hit| hit.action.clone())
-        else {
-            break;
-        };
+        first_screen.get_or_insert(shown);
         runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: next,
-                    value: None,
-                }),
-            )
+            .dispatch(instance, view, AppEvent::ScrollLines(1))
             .unwrap();
     }
-    assert_eq!(seen.len(), SettingsRoute::ALL.len());
+    assert_eq!(seen.len(), SettingsRoute::rail_len());
+    assert!(
+        first_screen.is_some_and(|shown| shown >= 6),
+        "a phone's category list holds many routes per screen: {first_screen:?}"
+    );
 }
 
 #[test]
@@ -19907,8 +24132,10 @@ fn top_keyword_toys_and_cursor_trail_emit_complete_runtime_patches() {
     let legacy_service =
         VersionedConfigService::new("[sparkle_words]\nenabled = false\n".to_string()).unwrap();
     let legacy = SettingsViewState::from_snapshot(&legacy_service.snapshot()).unwrap();
-    assert!(legacy.is_explicit(SPARKLE_WORDS_KEY));
-    assert!(legacy.is_explicit(KEYWORD_KITTIES_KEY));
+    // The old shared master is its own written key, not either toy's.
+    assert!(legacy.is_explicit(SPARKLE_MASTER_KEY));
+    assert!(!legacy.is_explicit(SPARKLE_WORDS_KEY));
+    assert!(!legacy.is_explicit(KEYWORD_KITTIES_KEY));
     assert!(!top_projected_toy_value(&legacy, SPARKLE_WORDS_KEY));
     assert!(!top_projected_toy_value(&legacy, KEYWORD_KITTIES_KEY));
 
@@ -19937,10 +24164,8 @@ fn top_keyword_toys_and_cursor_trail_emit_complete_runtime_patches() {
             .iter()
             .map(|edit| (edit.key.as_str(), edit.value.as_deref()))
             .collect::<Vec<_>>(),
-        [
-            (prefs::EDIT_CURSOR_TRAIL_STYLE, Some("off")),
-            (prefs::EDIT_CURSOR_TRAIL, Some("false")),
-        ]
+        [(prefs::EDIT_CURSOR_TRAIL_STYLE, Some("off"))],
+        "Off is the style alone: the effects switch keeps the momentum glow"
     );
 }
 
@@ -20078,18 +24303,23 @@ fn top_effect_controls_truthfully_escape_the_serious_mode_override() {
     }
 
     let defaulted = "serious_mode = true\n";
+    // A style turns the effects switch on only where it is off: on this
+    // platform's default, or an explicit `false` (below).
+    let mut water = vec![(prefs::EDIT_CURSOR_TRAIL_STYLE, Some("water"))];
+    if !crate::app_config::DEFAULT_DECORATIVE_EFFECTS {
+        water.push((prefs::EDIT_CURSOR_TRAIL, Some("true")));
+    }
+    water.extend([
+        (prefs::EDIT_TRAIL_SOUNDS, Some("false")),
+        (SPARKLE_WORDS_KEY, Some("false")),
+        (KEYWORD_KITTIES_KEY, Some("false")),
+        (prefs::EDIT_SERIOUS_MODE, None),
+    ]);
     assert_transition(
         defaulted,
         prefs::EDIT_CURSOR_TRAIL_STYLE,
         SemanticInput::Text("water".to_string()),
-        &expect(&[
-            (prefs::EDIT_CURSOR_TRAIL_STYLE, Some("water")),
-            (prefs::EDIT_CURSOR_TRAIL, Some("true")),
-            (prefs::EDIT_TRAIL_SOUNDS, Some("false")),
-            (SPARKLE_WORDS_KEY, Some("false")),
-            (KEYWORD_KITTIES_KEY, Some("false")),
-            (prefs::EDIT_SERIOUS_MODE, None),
-        ]),
+        &water,
         ("water", false, false, false),
     );
     assert_transition(
@@ -20150,7 +24380,11 @@ fn top_effect_controls_truthfully_escape_the_serious_mode_override() {
         SemanticInput::Text("water".to_string()),
         &[
             (prefs::EDIT_CURSOR_TRAIL_STYLE, Some("water")),
-            (prefs::EDIT_CURSOR_TRAIL, Some("true")),
+            // The switch's canonical ON: no key where the default draws.
+            (
+                prefs::EDIT_CURSOR_TRAIL,
+                (!crate::app_config::DEFAULT_DECORATIVE_EFFECTS).then_some("true"),
+            ),
             (prefs::EDIT_SERIOUS_MODE, None),
         ],
         ("water", false, false, false),
@@ -20167,49 +24401,37 @@ fn top_effect_controls_truthfully_escape_the_serious_mode_override() {
     );
 }
 
+/// A toy's Reset removes that toy's own key and nothing else: the old shared
+/// master and the other toy are rows of their own on Modified, with their
+/// own Resets.
 #[test]
-fn resetting_a_top_toy_under_serious_mode_preserves_the_authored_sibling() {
-    for (source, expected_sibling) in [
-        (
-            "serious_mode = true\n[sparkle_words.profanity]\nenabled = false\n",
-            None,
-        ),
-        (
-            "serious_mode = true\n[sparkle_words.profanity]\nenabled = false\n[sparkle_words.feline]\nenabled = false\n",
-            Some("false"),
-        ),
-    ] {
-        let service = VersionedConfigService::new(source.to_string()).unwrap();
-        let (mut runtime, instance, view) = setup();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-            unreachable!()
-        };
-        **state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
-        let outcome = runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: ActionId::new(format!("settings/reset/{SPARKLE_WORDS_KEY}")),
-                    value: None,
-                }),
-            )
-            .unwrap();
-        let patch = outcome
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                AppEffect::ConfigPatch { patch, .. } => Some(patch),
-                _ => None,
-            })
-            .expect("toy reset emits one migration patch");
-        let sibling = patch
+fn resetting_a_toy_removes_only_its_own_key() {
+    let source = "serious_mode = true\n[sparkle_words]\nenabled = false\n[sparkle_words.profanity]\nenabled = false\n[sparkle_words.feline]\nenabled = false\n";
+    let service = VersionedConfigService::new(source.to_string()).unwrap();
+    let (mut runtime, instance, view) = setup();
+    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        unreachable!()
+    };
+    **state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+    let outcome = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(format!("settings/reset/{SPARKLE_WORDS_KEY}")),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let patch = emitted_config_patch(&outcome);
+    assert_eq!(
+        patch
             .edits
             .iter()
-            .find(|edit| edit.key == KEYWORD_KITTIES_KEY)
-            .expect("sibling state is preserved while removing the legacy master");
-        assert_eq!(sibling.value.as_deref(), expected_sibling, "{source}");
-    }
+            .map(|edit| (edit.key.as_str(), edit.value.as_deref()))
+            .collect::<Vec<_>>(),
+        [(SPARKLE_WORDS_KEY, None)]
+    );
 }
 
 #[test]
@@ -20240,7 +24462,6 @@ fn modified_shows_authored_playful_values_and_names_serious_mode_suppression() {
             index,
             field,
             true,
-            false,
             SettingsWidth::Wide,
         )]),
     )
@@ -20252,14 +24473,18 @@ fn modified_shows_authored_playful_values_and_names_serious_mode_suppression() {
             prefs::EDIT_CURSOR_TRAIL_STYLE
         )))
         .unwrap();
-    assert_eq!(control.value, SemanticValue::Text("water".to_string()));
+    assert_eq!(
+        control.value,
+        SemanticValue::Text(cursor_style_name("water")),
+        "the control speaks the style's name, never its config token"
+    );
     let label = tree
         .semantic(&UiKey::new(format!(
             "settings/label/{}",
             prefs::EDIT_CURSOR_TRAIL_STYLE
         )))
         .unwrap();
-    assert!(label.label.contains("Inactive · Serious Mode"));
+    assert!(label.label.contains("Inactive: Serious Mode"));
 }
 
 #[test]
@@ -20320,7 +24545,7 @@ fn ordinary_advanced_effect_rows_disclose_saved_on_but_runtime_suppressed() {
     .unwrap();
     let state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
     for (key, route) in [
-        (prefs::EDIT_STREAM_FADE, SettingsRoute::CursorMotion),
+        (prefs::EDIT_STREAM_FADE, SettingsRoute::Terminal),
         (prefs::EDIT_MATRIX_RAIN_ENABLED, SettingsRoute::Appearance),
     ] {
         assert_eq!(route.section(), Some(prefs::section_of(key)));
@@ -20335,7 +24560,6 @@ fn ordinary_advanced_effect_rows_disclose_saved_on_but_runtime_suppressed() {
             &state,
             index,
             field,
-            false,
             false,
             SettingsWidth::Wide,
         ))
@@ -20358,15 +24582,15 @@ fn ordinary_advanced_effect_rows_disclose_saved_on_but_runtime_suppressed() {
         let label = compiled
             .semantic(&UiKey::new(format!("settings/label/{key}")))
             .unwrap();
-        assert!(label.label.contains("Inactive · Serious Mode"));
+        assert!(label.label.contains("Inactive: Serious Mode"));
     }
-    let stream_note = prefs::group_footnote("Stream fade").unwrap();
+    let stream_note = prefs::footnote_of(prefs::EDIT_STREAM_FADE).unwrap();
     for cause in [
         "Reduce Motion",
         "unfocused",
         "full-screen apps",
         "scrollback",
-        "input",
+        "typing",
         "Serious Mode",
     ] {
         assert!(
@@ -20374,7 +24598,7 @@ fn ordinary_advanced_effect_rows_disclose_saved_on_but_runtime_suppressed() {
             "missing stream-fade bypass: {cause}"
         );
     }
-    let rain_note = prefs::group_footnote("Matrix rain").unwrap();
+    let rain_note = prefs::footnote_of(prefs::EDIT_MATRIX_RAIN_ENABLED).unwrap();
     assert!(rain_note.contains("Serious Mode"));
     assert!(rain_note.contains("Reduce Motion"));
 }
@@ -20426,10 +24650,7 @@ enabled = true
             .is_some_and(|entry| entry.known && entry.reset_safe),
         "the exact known map is safely reset as a unit, never as guessed child paths"
     );
-    state.page_scroll = overrides
-        .iter()
-        .position(|entry| entry.key == "keybindings")
-        .unwrap();
+    state.page_reveal = Some(UiKey::new("settings/modified/manual/reset/keybindings"));
 
     let cx = view_cx_at(1_080.0, 720.0);
     let compiled = runtime
@@ -20440,7 +24661,7 @@ enabled = true
     compiled.validate_parity().unwrap();
     assert!(
         compiled
-            .semantic(&UiKey::new("settings/modified/manual-overrides"))
+            .semantic(&UiKey::new("settings/modified/manual/row/keybindings"))
             .is_some()
     );
     assert!(
@@ -20686,17 +24907,16 @@ fn assert_modified_tells_the_disk_fault(
         "{reader} turns every removal off: {fault:?}"
     );
     let (state, overrides) = modified_rows(source);
-    let (ordinal, row) = overrides
+    let row = overrides
         .iter()
-        .enumerate()
-        .find(|(_, entry)| entry.key == key)
+        .find(|entry| entry.key == key)
         .unwrap_or_else(|| panic!("{key} has a Modified row: {overrides:?}"));
     assert_eq!(
         modified_effect_notes(&state, key),
         std::slice::from_ref(&fault.note)
     );
     assert!(
-        manual_override_disclosure(&state, row, ordinal, overrides.len()).contains(&fault.note),
+        manual_override_disclosure(&state, row).contains(&fault.note),
         "{key}'s detail lines carry the reader's note"
     );
     assert!(row.preview.starts_with(preview), "{row:?}");
@@ -20765,7 +24985,8 @@ fn modified_tells_an_array_of_tables_that_holds_a_disk_off_switch_as_holding_one
 
 #[test]
 fn modified_calls_a_key_this_build_still_reads_by_what_it_does_not_unknown() {
-    let source = "game_font = \"pixel\"\n[harness]\napprove_all = false\nauto_reads = true\n";
+    let source = "game_font = \"pixel\"\n[harness]\napprove_all = false\nauto_reads = true\n\
+                  rm_breaker = \"yes\"\ntrust_dialog = \"maybe\"\nread_outside_cwd = \"no\"\n";
     let snapshot = VersionedConfigService::new(source.to_string())
         .unwrap()
         .snapshot();
@@ -20780,16 +25001,25 @@ fn modified_calls_a_key_this_build_still_reads_by_what_it_does_not_unknown() {
 
     let font = row(prefs::LEGACY_EDIT_DISPLAY_FONT);
     assert_eq!(font.label, "Old spelling of Display face");
-    assert_eq!(font.preview, "Still applies · Open Manual…");
+    assert_eq!(font.preview, "Still applies");
     assert!(font.known && !font.reset_safe);
 
     let limit = row("harness.approve_all");
     assert_eq!(limit.label, "Retired supervisor setting");
-    assert_eq!(limit.preview, "Still limits approvals · Open Manual…");
+    assert_eq!(limit.preview, "Still limits approvals");
     assert!(limit.known && !limit.reset_safe);
 
     let inert = row("harness.auto_reads");
-    assert_eq!(inert.preview, "No effect · Open Manual…");
+    assert_eq!(inert.preview, "No effect");
+    // Each value as the supervisor's reader takes it: `"yes"` is an on and
+    // `"maybe"` no setting (neither limits), `"no"` an off (it limits).
+    for (key, preview) in [
+        ("harness.rm_breaker", "No effect"),
+        ("harness.trust_dialog", "No effect"),
+        ("harness.read_outside_cwd", "Still limits approvals"),
+    ] {
+        assert_eq!(row(key).preview, preview, "{key}");
+    }
     assert!(
         overrides
             .iter()
@@ -20812,18 +25042,18 @@ fn modified_manual_previews_are_typed_bounded_and_do_not_echo_unknown_values() {
         .iter()
         .find(|entry| entry.key == prefs::EDIT_SHELL_ARGS)
         .expect("known Manual list override");
-    assert_eq!(list.preview, "Current list · 2 values");
+    assert_eq!(list.preview, "2 values");
     let map = overrides
         .iter()
         .find(|entry| entry.key == "keybindings")
         .expect("known Manual map override");
-    assert_eq!(map.preview, "Current map · 2 entries");
+    assert_eq!(map.preview, "2 entries");
     let unknown = overrides
         .iter()
         .find(|entry| entry.key == "future_secret")
         .expect("unknown-key override");
     assert_eq!(unknown.label, "Unknown key");
-    assert!(unknown.preview.contains("Open Manual to inspect"));
+    assert_eq!(unknown.preview, UNKNOWN_KEY_PREVIEW);
     assert!(!unknown.preview.contains(secret));
 
     let ordinal = overrides
@@ -20834,8 +25064,8 @@ fn modified_manual_previews_are_typed_bounded_and_do_not_echo_unknown_values() {
         &state,
         unknown,
         ordinal,
-        overrides.len(),
-        SettingsWidth::Compact,
+        &key_fragment(&unknown.key),
+        300.0,
     ))
     .compile(LogicalRect::new(0.0, 0.0, 340.0, 280.0))
     .unwrap();
@@ -20850,22 +25080,6 @@ fn modified_manual_previews_are_typed_bounded_and_do_not_echo_unknown_values() {
             .iter()
             .all(|node| !node.label.contains(secret)),
         "Modified semantics must not leak an unknown authored value"
-    );
-
-    let (landscape_node, height) =
-        manual_override_landscape_node(&state, unknown, ordinal, overrides.len());
-    let landscape = UiTree::new(landscape_node)
-        .compile(LogicalRect::new(0.0, 0.0, 900.0, height))
-        .unwrap();
-    assert_eq!(
-        landscape.semantic(&value_key).unwrap().label,
-        unknown.preview
-    );
-    assert!(
-        landscape
-            .semantics
-            .iter()
-            .all(|node| !node.label.contains(secret))
     );
 
     let long = "x".repeat(MANUAL_OVERRIDE_VALUE_PREVIEW_GRAPHEMES + 20);
@@ -20923,8 +25137,8 @@ fn modified_identifies_retired_bottom_hud_keys_without_offering_reset() {
             .position(|entry| entry.key == key)
             .unwrap_or_else(|| panic!("retired {key} remains visible in Modified"));
         let retired = &overrides[ordinal];
-        assert_eq!(retired.label, "Retired Bottom HUD setting");
-        assert_eq!(retired.preview, "No effect · Open Manual…");
+        assert_eq!(retired.label, "Bottom HUD (removed)");
+        assert_eq!(retired.preview, "No effect");
         assert!(retired.known);
         assert!(!retired.reset_safe, "retired keys are preserve-only");
 
@@ -20932,8 +25146,8 @@ fn modified_identifies_retired_bottom_hud_keys_without_offering_reset() {
             &state,
             retired,
             ordinal,
-            overrides.len(),
-            SettingsWidth::Wide,
+            &key_fragment(&retired.key),
+            860.0,
         ))
         .compile(LogicalRect::new(0.0, 0.0, 900.0, 320.0))
         .unwrap();
@@ -20944,7 +25158,7 @@ fn modified_identifies_retired_bottom_hud_keys_without_offering_reset() {
                     "settings/modified/manual/value/{fragment}"
                 )))
                 .map(|node| node.label.as_str()),
-            Some("No effect · Open Manual…")
+            Some("No effect")
         );
         assert!(
             compiled
@@ -20956,7 +25170,9 @@ fn modified_identifies_retired_bottom_hud_keys_without_offering_reset() {
         );
         assert!(
             compiled
-                .semantic(&UiKey::new("settings/modified/manual/open"))
+                .semantic(&UiKey::new(format!(
+                    "settings/modified/manual/open/{fragment}"
+                )))
                 .is_some(),
             "Manual remains the explicit preservation/editing path"
         );
@@ -20986,49 +25202,84 @@ fn retired_keyword_kitty_controls_are_manual_only_and_name_no_effect() {
         "sparkle_words.feline.intensity",
     ] {
         assert!(native_compatibility_only_key(key));
-        let registered = state
-            .legacy
-            .fields
-            .iter()
-            .find(|field| field.key == key)
-            .unwrap_or_else(|| panic!("retired {key} remains registered for Manual metadata"));
         assert!(
-            !settings_field_is_visible(registered.key, true, false),
-            "retired {key} stays in the registry but must not render a native control"
+            state.legacy.fields.iter().all(|field| field.key != key),
+            "retired {key} is no Settings row; Manual types it from its metadata"
+        );
+        assert!(
+            crate::native_config_language::config_schema_entry(key).is_some(),
+            "Manual still types retired {key}"
         );
         let (ordinal, authored) = overrides
             .iter()
             .enumerate()
             .find(|(_, authored)| authored.key == key)
             .unwrap_or_else(|| panic!("retired {key} remains reachable in Modified"));
-        assert!(authored.label.starts_with("Retired Keyword Kitty"));
-        assert_eq!(authored.preview, "No effect · Open Manual…");
+        assert!(
+            authored.label.starts_with("Keyword Kitty"),
+            "{}",
+            authored.label
+        );
+        assert_eq!(authored.preview, "No effect");
         assert!(authored.known);
-        assert!(!authored.reset_safe);
+        assert!(
+            authored.reset_safe,
+            "a key that does nothing can be removed"
+        );
 
         let compiled = UiTree::new(manual_override_node(
             &state,
             authored,
             ordinal,
-            overrides.len(),
-            SettingsWidth::Wide,
+            &key_fragment(&authored.key),
+            860.0,
         ))
         .compile(LogicalRect::new(0.0, 0.0, 900.0, 320.0))
         .unwrap();
         assert!(
             compiled
-                .semantic(&UiKey::new("settings/modified/manual/open"))
+                .semantic(&UiKey::new(format!(
+                    "settings/modified/manual/open/{}",
+                    key_fragment(&authored.key)
+                )))
                 .is_some(),
             "Manual is the explicit preservation/editing path for {key}"
         );
-        assert!(
+        let remove = compiled
+            .semantic(&UiKey::new(format!(
+                "settings/modified/manual/reset/{}",
+                key_fragment(key)
+            )))
+            .unwrap_or_else(|| panic!("retired {key} offers Remove"));
+        assert!(remove.label.starts_with("Remove "), "{}", remove.label);
+        assert_eq!(
             compiled
                 .semantic(&UiKey::new(format!(
-                    "settings/modified/manual/reset/{}",
-                    key_fragment(key)
+                    "settings/modified/manual/value/{}",
+                    key_fragment(&authored.key)
                 )))
-                .is_none(),
-            "retired {key} is preserve-only"
+                .unwrap()
+                .label,
+            "No effect",
+            "the preview says it does nothing, once"
+        );
+        // Removing it leaves nothing to report on a key that is gone.
+        let removed = config_application_projection(
+            &state,
+            &ConfigPatch {
+                base_revision: 1,
+                edits: vec![ConfigEdit {
+                    key: key.to_string(),
+                    expected: ExpectedConfigValue::Exact(None),
+                    value: None,
+                }],
+            },
+            audited_availability(),
+        );
+        assert!(
+            removed.unavailable_notes.is_empty(),
+            "{key}: {:?}",
+            removed.unavailable_notes
         );
     }
 }
@@ -21251,8 +25502,16 @@ fn native_sound_menu_is_one_box_on_one_route() {
             prefs::SOUND_MENU_KEYS.contains(&key),
             "{key} is audible but absent from SOUND_MENU_KEYS"
         );
-        assert_eq!(prefs::section_of(key), prefs::Section::Cursor, "{key}");
-        assert_eq!(prefs::group_of(key).0, "Sound", "{key}");
+        assert_eq!(prefs::section_of(key), prefs::Section::Sound, "{key}");
+        assert_eq!(
+            prefs::group_of(key).0,
+            if key == prefs::EDIT_BELL_SOUND {
+                "Terminal bell"
+            } else {
+                "Sound effects"
+            },
+            "{key}"
+        );
     }
     // Nothing NON-audible smuggled itself into the routing list.
     assert_eq!(
@@ -21283,6 +25542,8 @@ fn native_sound_menu_is_one_box_on_one_route() {
         prefs::EDIT_SPARKLE_BONK_DETONATION,
         // The supervisor's choice chime (the question-policy contract).
         prefs::EDIT_CHOICE_SOUND,
+        // The output streak's pip.
+        prefs::EDIT_OUTPUT_STREAK_SOUND,
     ] {
         assert!(
             shown.contains(&required),
@@ -21297,34 +25558,49 @@ fn native_sound_menu_is_one_box_on_one_route() {
         "the terminal bell row must not promise a beep this platform never makes"
     );
 
-    // The MASTER switch is deliberately not duplicated into the box: it is a
-    // Top Setting ("Music effects"), and a second copy would let two
-    // controls disagree about one key. It stays findable by search.
+    // The MASTER switch is no ordinary row: the Sound page leads with the
+    // Top Settings card's own Music effects control (`music_effects_rows`), so
+    // the two places run one transaction and cannot disagree.
     assert!(
         !settings_field_is_visible(prefs::EDIT_TRAIL_SOUNDS, false, false),
-        "the master belongs to Top Settings, not a second Advanced row"
+        "the master is the shared Top control, not a second Advanced row"
     );
     assert!(
         settings_field_is_visible(prefs::EDIT_TRAIL_SOUNDS, false, true),
         "the master must still answer a global search for sound"
     );
-    // …but the box must SAY where it went, or a user who opens Sound looking
-    // for the on/off switch finds seven rows and no master.
-    let note = prefs::group_footnote("Sound").expect("the Sound box needs consequence copy");
+    let (mut runtime, instance, view) = setup();
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: route_action(SettingsRoute::Sound),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_024.0, 768.0));
     assert!(
-        note.contains("Music effects") && note.contains("Top Settings"),
-        "the Sound box must point at the master switch it does not host: {note}"
+        compiled
+            .semantic(&UiKey::new(format!(
+                "settings/control/{}",
+                prefs::EDIT_TRAIL_SOUNDS
+            )))
+            .is_some(),
+        "the Sound page leads with the Music effects switch"
     );
-    // …and it must SCOPE that master, because this box holds two
-    // independent audio paths. `lib.rs::on_bell` reads neither
-    // `trail_sounds` nor `trail_sound_volume`
-    // (`sound_menu_keys_are_read_at_their_consumers` pins that), so copy
-    // calling Music effects "the master switch" flatly promised a user that
-    // muting it would stop the beep. It does not.
+    // The page holds two independent audio paths, and its notes say which
+    // rows the master and the volume reach: `lib.rs::on_bell` reads neither
+    // (`sound_menu_keys_are_read_at_their_consumers` pins that).
+    let synth_note = prefs::footnote_of(prefs::EDIT_TRAIL_SOUND_VOLUME)
+        .expect("the synth box needs consequence copy");
+    assert!(synth_note.contains("Music effects") && synth_note.contains("Sound volume"));
+    let bell_note =
+        prefs::footnote_of(prefs::EDIT_BELL_SOUND).expect("the bell needs consequence copy");
     assert!(
-        note.contains("synth voices") && note.contains("bell"),
-        "the Sound box must scope the master to the synth voices and name \
-         the bell as the exception: {note}"
+        bell_note.contains("Music effects") && bell_note.contains("do not change it"),
+        "the bell's note names it as the exception: {bell_note}"
     );
 
     // The bonk keys' escape from the keyword-toy rule is exact: their
@@ -21338,6 +25614,168 @@ fn native_sound_menu_is_one_box_on_one_route() {
             "{sibling} must stay a Manual-only keyword-toy internal"
         );
     }
+}
+
+/// REDUCE MOTION READS AS ITS OPTION LABEL ON EVERY SURFACE: the Motion
+/// picker's "Reduce motion" is the word for the person's choice on the
+/// Sound page's rows and its Music effects status, and in the cursor
+/// preview's badge and spoken summary; no surface keeps the old "Reduced".
+#[test]
+fn reduce_motion_reads_as_its_option_label_on_every_surface() {
+    let words = reduce_motion_words();
+    assert_eq!(words, "Reduce motion", "the picker's own label");
+    let stale = [
+        "Motion: Reduced",
+        "set to Reduced",
+        "Motion reduced",
+        "Reduced motion",
+    ];
+    // Negative control: the old status line is what the list catches.
+    assert!(
+        stale
+            .iter()
+            .any(|old| "On, currently suppressed by Motion: Reduced.".contains(old))
+    );
+    let snapshot = VersionedConfigService::new("motion = \"reduced\"\n".to_string())
+        .unwrap()
+        .snapshot();
+    for route in [
+        SettingsRoute::Sound,
+        SettingsRoute::CursorMotion,
+        SettingsRoute::Home,
+    ] {
+        let mut state = SettingsViewState::from_snapshot(&snapshot).unwrap();
+        state.navigate(route);
+        let compiled = settings_route_at(&state, &view_cx_at(1_200.0, 1_600.0));
+        let mut said: Vec<String> = painted_texts(&compiled);
+        for node in &compiled.semantics {
+            said.push(node.label.clone());
+            if let SemanticValue::Text(value) = &node.value {
+                said.push(value.clone());
+            }
+        }
+        let said = said.join("\n");
+        assert!(said.contains(&words), "{route:?} names {words:?}:\n{said}");
+        for old in stale {
+            assert!(!said.contains(old), "{route:?} still says {old:?}:\n{said}");
+        }
+    }
+    let state = SettingsViewState::from_snapshot(&snapshot).unwrap();
+    let status = top_music_suppression_reason_for_output(
+        &state,
+        crate::native_app::ViewMotionCx::default(),
+        true,
+    )
+    .expect("the music status names the pause");
+    assert!(status.full().contains(&words), "{}", status.full());
+}
+
+/// A SOUND ROW SAYS "INACTIVE" UNDER A MOTION POLICY EXACTLY WHERE ITS VOICES
+/// ARE SILENT, by the voice table the host plays by
+/// (`aterm_effects::sound_policy::voice_gain`). Reduce motion, the system's
+/// Reduce Motion and the load shed stop the light of the bonk and the output
+/// streak, so their rows say so; the typing notes, the riff and the chime
+/// play on, so Music effects, its volume, the melody, the bed, the riff and
+/// the chime say nothing. This window being in the background silences
+/// nothing: the window that plays is the one a key lands in.
+#[test]
+fn sound_rows_say_inactive_exactly_where_their_voices_are_silent() {
+    use crate::motion::{MotionEffect, MotionMode, MotionPolicy};
+    use aterm_effects::sound_policy::{Voice, VoiceTerms, voice_gain};
+    let availability = audited_availability();
+    let base = "cursor_trail = true\ncursor_trail_style = \"rainbow kitty pet\"\n\
+                [output_streak]\nenabled = true\n";
+    let rows: [(&str, &[Voice]); 8] = [
+        (prefs::EDIT_TRAIL_SOUNDS, &Voice::ALL),
+        (prefs::EDIT_TRAIL_SOUND_VOLUME, &Voice::ALL),
+        (prefs::EDIT_TONE_MELODY, &[Voice::Keystroke]),
+        (prefs::EDIT_TRAIL_SOUND_BED, &[Voice::Keystroke]),
+        (prefs::EDIT_TRAIL_SOUND_RIFF, &[Voice::Riff]),
+        (prefs::EDIT_CHOICE_SOUND, &[Voice::Chime]),
+        (prefs::EDIT_SPARKLE_BONK, &[Voice::Bonk]),
+        (prefs::EDIT_OUTPUT_STREAK_SOUND, &[Voice::StreakPip]),
+    ];
+    let still = crate::native_app::ViewMotionCx::default();
+    // The playing window's policy for one effect.
+    type Playing = fn(MotionEffect) -> MotionPolicy;
+    // (the case, what is set, the Settings window's state, the playing
+    // window's policy)
+    let cases: [(&str, &str, crate::native_app::ViewMotionCx, Playing); 5] = [
+        ("nothing", "", still, |_| MotionPolicy::Full),
+        ("Reduce motion", "motion = \"reduced\"\n", still, |_| {
+            MotionPolicy::resolve(MotionMode::Reduced, false, true)
+        }),
+        (
+            "system Reduce Motion",
+            "",
+            crate::native_app::ViewMotionCx {
+                system_reduced: true,
+                ..still
+            },
+            |_| MotionPolicy::resolve(MotionMode::Auto, true, true),
+        ),
+        (
+            "heavy load",
+            "",
+            crate::native_app::ViewMotionCx {
+                performance_reduced: true,
+                ..still
+            },
+            |effect| {
+                if effect.load_shed_exempt() {
+                    MotionPolicy::Full
+                } else {
+                    MotionPolicy::Reduced
+                }
+            },
+        ),
+        (
+            "this window unfocused",
+            "",
+            crate::native_app::ViewMotionCx {
+                focused: false,
+                ..still
+            },
+            // The window a key lands in, or a chime plays from, is focused.
+            |_| MotionPolicy::Full,
+        ),
+    ];
+    let mut idled = 0;
+    for (case, extra, cx, playing) in cases {
+        // Top-level keys go before the base's table.
+        let source = format!("{extra}{base}");
+        for (key, voices) in rows {
+            let silent = voices.iter().all(|voice| {
+                voice_gain(
+                    *voice,
+                    &VoiceTerms {
+                        master: true,
+                        own: true,
+                        volume: 0.4,
+                        raw_focused: true,
+                        reduced_motion: voice
+                            .motion_twin()
+                            .is_some_and(|twin| !playing(twin).animate(twin)),
+                    },
+                )
+                .is_none()
+            });
+            let effect = projected_effect(&source, &[], key, availability, cx);
+            let inactive = effect
+                .notes
+                .iter()
+                .any(|note| note.kind == EffectNoteKind::Inactive);
+            assert_eq!(
+                inactive, silent,
+                "{case}: {key} says Inactive exactly when its voices are silent: {effect:?}"
+            );
+            idled += usize::from(inactive);
+        }
+    }
+    assert!(
+        idled >= 6,
+        "non-vacuous: the bonk and the pip idle under each reduction"
+    );
 }
 
 /// THE SOUND ROWS DISCLOSE THEIR REAL GATES, AND ONLY THEIR REAL GATES.
@@ -21365,8 +25803,19 @@ fn sound_rows_disclose_their_real_gates_and_no_false_ones() {
     for key in [prefs::EDIT_TONE_MELODY, prefs::EDIT_TRAIL_SOUND_BED] {
         let effect = projected_effect("cursor_trail = false\n", &[], key, availability, motion);
         assert!(
-            effect_note_contains(&effect, "Cursor trail is Off"),
+            effect_note_contains(&effect, "cursor effects off"),
             "{key} must disclose the trail gate it actually has: {effect:?}"
+        );
+        let style_off = projected_effect(
+            "cursor_trail = true\ncursor_trail_style = \"off\"\n",
+            &[],
+            key,
+            availability,
+            motion,
+        );
+        assert!(
+            effect_note_contains(&style_off, "Cursor style Off"),
+            "{key}: {style_off:?}"
         );
         assert!(!effect.has_live_effect, "{key}");
     }
@@ -21380,9 +25829,58 @@ fn sound_rows_disclose_their_real_gates_and_no_false_ones() {
         motion,
     );
     assert!(
-        !effect_note_contains(&trail_off, "Cursor trail is Off"),
+        !effect_note_contains(&trail_off, "cursor effects off"),
         "the riff still sings with the trail off; claiming otherwise is a lie: {trail_off:?}"
     );
+
+    // Only the companion styles sing it: under another style it is idle.
+    for source in [
+        "cursor_trail = true\ncursor_trail_style = \"comet\"\n",
+        "cursor_trail = true\ncursor_trail_style = \"off\"\n",
+    ] {
+        let riff = projected_effect(
+            source,
+            &[],
+            prefs::EDIT_TRAIL_SOUND_RIFF,
+            availability,
+            motion,
+        );
+        assert!(
+            effect_note_contains(&riff, "companion styles only"),
+            "{source}{riff:?}"
+        );
+        assert!(!riff.has_live_effect, "{source}");
+    }
+
+    // THE VOLUME scales the chime, the bonk, the riff and the output sounds,
+    // which all play with no trail drawn: the trail is not its gate, the
+    // Music effects switch is.
+    for source in [
+        "cursor_trail = false\n",
+        "cursor_trail = true\ncursor_trail_style = \"off\"\n",
+    ] {
+        let volume = projected_effect(
+            source,
+            &[],
+            prefs::EDIT_TRAIL_SOUND_VOLUME,
+            availability,
+            motion,
+        );
+        assert!(volume.has_live_effect, "{source}{volume:?}");
+        assert!(volume.notes.is_empty(), "{source}{volume:?}");
+    }
+    let volume_music_off = projected_effect(
+        "trail_sounds = false\n",
+        &[],
+        prefs::EDIT_TRAIL_SOUND_VOLUME,
+        availability,
+        motion,
+    );
+    assert!(
+        effect_note_contains(&volume_music_off, "Music effects is Off"),
+        "{volume_music_off:?}"
+    );
+    assert!(!volume_music_off.has_live_effect);
 
     // …and it must disclose the master switch, which IS one of its gates.
     let music_off = projected_effect(
@@ -21408,7 +25906,7 @@ fn sound_rows_disclose_their_real_gates_and_no_false_ones() {
         motion,
     );
     assert!(
-        !effect_note_contains(&bonk_trail_off, "Cursor trail is Off"),
+        !effect_note_contains(&bonk_trail_off, "cursor effects off"),
         "the bonk fires with the trail off: {bonk_trail_off:?}"
     );
     // Its REAL gate, asserted so the negative above cannot pass merely
@@ -21421,7 +25919,7 @@ fn sound_rows_disclose_their_real_gates_and_no_false_ones() {
         motion,
     );
     assert!(
-        effect_note_contains(&bonk_master_off, "Sparkle Words master is Off"),
+        effect_note_contains(&bonk_master_off, "all word effects are switched off"),
         "the bonk must disclose the sparkle master that does silence it: {bonk_master_off:?}"
     );
     // …and the MUSIC master, which since 2026-08-09 also silences it
@@ -21490,6 +25988,170 @@ fn sound_rows_disclose_their_real_gates_and_no_false_ones() {
     );
 }
 
+/// A BOX SAYS WHY ITS ROWS ARE IDLE ONLY WHERE ALL OF THEM ARE. With cursor
+/// effects off only Tone-adaptive melody and Ambient sound bed fall idle, so
+/// the Sound box says nothing for itself (nothing claims Sound volume, the
+/// chime or the bonks) and those two rows paint their own Inactive tag. With
+/// Music effects off every row is idle for that one reason, and the box says
+/// it once. Under Rainbow kitty the trail-effect box, whose duration and
+/// intensity it still reads, says nothing for itself; the trail-color box,
+/// both of whose rows it ignores, speaks of all of them, never of "it".
+#[test]
+fn a_box_says_why_its_rows_are_idle_only_where_all_of_them_are() {
+    let state_for = |source: &str| {
+        let service = VersionedConfigService::new(source.to_string()).unwrap();
+        SettingsViewState::from_snapshot(&service.snapshot()).unwrap()
+    };
+    let sound_box: Vec<&str> = prefs::SOUND_MENU_KEYS
+        .iter()
+        .copied()
+        .filter(|key| {
+            prefs::group_of(key).0 == "Sound effects"
+                && settings_field_is_visible(key, false, false)
+        })
+        .collect();
+    assert!(sound_box.len() >= 2 && sound_box.contains(&prefs::EDIT_TRAIL_SOUND_VOLUME));
+    assert_eq!(
+        shared_inactive_reason(&state_for("cursor_trail = false\n"), &sound_box),
+        None,
+        "cursor effects off idles two of the box's rows, not Sound volume"
+    );
+    assert_eq!(
+        shared_inactive_reason(&state_for("trail_sounds = false\n"), &sound_box)
+            .map(|(_, sentence)| sentence),
+        Some("These are inactive for now: Music effects is Off.".to_string()),
+        "Music effects off idles every row of the box"
+    );
+    let rainbow = state_for("");
+    assert_eq!(
+        shared_inactive_reason(
+            &rainbow,
+            &[
+                prefs::EDIT_CURSOR_TRAIL_MS,
+                prefs::EDIT_CURSOR_TRAIL_INTENSITY,
+                prefs::EDIT_CURSOR_TRAIL_LENGTH,
+                prefs::EDIT_CURSOR_TRAIL_RADIUS,
+            ],
+        ),
+        None,
+        "Rainbow kitty reads the duration and intensity"
+    );
+    assert_eq!(
+        shared_inactive_reason(
+            &rainbow,
+            &[
+                prefs::EDIT_CURSOR_TRAIL_COLOR,
+                prefs::EDIT_CURSOR_TRAIL_ACCENT
+            ],
+        )
+        .map(|(_, sentence)| sentence),
+        Some("Rainbow kitty does not use these.".to_string())
+    );
+
+    // On the page: no box sentence, and the idle rows say it themselves.
+    let (mut runtime, instance, view) = setup();
+    replace_settings_source(&mut runtime, view, "cursor_trail = false\n".to_string());
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: route_action(SettingsRoute::Sound),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 1_600.0));
+    let painted = |prefixes: &[String]| -> String {
+        compiled
+            .paint
+            .iter()
+            .filter(|node| {
+                !node.peek
+                    && prefixes
+                        .iter()
+                        .any(|prefix| node.key.as_str().starts_with(prefix.as_str()))
+            })
+            .filter_map(|node| match &node.content {
+                UiContent::Text(spec) => Some(spec.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    assert_eq!(
+        painted(&["settings/group-reason/".to_string()]),
+        "",
+        "no sentence heads a box whose other rows still work"
+    );
+    for key in [prefs::EDIT_TONE_MELODY, prefs::EDIT_TRAIL_SOUND_BED] {
+        let row = painted(&[
+            format!("settings/label/{key}/visual"),
+            format!("settings/detail/{key}/line-"),
+        ]);
+        assert!(
+            row.contains("Inactive"),
+            "{key} paints its own tag: {row:?}"
+        );
+    }
+    let volume = painted(&[
+        format!("settings/label/{}/visual", prefs::EDIT_TRAIL_SOUND_VOLUME),
+        format!("settings/detail/{}/line-", prefs::EDIT_TRAIL_SOUND_VOLUME),
+    ]);
+    assert!(
+        !volume.contains("Inactive"),
+        "Sound volume works: {volume:?}"
+    );
+}
+
+/// BLOOM IS A GLOW OF LIGHT, which a light background cannot show (a light
+/// theme draws trails as ink): on GitHub Light the Bloom switch and its two
+/// sliders say they apply on dark themes only, before Bloom Off's own note;
+/// on the default dark theme they are live, and Bloom Off still idles the
+/// sliders.
+#[test]
+fn bloom_rows_say_they_have_no_effect_on_a_light_theme() {
+    let project = |source: &str, key: &str| {
+        let service = VersionedConfigService::new(source.to_string()).unwrap();
+        let state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+        setting_effect_projection(
+            &state,
+            None,
+            key,
+            audited_availability(),
+            // A dark system: with no theme authored, Default is dark.
+            crate::native_app::ViewMotionCx {
+                system_dark: true,
+                ..crate::native_app::ViewMotionCx::default()
+            },
+        )
+    };
+    for key in [
+        prefs::EDIT_CURSOR_TRAIL_BLOOM,
+        prefs::EDIT_CURSOR_TRAIL_BLOOM_STRENGTH,
+        prefs::EDIT_CURSOR_TRAIL_BLOOM_RADIUS,
+    ] {
+        let light = project(
+            "theme = \"GitHub Light\"\ncursor_trail_style = \"comet\"\n",
+            key,
+        );
+        assert!(
+            effect_note_contains(&light, "dark themes only") && !light.has_live_effect,
+            "{key} on a light theme: {light:?}"
+        );
+        let dark = project("cursor_trail_style = \"comet\"\n", key);
+        assert!(
+            !effect_note_contains(&dark, "dark themes only"),
+            "{key} on the default dark theme: {dark:?}"
+        );
+    }
+    let off = project(
+        "cursor_trail_style = \"comet\"\ncursor_trail_bloom = false\n",
+        prefs::EDIT_CURSOR_TRAIL_BLOOM_STRENGTH,
+    );
+    assert!(effect_note_contains(&off, "Bloom Off"), "{off:?}");
+}
+
 /// SERIOUS MODE IS DISCLOSED ON EVERY AUDIBLE ROW IT ACTUALLY SILENCES —
 /// and on none that it does not.
 ///
@@ -21528,7 +26190,7 @@ fn serious_mode_is_disclosed_on_the_sound_rows_it_silences() {
         prefs::EDIT_SPARKLE_BONK_DETONATION,
     ] {
         // Both postures AUTHOR the trail master. It is the top rung of the
-        // same disclosure ladder ("Inactive · Cursor trail Off" outranks the
+        // same disclosure ladder ("Inactive: cursor effects off" outranks the
         // Serious Mode note), and its absent-key default is platform-split —
         // so leaving it unwritten would make the quiet case pass for the
         // wrong reason on Windows and the serious case fail outright.
@@ -21598,7 +26260,7 @@ fn typing_sound_choice_labels_read_as_instruments() {
     }
     // Other keys' `auto` keeps its generic label.
     assert_eq!(
-        setting_choice_label(prefs::EDIT_WINDOW_THEME, "auto"),
+        setting_choice_label(prefs::EDIT_MOTION, "auto"),
         "Automatic"
     );
     let field = prefs::editable_fields(&crate::app_config::Config::default())
@@ -21617,9 +26279,8 @@ fn typing_sound_choice_labels_read_as_instruments() {
         false,
         false,
         "auto",
-        &crate::app_config::ThemeCatalog::default(),
     );
-    assert_eq!(picker.options[0].label, "Follow the trail");
+    assert_eq!(picker.options[0].label, "Follow the trail (default)");
     assert!(picker.options.iter().any(|o| o.label == "Music box"));
     assert!(
         picker.options.iter().all(|o| o.label != "Glass bell"),
@@ -21627,92 +26288,34 @@ fn typing_sound_choice_labels_read_as_instruments() {
     );
 }
 
-/// THE UNDERLINE ROW FITS ITS OWN BUTTON. `rainbow kitty underline` is the
-/// longest spelling the trail list has ever carried (23 characters, against
-/// the previous longest `rainbow kitty pet` at 17), and sentence-cased it
-/// measured 133.6 pt inside the 132.0 pt Top control at 1.0× text scale —
-/// the renderer clipped it to `Rainbow kitty underl…` and the Top paint
-/// audit went red
-/// (`top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow`).
-///
-/// The fix is a PAINT LABEL, like `EDIT_MOTION`'s, not a narrower control
-/// and not a renamed config value: the button reads the family's shorter
-/// spelling, which stays honest (it names the highlighter-plus-strip mark,
-/// the geometry that spelling selects — and, since 2026-08-28, the family
-/// default) and stays a legal `cursor_trail_style` — pinned below by
-/// canonicalising the label itself.
-/// The committed value, the semantics and the open picker's rows keep the
-/// complete spelling.
+/// A STYLE READS AS ITS NAME, through any spelling of it: the name its row
+/// on Cursor Styles shows, in the closed control, the preview and the
+/// accessible label alike. The naming is scoped to this key.
 #[test]
-fn cursor_trail_underline_choice_label_fits_the_control() {
-    // Every spelling the ENGINE routes to the strip gets the one label —
-    // the predicate is asked, not a second copy of the list.
-    for spelling in [
-        "rainbow kitty underline",
-        "rainbow underline",
-        "underline rainbow",
-        "nyan underline",
-        "  Rainbow Kitty Underline  ",
+fn every_cursor_style_spelling_reads_as_its_list_name() {
+    for (spelling, name) in [
+        ("rainbow kitty pet", "Rainbow kitty"),
+        ("rainbow kitty", "Rainbow kitty"),
+        ("Rainbow Kitty Tall", "Rainbow kitty"),
+        ("kitty", "Rainbow kitty"),
+        ("rainbow kitty underline", "Rainbow underline"),
+        ("  nyan underline  ", "Rainbow underline"),
+        ("nyan", "Flying kitty"),
+        ("dog pet", "Rainbow dog"),
+        ("classic lumen", "Classic mono"),
+        ("off", "Off"),
+        ("pack:synthwave", "Trail pack · Synthwave"),
+        ("plasma", "Plasma"),
     ] {
         assert_eq!(
             setting_choice_label(prefs::EDIT_CURSOR_TRAIL_STYLE, spelling),
-            "Rainbow underline",
-            "{spelling:?} is an underline spelling and must read as the short label"
+            name,
+            "{spelling:?}"
         );
     }
-    // HONEST: the label is itself a spelling of the style it names, so it
-    // resolves back to the value the control is holding.
-    assert_eq!(
-        prefs::cursor_trail_style_canonical("rainbow underline"),
-        Some("rainbow kitty underline")
-    );
-    // Every other trail entry keeps its plain sentence case…
-    for (value, label) in [
-        ("rainbow kitty", "Rainbow kitty"),
-        ("rainbow kitty pet", "Rainbow kitty pet"),
-        ("rainbow kitty flying", "Rainbow kitty flying"),
-        ("rainbow kitty tall", "Rainbow kitty tall"),
-        ("off", "Off"),
-    ] {
-        assert_eq!(
-            setting_choice_label(prefs::EDIT_CURSOR_TRAIL_STYLE, value),
-            label
-        );
-    }
-    // …and the shortening is scoped to this key.
     assert_eq!(
         setting_choice_label(prefs::EDIT_WINDOW_THEME, "rainbow kitty underline"),
         "Rainbow kitty underline"
-    );
-    // The open list — which has the width for it — still names the config
-    // spelling, so the row a screen reader announces is the value written.
-    let field = prefs::editable_fields(&crate::app_config::Config::default())
-        .into_iter()
-        .find(|f| f.key == prefs::EDIT_CURSOR_TRAIL_STYLE)
-        .expect("the cursor-trail row");
-    let choices = choices_for_field(&field, &[], &crate::app_config::ThemeCatalog::default())
-        .expect("static options");
-    assert!(choices.iter().any(|c| c == "rainbow kitty underline"));
-    let picker = ChoicePicker::new(
-        prefs::EDIT_CURSOR_TRAIL_STYLE,
-        choices,
-        prefs::DEFAULT_CURSOR_TRAIL_STYLE,
-        false,
-        false,
-        prefs::DEFAULT_CURSOR_TRAIL_STYLE,
-        &crate::app_config::ThemeCatalog::default(),
-    );
-    assert!(
-        picker
-            .options
-            .iter()
-            .any(|option| option.label == "Rainbow kitty underline"),
-        "picker rows: {:?}",
-        picker
-            .options
-            .iter()
-            .map(|option| option.label.clone())
-            .collect::<Vec<_>>()
     );
 }
 
@@ -21948,7 +26551,19 @@ fn visual_forms_hide_inert_and_compatibility_only_effect_controls() {
         assert!(!settings_field_is_visible(key, false, true), "{key}");
     }
     assert!(settings_field_is_visible(SPARKLE_WORDS_KEY, true, false));
-    assert!(!settings_field_is_visible(prefs::EDIT_THEME, false, false));
+    // Color theme and Window appearance lead the Appearance page as well as
+    // Top Settings; the other Top Settings stay there alone.
+    assert!(settings_field_is_visible(prefs::EDIT_THEME, false, false));
+    assert!(settings_field_is_visible(
+        prefs::EDIT_WINDOW_THEME,
+        false,
+        false
+    ));
+    assert!(!settings_field_is_visible(
+        prefs::EDIT_TRAIL_SOUNDS,
+        false,
+        false
+    ));
     assert!(settings_field_is_visible(prefs::EDIT_THEME, true, false));
     for macos_only in [
         prefs::EDIT_FONT_THICKEN,
@@ -22001,7 +26616,8 @@ fn visual_forms_hide_inert_and_compatibility_only_effect_controls() {
         "net.listen",
         "update.owner",
         "matrix_rain.fps",
-        prefs::EDIT_CURSOR_TRAIL_BLOOM_STRENGTH,
+        // What HDR glow does depends on the display: Manual keeps it.
+        prefs::EDIT_HDR_GLOW,
         prefs::EDIT_SHOW_BUILD_BADGE,
         prefs::EDIT_COLUMNS,
         prefs::EDIT_LINES,
@@ -22044,44 +26660,51 @@ fn visual_forms_hide_inert_and_compatibility_only_effect_controls() {
         .map(|field| prefs::group_of(field.key).0)
         .collect::<BTreeSet<_>>();
     let mut group_witnesses = vec![
+        // The color theme leads Appearance, its Browse themes… beside it.
+        ("Theme", prefs::EDIT_THEME),
         ("Colors", prefs::EDIT_FOREGROUND),
         ("Text & Contrast", prefs::EDIT_MINIMUM_CONTRAST),
         ("Font", prefs::EDIT_FONT_FAMILY),
-        ("Shaping", prefs::EDIT_LIGATURES),
-        ("Line layout", prefs::EDIT_LINE_HEIGHT),
-        ("Rendering", prefs::EDIT_FONT_WEIGHT),
+        ("Rendering", prefs::EDIT_LIGATURES),
+        ("Styles & fallbacks", prefs::EDIT_EMOJI_FONT),
+        ("Cursor", prefs::EDIT_CURSOR_BLINK),
         ("Cursor", prefs::EDIT_CURSOR_STYLE),
         ("Motion", prefs::EDIT_MOTION),
-        ("Stream fade", prefs::EDIT_STREAM_FADE),
-        ("Matrix rain", prefs::EDIT_MATRIX_RAIN_ENABLED),
-        ("Window padding", prefs::EDIT_WINDOW_PADDING),
+        ("Output", prefs::EDIT_STREAM_FADE),
+        ("Effects", prefs::EDIT_MATRIX_RAIN_ENABLED),
+        ("Theme", prefs::EDIT_THEME),
+        ("Tabs & panes", prefs::EDIT_SPLIT_FOCUS_MARK),
+        ("Padding", prefs::EDIT_WINDOW_PADDING),
         ("Session", prefs::EDIT_RESTORE_SESSION),
         ("Clipboard", prefs::EDIT_COPY_ON_SELECT),
         ("Keyboard", prefs::EDIT_PREDICTIVE_ECHO),
         ("Scrollback", prefs::EDIT_SCROLLBACK),
         ("Text direction & width", prefs::EDIT_BIDI),
         ("Permissions", prefs::EDIT_ALLOW_WINDOW_OPS),
-        // 2026-07-24 UX audit: exposing `cursor_trail_intensity` (plus the
-        // two trail-sound keys) surfaced the "Trail effect" caption, which
-        // needs its own curated witness like every other group.
+        // The style tuning the Cursor Styles page shows for a style.
         ("Trail effect", prefs::EDIT_CURSOR_TRAIL_INTENSITY),
-        // The Sound menu's curated witness is the master VOLUME slider —
-        // the one control the owner named first, and the only one every
-        // other row in the box is scaled by.
-        ("Sound", prefs::EDIT_TRAIL_SOUND_VOLUME),
-        // The Cursor Kitty page contributes NO ordinary group box. Its
-        // "Companion" caption belongs to `cursor_trail_style`, a Top
-        // Setting the ordinary form never draws — the showcase card owns
-        // that row — and its one real box, "Rainbow wake", went with the
-        // retired dial (2026-09-16).
+        ("Trail color", prefs::EDIT_CURSOR_TRAIL_COLOR),
+        ("Bloom & glow", prefs::EDIT_CURSOR_TRAIL_BLOOM),
+        // The Sound page's synth voices; its witness is the VOLUME slider,
+        // the one every other row in the box is scaled by.
+        ("Sound effects", prefs::EDIT_TRAIL_SOUND_VOLUME),
+        // The Harness page's SUPERVISION card: the coding-agent supervisor.
+        ("Harness supervision", prefs::EDIT_HARNESS_ENABLED),
     ];
+    // The bell's row exists where there is a system beep to silence.
+    if cfg!(any(target_os = "macos", windows)) {
+        group_witnesses.push(("Terminal bell", prefs::EDIT_BELL_SOUND));
+    }
     if cfg!(target_os = "macos") {
-        group_witnesses.push(("Transparency", prefs::EDIT_BACKGROUND_OPACITY));
-        // The Security page's second box: the [machine] host settings the
-        // "This Mac" card confirms.
+        // The Security page's second box: the [machine] host setting, with
+        // the measured state under it.
         group_witnesses.push(("This Mac", prefs::EDIT_MACHINE_UNIVERSAL_CONTROL));
     }
-    group_witnesses.push(("Paste safety", prefs::EDIT_CONFIRM_MULTILINE_PASTE));
+    // Appearance's Background box: the window material, where a platform
+    // backdrop consumes it.
+    if cfg!(any(target_os = "macos", windows)) {
+        group_witnesses.push(("Background", prefs::EDIT_BACKGROUND_MATERIAL));
+    }
     // The Security page's "Notifications" box (`desktop_alerts`): a row only
     // where a desktop notifier exists.
     if crate::notify::delivery_available() {
@@ -22102,41 +26725,6 @@ fn visual_forms_hide_inert_and_compatibility_only_effect_controls() {
         );
         assert_eq!(prefs::group_of(key).0, *group, "{group}: {key}");
     }
-    for (group, relevant_copy) in [
-        ("Text & Contrast", "contrast"),
-        ("Transparency", "opacity"),
-        ("Rendering", "weight"),
-        ("Motion", "motion"),
-        ("Stream fade", "fades"),
-        ("Matrix rain", "Rain"),
-        ("Window padding", "padding"),
-        ("Paste safety", "paste"),
-        ("Keyboard", "Predictive echo"),
-        ("Scrollback", "Searchable scrollback lines"),
-        ("Text direction & width", "right-to-left"),
-        ("Permissions", "refuses the program"),
-        // Off loses nothing: the note says where the alerts still go.
-        ("Notifications", "menu bar"),
-        // The This Mac box must say the second way its rows apply — the
-        // card's own button — and how each change is undone.
-        ("This Mac", "Apply now"),
-        // The Sound box's footnote must name what the VOLUME slider does
-        // and does not reach — the reason the bell needed its own row.
-        ("Sound", "Volume"),
-    ] {
-        if ordinary_groups.contains(group) {
-            let note = prefs::group_footnote(group)
-                .unwrap_or_else(|| panic!("{group} needs consequence copy"));
-            assert!(
-                note.to_lowercase().contains(&relevant_copy.to_lowercase()),
-                "{group} copy does not describe its retained control: {note}",
-            );
-        }
-    }
-    assert!(
-        prefs::group_footnote("Clipboard").is_none(),
-        "copy-on-select must not inherit Manual-only paste-safety copy",
-    );
     for field in fields.iter().filter(|field| ordinary_advanced_field(field)) {
         assert!(
             native_advanced_effect(field.key).is_some(),
@@ -22159,28 +26747,11 @@ fn visual_forms_hide_inert_and_compatibility_only_effect_controls() {
             prefs::section_of(field.key) == section
                 && settings_field_is_visible(field.key, false, false)
         });
-        if !has_ordinary_row {
-            // AN EMPTY DESTINATION IS THE DEFECT; A ROWLESS ONE IS NOT THE
-            // SAME THING. This asked "does the route own a visible ordinary
-            // field" as a proxy for "does the route show the user
-            // anything", and the proxy held only while every destination
-            // was built out of registry rows. Cursor Kitty is not: its
-            // content is the companion showcase card (`cursor_kitty_card`,
-            // which "can never be shed outright"), and its two filed keys
-            // are a Top Setting and a Manual-only asset path. The proxy
-            // also passed this page for six weeks while its one row was
-            // `cursor_trail_wake_ms`, a dial nothing read — so it was
-            // admitting an empty page and is now about to refuse a full
-            // one. The exception is therefore enumerated, not widened, and
-            // the card itself is pinned by
-            // `the_cursor_kitty_page_is_its_showcase_card`.
-            assert_eq!(
-                route,
-                SettingsRoute::CursorKitty,
-                "{} must not be an empty Advanced destination",
-                route.label()
-            );
-        }
+        assert!(
+            has_ordinary_row,
+            "{} must not be an empty Advanced destination",
+            route.label()
+        );
     }
 
     let predictive = fields
@@ -22212,16 +26783,9 @@ fn restart_only_overrides_disclose_timing_in_rows_and_apply_feedback() {
             .enumerate()
             .find(|(_, field)| field.key == key)
             .unwrap();
-        let compiled = UiTree::new(setting_row(
-            &state,
-            index,
-            field,
-            true,
-            false,
-            SettingsWidth::Wide,
-        ))
-        .compile(LogicalRect::new(0.0, 0.0, 720.0, 80.0))
-        .unwrap();
+        let compiled = UiTree::new(setting_row(&state, index, field, true, SettingsWidth::Wide))
+            .compile(LogicalRect::new(0.0, 0.0, 720.0, 80.0))
+            .unwrap();
         assert!(
             compiled
                 .semantic(&UiKey::new(format!("settings/label/{key}")))
@@ -22280,7 +26844,7 @@ fn restart_only_overrides_disclose_timing_in_rows_and_apply_feedback() {
     };
     assert_eq!(
         state.feedback.as_deref(),
-        Some("Saved · Applies next launch · Undo available")
+        Some("GPU rendering turned on · Applies next launch")
     );
 }
 
@@ -22330,7 +26894,7 @@ fn ambiguous_width_discloses_preserved_cells_but_feedback_remains_applied() {
     assert_eq!(
         state.feedback.as_deref(),
         Some(
-            "Applied · Applies to newly received text; existing cells keep their current width · Undo available"
+            "Ambiguous-character width set to Wide · Applies to newly received text; existing cells keep their current width"
         )
     );
 
@@ -22341,16 +26905,9 @@ fn ambiguous_width_discloses_preserved_cells_but_feedback_remains_applied() {
         .enumerate()
         .find(|(_, field)| field.key == prefs::EDIT_AMBIGUOUS_WIDTH)
         .unwrap();
-    let compiled = UiTree::new(setting_row(
-        state,
-        index,
-        field,
-        false,
-        false,
-        SettingsWidth::Wide,
-    ))
-    .compile(LogicalRect::new(0.0, 0.0, 900.0, 90.0))
-    .unwrap();
+    let compiled = UiTree::new(setting_row(state, index, field, false, SettingsWidth::Wide))
+        .compile(LogicalRect::new(0.0, 0.0, 900.0, 90.0))
+        .unwrap();
     let timing = prefs::application_timing(prefs::EDIT_AMBIGUOUS_WIDTH).unwrap();
     assert!(
         compiled
@@ -22398,7 +26955,6 @@ fn configured_draft_and_pinned_font_sizes_reach_paint_at_physical_size() {
                     crate::native_app::ViewMotionCx::default(),
                     24.0,
                     scale,
-                    aterm_render::Theme::default(),
                     None,
                 )
                 .unwrap();
@@ -22456,7 +27012,6 @@ fn active_environment_override_drives_row_preview_and_save_feedback() {
         index,
         field,
         false,
-        false,
         SettingsWidth::Wide,
     ))
     .compile(LogicalRect::new(0.0, 0.0, 900.0, 90.0))
@@ -22476,7 +27031,6 @@ fn active_environment_override_drives_row_preview_and_save_feedback() {
         crate::native_app::ViewMotionCx::default(),
         12.0,
         1.0,
-        aterm_render::Theme::default(),
         None,
     )
     .unwrap();
@@ -22532,7 +27086,7 @@ fn active_environment_override_drives_row_preview_and_save_feedback() {
     };
     assert_eq!(
         runtime_state.feedback.as_deref(),
-        Some("Saved · --font-px remains active (effective 22)")
+        Some("Font size set to 19 px · --font-px remains active (effective 22)")
     );
 }
 
@@ -22560,15 +27114,18 @@ fn modified_manual_override_discloses_lifecycle_and_precedence() {
         &state,
         &authored,
         0,
-        1,
-        SettingsWidth::Wide,
+        &key_fragment(&authored.key),
+        860.0,
     ))
     .compile(LogicalRect::new(0.0, 0.0, 900.0, 220.0))
     .unwrap();
     let disclosure = compiled
-        .semantic(&UiKey::new("settings/modified/manual/detail"))
+        .semantic(&UiKey::new(format!(
+            "settings/modified/manual/value/{}",
+            key_fragment(&authored.key)
+        )))
         .unwrap();
-    assert!(disclosure.label.contains("next package check"));
+    assert!(disclosure.label.contains("next ALab tools check"));
     assert!(
         disclosure
             .label
@@ -22579,9 +27136,10 @@ fn modified_manual_override_discloses_lifecycle_and_precedence() {
         .paint
         .iter()
         .filter(|node| {
-            node.key
-                .as_str()
-                .starts_with("settings/modified/manual/detail/line-")
+            node.key.as_str().starts_with(&format!(
+                "settings/modified/manual/value/{}/line-",
+                key_fragment(&authored.key)
+            ))
         })
         .collect::<Vec<_>>();
     assert!(!visual_lines.is_empty());
@@ -22606,7 +27164,6 @@ fn appearance_preview_uses_the_live_renderer_contrast_floor() {
             crate::native_app::ViewMotionCx::default(),
             13.0,
             1.0,
-            aterm_render::Theme::default(),
             None,
         )
         .unwrap();
@@ -22616,17 +27173,17 @@ fn appearance_preview_uses_the_live_renderer_contrast_floor() {
             "opacity={opacity}, configured={configured}"
         );
     }
-    for group in ["Text & Contrast", "Transparency"] {
-        let footnote = prefs::group_footnote(group).unwrap();
-        assert!(
-            footnote
-                .to_ascii_lowercase()
-                .contains("translucent background")
-                && footnote.contains("at least")
-                && footnote.contains("4.5:1"),
-            "{group} explains the effective glass floor"
-        );
-    }
+    // The floor is stated once, on the row that causes it.
+    let footnote = prefs::footnote_of(prefs::EDIT_BACKGROUND_OPACITY).unwrap();
+    assert!(
+        footnote.contains("translucent background") && footnote.contains("4.5:1"),
+        "Background opacity explains the effective glass floor"
+    );
+    assert!(
+        !prefs::footnote_of(prefs::EDIT_MINIMUM_CONTRAST)
+            .unwrap()
+            .contains("4.5:1")
+    );
 }
 
 #[test]
@@ -22647,7 +27204,6 @@ fn minimum_contrast_row_and_feedback_disclose_the_translucent_floor() {
         index,
         field,
         false,
-        false,
         SettingsWidth::Wide,
     ))
     .compile(LogicalRect::new(0.0, 0.0, 1_000.0, 90.0))
@@ -22660,9 +27216,7 @@ fn minimum_contrast_row_and_feedback_disclose_the_translucent_floor() {
             )))
             .unwrap()
             .label
-            .contains(
-                "configured 1:1; effective 4.5:1 because translucent backgrounds enforce the accessibility floor",
-            )
+            .contains("set to 1:1; 4.5:1 while the background is translucent")
     );
     assert!(
         compiled
@@ -22672,7 +27226,7 @@ fn minimum_contrast_row_and_feedback_disclose_the_translucent_floor() {
             )))
             .unwrap()
             .label
-            .contains("Effective 4.5:1 · Translucent floor")
+            .contains("4.5:1 while the background is translucent")
     );
 
     for (source, expected) in [
@@ -22707,7 +27261,7 @@ fn minimum_contrast_row_and_feedback_disclose_the_translucent_floor() {
             .iter()
             .map(|(key, value)| ConfigEdit {
                 key: (*key).to_string(),
-                expected: ExpectedConfigValue::Any,
+                expected: ExpectedConfigValue::Exact(None),
                 value: Some((*value).to_string()),
             })
             .collect(),
@@ -22786,9 +27340,10 @@ fn minimum_contrast_row_and_feedback_disclose_the_translucent_floor() {
     let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
         unreachable!()
     };
-    assert!(state.feedback.as_deref().unwrap().contains(
-        "Effective minimum contrast is 4.5:1 (configured 1:1; translucent background floor)"
-    ));
+    // The floor is the Minimum contrast row's to show; saving opacity says
+    // only that it applied.
+    let feedback = state.feedback.as_deref().unwrap();
+    assert!(!feedback.contains("contrast"), "{feedback}");
 }
 
 #[test]
@@ -22837,9 +27392,8 @@ fn background_opacity_discloses_exact_platform_and_backend_availability() {
         .notes
         .is_empty()
     );
-    let note = prefs::group_footnote("Transparency").unwrap();
-    assert!(note.contains("macOS GPU"));
-    assert!(note.contains("solid"));
+    let note = prefs::footnote_of(prefs::EDIT_BACKGROUND_OPACITY).unwrap();
+    assert!(note.contains("GPU rendering"));
 }
 
 #[test]
@@ -22938,8 +27492,8 @@ fn a_deferred_gpu_intent_projects_the_same_availability_as_a_live_device() {
         known: true,
         reset_safe: true,
     };
-    let settled_disclosure = manual_override_disclosure(&settled, &authored, 0, 1);
-    let capable_disclosure = manual_override_disclosure(&capable, &authored, 0, 1);
+    let settled_disclosure = manual_override_disclosure(&settled, &authored);
+    let capable_disclosure = manual_override_disclosure(&capable, &authored);
     assert!(
         settled_disclosure.contains("requires the GPU renderer"),
         "a settled CPU run still discloses the denial: {settled_disclosure}"
@@ -22968,10 +27522,11 @@ fn config_feedback_projection_distinguishes_unavailable_from_mixed_live_edits() 
         notifications: true,
         trail_audio: false,
         packages: PackageAdmission::Ready,
+        update_installable: true,
     };
     let edit = |key: &str, value: &str| ConfigEdit {
         key: key.to_string(),
-        expected: ExpectedConfigValue::Any,
+        expected: ExpectedConfigValue::Exact(None),
         value: Some(value.to_string()),
     };
     for (key, value, note) in [
@@ -23053,6 +27608,7 @@ fn config_feedback_projection_names_durable_effect_suppression() {
         notifications: true,
         trail_audio: true,
         packages: PackageAdmission::Ready,
+        update_installable: true,
     };
     let patch = |edits: &[(&str, &str)]| ConfigPatch {
         base_revision: 1,
@@ -23060,7 +27616,7 @@ fn config_feedback_projection_names_durable_effect_suppression() {
             .iter()
             .map(|(key, value)| ConfigEdit {
                 key: (*key).to_string(),
-                expected: ExpectedConfigValue::Any,
+                expected: ExpectedConfigValue::Exact(None),
                 value: Some((*value).to_string()),
             })
             .collect(),
@@ -23075,7 +27631,7 @@ fn config_feedback_projection_names_durable_effect_suppression() {
         (
             "motion = \"reduced\"\n",
             prefs::EDIT_STREAM_FADE,
-            "Currently inactive: Motion Reduced",
+            "Currently inactive: Reduce motion",
         ),
         (
             "serious_mode = true\n",
@@ -23085,7 +27641,7 @@ fn config_feedback_projection_names_durable_effect_suppression() {
         (
             "motion = \"reduced\"\n",
             prefs::EDIT_MATRIX_RAIN_ENABLED,
-            "Currently inactive: Motion Reduced",
+            "Currently inactive: Reduce motion",
         ),
     ] {
         let config: Config = aterm_toml::from_str(source).unwrap();
@@ -23289,6 +27845,113 @@ fn effect_projection_exhaustively_names_platform_backend_and_admission_gates() {
             assert!(effect_note_contains(&effect, expected), "{key}: {effect:?}");
         }
     }
+    // ONE reason a setting does nothing: without its package tool, Install ALab
+    // tools says that alone, not also that it waits on Keep ALab tools up to
+    // date. NEGATIVE CONTROL: with the tool there, the wait is the reason.
+    for (admission, expected) in [
+        (PackageAdmission::MissingBinary, "Package tool missing"),
+        (
+            PackageAdmission::Ready,
+            "Waits until Keep ALab tools up to date is on",
+        ),
+    ] {
+        let effect = projected_effect(
+            "[packages]\nenabled = false\n",
+            &[(prefs::EDIT_PACKAGES_AUTO_INSTALL, "true")],
+            prefs::EDIT_PACKAGES_AUTO_INSTALL,
+            SettingsAvailability {
+                packages: admission,
+                ..base
+            },
+            crate::native_app::ViewMotionCx::default(),
+        );
+        assert_eq!(effect.notes.len(), 1, "{admission:?}: {effect:?}");
+        assert!(
+            effect_note_contains(&effect, expected),
+            "{admission:?}: {effect:?}"
+        );
+    }
+}
+
+/// An Off install consent waits for nothing: with Keep ALab tools up to date
+/// off, Install ALab tools turned Off says no "Waits until …" (nothing
+/// installs, now or later). NEGATIVE CONTROL: turned On, it waits.
+#[test]
+fn an_off_install_consent_does_not_wait_for_keep_up_to_date() {
+    let availability = SettingsAvailability {
+        packages: PackageAdmission::Ready,
+        ..audited_availability()
+    };
+    for (value, waits) in [("false", false), ("true", true)] {
+        let effect = projected_effect(
+            "[packages]\nenabled = false\n",
+            &[(prefs::EDIT_PACKAGES_AUTO_INSTALL, value)],
+            prefs::EDIT_PACKAGES_AUTO_INSTALL,
+            availability,
+            crate::native_app::ViewMotionCx::default(),
+        );
+        assert_eq!(
+            effect_note_contains(&effect, "Waits until Keep ALab tools up to date is on"),
+            waits,
+            "auto_install = {value}: {effect:?}"
+        );
+    }
+}
+
+/// A Packages switch row measures its label beside the switch AND Reset's
+/// place, which an unwritten row keeps too: at 80x24 (a 512pt row) the
+/// "Install ALab tools · Waits until …" line does not fit beside both, so the
+/// note goes under the name, wrapped, and the label is never cut off.
+/// CONTROL: the same row written (Changed, Reset drawn) lays out the same way.
+#[test]
+fn a_packages_switch_note_wraps_under_the_name_beside_resets_place() {
+    let (label_px, label_face) =
+        crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+    for source in [
+        "[packages]\nenabled = false\n",
+        "[packages]\nenabled = false\nauto_install = true\n",
+    ] {
+        let config: Config = aterm_toml::from_str(source).unwrap();
+        let state = SettingsViewState::new(&config);
+        state
+            .presented_package_admission
+            .set(PackageAdmission::Ready);
+        let text_width = 512.0;
+        let (row, _) = registry_switch_row(
+            &state,
+            prefs::EDIT_PACKAGES_AUTO_INSTALL,
+            SettingsWidth::Medium,
+            SettingsWidth::Medium.row_height(),
+            text_width,
+            "packages/switch-row/test".to_string(),
+            "packages",
+        )
+        .expect("the row");
+        let mut nodes = vec![&row];
+        let mut label = None;
+        let mut detail = None;
+        while let Some(node) = nodes.pop() {
+            if node.key.as_str() == format!("settings/label/{}", prefs::EDIT_PACKAGES_AUTO_INSTALL)
+                && let UiContent::Text(spec) = &node.content
+            {
+                label = Some(spec.text.clone());
+            }
+            if node.key.as_str() == format!("packages/detail/{}", prefs::EDIT_PACKAGES_AUTO_INSTALL)
+            {
+                detail = Some(node);
+            }
+            nodes.extend(node.children.iter());
+        }
+        let label = label.expect("the label");
+        assert!(
+            crate::tray_raster::ui_text_width_for(label_face, &label, label_px)
+                <= inline_row_label_width(&EditKind::Bool, text_width, true),
+            "{source}: {label}"
+        );
+        assert!(!label.contains('\u{2026}'), "{source}: cut off: {label}");
+        assert!(!label.contains("Waits"), "{source}: {label}");
+        assert!(detail.is_some(), "{source}: the note goes under the name");
+    }
 }
 
 #[test]
@@ -23320,7 +27983,7 @@ fn effect_projection_exhaustively_gates_disabled_effect_families() {
             motion,
         );
         assert!(
-            effect_note_contains(&effect, "Matrix Rain is Off"),
+            effect_note_contains(&effect, "Matrix rain is Off"),
             "{}: {effect:?}",
             leaf.key
         );
@@ -23337,7 +28000,7 @@ fn effect_projection_exhaustively_gates_disabled_effect_families() {
             motion,
         );
         assert!(
-            effect_note_contains(&effect, "Cursor trail is Off"),
+            effect_note_contains(&effect, "cursor effects off"),
             "{key}: {effect:?}"
         );
         assert!(!effect.has_live_effect, "{key}");
@@ -23356,7 +28019,7 @@ fn effect_projection_exhaustively_gates_disabled_effect_families() {
             motion,
         );
         assert!(
-            effect_note_contains(&effect, "Sparkle Words master is Off"),
+            effect_note_contains(&effect, "all word effects are switched off"),
             "{}: {effect:?}",
             leaf.key
         );
@@ -23378,7 +28041,11 @@ fn effect_projection_exhaustively_gates_disabled_effect_families() {
 #[test]
 fn an_unknown_trail_style_leaves_the_tuning_rows_live() {
     let availability = audited_availability();
-    let motion = crate::native_app::ViewMotionCx::default();
+    // A dark system, so Default is dark and the bloom rows can be live.
+    let motion = crate::native_app::ViewMotionCx {
+        system_dark: true,
+        ..crate::native_app::ViewMotionCx::default()
+    };
     let sample = |kind: EditKind| match kind {
         EditKind::Bool => "true",
         EditKind::Integer => "5",
@@ -23426,31 +28093,41 @@ fn an_unknown_trail_style_leaves_the_tuning_rows_live() {
                 effect_note_contains(&fallback, "this tuning applies to that fallback trail"),
                 "{key}: a live tuning row must name the trail it is tuning: {fallback:?}"
             );
-        } else {
-            // The one honest exception, and it must be dark for ITS OWN
-            // reason — the resolved fallback is the rainbow pet, not Fire.
-            assert_eq!(*key, prefs::EDIT_CURSOR_FIRE_SHIMMER, "{fallback:?}");
+        } else if *key == prefs::EDIT_CURSOR_FIRE_SHIMMER {
+            // Dark for ITS OWN reason: the resolved fallback is the rainbow
+            // pet, not Fire.
             assert!(
                 effect_note_contains(&fallback, "Fire style only"),
                 "{fallback:?}"
             );
+        } else {
+            // A knob the fallback trail never reads names the trail drawn,
+            // not the misspelling.
+            assert!(
+                effect_note_contains(&fallback, "not used by Rainbow kitty"),
+                "{key}: {fallback:?}"
+            );
         }
     }
-    // Non-vacuity: all but one of the table stays live. The exception is
-    // `cursor_fire_shimmer`, which is correctly gated on the RESOLVED style
-    // being Fire — the fallback is the rainbow pet, so it is genuinely
-    // inactive and says so for the right reason.
+    // Non-vacuity: every row the fallback trail reads stays live.
+    let fallback_style = crate::app_config::resolve_trail_style(
+        good,
+        &crate::app_config::TrailPackCatalog::default(),
+    );
+    let read = TRAIL_TUNING_KEYS
+        .iter()
+        .filter(|key| {
+            !prefs::CURSOR_STYLE_TUNING_KEYS.contains(key) || trail_style_uses(&fallback_style, key)
+        })
+        .count();
     assert_eq!(
-        any_live,
-        TRAIL_TUNING_KEYS.len() - 1,
-        "{any_live} of {} tuning rows stayed live",
-        TRAIL_TUNING_KEYS.len()
+        any_live, read,
+        "{any_live} of the {read} rows the fallback trail reads stayed live"
     );
     for key in [
         prefs::EDIT_CURSOR_TRAIL_INTENSITY,
         prefs::EDIT_HDR_GLOW,
         prefs::EDIT_CURSOR_TRAIL_MS,
-        prefs::EDIT_CURSOR_TRAIL_COLOR,
     ] {
         let effect = projected_effect(
             &format!("cursor_trail = true\ncursor_trail_style = \"{typo}\"\n"),
@@ -23500,7 +28177,7 @@ fn an_unknown_trail_style_leaves_the_tuning_rows_live() {
         motion,
     );
     assert!(
-        effect_note_contains(&style_row, "Invalid trail style · Runtime fallback active"),
+        effect_note_contains(&style_row, "Invalid trail style: runtime fallback active"),
         "{style_row:?}"
     );
     assert!(!style_row.has_live_effect, "{style_row:?}");
@@ -23515,7 +28192,7 @@ fn an_unknown_trail_style_leaves_the_tuning_rows_live() {
             motion,
         );
         assert!(
-            effect_note_contains(&effect, "Cursor trail is Off"),
+            effect_note_contains(&effect, "cursor effects off"),
             "{key}: {effect:?}"
         );
         assert!(!effect.has_live_effect, "{key}");
@@ -23551,7 +28228,7 @@ fn the_momentum_glow_row_discloses_the_cursor_trail_master_and_nothing_else() {
         |source: &str| projected_effect(source, &[(key, "true")], key, availability, motion);
 
     let off = project("cursor_trail = false\n");
-    assert!(effect_note_contains(&off, "Cursor trail is Off"), "{off:?}");
+    assert!(effect_note_contains(&off, "cursor effects off"), "{off:?}");
     assert!(!off.has_live_effect, "{off:?}");
 
     for source in [
@@ -23562,7 +28239,8 @@ fn the_momentum_glow_row_discloses_the_cursor_trail_master_and_nothing_else() {
         let on = project(source);
         assert!(on.has_live_effect, "{source}{on:?}");
         assert!(
-            !effect_note_contains(&on, "Cursor trail is Off"),
+            !effect_note_contains(&on, "cursor effects off")
+                && !effect_note_contains(&on, "Cursor style Off"),
             "{source}{on:?}"
         );
     }
@@ -23575,17 +28253,67 @@ fn the_momentum_glow_row_discloses_the_cursor_trail_master_and_nothing_else() {
     );
 }
 
+/// REDUCE MOTION UNDER HEAVY LOAD SAYS IT IS IDLE UNDER ALWAYS ANIMATE, AND
+/// NOWHERE ELSE: the host never sheds while Motion is Always animate
+/// (`MotionMode::admits_load_shed`), so there the switch is saved and does
+/// nothing whichever way it is set, a pending Motion change included; under
+/// Automatic or Reduce motion the shed is still live.
+#[test]
+fn load_adaptive_motion_row_discloses_always_animate_and_nothing_else() {
+    let availability = audited_availability();
+    let motion = crate::native_app::ViewMotionCx::default();
+    let key = prefs::EDIT_LOAD_ADAPTIVE_MOTION;
+    let always = setting_choice_label(prefs::EDIT_MOTION, "full");
+    assert_eq!(always, "Always animate");
+    for value in ["true", "false"] {
+        for (source, edits) in [
+            ("motion = \"full\"\n", vec![(key, value)]),
+            ("", vec![(prefs::EDIT_MOTION, "full"), (key, value)]),
+        ] {
+            let effect = projected_effect(source, &edits, key, availability, motion);
+            assert!(
+                effect
+                    .notes
+                    .iter()
+                    .any(|note| note.kind == EffectNoteKind::Inactive
+                        && note.visual == format!("Inactive: {always}")
+                        && note.feedback.contains(&always)),
+                "{source:?} {edits:?}: {effect:?}"
+            );
+            assert!(!effect.has_live_effect, "{source:?} {edits:?}: {effect:?}");
+        }
+        for (source, motion) in [
+            ("", motion),
+            ("motion = \"auto\"\n", motion),
+            ("motion = \"reduced\"\n", motion),
+            (
+                "motion = \"auto\"\n",
+                crate::native_app::ViewMotionCx {
+                    system_reduced: true,
+                    ..motion
+                },
+            ),
+        ] {
+            let effect = projected_effect(source, &[(key, value)], key, availability, motion);
+            assert!(
+                !effect_note_contains(&effect, &always) && effect.has_live_effect,
+                "{source:?} {motion:?}: {effect:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn effect_projection_covers_live_motion_and_specific_child_dependencies() {
     let availability = audited_availability();
     for (source, motion, expected) in [
         (
-            "motion = \"reduced\"\ncursor_trail = true\n",
+            "motion = \"reduced\"\ncursor_trail = true\ncursor_trail_style = \"comet\"\n",
             crate::native_app::ViewMotionCx::default(),
-            "Motion Reduced",
+            "Inactive: Reduce motion",
         ),
         (
-            "motion = \"auto\"\ncursor_trail = true\n",
+            "motion = \"auto\"\ncursor_trail = true\ncursor_trail_style = \"comet\"\n",
             crate::native_app::ViewMotionCx {
                 system_reduced: true,
                 ..crate::native_app::ViewMotionCx::default()
@@ -23593,20 +28321,20 @@ fn effect_projection_covers_live_motion_and_specific_child_dependencies() {
             "System Reduce Motion",
         ),
         (
-            "motion = \"auto\"\nload_adaptive_motion = true\ncursor_trail = true\n",
+            "motion = \"auto\"\nload_adaptive_motion = true\ncursor_trail = true\ncursor_trail_style = \"comet\"\n",
             crate::native_app::ViewMotionCx {
                 performance_reduced: true,
                 ..crate::native_app::ViewMotionCx::default()
             },
-            "Heavy load",
+            "heavy load",
         ),
         (
-            "motion = \"full\"\ncursor_trail = true\n",
+            "motion = \"full\"\ncursor_trail = true\ncursor_trail_style = \"comet\"\n",
             crate::native_app::ViewMotionCx {
                 focused: false,
                 ..crate::native_app::ViewMotionCx::default()
             },
-            "Window unfocused",
+            "window unfocused",
         ),
     ] {
         let effect = projected_effect(
@@ -23625,27 +28353,28 @@ fn effect_projection_covers_live_motion_and_specific_child_dependencies() {
             "stream_fade = false\n",
             prefs::EDIT_STREAM_FADE_MS,
             "120",
-            "Stream fade is Off",
+            "Fade in new output is Off",
         ),
         (
             "cursor_trail = true\ncursor_trail_style = \"water\"\n",
             prefs::EDIT_CURSOR_FIRE_SHIMMER,
             "true",
-            "Fire trail style",
+            "needs the Fire style",
         ),
         (
-            "cursor_trail = true\ncursor_trail_bloom = false\n",
+            // A dark theme: on a light one the bloom has no effect at all.
+            "theme = \"Dracula\"\ncursor_trail = true\ncursor_trail_bloom = false\n",
             prefs::EDIT_CURSOR_TRAIL_BLOOM_RADIUS,
             "2.4",
-            "Cursor trail bloom is Off",
+            "Bloom is Off",
         ),
         (
-            // The install consent is dormant while "Automatic updates" (was
-            // "Automatic package maintenance") is off, and says so by that name.
+            // The install consent is dormant while "Keep ALab tools up to date"
+            // is off, and says so by that name, in a sentence.
             "[packages]\nenabled = false\n",
             prefs::EDIT_PACKAGES_AUTO_INSTALL,
             "true",
-            "Automatic updates is Off",
+            "Waits until Keep ALab tools up to date is on",
         ),
         (
             "ligatures = false\n",
@@ -23675,7 +28404,7 @@ fn effect_projection_covers_live_motion_and_specific_child_dependencies() {
             "[sparkle_words.profanity]\nenabled = false\n[sparkle_words.feline]\nenabled = true\n",
             "sparkle_words.ink.strength",
             "0.8",
-            "Sparkle Words is Off",
+            "Sparkle words is Off",
         ),
         (
             "[sparkle_words.profanity]\nenabled = true\nstyle = \"rainbow\"\n[sparkle_words.feline]\nenabled = true\n",
@@ -23712,7 +28441,7 @@ fn effect_projection_covers_live_motion_and_specific_child_dependencies() {
         crate::native_app::ViewMotionCx::default(),
     );
     assert!(
-        !effect_note_contains(&auto_install, "Automatic updates is Off"),
+        !effect_note_contains(&auto_install, "Keep ALab tools up to date is Off"),
         "the consent is not dormant while the switch is on: {auto_install:?}"
     );
 }
@@ -23838,7 +28567,7 @@ fn trail_dependencies_use_the_admitted_style_resolution() {
             "cursor_trail = true\ncursor_trail_style = \"off\"\n",
             prefs::EDIT_CURSOR_TRAIL_RADIUS,
             "1.0",
-            "Cursor trail is Off",
+            "Cursor style Off",
         ),
     ];
     for (source, key, value, expected) in cases {
@@ -23919,7 +28648,7 @@ fn dependent_style_projection_uses_runtime_fallbacks_not_raw_enum_text() {
             effect_note_contains(
                 &projected,
                 if key.ends_with("loop") {
-                    "Class TwoTone only"
+                    "class TwoTone only"
                 } else {
                     "TwoTone ink only"
                 }
@@ -23979,7 +28708,7 @@ fn dependent_style_projection_uses_runtime_fallbacks_not_raw_enum_text() {
         motion,
     );
     assert!(effect_note_contains(&paw_product, "no kitty graphic"));
-    assert!(effect_note_contains(&paw_product, "Legacy Paw ink only"));
+    assert!(effect_note_contains(&paw_product, "legacy Paw ink only"));
     assert!(
         paw_product.has_live_effect,
         "Paw still has a live ink effect; Top must describe it rather than pretending the toggle is inert"
@@ -24035,6 +28764,43 @@ fn invalid_registered_enum_and_color_values_disclose_runtime_fallbacks() {
         motion,
     );
     assert!(!effect_note_contains(&valid, "Invalid color"));
+}
+
+/// A SETTING WITH NO EFFECT PAINTS IDLE, as one waiting on another does: a
+/// saved value the runtime cannot use ("Invalid choice · Runtime fallback
+/// active") mutes its control (`ControlState::muted`: quiet ink, never the
+/// live accent), and it stays operable to repair. NEGATIVE CONTROL: a value
+/// the runtime uses leaves it live.
+#[test]
+fn a_setting_with_no_effect_here_paints_idle() {
+    let control = |source: &str| {
+        let (mut runtime, instance, view) = setup();
+        replace_settings_source(&mut runtime, view, source.to_string());
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: route_action(SettingsRoute::Modified),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx());
+        let key = format!("settings/control/{}", prefs::EDIT_BIDI);
+        let node = compiled
+            .semantic(&UiKey::new(key.clone()))
+            .unwrap_or_else(|| panic!("{key} is on Modified"));
+        (node.label.clone(), node.state.expect("a control"))
+    };
+    let (label, state) = control("bidi = \"sideways\"\n");
+    assert!(
+        label.contains("outside this setting's registered choices"),
+        "{label}"
+    );
+    assert!(state.muted && state.enabled, "{label}: {state:?}");
+    let (label, state) = control("bidi = \"explicit\"\n");
+    assert!(!state.muted, "{label}: {state:?}");
 }
 
 #[test]
@@ -24108,7 +28874,7 @@ fn custom_ink_and_emphasis_dependencies_match_runtime_ownership() {
 
     let loop_projection = effect(&twotone_source, "sparkle_words.ink.loop", "true");
     assert!(
-        effect_note_contains(&loop_projection, "Class TwoTone only"),
+        effect_note_contains(&loop_projection, "class TwoTone only"),
         "custom sweep_once ownership must not make global ink.loop live"
     );
 
@@ -24137,7 +28903,7 @@ fn custom_ink_and_emphasis_dependencies_match_runtime_ownership() {
         "sparkle_words.emphasis.enabled",
         "true",
     );
-    assert!(effect_note_contains(&ink_off, "Keyword ink Off"));
+    assert!(effect_note_contains(&ink_off, "Ink shimmer Off"));
 }
 
 #[test]
@@ -24150,56 +28916,56 @@ fn custom_consumers_obey_master_product_and_ink_parent_gates() {
              [[sparkle_words.custom]]\nwords = [\"nova\"]\nburst = { kind = \"nova\", chance = 100 }\n",
             "sparkle_words.profanity.magic",
             "true",
-            "Sparkle Words master is Off",
+            "all word effects are switched off in aterm.toml",
         ),
         (
             "[sparkle_words.profanity]\nenabled = false\nstyle = \"rainbow\"\n\
              [[sparkle_words.custom]]\nwords = [\"nova\"]\nburst = { kind = \"nova\", chance = 100 }\n",
             "sparkle_words.profanity.magic",
             "true",
-            "keyword-toy class is Off",
+            "Sparkle words is Off",
         ),
         (
             "[sparkle_words.profanity]\nenabled = false\n\
              [[sparkle_words.custom]]\nwords = [\"ink\"]\nink = \"twotone:#112233,#445566\"\n",
             "sparkle_words.ink.sweep_ms",
             "1200",
-            "Sparkle Words is Off",
+            "Sparkle words is Off",
         ),
         (
             "[sparkle_words.ink]\nenabled = false\n\
              [[sparkle_words.custom]]\nwords = [\"ink\"]\nink = \"twotone:#112233,#445566\"\n",
             "sparkle_words.ink.sweep_ms",
             "1200",
-            "keyword-toy class is Off",
+            "Ink shimmer is Off",
         ),
         (
             "[sparkle_words.profanity]\nenabled = false\n\
              [sparkle_words.feline]\nenabled = false\n",
             "sparkle_words.reduced_motion",
             "true",
-            "both keyword toys are Off",
+            "Sparkle words and Keyword kitties are Off",
         ),
         (
             "[sparkle_words.profanity]\nenabled = false\n\
              [sparkle_words.feline]\nenabled = false\n",
             "sparkle_words.suppress_in_alt_screen",
             "true",
-            "both keyword toys are Off",
+            "Sparkle words and Keyword kitties are Off",
         ),
         (
             "[sparkle_words.profanity]\nenabled = false\n\
              [sparkle_words.feline]\nenabled = false\n",
             "sparkle_words.ink.enabled",
             "true",
-            "both keyword toys are Off",
+            "Sparkle words and Keyword kitties are Off",
         ),
         (
             "[sparkle_words.profanity]\nenabled = false\n\
              [sparkle_words.feline]\nenabled = false\n",
             SPARKLE_MASTER_KEY,
             "true",
-            "both keyword toys are Off",
+            "Sparkle words and Keyword kitties are Off",
         ),
     ];
     for (source, key, value, expected) in cases {
@@ -24324,7 +29090,7 @@ fn settings_projection_consumes_the_admitted_toy_pack_capability_carrier() {
             motion,
         );
         assert!(
-            effect_note_contains(&projected, "Sparkle Words is Off"),
+            effect_note_contains(&projected, "Sparkle words is Off"),
             "the hard product gate decides {key} even before recipe admission: {projected:?}"
         );
         assert!(!effect_note_contains(
@@ -24389,7 +29155,7 @@ fn settings_projection_consumes_the_admitted_toy_pack_capability_carrier() {
         audited_availability(),
         motion,
     );
-    assert!(effect_note_contains(&emphasis, "Keyword ink is Off"));
+    assert!(effect_note_contains(&emphasis, "Ink shimmer is Off"));
     assert!(!effect_note_contains(&emphasis, "recipe admission pending"));
 }
 
@@ -24487,16 +29253,9 @@ fn row_and_completion_share_the_exact_effect_projection() {
         .iter()
         .find(|note| note.kind == EffectNoteKind::Inactive)
         .unwrap();
-    let compiled = UiTree::new(setting_row(
-        &state,
-        index,
-        field,
-        true,
-        false,
-        SettingsWidth::Wide,
-    ))
-    .compile(LogicalRect::new(0.0, 0.0, 900.0, 84.0))
-    .unwrap();
+    let compiled = UiTree::new(setting_row(&state, index, field, true, SettingsWidth::Wide))
+        .compile(LogicalRect::new(0.0, 0.0, 900.0, 84.0))
+        .unwrap();
     let control = compiled
         .semantic(&UiKey::new(format!("settings/control/{}", field.key)))
         .unwrap();
@@ -24525,13 +29284,18 @@ fn row_and_completion_share_the_exact_effect_projection() {
     assert!(mixed.suppression_notes.contains(&inactive.feedback));
 }
 
-/// SETTINGS ▸ HARNESS SPEAKS THE RULE: the row reads `Automatic` while
-/// every key is at its full-power default, names each written key as the
-/// limit it is, and `Off` once the switch is — saved or in a pending patch.
-/// NEGATIVE CONTROL: a written key AT its default limits nothing.
+/// THE HARNESS ROW SPEAKS THE TABLE SETTINGS HOLDS, a pending patch included:
+/// `Automatic` while every key is at its full-power default, the table
+/// Settings rebuilds from its dotted leaves read exactly as the supervisor's
+/// reader reads the file (a root `harness.<key>` the same table as a
+/// `[harness]` header; a saved string, bool and integer leaf each read), a
+/// saved limit gone once a pending reset clears it, and off once a pending
+/// patch turns the switch off (the painted words are `HarnessPolicy::badge`'s,
+/// tested in `app_config`). NEGATIVE CONTROL: a written key AT its default
+/// limits nothing.
 #[test]
 fn the_harness_row_says_automatic_and_names_each_limit() {
-    let words = |source: &str, patch: Option<&ConfigPatch>| {
+    let note = |source: &str, patch: Option<&ConfigPatch>| {
         let snapshot = VersionedConfigService::new(source.to_string())
             .unwrap()
             .snapshot();
@@ -24539,8 +29303,40 @@ fn the_harness_row_says_automatic_and_names_each_limit() {
         let notes = cross_field_constraints(&state, patch, prefs::EDIT_HARNESS_ENABLED);
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert_eq!(notes[0].kind, EffectNoteKind::Constraint);
-        notes[0].visual.clone()
+        notes[0].clone()
     };
+    // The row's accessible name says the words; glass shows only a limit no
+    // row of its own shows, and never a raw `key: value`.
+    let words = |source: &str, patch: Option<&ConfigPatch>| {
+        note(source, patch)
+            .semantic
+            .strip_prefix("Agent supervision: ")
+            .expect("the spoken words")
+            .to_string()
+    };
+    let painted = |source: &str, patch: Option<&ConfigPatch>| note(source, patch).visual;
+    assert_eq!(painted("", None), "", "the On switch already says it");
+    assert_eq!(
+        painted("[harness]\napprove = \"safe\"\n", None),
+        "",
+        "Approve has a row that says Changed"
+    );
+    assert_eq!(
+        painted("harness.relaunch = false\n", None),
+        "Limited in Manual"
+    );
+    // A limit set on a row of the page is that row's to show (it says
+    // Changed): an agent's switch and the default Autopilot are no Manual
+    // limit.
+    for source in [
+        "[harness.claude]\nenabled = false\n",
+        "[harness.codex]\nenabled = false\n",
+        "[harness]\nautopilot = \"land\"\n",
+        "[harness]\nautopilot = \"off\"\n",
+    ] {
+        assert_eq!(painted(source, None), "", "{source}");
+        assert!(!words(source, None).contains("aterm.toml"), "{source}");
+    }
     assert_eq!(words("", None), "Automatic");
     assert_eq!(
         words(
@@ -24550,27 +29346,31 @@ fn the_harness_row_says_automatic_and_names_each_limit() {
         "Automatic",
         "a key written at its default limits nothing"
     );
-    assert_eq!(
-        words(
-            "[harness]\napprove = \"safe\"\ncontinue = false\ncontinue_per_hour = 3\n",
-            None
-        ),
-        "Automatic \u{b7} limited: approve: safe \u{b7} continue: off \u{b7} continue_per_hour: 3"
-    );
+    // The rebuild against the reader, never a sentence: each saved table reads
+    // as the file does (a rebuild that dropped a leaf names fewer limits), and
+    // the file limits, so the two cannot agree by both reading `Automatic`.
+    for source in [
+        "[harness]\napprove = \"safe\"\ncontinue = false\ncontinue_per_hour = 3\n",
+        "harness.relaunch = false\n",
+        "[harness]\nenabled = false\n",
+        "[harness.codex]\nenabled = false\n",
+    ] {
+        let read = crate::app_config::HarnessPolicy::read(source);
+        assert_eq!(words(source, None), read.words(), "{source}");
+        assert_ne!(read.words(), "Automatic", "{source}");
+    }
     assert_eq!(
         words("harness.relaunch = false\n", None),
-        "Automatic \u{b7} limited: relaunch: off",
+        words("[harness]\nrelaunch = false\n", None),
         "a dotted key at the root is the same table"
     );
-    assert_eq!(
-        words("[harness]\nenabled = false\n", None),
-        "Off: no agent session is supervised"
-    );
+    // The saved limit is read: the control for the reset below.
+    assert_ne!(words("[harness]\napprove = \"safe\"\n", None), "Automatic");
     let switch_off = ConfigPatch {
         base_revision: 1,
         edits: vec![ConfigEdit {
             key: prefs::EDIT_HARNESS_ENABLED.to_string(),
-            expected: ExpectedConfigValue::Any,
+            expected: ExpectedConfigValue::Exact(None),
             value: Some("false".to_string()),
         }],
     };
@@ -24582,7 +29382,7 @@ fn the_harness_row_says_automatic_and_names_each_limit() {
         base_revision: 1,
         edits: vec![ConfigEdit {
             key: "harness.approve".to_string(),
-            expected: ExpectedConfigValue::Any,
+            expected: ExpectedConfigValue::Exact(None),
             value: None,
         }],
     };
@@ -24590,6 +29390,21 @@ fn the_harness_row_says_automatic_and_names_each_limit() {
         words("[harness]\napprove = \"safe\"\n", Some(&reset)),
         "Automatic"
     );
+    // An agent's switch, pending, lands in its own table and is read as that
+    // agent off.
+    let codex_off = ConfigPatch {
+        base_revision: 1,
+        edits: vec![ConfigEdit {
+            key: prefs::EDIT_HARNESS_CODEX_ENABLED.to_string(),
+            expected: ExpectedConfigValue::Exact(None),
+            value: Some("false".to_string()),
+        }],
+    };
+    assert_eq!(
+        words("", Some(&codex_off)),
+        crate::app_config::HarnessPolicy::read("[harness.codex]\nenabled = false\n").words()
+    );
+    assert_ne!(words("", Some(&codex_off)), "Automatic");
 }
 
 #[test]
@@ -24611,7 +29426,6 @@ fn constrained_window_top_padding_is_honest_in_settings_manual_and_feedback() {
         index,
         field,
         false,
-        false,
         SettingsWidth::Wide,
     ))
     .compile(LogicalRect::new(0.0, 0.0, 720.0, 80.0))
@@ -24624,7 +29438,7 @@ fn constrained_window_top_padding_is_honest_in_settings_manual_and_feedback() {
             )))
             .unwrap()
             .label
-            .contains("Effective 12 px")
+            .contains("Set to 64 px")
     );
     let control = compiled
         .semantic(&UiKey::new(format!(
@@ -24632,8 +29446,37 @@ fn constrained_window_top_padding_is_honest_in_settings_manual_and_feedback() {
             prefs::EDIT_WINDOW_PADDING_TOP
         )))
         .unwrap();
-    assert!(control.label.contains("configured 64 px"));
-    assert!(control.label.contains("effective 12 px"));
+    assert!(control.label.contains("set to 64 px; 12 px"));
+    // The All edges row is not the one held back, and Top edge's numbers are
+    // not its own: it carries no note.
+    let (index, field) = state
+        .legacy
+        .fields
+        .iter()
+        .enumerate()
+        .find(|(_, field)| field.key == prefs::EDIT_WINDOW_PADDING)
+        .unwrap();
+    let compiled = UiTree::new(setting_row(
+        &state,
+        index,
+        field,
+        false,
+        SettingsWidth::Wide,
+    ))
+    .compile(LogicalRect::new(0.0, 0.0, 720.0, 80.0))
+    .unwrap();
+    let all_edges = compiled
+        .semantic(&UiKey::new(format!(
+            "settings/label/{}",
+            prefs::EDIT_WINDOW_PADDING
+        )))
+        .unwrap()
+        .label
+        .clone();
+    assert!(
+        !all_edges.contains("Top") && !all_edges.contains("Effective"),
+        "{all_edges}"
+    );
 
     let analysis = crate::native_config_language::analyze(source);
     assert!(analysis.diagnostics.iter().any(|diagnostic| {
@@ -24648,6 +29491,8 @@ fn constrained_window_top_padding_is_honest_in_settings_manual_and_feedback() {
     runtime
         .dispatch(instance, view, AppEvent::ConfigChanged(base_snapshot))
         .unwrap();
+    // The top's slider stops at the sides: a value past them is the
+    // sides' value, never a value the window would ignore.
     let requested = runtime
         .dispatch(
             instance,
@@ -24658,6 +29503,13 @@ fn constrained_window_top_padding_is_honest_in_settings_manual_and_feedback() {
             }),
         )
         .unwrap();
+    assert_eq!(
+        patch_edits(&requested),
+        vec![(
+            prefs::EDIT_WINDOW_PADDING_TOP.to_string(),
+            Some("12".to_string())
+        )]
+    );
     let operation = requested
         .effects
         .iter()
@@ -24679,48 +29531,324 @@ fn constrained_window_top_padding_is_honest_in_settings_manual_and_feedback() {
             },
         )
         .unwrap();
-    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
-        panic!("Settings view")
-    };
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            panic!("Settings view")
+        };
+        assert_eq!(state.feedback.as_deref(), Some("Top (px) set to 12"));
+    }
+    // Typed past them, it is refused and says why.
+    let typed = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(format!("settings/set/{}", prefs::EDIT_WINDOW_PADDING_TOP)),
+                value: Some(SemanticInput::Text("40".to_string())),
+            }),
+        )
+        .unwrap();
+    assert!(patch_edits(&typed).is_empty(), "nothing is written");
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            panic!("Settings view")
+        };
+        assert_eq!(
+            state
+                .field_errors
+                .get(prefs::EDIT_WINDOW_PADDING_TOP)
+                .map(String::as_str),
+            Some("Top (px) can't be more than Sides and bottom (12 px); 40 was not saved")
+        );
+    }
+
+    // Lowering the sides under a saved top lowers the top in the same
+    // change.
+    let snapshot =
+        VersionedConfigService::new("window_padding = 20\nwindow_padding_top = 20\n".to_string())
+            .unwrap()
+            .snapshot();
+    let (mut runtime, instance, view) = setup();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            panic!("Settings view")
+        };
+        **state = SettingsViewState::from_snapshot(&snapshot).unwrap();
+    }
+    let lowered = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(format!("settings/set/{}", prefs::EDIT_WINDOW_PADDING)),
+                value: Some(SemanticInput::Number(4.0)),
+            }),
+        )
+        .unwrap();
     assert_eq!(
-        state.feedback.as_deref(),
-        Some("Applied · Effective top padding is 12 px (configured 64 px) · Undo available")
+        patch_edits(&lowered),
+        vec![
+            (
+                prefs::EDIT_WINDOW_PADDING.to_string(),
+                Some("4".to_string())
+            ),
+            (
+                prefs::EDIT_WINDOW_PADDING_TOP.to_string(),
+                Some("4".to_string())
+            ),
+        ]
     );
 }
 
+/// A top held back by a hand edit says what the window draws once: a change
+/// to the top already names its value, a change to the sides does not.
 #[test]
-fn explicit_zero_scrollback_is_announced_as_unlimited() {
-    let snapshot = VersionedConfigService::new("scrollback_lines = 0\n".to_string())
+fn a_held_back_top_padding_says_it_once() {
+    let held = |source: &str, edits: Vec<ConfigEdit>| {
+        let snapshot = VersionedConfigService::new(source.to_string())
+            .unwrap()
+            .snapshot();
+        let state = SettingsViewState::from_snapshot(&snapshot).unwrap();
+        let patch = ConfigPatch {
+            base_revision: 1,
+            edits,
+        };
+        cross_field_constraints(&state, Some(&patch), prefs::EDIT_WINDOW_PADDING_TOP)
+            .into_iter()
+            .map(|note| note.feedback.to_string())
+            .collect::<Vec<_>>()
+    };
+    let edit = |key: &str, value: &str| ConfigEdit {
+        key: key.to_string(),
+        expected: ExpectedConfigValue::Exact(None),
+        value: Some(value.to_string()),
+    };
+    assert_eq!(
+        held(
+            "window_padding = 20\n",
+            vec![edit(prefs::EDIT_WINDOW_PADDING_TOP, "40")]
+        ),
+        ["uses 20 px; the top cannot exceed Sides and bottom"]
+    );
+    assert_eq!(
+        held(
+            "window_padding_top = 40\n",
+            vec![edit(prefs::EDIT_WINDOW_PADDING, "10")]
+        ),
+        ["Top is 10 px (set to 40 px; it cannot exceed Sides and bottom)"]
+    );
+}
+
+/// A ROW PAINTS ITS DISCLOSURE AS WRITTEN: the note's words follow the row's
+/// name and its one separator exactly, with no case or punctuation guessed
+/// at paint time (an ordinary word after the colon stays lower case, a name
+/// keeps its capital), so the row reads as its status line does.
+#[test]
+fn setting_row_paints_its_disclosure_verbatim() {
+    let snapshot = VersionedConfigService::new("cursor_trail = false\n".to_string())
         .unwrap()
         .snapshot();
-    let state = SettingsViewState::from_snapshot(&snapshot).unwrap();
-    let (index, field) = state
-        .legacy
-        .fields
-        .iter()
-        .enumerate()
-        .find(|(_, field)| field.key == prefs::EDIT_SCROLLBACK)
-        .unwrap();
-    let compiled = UiTree::new(setting_row(
-        &state,
-        index,
-        field,
-        true,
-        false,
-        SettingsWidth::Wide,
-    ))
-    .compile(LogicalRect::new(0.0, 0.0, 720.0, 80.0))
-    .unwrap();
-    for key in [
-        format!("settings/label/{}", prefs::EDIT_SCROLLBACK),
-        format!("settings/control/{}", prefs::EDIT_SCROLLBACK),
+    for (route, key) in [
+        (SettingsRoute::Sound, prefs::EDIT_TONE_MELODY),
+        (
+            SettingsRoute::CursorMotion,
+            prefs::EDIT_CURSOR_MOMENTUM_GLOW,
+        ),
     ] {
+        let mut state = SettingsViewState::from_snapshot(&snapshot).unwrap();
+        state.navigate(route);
+        let note = setting_effect_projection(
+            &state,
+            None,
+            key,
+            SettingsAvailability::for_state(&state),
+            crate::native_app::ViewMotionCx::default(),
+        )
+        .notes
+        .into_iter()
+        .find(|note| note.kind == EffectNoteKind::Inactive)
+        .unwrap_or_else(|| panic!("{key} is idle while cursor effects are off"));
+        assert_eq!(
+            note.visual, "Inactive: cursor effects off; choose a cursor style",
+            "{key}: one phrase, cased as written"
+        );
+        let compiled = settings_route_at(&state, &view_cx_at(1_200.0, 1_600.0));
+        let painted = compiled
+            .paint
+            .iter()
+            .find(|node| node.key.as_str() == format!("settings/label/{key}/visual"))
+            .and_then(|node| match &node.content {
+                UiContent::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{key}'s label line"));
+        let label = state.field_by_key(key).unwrap().label;
+        assert_eq!(
+            painted,
+            format!("{label}{ROW_TAG_SEPARATOR}{}", note.visual),
+            "{key}: the row paints the note verbatim"
+        );
+    }
+    // A name after the colon keeps its capital, whatever word it starts with
+    // ("Ink" begins an ordinary phrase elsewhere: "Legacy Paw: ink only").
+    let effect = projected_effect(
+        "[sparkle_words.ink]\nenabled = false\n",
+        &[],
+        "sparkle_words.emphasis.enabled",
+        audited_availability(),
+        crate::native_app::ViewMotionCx::default(),
+    );
+    assert!(
+        effect
+            .notes
+            .iter()
+            .any(|note| note.visual == "Inactive: Ink shimmer Off"),
+        "{effect:?}"
+    );
+    // Painted as written, a disclosure is one phrase: the row's separator is
+    // the only dot on its line, so no note may carry a dot of its own (the
+    // harness rows' "Inactive · Supervision Off" painted "Approve permission
+    // boxes · Inactive · Supervision Off" once nothing rewrote it). Every
+    // row, under states that idle whole families of them.
+    let still = crate::native_app::ViewMotionCx::default();
+    let mut idle = BTreeSet::new();
+    for (source, motion) in [
+        ("", still),
+        ("cursor_trail = false\n", still),
+        ("[harness]\nenabled = false\n", still),
+        ("[harness]\nanswer_questions = false\n", still),
+        ("motion = \"reduced\"\n", still),
+        ("motion = \"full\"\n", still),
+        (
+            "",
+            crate::native_app::ViewMotionCx {
+                serious: true,
+                ..still
+            },
+        ),
+        ("trail_sounds = false\n", still),
+        ("[output_streak]\nenabled = false\n", still),
+    ] {
+        let snapshot = VersionedConfigService::new(source.to_string())
+            .unwrap()
+            .snapshot();
+        let state = SettingsViewState::from_snapshot(&snapshot).unwrap();
+        for field in &state.legacy.fields {
+            let effect =
+                setting_effect_projection(&state, None, field.key, audited_availability(), motion);
+            for note in &effect.notes {
+                assert!(
+                    !note.visual.contains('\u{b7}'),
+                    "{source:?} {}: one phrase, no dot of its own: {:?}",
+                    field.key,
+                    note.visual
+                );
+                idle.insert(field.key);
+            }
+        }
+    }
+    // Not vacuous: the families these states idle were all read.
+    for key in [
+        prefs::EDIT_HARNESS_APPROVE,
+        prefs::EDIT_HARNESS_QUESTION_PRIORITY,
+        prefs::EDIT_TONE_MELODY,
+        prefs::EDIT_OUTPUT_STREAK_SOUND,
+        prefs::EDIT_LOAD_ADAPTIVE_MOTION,
+    ] {
+        assert!(idle.contains(key), "{key} carried a note in some state");
+    }
+}
+
+/// A ZERO SAYS WHAT IT MEANS ONCE ON GLASS: the row's note ("0 keeps every
+/// line.", "...0 searches only the screen.") is the one painted statement of
+/// it, and the control's spoken name carries the state (a text field's note
+/// is paint-only), so the two neighbouring rows paint alike: their name and
+/// Changed, with no chip repeating the note, on the page, in Modified and in
+/// search.
+#[test]
+fn zero_scrollback_rows_paint_what_zero_means_once() {
+    let rows = [
+        (prefs::EDIT_SCROLLBACK, "Unlimited (0)"),
+        (prefs::EDIT_SEARCH_HISTORY_LINES, "Screen only (0)"),
+    ];
+    let compile = |source: &str, route: SettingsRoute, search: &str, size: (f32, f32)| {
+        let snapshot = VersionedConfigService::new(source.to_string())
+            .unwrap()
+            .snapshot();
+        let mut state = SettingsViewState::from_snapshot(&snapshot).unwrap();
+        state.navigate(route);
+        state.search = search.to_string();
+        settings_route_at(&state, &view_cx_at(size.0, size.1))
+    };
+    let zero = "scrollback_lines = 0\nsearch_history_lines = 0\n";
+    for size in [(738.0_f32, 418.0_f32), (1_074.0, 684.0), (1_200.0, 1_600.0)] {
+        for (route, search) in [
+            (SettingsRoute::Terminal, ""),
+            (SettingsRoute::Modified, ""),
+            (SettingsRoute::Terminal, "scrollback"),
+        ] {
+            let compiled = compile(zero, route, search, size);
+            let at = format!("{size:?} {route:?} {search:?}");
+            let painted = painted_texts(&compiled).join(" ");
+            for (key, state_words) in rows {
+                let Some(control) =
+                    compiled.semantic(&UiKey::new(format!("settings/control/{key}")))
+                else {
+                    // A row this screen does not reach says nothing on it.
+                    continue;
+                };
+                assert!(
+                    control.label.contains(state_words),
+                    "{at}: {key} speaks {state_words:?}: {:?}",
+                    control.label
+                );
+                let note = prefs::footnote_of(key).expect("the row has its note");
+                assert_eq!(
+                    painted.matches(note).count(),
+                    1,
+                    "{at}: {key}'s note is painted once: {painted}"
+                );
+            }
+            assert!(
+                !painted.contains("Unlimited") && !painted.contains("Screen only"),
+                "{at}: no chip repeats the notes: {painted}"
+            );
+        }
+    }
+    // Both rows paint their name and Changed and nothing more, where the
+    // label line holds them.
+    let compiled = compile(zero, SettingsRoute::Terminal, "", (1_200.0, 1_600.0));
+    for (key, _) in rows {
+        let label = compiled
+            .paint
+            .iter()
+            .find(|node| node.key.as_str() == format!("settings/label/{key}/visual"))
+            .and_then(|node| match &node.content {
+                UiContent::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{key}'s label line"));
+        let field_label = SettingsViewState::new(&Config::default())
+            .field_by_key(key)
+            .unwrap()
+            .label;
+        assert_eq!(label, format!("{field_label}  ·  Changed"), "{key}");
+    }
+    // Negative control: a nonzero value does not speak the zero state.
+    let compiled = compile(
+        "scrollback_lines = 100000\nsearch_history_lines = 100\n",
+        SettingsRoute::Terminal,
+        "",
+        (1_200.0, 1_600.0),
+    );
+    for (key, state_words) in rows {
+        let control = compiled
+            .semantic(&UiKey::new(format!("settings/control/{key}")))
+            .unwrap();
         assert!(
-            compiled
-                .semantic(&UiKey::new(key))
-                .unwrap()
-                .label
-                .contains("Unlimited (0)")
+            !control.label.contains(state_words),
+            "{key}: {:?}",
+            control.label
         );
     }
 }
@@ -24728,17 +29856,22 @@ fn explicit_zero_scrollback_is_announced_as_unlimited() {
 #[test]
 fn generic_search_hides_absent_compatibility_keys_but_modified_retains_authored_ones() {
     let state = SettingsViewState::new(&Config::default());
-    assert_eq!(manual_search_match_count(&state, "materialize"), 0);
-    assert_eq!(manual_search_match_count(&state, "orca"), 0);
+    assert_eq!(manual_search_matching_keys(&state, "materialize").len(), 0);
+    assert_eq!(manual_search_matching_keys(&state, "orca").len(), 0);
 
     let mut service = VersionedConfigService::new(String::new()).unwrap();
     let snapshot = service
         .replace_external("[matrix_rain]\nmaterialize = true\n".to_string())
         .unwrap();
     let state = SettingsViewState::from_snapshot(&snapshot).unwrap();
-    assert_eq!(manual_search_match_count(&state, "materialize"), 1);
+    assert_eq!(manual_search_matching_keys(&state, "materialize").len(), 1);
+    // Known by what it was for, and removable: taking it out loses nothing.
     assert!(authored_manual_overrides(&state).iter().any(|entry| {
-        entry.key == "matrix_rain.materialize" && entry.known && !entry.reset_safe
+        entry.key == "matrix_rain.materialize"
+            && entry.known
+            && entry.reset_safe
+            && entry.label == "Matrix rain materialize"
+            && entry.preview == "No effect"
     }));
 
     let (mut runtime, instance, view) = setup();
@@ -24760,7 +29893,7 @@ fn generic_search_hides_absent_compatibility_keys_but_modified_retains_authored_
             instance,
             view,
             AppEvent::Action(ActionInvocation {
-                id: ActionId::new("settings/manual/open-search"),
+                id: ActionId::new("settings/manual/open-match/0"),
                 value: None,
             }),
         )
@@ -24779,92 +29912,109 @@ fn generic_search_hides_absent_compatibility_keys_but_modified_retains_authored_
 /// "unless there is a setting added later by the user explicitly to NOT do
 /// this", and every shipped surface tells the user to search Settings for
 /// "approve". From the DEFAULT config (the key absent) that search must
-/// draw the `harness.approve` row as a native control — and the
-/// harness master switch with it — not only the Manual count: before the
+/// draw the `harness.approve` row as a native control — the harness master
+/// switch a native row beside it — not only the Manual count: before the
 /// fix the row appeared under Modified alone, once the key was already
-/// written. Negative control: the Manual sweep no longer counts the key
-/// (a native row and a Manual match for one key would be two answers).
-/// The question answer (2026-09-25) is a native switch the same way: from
-/// the default config a search for "question" draws it, its effect is the
-/// harness runtime, and the Manual sweep does not count it too.
+/// written. The question answer and its priority (2026-09-25) are native
+/// rows the same way, drawn by a search for "question" and "priority", and
+/// so is the default Autopilot (2026-10-15), drawn by its name, a mode's
+/// word and the owner's "wrap up" (its key was missing from
+/// [`native_advanced_effect`], so Search drew only the Manual count); each
+/// row's effect is the harness runtime (the host restarts its workers under
+/// a changed policy). Negative controls: the Manual sweep does not count the
+/// key too (a native row and a Manual match for one key would be two
+/// answers), and a search a row does not answer to draws no row for it, so
+/// the draw is the search's.
 #[test]
-fn a_search_for_question_draws_the_answer_questions_switch() {
-    let key = prefs::EDIT_HARNESS_ANSWER_QUESTIONS;
+fn a_search_draws_each_harness_row_as_a_native_control() {
     let state = SettingsViewState::new(&Config::default());
-    assert!(!state.is_explicit(key));
-    assert!(settings_field_is_visible(key, false, true));
-    assert!(matches!(
-        native_advanced_effect(key),
-        Some(AdvancedEffectPath::HarnessRuntime)
-    ));
+    let drawn = |key: &str, search: &str| {
+        let (mut runtime, instance, view) = setup();
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new("settings/search"),
+                    value: Some(SemanticInput::Text(search.to_string())),
+                }),
+            )
+            .unwrap();
+        compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 900.0))
+            .semantic(&UiKey::new(format!("settings/control/{key}")))
+            .is_some()
+    };
+    for (key, searches) in [
+        (prefs::EDIT_HARNESS_APPROVE, &["approve"][..]),
+        (prefs::EDIT_HARNESS_ANSWER_QUESTIONS, &["question"]),
+        (prefs::EDIT_HARNESS_QUESTION_PRIORITY, &["priority"]),
+        (
+            prefs::EDIT_HARNESS_AUTOPILOT,
+            &["autopilot", "cruise", "wrap up"],
+        ),
+    ] {
+        assert!(!state.is_explicit(key), "{key}");
+        for &search in searches {
+            assert!(
+                !manual_search_matching_keys(&state, search)
+                    .iter()
+                    .any(|k| k == key),
+                "{key}: a native row, not a Manual match for {search:?}"
+            );
+            assert!(drawn(key, search), "a search for {search:?} draws {key}");
+        }
+    }
     assert!(
-        !manual_search_matching_keys(&state, "question")
-            .iter()
-            .any(|k| k == key),
-        "the key is a native row, not a Manual match"
+        !drawn(prefs::EDIT_HARNESS_AUTOPILOT, "font"),
+        "a search it does not answer to draws no row"
     );
-    let (mut runtime, instance, view) = setup();
-    runtime
-        .dispatch(
-            instance,
-            view,
-            AppEvent::Action(ActionInvocation {
-                id: ActionId::new("settings/search"),
-                value: Some(SemanticInput::Text("question".to_string())),
-            }),
-        )
-        .unwrap();
-    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 900.0));
-    let control = compiled
-        .semantic(&UiKey::new(format!("settings/control/{key}")))
-        .expect("a search for \"question\" draws the answer-questions switch");
-    assert!(
-        control.label.contains("Answer questions"),
-        "{}",
-        control.label
-    );
+    for key in [
+        prefs::EDIT_HARNESS_ENABLED,
+        prefs::EDIT_HARNESS_APPROVE,
+        prefs::EDIT_HARNESS_ANSWER_QUESTIONS,
+        prefs::EDIT_HARNESS_QUESTION_PRIORITY,
+        prefs::EDIT_HARNESS_AUTOPILOT,
+    ] {
+        assert!(settings_field_is_visible(key, false, true), "{key}");
+        assert!(
+            matches!(
+                native_advanced_effect(key),
+                Some(AdvancedEffectPath::HarnessRuntime)
+            ),
+            "{key}"
+        );
+    }
 }
 
-/// HOW a question is answered (2026-09-25) is a native Enum row the same
-/// way: from the default config a search for "priority" draws it — its
-/// effect is the harness runtime (the host restarts its workers under a
-/// changed policy) — and the Manual sweep does not count it too.
+/// Security's permission rows are named in plain words, so the escape
+/// sequences they gate left their labels: a search for a sequence's name
+/// still finds its row (OSC 52, XTWINOPS, OSC 4).
 #[test]
-fn a_search_for_priority_draws_the_question_priority_row() {
-    let key = prefs::EDIT_HARNESS_QUESTION_PRIORITY;
-    let state = SettingsViewState::new(&Config::default());
-    assert!(!state.is_explicit(key));
-    assert!(settings_field_is_visible(key, false, true));
-    assert!(matches!(
-        native_advanced_effect(key),
-        Some(AdvancedEffectPath::HarnessRuntime)
-    ));
-    assert!(
-        !manual_search_matching_keys(&state, "priority")
-            .iter()
-            .any(|k| k == key),
-        "the key is a native row, not a Manual match"
-    );
-    let (mut runtime, instance, view) = setup();
-    runtime
-        .dispatch(
-            instance,
-            view,
-            AppEvent::Action(ActionInvocation {
-                id: ActionId::new("settings/search"),
-                value: Some(SemanticInput::Text("priority".to_string())),
-            }),
-        )
-        .unwrap();
-    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 900.0));
-    let control = compiled
-        .semantic(&UiKey::new(format!("settings/control/{key}")))
-        .expect("a search for \"priority\" draws the question-priority row");
-    assert!(
-        control.label.contains("Question priority"),
-        "{}",
-        control.label
-    );
+fn a_security_permissions_sequence_name_still_finds_its_row() {
+    for (search, key) in [
+        ("osc 52", prefs::EDIT_ALLOW_OSC52_QUERY),
+        ("xtwinops", prefs::EDIT_ALLOW_WINDOW_OPS),
+        ("osc 4", prefs::EDIT_ALLOW_PALETTE_RECONFIGURE),
+    ] {
+        let (mut runtime, instance, view) = setup();
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new("settings/search"),
+                    value: Some(SemanticInput::Text(search.to_string())),
+                }),
+            )
+            .unwrap();
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 900.0));
+        assert!(
+            compiled
+                .semantic(&UiKey::new(format!("settings/control/{key}")))
+                .is_some(),
+            "a search for {search:?} finds {key}"
+        );
+    }
 }
 
 /// `desktop_alerts` (2026-09-28: the owner turned aterm's own desktop
@@ -24879,7 +30029,7 @@ fn the_security_page_carries_the_desktop_alerts_switch() {
     let key = prefs::EDIT_DESKTOP_ALERTS;
     assert_eq!(prefs::section_of(key), prefs::Section::Security);
     assert_eq!(prefs::group_of(key).0, "Notifications");
-    assert!(prefs::group_footnote("Notifications").is_some());
+    assert!(prefs::footnote_of(key).is_some());
     let on: Config = aterm_toml::from_str("desktop_alerts = true").unwrap();
     let seed = |cfg: &Config| {
         prefs::editable_fields(cfg)
@@ -24930,55 +30080,16 @@ fn the_security_page_carries_the_desktop_alerts_switch() {
 }
 
 #[test]
-fn a_search_for_approve_draws_the_approve_row() {
-    let state = SettingsViewState::new(&Config::default());
-    assert!(!state.is_explicit(prefs::EDIT_HARNESS_APPROVE));
-    for key in [prefs::EDIT_HARNESS_APPROVE, prefs::EDIT_HARNESS_ENABLED] {
-        assert!(settings_field_is_visible(key, false, true), "{key}");
-        assert!(native_advanced_effect(key).is_some(), "{key}");
-    }
-    assert!(
-        !manual_search_matching_keys(&state, "approve")
-            .iter()
-            .any(|key| key == prefs::EDIT_HARNESS_APPROVE),
-        "the key is a native row, not a Manual match"
-    );
-    let (mut runtime, instance, view) = setup();
-    runtime
-        .dispatch(
-            instance,
-            view,
-            AppEvent::Action(ActionInvocation {
-                id: ActionId::new("settings/search"),
-                value: Some(SemanticInput::Text("approve".to_string())),
-            }),
-        )
-        .unwrap();
-    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 900.0));
-    let control = compiled
-        .semantic(&UiKey::new(format!(
-            "settings/control/{}",
-            prefs::EDIT_HARNESS_APPROVE
-        )))
-        .expect("a search for \"approve\" draws the approve row");
-    assert!(
-        control.label.contains("Approve permission boxes"),
-        "{}",
-        control.label
-    );
-}
-
-#[test]
-fn advanced_group_footnotes_are_native_semantic_and_fit_responsive_layouts() {
+fn row_notes_are_native_semantic_and_fit_responsive_layouts() {
     at_each_text_scale(
         &[1.0, 2.0],
-        "native-footnote audit",
-        advanced_group_footnotes_are_native_semantic_and_fit_responsive_layouts_at_scale,
+        "native-note audit",
+        row_notes_are_native_semantic_and_fit_responsive_layouts_at_scale,
     );
 }
 
-/// One rung of [`advanced_group_footnotes_are_native_semantic_and_fit_responsive_layouts`] ([`at_each_text_scale`]).
-fn advanced_group_footnotes_are_native_semantic_and_fit_responsive_layouts_at_scale(scale: f32) {
+/// One rung of [`row_notes_are_native_semantic_and_fit_responsive_layouts`] ([`at_each_text_scale`]).
+fn row_notes_are_native_semantic_and_fit_responsive_layouts_at_scale(scale: f32) {
     for (viewport_width, viewport_height) in [(1_200.0, 720.0), (320.0, 568.0), (568.0, 320.0)] {
         let (mut runtime, instance, view) = setup();
         runtime
@@ -24992,71 +30103,102 @@ fn advanced_group_footnotes_are_native_semantic_and_fit_responsive_layouts_at_sc
             )
             .unwrap();
         let cx = view_cx_at(viewport_width, viewport_height);
-        let compiled = runtime
-            .render(instance, view, &cx)
-            .unwrap()
-            .compile(cx.viewport)
-            .unwrap();
-        let expected = prefs::group_footnote("Permissions").unwrap();
-        let semantic = compiled
-            .semantics
-            .iter()
-            .find(|node| {
-                node.key.as_str().starts_with("settings/group-footnote/")
-                    && node.role == SemanticRole::Status
-            })
-            .expect("native Permissions footnote status");
-        assert_eq!(semantic.label, expected);
-        assert!(semantic.rect.height > 0.0);
-        let visual_lines = compiled
-            .paint
-            .iter()
-            .filter(|node| {
-                node.key.as_str().starts_with("settings/group-footnote/")
-                    && node.key.as_str().contains("/line-")
-            })
-            .collect::<Vec<_>>();
-        assert!(!visual_lines.is_empty());
-        assert!(visual_lines.iter().all(|line| {
-            compiled.semantic(&line.key).is_none() && matches!(&line.content, UiContent::Text(_))
-        }));
-        // ONE footnote per group box on the page — the Security page carries
-        // Permissions everywhere and, on macOS, the [machine] "This Mac" box
-        // too (2026-09-14); a compact page may show only the first group.
-        let painted_groups = compiled
-            .semantics
-            .iter()
-            .filter_map(|node| node.key.as_str().strip_prefix("settings/row/"))
-            .filter_map(|rest| rest.split_once('/').map(|(_, key)| key))
-            .map(|key| prefs::group_of(key).0)
-            .filter(|group| prefs::group_footnote(group).is_some())
-            .collect::<BTreeSet<_>>();
-        assert!(painted_groups.contains("Permissions"), "{painted_groups:?}");
-        assert_eq!(
-            compiled
-                .semantics
-                .iter()
-                .filter(|node| {
-                    node.key.as_str().starts_with("settings/group-footnote/")
-                        && node.role == SemanticRole::Status
-                })
-                .count(),
-            painted_groups.len(),
-            "{viewport_width}×{viewport_height} at {scale}×: {painted_groups:?}"
-        );
-        let overflow = compiled
-            .paint_audit_lines()
+        // The Permissions box's footnote speaks for the rows it holds.
+        let permissions = prefs::editable_fields(&crate::app_config::Config::default())
             .into_iter()
-            .filter(|line| {
-                line.contains("paint-text key=\"settings/group-footnote/")
-                    && (line.contains("overflow=true") || line.contains("clip-truncated=true"))
+            .map(|field| field.key)
+            .filter(|key| {
+                prefs::section_of(key) == prefs::Section::Security
+                    && prefs::group_of(key).0 == "Permissions"
+                    && settings_field_is_visible(key, false, false)
             })
             .collect::<Vec<_>>();
+        // Each row draws its own note inside it, a shared one in the last
+        // row that shares it; its control's description says it too.
+        let notes: Vec<(&str, &str)> = permissions
+            .iter()
+            .copied()
+            .zip(prefs::row_notes(&permissions))
+            .filter_map(|(key, note)| Some((key, note?)))
+            .collect();
+        assert!(!notes.is_empty(), "the Permissions rows carry notes");
+        let mut reached = false;
+        let mut painted_notes = std::collections::BTreeSet::new();
+        each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+            let context = format!("{viewport_width}×{viewport_height} screen {top} at {scale}×");
+            for (key, note) in &notes {
+                // In its row, or the stop right after it where the two
+                // outgrow a screen together.
+                let lines = compiled
+                    .paint
+                    .iter()
+                    .filter(|node| {
+                        !node.peek
+                            && (node
+                                .key
+                                .as_str()
+                                .starts_with(&format!("settings/detail/{key}/line-"))
+                                || node
+                                    .key
+                                    .as_str()
+                                    .starts_with(&format!("settings/note/{key}/line-")))
+                    })
+                    .collect::<Vec<_>>();
+                if lines.is_empty() {
+                    continue;
+                }
+                assert!(
+                    lines.iter().all(|line| {
+                        compiled.semantic(&line.key).is_none()
+                            && matches!(&line.content, UiContent::Text(_))
+                    }),
+                    "{context}: a note's lines are paint-only copy"
+                );
+                let painted = lines
+                    .iter()
+                    .filter_map(|line| match &line.content {
+                        UiContent::Text(spec) => Some(spec.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if painted.contains(note.split_whitespace().next().unwrap()) {
+                    painted_notes.insert(*key);
+                }
+                if let Some(control) =
+                    compiled.semantic(&UiKey::new(format!("settings/control/{key}")))
+                {
+                    assert!(
+                        control
+                            .description
+                            .as_deref()
+                            .is_some_and(|description| description.contains(note)),
+                        "{context}: {key}'s description says its note"
+                    );
+                    reached = true;
+                }
+            }
+            let overflow = compiled
+                .paint_audit_lines()
+                .into_iter()
+                .filter(|line| {
+                    line.contains("paint-text key=\"settings/detail/")
+                        && (line.contains("overflow=true") || line.contains("clip-truncated=true"))
+                })
+                .collect::<Vec<_>>();
+            assert!(overflow.is_empty(), "{context}: {}", overflow.join("\n"));
+        });
         assert!(
-            overflow.is_empty(),
-            "{viewport_width}×{viewport_height} at {scale}×: {}",
-            overflow.join("\n")
+            reached,
+            "native Permissions note at {viewport_width}×{viewport_height} {scale}×"
         );
+        // Each note paints, in its row or the stop right after it.
+        for (key, _) in &notes {
+            assert!(
+                painted_notes.contains(key),
+                "{viewport_width}×{viewport_height} {scale}×: {key} paints its own note"
+            );
+        }
     }
 
     if scale == 2.0 {
@@ -25090,44 +30232,34 @@ fn advanced_group_footnotes_are_native_semantic_and_fit_responsive_layouts_at_sc
                     .map(|field| field.key.to_string())
                     .collect::<BTreeSet<_>>()
             };
-            if expected.is_empty() {
-                // A ROUTE WITH NO ORDINARY ROWS IS NOT A VACUOUS RUN — but
-                // it must be a KNOWN one. Cursor Kitty's content is its
-                // companion showcase card (`cursor_kitty_card`): both keys
-                // filed there are drawn by something other than the
-                // ordinary registry, so this sweep — which checks that
-                // every registry row is reachable, with an unelided label,
-                // at 2x on a 320pt page — has nothing of its own to check
-                // and would otherwise pass vacuously.
-                //
-                // The guard was `assert!(!expected.is_empty())`, which
-                // measured "does this page have rows" as a proxy for "does
-                // this page have content". That proxy failed the moment the
-                // page's one row (the retired `cursor_trail_wake_ms`) was a
-                // row for nothing. So: the empty set is admitted for
-                // exactly this route and no other, and the thing that
-                // actually makes it non-empty is pinned where it belongs,
-                // by `the_cursor_kitty_page_is_its_showcase_card`.
-                assert_eq!(
-                    route,
-                    SettingsRoute::CursorKitty,
-                    "{} lost every curated field: a page with no rows must be a page \
-                     whose content is a card, and only Cursor Kitty is one",
-                    route.label()
+            // Cursor Styles shows the tuning the saved style (the default
+            // here) draws with, and only that.
+            let expected = if route == SettingsRoute::CursorStyles {
+                let default = crate::app_config::resolve_trail_style(
+                    prefs::DEFAULT_CURSOR_TRAIL_STYLE,
+                    &crate::app_config::TrailPackCatalog::default(),
                 );
-                continue;
-            }
+                expected
+                    .into_iter()
+                    .filter(|key| {
+                        !prefs::CURSOR_STYLE_TUNING_KEYS.contains(&key.as_str())
+                            || trail_style_uses(&default, key)
+                    })
+                    .collect()
+            } else {
+                expected
+            };
+            assert!(
+                !expected.is_empty(),
+                "{} lost every curated field",
+                route.label()
+            );
             let cx = view_cx_at(320.0, 568.0);
             let mut reached = BTreeSet::new();
-            for page in 0..=expected.len() {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
-                    unreachable!();
-                };
-                state.page_scroll = page;
-                let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            each_screen(&mut runtime, instance, view, &cx, |compiled, page| {
                 assert_zero_top_paint(
-                    &compiled,
-                    &format!("2× compact {} page {page}", route.label()),
+                    compiled,
+                    &format!("2× compact {} screen {page}", route.label()),
                 );
                 let visible = compiled
                     .hits
@@ -25143,13 +30275,13 @@ fn advanced_group_footnotes_are_native_semantic_and_fit_responsive_layouts_at_sc
                     let semantic_key = UiKey::new(format!("settings/label/{key}"));
                     let semantic = compiled.semantic(&semantic_key).unwrap_or_else(|| {
                         panic!(
-                            "2× compact {} page {page}: {key} lost its complete label semantics",
+                            "2× compact {} screen {page}: {key} lost its complete label semantics",
                             route.label()
                         )
                     });
                     assert!(
                         !semantic.label.contains('…'),
-                        "2× compact {} page {page}: semantic label was elided: {}",
+                        "2× compact {} screen {page}: semantic label was elided: {}",
                         route.label(),
                         semantic.label,
                     );
@@ -25167,7 +30299,7 @@ fn advanced_group_footnotes_are_native_semantic_and_fit_responsive_layouts_at_sc
                         .unwrap_or_else(|| panic!("{key} lost its paint-only visual label"));
                     assert!(
                         visual.chars().any(char::is_alphanumeric),
-                        "2× compact {} page {page}: {key} collapsed to {visual:?}",
+                        "2× compact {} screen {page}: {key} collapsed to {visual:?}",
                         route.label(),
                     );
                     let control_key = format!("settings/control/{key}");
@@ -25183,40 +30315,43 @@ fn advanced_group_footnotes_are_native_semantic_and_fit_responsive_layouts_at_sc
                             .unwrap_or(&button.spec.label);
                         assert!(
                             visual.chars().any(char::is_alphanumeric),
-                            "2× compact {} page {page}: {key} choice collapsed to {visual:?}",
+                            "2× compact {} screen {page}: {key} choice collapsed to {visual:?}",
                             route.label(),
                         );
                         assert!(
                             !button.spec.label.contains('…'),
-                            "2× compact {} page {page}: {key} control semantics were elided",
+                            "2× compact {} screen {page}: {key} control semantics were elided",
                             route.label(),
                         );
                     }
                 }
-                if visible.is_empty() {
-                    assert_eq!(
-                        page,
-                        0,
-                        "2× compact {} page {page} has fields but no actionable control\n{}",
-                        route.label(),
-                        compiled.paint_audit_lines().join("\n"),
-                    );
-                    assert!(
-                        compiled
-                            .paint
-                            .iter()
-                            .any(|node| { matches!(node.content, UiContent::SettingsPreview(_)) }),
-                        "2× compact {} page 0 is empty instead of a dedicated preview",
-                        route.label(),
-                    );
-                    continue;
-                }
-                reached.extend(visible.into_iter().map(str::to_string));
-                assert_all_hits_material_and_contained(
-                    &compiled,
-                    &format!("2× compact {} page {page}", route.label()),
+                // No screen is only a preview: the list always shows a stop.
+                assert!(
+                    compiled.semantics.iter().any(|node| {
+                        node.parent
+                            .as_ref()
+                            .is_some_and(|parent| parent.as_str() == "settings/list")
+                    }),
+                    "2× compact {} screen {page} shows no stop of its list\n{}",
+                    route.label(),
+                    compiled.paint_audit_lines().join("\n"),
                 );
-            }
+                reached.extend(visible.into_iter().map(str::to_string));
+                // The theme is its card's rows (its slots, or the Color
+                // theme control, and the Follow system switch).
+                if expected.contains(prefs::EDIT_THEME)
+                    && compiled
+                        .hits
+                        .iter()
+                        .any(|hit| theme_card_control_key(hit.key.as_str()))
+                {
+                    reached.insert(prefs::EDIT_THEME.to_string());
+                }
+                assert_all_hits_material_and_contained(
+                    compiled,
+                    &format!("2× compact {} screen {page}", route.label()),
+                );
+            });
             assert_eq!(
                 reached,
                 expected,
@@ -25229,8 +30364,7 @@ fn advanced_group_footnotes_are_native_semantic_and_fit_responsive_layouts_at_sc
 
 #[test]
 fn keyboard_safety_footnote_is_fully_painted_on_desktop_and_compact_pages() {
-    let expected = prefs::group_footnote("Keyboard").unwrap();
-    let warning = "Always, set in Manual, can show a password.";
+    let expected = prefs::footnote_of(prefs::EDIT_PREDICTIVE_ECHO).unwrap();
     for (variant, viewport_width, viewport_height) in
         [("desktop", 1_224.0, 722.0), ("compact", 568.0, 658.0)]
     {
@@ -25257,29 +30391,38 @@ fn keyboard_safety_footnote_is_fully_painted_on_desktop_and_compact_pages() {
                 &compiled,
                 &format!("{variant} Keyboard & Input page {page}"),
             );
-            let Some(semantic) = compiled.semantics.iter().find(|node| {
-                node.role == SemanticRole::Status
-                    && node.key.as_str().starts_with("settings/group-footnote/")
-                    && node.label == expected
-            }) else {
+            // The note is drawn inside Predictive echo's own row, whole, and
+            // its control's description says it.
+            let Some(control) = compiled.semantic(&UiKey::new(format!(
+                "settings/control/{}",
+                prefs::EDIT_PREDICTIVE_ECHO
+            ))) else {
                 continue;
             };
-            let prefix = format!("{}/line-", semantic.key.as_str());
+            assert!(
+                control
+                    .description
+                    .as_deref()
+                    .is_some_and(|description| description.contains(expected)),
+                "{variant}: the control's description carries the note"
+            );
+            let prefix = format!("settings/detail/{}/line-", prefs::EDIT_PREDICTIVE_ECHO);
+            let split = format!("settings/note/{}/line-", prefs::EDIT_PREDICTIVE_ECHO);
             let painted = compiled
                 .paint
                 .iter()
-                .filter_map(|node| {
-                    if !node.key.as_str().starts_with(&prefix) {
-                        return None;
-                    }
-                    let UiContent::Text(spec) = &node.content else {
-                        return None;
-                    };
-                    Some(spec.text.as_str())
+                .filter(|node| {
+                    !node.peek
+                        && (node.key.as_str().starts_with(&prefix)
+                            || node.key.as_str().starts_with(&split))
                 })
-                .collect::<String>();
-            assert_eq!(painted, expected, "{variant}: full authored footnote");
-            assert!(painted.contains(warning), "{variant}: {painted}");
+                .filter_map(|node| match &node.content {
+                    UiContent::Text(spec) => Some(spec.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(painted, expected, "{variant}: full authored note");
             found = true;
             break;
         }
@@ -25321,7 +30464,7 @@ fn native_about_byline_steps_down_to_the_longest_form_its_column_fits_at_every_7
 
 /// One Dynamic Type rung of the byline sweep, over widths `coarse` apart
 /// from 120pt and, where two neighbours disagree about the hero (its
-/// eyebrow, the rung painted, large-type narrow), bisected down to
+/// column, the rung painted, large-type narrow), bisected down to
 /// `resolution` — the thresholds, which are where a byline can overflow.
 ///
 /// WHY (30, 0.5), MEASURED 2026-09-30 by putting each of these into the
@@ -25359,11 +30502,13 @@ fn about_byline_sweep(scale: f32, coarse: f32, resolution: f32) {
         column: f32,
         large_type_narrow: bool,
     }
-    // `about/eyebrow` is a child of the SAME hero column and exists only in
-    // the full (non short-landscape) hero, so it measures the column even
-    // where no byline was authored — the one geometry a byline node cannot
-    // report on. Where both exist the two measures are asserted equal, which
-    // is what makes the eyebrow an honest proxy rather than a second guess.
+    // `about/wordmark` is a child of the SAME hero column in the full hero,
+    // where the version line sits below it (the short-landscape hero sets the
+    // wordmark in a row beside its summary instead), so it measures the
+    // column even where no byline was authored — the one geometry a byline
+    // node cannot report on. Where both exist the two measures are asserted
+    // equal, which is what makes the wordmark an honest proxy rather than a
+    // second guess.
     let byline_at = |width: f32, height: f32| {
         let cx = view_cx_at(width, height);
         let compiled = runtime
@@ -25371,18 +30516,31 @@ fn about_byline_sweep(scale: f32, coarse: f32, resolution: f32) {
             .unwrap()
             .compile(cx.viewport)
             .unwrap();
-        let eyebrow = compiled
+        let painted_rect = |key: &str| {
+            compiled
+                .paint
+                .iter()
+                .find(|node| node.key == UiKey::new(key))
+                .map(|node| node.rect)
+        };
+        let version = painted_rect("about/version-summary")?;
+        let wordmark = compiled
             .paint
             .iter()
-            .find(|node| node.key == UiKey::new("about/eyebrow"))?;
-        let UiContent::Text(TextSpec {
-            text: eyebrow_text, ..
-        }) = &eyebrow.content
-        else {
-            panic!("{width}x{height} at {scale}×: the eyebrow is a text node");
-        };
-        let large_type_narrow = eyebrow_text == "NATIVE APP";
-        let column = eyebrow.rect.width;
+            .find(|node| node.key == UiKey::new("about/wordmark"))?;
+        if version.y + 0.5 < wordmark.rect.y + wordmark.rect.height {
+            return None;
+        }
+        assert!(
+            matches!(wordmark.content, UiContent::Text(_)),
+            "{width}x{height} at {scale}×: the wordmark is a text node"
+        );
+        // The narrow large-type hero is the one that yields its tagline.
+        let large_type_narrow = !compiled
+            .paint
+            .iter()
+            .any(|node| node.key == UiKey::new("about/tagline"));
+        let column = wordmark.rect.width;
         let painted = compiled
             .paint
             .iter()
@@ -25393,7 +30551,7 @@ fn about_byline_sweep(scale: f32, coarse: f32, resolution: f32) {
                 };
                 assert!(
                     (node.rect.width - column).abs() < 0.05,
-                    "{width}x{height} at {scale}×: the byline's {}pt box and its eyebrow sibling's {column}pt box are the same hero column",
+                    "{width}x{height} at {scale}×: the byline's {}pt box and its wordmark sibling's {column}pt box are the same hero column",
                     node.rect.width
                 );
                 let audit = compiled
@@ -25414,7 +30572,7 @@ fn about_byline_sweep(scale: f32, coarse: f32, resolution: f32) {
     let mut rungs_seen = [0usize; 4];
     let mut omissions = 0usize;
     // One width of the sweep, every assertion it makes. What it returns —
-    // whether the hero has an eyebrow at all, the rung painted (`None`: no
+    // whether the hero is the full one at all, the rung painted (`None`: no
     // byline) and whether it is the large-type narrow one — is what
     // [`sample_where_it_changes`] compares between neighbouring widths.
     let mut at = |width: f32, height: f32| -> Option<(Option<usize>, bool)> {
@@ -25482,8 +30640,7 @@ fn about_byline_sweep(scale: f32, coarse: f32, resolution: f32) {
     // From 120pt: this product's own window floor is 164 LOGICAL points wide
     // (`App::whole_cell_min_size`), so the narrow band below the old 240pt
     // sweep start is shipping geometry, not a synthetic one.
-    // 336pt tall puts a 480-760pt compact host in the landscape pager,
-    // where the hero shares its row with the fixed-width side pager.
+    // 336pt tall is a short landscape compact host at 480-760pt.
     for height in [558.0_f32, 336.0, 400.0, 820.0] {
         sample_where_it_changes(120.0, 1_320.0, coarse, resolution, |width| {
             at(width, height)
@@ -25724,8 +30881,8 @@ fn watcher_warning_is_global_separate_from_action_feedback_and_recovery_clears_i
 /// 2026-08 settings audit: a wide global search whose top match drives the
 /// renderer preview ("kitty") painted page 1 as '1–1 of 3' with the Manual
 /// editor card alone — ZERO native result rows — while every actual
-/// control hid on later pages. A Medium/Wide page must list the Manual
-/// result inline WITH the native rows it summarizes.
+/// control hid on later pages. The native rows lead the list; the Manual
+/// card follows them.
 #[test]
 fn wide_search_page_one_lists_native_rows_beside_the_manual_result() {
     let (mut runtime, instance, view) = setup();
@@ -25742,10 +30899,14 @@ fn wide_search_page_one_lists_native_rows_beside_the_manual_result() {
     let cx = view_cx_at(1_275.0, 828.0);
     let compiled = compile_settings_view(&runtime, instance, view, &cx);
     compiled.validate_parity().unwrap();
-    assert!(
-        compiled
+    let mut manual = false;
+    each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
+        manual |= compiled
             .semantic(&UiKey::new("settings/search/manual-result"))
-            .is_some(),
+            .is_some();
+    });
+    assert!(
+        manual,
         "the Manual editor result stays a first-class search result"
     );
     let rows: Vec<&str> = compiled
@@ -25762,38 +30923,15 @@ fn wide_search_page_one_lists_native_rows_beside_the_manual_result() {
         rows.iter().any(|key| key.ends_with("cursor_trail_style")),
         "the ranked native match paints on page 1: {rows:?}"
     );
-    // The window the pager/summary reports covers what is actually painted:
-    // the Manual card plus every native row fits this viewport, so the
-    // page reports the complete roster instead of a phantom '1–1 of 3'.
+    // The summary counts pages and settings; the Manual card names the
+    // aterm.toml keys, so the summary does not count them too.
     let range = compiled
         .semantic(&UiKey::new("settings/results-range"))
-        .expect("search results always disclose their visible window");
-    assert_eq!(range.label, "2 settings · 9 Manual config keys");
-    // Later pages keep the classic one-result-per-step window (the audit
-    // found only page 1 broken).
-    runtime
-        .dispatch(
-            instance,
-            view,
-            AppEvent::Action(ActionInvocation {
-                id: ActionId::new("settings/page-down"),
-                value: None,
-            }),
-        )
-        .unwrap();
-    let paged = compile_settings_view(&runtime, instance, view, &cx);
-    assert_eq!(
-        paged
-            .semantic(&UiKey::new("settings/results-range"))
-            .map(|node| node.label.as_str()),
-        Some("2–3 of 3")
-    );
+        .expect("search results always disclose what they found");
     assert!(
-        paged
-            .semantics
-            .iter()
-            .any(|node| node.key.as_str().starts_with("settings/row/")),
-        "page 2 keeps its native rows"
+        range.label.starts_with("1 page · ") && range.label.ends_with(" settings"),
+        "{}",
+        range.label
     );
 }
 
@@ -25818,46 +30956,26 @@ fn settings_route_at(state: &SettingsViewState, cx: &ViewCx<'_>) -> crate::nativ
         &UpdateState::from_status(1, "0.1.0", None, false).projection(),
         &PackagesState::unobserved().projection(),
         &MessagesState::empty(),
+        &HarnessState::unobserved().projection(),
         cx,
     )
     .compile(cx.viewport)
     .expect("Settings compiles")
 }
 
-fn builtin_title_summary_health() -> TitleSummaryHealth {
-    TitleSummaryHealth {
-        state: TitleSummaryRuntimeState::Builtin,
-        provider: crate::app_config::TitleSummaryProvider::Builtin,
-        model: None,
-        endpoint: None,
-        locality: TitleSummaryLocality::NotApplicable,
-        managed_install_present: false,
-        model_ready: false,
-        last_error: None,
-        next_retry_after: None,
-        next_refresh_after: None,
-        timeout: None,
-        proxy_mode: None,
-        ca_file: None,
-    }
-}
-
 /// THE SHIPPED DEFAULT WINDOW CAN READ ITS OWN EXPLANATORY COPY.
 ///
-/// 80×24 is a 744×420 app viewport (`app_config.rs`), and three long
-/// settings strings were authored as ONE fixed line there, so the painter
-/// ellipsized them — 280.6, 108.7 and 209.1 points of text discarded with
-/// no tooltip, wrap, scroll or selection to get any of it back (2026-09
-/// settings audit):
+/// 80×24 is a 744×420 app viewport (`app_config.rs`), and long settings
+/// strings were authored as ONE fixed line there, so the painter ellipsized
+/// them — 280.6 and 108.7 points of text discarded with no tooltip, wrap,
+/// scroll or selection to get any of it back (2026-09 settings audit; a third,
+/// the retired Smart Titles runtime row, left with that card):
 ///
 /// * `settings/top/wallpaper/description` — required 968.6 against 688.0
 /// * `settings/wallpaper/hint` — the ONLY pointer to where the wallpaper
 ///   dim and text-tint controls live, required 796.7
-/// * `settings/smart-titles/health/summary` — required 897.1, losing the
-///   clause that reports whether the provider errored, and in the error
-///   case the error text itself, since `detail` is composed last
 ///
-/// The first two were never a compact-layout property: [`page_insets`]
+/// Neither was ever a compact-layout property: [`page_insets`]
 /// caps the content column at [`page_maximum`]'s 720 in EVERY width class,
 /// so they were unreadable at every window size. (Both are one short line
 /// now; the wrap path stays, and this still proves nothing is elided.) The
@@ -25876,83 +30994,33 @@ fn long_settings_copy_wraps_instead_of_one_elided_line() {
         let context = format!("Wallpaper at {width}×{height}");
         assert_zero_top_paint(&compiled, &context);
 
-        for (key, tail) in [
-            (
-                "settings/top/wallpaper/description",
-                "still paint over the picture.",
-            ),
-            ("settings/wallpaper/hint", "are set in Manual."),
-        ] {
-            let label = compiled
-                .semantic(&UiKey::new(key))
-                .unwrap_or_else(|| panic!("{context}: {key} is a semantic node"))
-                .label
-                .clone();
-            assert!(
-                label.ends_with(tail),
-                "{context}: {key} keeps its whole sentence: {label}"
-            );
-            let painted = painted_copy_lines(&compiled, key);
-            assert!(
-                painted.iter().all(|line| !line.contains('…')),
-                "{context}: {key} paints no ellipsis: {painted:?}"
-            );
-            assert_eq!(
-                painted
-                    .join(" ")
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                label.split_whitespace().collect::<Vec<_>>().join(" "),
-                "{context}: {key} paints every word it claims"
-            );
-        }
+        // The Wallpaper card's note took over the description's sentence;
+        // dim and text tint are rows of their own now, so the hint is gone.
+        let (key, tail) = ("settings/wallpaper/note", "still paint over the image.");
+        let label = compiled
+            .semantic(&UiKey::new(key))
+            .unwrap_or_else(|| panic!("{context}: {key} is a semantic node"))
+            .label
+            .clone();
+        assert!(
+            label.ends_with(tail),
+            "{context}: {key} keeps its whole sentence: {label}"
+        );
+        let painted = painted_copy_lines(&compiled, key);
+        assert!(
+            painted.iter().all(|line| !line.contains('…')),
+            "{context}: {key} paints no ellipsis: {painted:?}"
+        );
+        assert_eq!(
+            painted
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            label.split_whitespace().collect::<Vec<_>>().join(" "),
+            "{context}: {key} paints every word it claims"
+        );
     }
-
-    // THE WINDOW PAGE'S CONSOLIDATED RUNTIME ROW. Compact joins the four
-    // composed clauses into one line; the wide layout already publishes
-    // them as six separate rows, so only the join was ever clipped.
-    const SUMMARY: &str = "settings/smart-titles/health/summary";
-    let mut state = SettingsViewState::new(&Config::default());
-    state.navigate(SettingsRoute::WindowTabs);
-    assert!(state.replace_title_summary_health(builtin_title_summary_health()));
-    let cx = view_cx_at(744.0, 420.0);
-    let compiled = settings_route_at(&state, &cx);
-    assert_zero_top_paint(&compiled, "Window at 744×420");
-    let painted = painted_copy_lines(&compiled, SUMMARY);
-    assert!(
-        painted
-            .last()
-            .is_some_and(|line| line.ends_with("nothing is sent.")),
-        "the whole consolidated row reaches glass: {painted:?}"
-    );
-    assert!(
-        painted.iter().all(|line| !line.contains('…')),
-        "the consolidated row paints no ellipsis: {painted:?}"
-    );
-
-    // THE ERROR CASE is the one that mattered most: `detail` is composed
-    // LAST, so a single clamped line turned the row Danger-red while
-    // clipping off the error text that earned the colour.
-    let mut failing = builtin_title_summary_health();
-    failing.state = TitleSummaryRuntimeState::Error;
-    failing.provider = crate::app_config::TitleSummaryProvider::Ollama;
-    failing.locality = TitleSummaryLocality::UnattestedLoopback;
-    failing.endpoint = Some("http://127.0.0.1:11434/api/chat".to_string());
-    failing.timeout = Some(std::time::Duration::from_secs(42));
-    failing.proxy_mode = Some(crate::app_config::TitleSummaryProxyMode::Direct);
-    failing.last_error = Some("managed runtime is not installed".to_string());
-    assert!(state.replace_title_summary_health(failing));
-    let compiled = settings_route_at(&state, &cx);
-    let painted = painted_copy_lines(&compiled, SUMMARY);
-    // Joined: the error may wrap across lines; it must not be clipped.
-    assert!(
-        painted
-            .join(" ")
-            .contains("managed runtime is not installed")
-            && painted.iter().all(|line| !line.contains('…')),
-        "the error text the Danger colour is about reaches glass: {painted:?}"
-    );
 }
 
 // -----------------------------------------------------------------------
@@ -26445,13 +31513,23 @@ fn one_past_day_is_headed_and_the_titles_hold_their_x_across_filters() {
 
 /// Settings ▸ Messages's TOP switch (design §10.14, ruling 212): "Explain
 /// heavy load" — the registry's `explain_heavy_load` Bool, resolved ON by
-/// default — at its deep-link key, with a visible label the pixel tray
-/// keeps, an accessible name, and the ordinary `settings/set/<key>`
-/// action, at the top of the page at every width, above the log.
+/// default — at its deep-link key, the ordinary setting row every page draws
+/// (its label, its switch with the value beside it, the `settings/set/<key>`
+/// action) in a card, with its note under it where the page has room — the
+/// compact list too, wherever the note leaves the first screen its log (the
+/// 102x29 window's) — and as the switch's description always, at the top of
+/// the page, above the log.
 #[test]
 fn the_messages_page_carries_the_explain_heavy_load_switch() {
     let key = prefs::EDIT_EXPLAIN_HEAVY_LOAD;
-    for (width, height) in [(1_200.0, 820.0), (320.0, 568.0)] {
+    for (width, height, noted) in [
+        (1_200.0, 820.0, true),
+        (738.0, 420.0, true),
+        (320.0, 568.0, true),
+        // NEGATIVE CONTROL: a window too short for the note and the log's
+        // newest entry keeps the note as the switch's description alone.
+        (320.0, 360.0, false),
+    ] {
         // On a compact page the switch heads the list's top and scrolls
         // away with it (rulings 262 and 264).
         let (runtime, instance, view) = setup_with_messages();
@@ -26498,20 +31576,22 @@ fn the_messages_page_carries_the_explain_heavy_load_switch() {
             )),
             "the label survives lowering into the pixel tray ({at})"
         );
-        // A plain switch: no boxed `On` beside it.
+        // The switch every setting row has: its value beside it.
         assert!(
-            !tray.prims.iter().any(|prim| matches!(
+            tray.prims.iter().any(|prim| matches!(
                 prim,
-                crate::widget::DrawPrim::Text { s, .. } if s == "On" || s == "Off"
+                crate::widget::DrawPrim::Text { s, .. } if s == "On"
             )),
-            "no On pill ({at})"
+            "the row's switch shows its value ({at})"
         );
+        let note = prefs::footnote_of(key).expect("the row has a note");
+        assert_eq!(control.description.as_deref(), Some(note), "{at}");
         assert_eq!(
             compiled
                 .semantic(&UiKey::new(format!("{MESSAGES_EXPLAIN_LOAD}/caption")))
                 .map(|node| node.label.as_str()),
-            Some(MESSAGES_EXPLAIN_LOAD_CAPTION),
-            "its one caption line ({at})"
+            noted.then_some(note),
+            "the note under the row where the page has room for it and the log ({at})"
         );
         let first_row = compiled
             .semantics
@@ -26519,11 +31599,14 @@ fn the_messages_page_carries_the_explain_heavy_load_switch() {
             .filter(|node| node.key.as_str().ends_with("/title"))
             .find(|node| node.key.as_str().starts_with("settings/messages/row/"))
             .map(|node| node.rect.y);
-        let row_y = first_row.unwrap_or_else(|| panic!("the log under it ({at})"));
-        assert!(
-            row.rect.bottom() <= row_y,
-            "the switch above the log ({at})"
-        );
+        // Where the note shows, the log's newest entry still does too.
+        if noted {
+            let row_y = first_row.unwrap_or_else(|| panic!("the log under it ({at})"));
+            assert!(
+                row.rect.bottom() <= row_y,
+                "the switch above the log ({at})"
+            );
+        }
         assert!(
             compiled
                 .semantic(&UiKey::new("settings/messages/pagination"))
@@ -26833,12 +31916,7 @@ fn messages_page_lists_newest_first_and_filters_by_tag() {
             .is_some_and(|state| !state.enabled),
         "Copy All has nothing to copy"
     );
-    // One subtitle at every width: the package records are listed here.
-    assert_eq!(
-        messages_page_subtitle(SettingsWidth::Medium),
-        messages_page_subtitle(SettingsWidth::Compact)
-    );
-    assert!(!messages_page_subtitle(SettingsWidth::Medium).contains("Packages"));
+    assert!(!messages_page_subtitle().contains("Packages"));
     assert!(
         compiled
             .semantic(&UiKey::new("settings/messages/range"))
@@ -27990,6 +33068,7 @@ fn page_keys_move_the_compact_category_list_by_the_page_it_shows() {
     let shown = |compiled: &crate::native_ui::CompiledUi| -> Vec<usize> {
         SettingsRoute::ALL
             .iter()
+            .filter(|route| route.on_rail())
             .enumerate()
             .filter(|(_, route)| {
                 compiled
@@ -28001,14 +33080,14 @@ fn page_keys_move_the_compact_category_list_by_the_page_it_shows() {
     };
     let mut seen = std::collections::BTreeSet::new();
     let mut pages = Vec::new();
-    for _ in 0..SettingsRoute::ALL.len() {
+    for _ in 0..SettingsRoute::rail_len() {
         let compiled = compile_settings_view(&runtime, instance, view, &cx);
         let rows = shown(&compiled);
         assert!(!rows.is_empty());
         seen.extend(rows.iter().copied());
         let last = *rows.last().unwrap();
         pages.push(rows);
-        if last + 1 == SettingsRoute::ALL.len() {
+        if last + 1 == SettingsRoute::rail_len() {
             break;
         }
         runtime
@@ -28016,12 +33095,12 @@ fn page_keys_move_the_compact_category_list_by_the_page_it_shows() {
             .unwrap();
     }
     assert!(
-        pages[0].len() < SettingsRoute::ALL.len(),
+        pages[0].len() < SettingsRoute::rail_len(),
         "the list pages at this size"
     );
     assert_eq!(
         seen.len(),
-        SettingsRoute::ALL.len(),
+        SettingsRoute::rail_len(),
         "every category shown: {pages:?}"
     );
     for pair in pages.windows(2) {
@@ -28040,16 +33119,17 @@ fn page_keys_move_the_compact_category_list_by_the_page_it_shows() {
     assert_eq!(shown(&compiled), pages[0]);
 }
 
-/// ROUND 16 REVIEW (ruling 267): a page that shows ONE section per page —
-/// the compact Packages pages, About's sections — indexes `page_scroll` by
-/// page, and Page Down still moved it eight: from page 1 of 13 on the
-/// compact Packages page it landed on page 9. Every Page Down now turns
-/// one page, and Page Up turns it back.
+/// PAGE DOWN TURNS A WHOLE SCREEN (ruling 267): the next screen starts at the
+/// stop after the last one shown, so no stop is shown twice and none is
+/// skipped, until the last screen; Page Up turns back by a screen. The wheel
+/// and the arrow keys keep their one-row step.
 #[test]
-fn page_keys_turn_one_page_on_pages_that_show_one_section() {
-    for (route, status_key) in [
-        (SettingsRoute::Packages, "packages/range"),
-        (SettingsRoute::About, "about/range"),
+fn page_keys_turn_a_whole_screen_and_the_wheel_a_row() {
+    for route in [
+        SettingsRoute::Packages,
+        SettingsRoute::About,
+        SettingsRoute::Appearance,
+        SettingsRoute::Security,
     ] {
         let (mut runtime, instance, view) = setup();
         assert!(runtime.replace_settings_packages(live_packages_state(None), 2));
@@ -28060,33 +33140,54 @@ fn page_keys_turn_one_page_on_pages_that_show_one_section() {
             state.navigate(route);
         }
         let cx = view_cx_at(474.0, 320.0);
-        let compiled = compile_settings_view(&runtime, instance, view, &cx);
-        let total = pager_total(&compiled, status_key);
-        assert!(total > 2, "{route:?} pages at this size: {total}");
-        let page = |runtime: &NativeRuntime| messages_view_state(runtime, view).page_scroll;
-        for expected in 1..total {
+        let screen = |runtime: &NativeRuntime| {
+            let _ = compile_settings_view(runtime, instance, view, &cx);
+            let state = messages_view_state(runtime, view);
+            let plan = state.scroll_plan().expect("a measured list");
+            let top = state.page_scroll.min(plan.limit());
+            (plan.view(top), plan.limit())
+        };
+        let (mut shown, limit) = screen(&runtime);
+        assert!(limit > 0, "{route:?} scrolls at this size");
+        while shown.start < limit {
             runtime
                 .dispatch(instance, view, AppEvent::ScrollPage(1))
                 .unwrap();
+            let (next, _) = screen(&runtime);
             assert_eq!(
-                page(&runtime),
-                expected,
-                "{route:?}: Page Down turns one page"
+                next.start,
+                shown.end.min(limit),
+                "{route:?}: Page Down starts at the stop after the screen it left"
             );
-            let compiled = compile_settings_view(&runtime, instance, view, &cx);
-            assert_eq!(pager_total(&compiled, status_key), total);
+            shown = next;
         }
-        for expected in (0..total - 1).rev() {
+        while shown.start > 0 {
             runtime
                 .dispatch(instance, view, AppEvent::ScrollPage(-1))
                 .unwrap();
-            assert_eq!(
-                page(&runtime),
-                expected,
-                "{route:?}: Page Up turns one back"
+            let (back, _) = screen(&runtime);
+            assert!(back.start < shown.start, "{route:?}: Page Up turns back");
+            assert!(
+                back.end >= shown.start,
+                "{route:?}: Page Up skips no stop before the screen it left"
             );
-            let _ = compile_settings_view(&runtime, instance, view, &cx);
+            let plan = messages_view_state(&runtime, view)
+                .scroll_plan()
+                .expect("a measured list");
+            assert!(
+                back.start == 0 || plan.span(back.start - 1..shown.start) > plan.room(),
+                "{route:?}: Page Up turns back a whole screen"
+            );
+            shown = back;
         }
+        runtime
+            .dispatch(instance, view, AppEvent::ScrollLines(1))
+            .unwrap();
+        assert_eq!(
+            screen(&runtime).0.start,
+            1,
+            "{route:?}: the wheel steps a row"
+        );
     }
 }
 
@@ -28218,6 +33319,8 @@ fn the_messages_pages_confirmation_takes_no_room_from_the_list() {
                 unreachable!();
             };
             state.feedback = None;
+            // The list's top, where a compact page seats its count line.
+            state.page_scroll = 0;
         }
         let quiet = message_rows(&compile_settings_view(&runtime, instance, view, &cx));
         {
@@ -28259,10 +33362,11 @@ fn a_count_lines_note_never_moves_its_buttons() {
     let mut placements = std::collections::BTreeSet::new();
     for w in (120..=900).step_by(10) {
         let w = w as f32;
-        let (bare, bare_h) = messages_count_line(Some("1,234 of 5,678".into()), None, w);
+        let (bare, bare_h) = messages_count_line(Some("1,234 of 5,678".into()), None, w, true);
         placements.insert(shape(&bare).len());
         for note in notes {
-            let (with, with_h) = messages_count_line(Some("1,234 of 5,678".into()), Some(note), w);
+            let (with, with_h) =
+                messages_count_line(Some("1,234 of 5,678".into()), Some(note), w, true);
             assert_eq!(with_h, bare_h, "{w} pt, {note:?}: the height moved");
             assert_eq!(
                 shape(&with),
@@ -28699,7 +33803,7 @@ fn messages_render_work(
 fn the_log_at_its_ring_cap_builds_only_the_rows_in_view() {
     // A stopwatch cannot say this: the best of nine timed renders read
     // 25.7 ms at 512 entries beside 6.4 ms at 40 in one loaded
-    // merge-contract run, 29 ms beside 5.7 ms in another, where the same
+    // whole-workspace run, 29 ms beside 5.7 ms in another, where the same
     // build takes 3.8 ms beside 3.1 ms of thread CPU alone — while a lead
     // column that measures every entry's words passed, alone, at 16.4 ms
     // beside 3.6 ms, inside the "twice plus 10 ms" it was held to. Nor can
@@ -29225,7 +34329,7 @@ fn shoot_settings(
 /// the Settings pages a 100- and a 60-column window open (774 and 470 pt
 /// wide, 612 tall), dark and GitHub Light — the list's top, one scrolled
 /// to the middle of a day, the end, the Problems filter, an entry opened
-/// under a past day, and High Contrast. Not a gate: `#[ignore]`d.
+/// under a past day, and High Contrast. Not part of a test run: `#[ignore]`d.
 ///
 /// ```sh
 /// SETTINGS_MESSAGES_PNG_DIR=<dir> targo --unverified test -p aterm-gui --lib \
@@ -29332,7 +34436,7 @@ fn settings_messages_day_headers_capture() {
 /// chip selected; a crash, a long toolchain failure and a strain record
 /// expanded to their details; the "Explain heavy load" switch; and the
 /// deep link's landing from Software Update (`settings/messages/show/update`).
-/// Not a gate: `#[ignore]`d (it needs a real UI face).
+/// Not part of a test run: `#[ignore]`d (it needs a real UI face).
 ///
 /// ```sh
 /// SETTINGS_MESSAGES_PNG_DIR=<dir> targo --unverified test -p aterm-gui --lib \
@@ -30076,13 +35180,13 @@ fn the_messages_clock_clears_only_the_line_it_set() {
         .unwrap();
     assert_eq!(
         feedback_line(&runtime, view).as_deref(),
-        Some("Couldn\u{2019}t apply: x"),
+        Some("Explain heavy load was not saved: x"),
         "premise"
     );
     publish_messages(&mut runtime, instance, view, base + 6_000, 9);
     assert_eq!(
         feedback_line(&runtime, view).as_deref(),
-        Some("Couldn\u{2019}t apply: x"),
+        Some("Explain heavy load was not saved: x"),
         "the Copy's clock cleared the config patch's result"
     );
 }
@@ -30391,5 +35495,3615 @@ fn open_log_folder_waits_for_its_outcome() {
         feedback_line(&runtime, view),
         None,
         "the next action on the page clears it"
+    );
+}
+
+/// The keys of every control a compiled screen draws, toolbar and rail aside.
+fn page_controls(compiled: &crate::native_ui::CompiledUi) -> BTreeSet<String> {
+    compiled
+        .semantics
+        .iter()
+        .filter(|node| node.action.is_some())
+        .map(|node| node.key.as_str().to_string())
+        .filter(|key| {
+            !key.starts_with("settings/nav")
+                && !key.starts_with("settings/search")
+                && !key.starts_with("settings/compact-navigation")
+        })
+        .collect()
+}
+
+/// EVERY CONTROL IS REACHED BY SCROLLING (the scroll-list ruling). For every
+/// route at 584×348, 738×418 and 1074×684, every control the route draws in a
+/// window of the same width tall enough to hold it all is on some screen of
+/// its list, whole and inside the window; a screen that shows a preview also
+/// shows a stop of the list under it; and the category sheet holds many
+/// routes on a screen.
+#[test]
+fn every_route_reaches_every_control_by_scrolling_at_every_window_size() {
+    for (width, height) in [(584.0, 348.0), (738.0, 418.0), (1_074.0, 684.0)] {
+        for route in SettingsRoute::ALL {
+            let (mut runtime, instance, view) = setup();
+            assert!(runtime.replace_settings_packages(live_packages_state(None), 2));
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!();
+                };
+                state.navigate(route);
+            }
+            let tall = view_cx_at(width, 4_000.0);
+            let expected = page_controls(&compile_settings_view(&runtime, instance, view, &tall));
+            let cx = view_cx_at(width, height);
+            let mut reached = BTreeSet::new();
+            each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+                let context = format!("{} {width}×{height} screen {top}", route.label());
+                compiled
+                    .validate_parity()
+                    .unwrap_or_else(|error| panic!("{context}: {error:?}"));
+                assert_all_hits_material_and_contained(compiled, &context);
+                for hit in &compiled.hits {
+                    let paint = compiled
+                        .paint
+                        .iter()
+                        .find(|paint| paint.key == hit.key)
+                        .unwrap_or_else(|| panic!("{context}: {:?} has no paint", hit.key));
+                    assert_eq!(paint.rect, hit.rect, "{context}: {:?} is clipped", hit.key);
+                }
+                if compiled
+                    .paint
+                    .iter()
+                    .any(|node| matches!(node.content, UiContent::SettingsPreview(_)))
+                {
+                    assert!(
+                        compiled.semantics.iter().any(|node| {
+                            node.parent
+                                .as_ref()
+                                .is_some_and(|parent| parent.as_str().ends_with("list"))
+                        }),
+                        "{context}: a screen is never only a preview"
+                    );
+                }
+                reached.extend(page_controls(compiled));
+            });
+            let missing = expected.difference(&reached).collect::<Vec<_>>();
+            assert!(
+                missing.is_empty(),
+                "{} {width}×{height}: never reached {missing:?}",
+                route.label()
+            );
+        }
+
+        let (mut runtime, instance, view) = setup();
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.compact_navigation = true;
+        }
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+        let routes = compiled
+            .semantics
+            .iter()
+            .filter(|node| node.key.as_str().starts_with("settings/categories/"))
+            .filter(|node| node.action.is_some())
+            .count();
+        if SettingsWidth::for_viewport(width) == SettingsWidth::Compact {
+            assert!(
+                routes >= 6,
+                "the {width}×{height} category sheet holds {routes} routes on a screen"
+            );
+        }
+    }
+}
+
+/// THE PINNED PREVIEW STILL PREVIEWS. A typography specimen paints whole
+/// rows only, so where a screen has room for one row beside the list it
+/// keeps that row (at 48pt the Text & Fonts preview showed its header and no
+/// text); and a screen of the list never shows one stop where the preview,
+/// yielding to its floor, would have made room for two.
+#[test]
+fn the_pinned_preview_keeps_a_specimen_row_and_yields_for_a_second_stop() {
+    for (route, width, height) in [
+        (SettingsRoute::TextFonts, 584.0, 348.0),
+        (SettingsRoute::TextFonts, 1_074.0, 684.0),
+        (SettingsRoute::CursorMotion, 724.0, 488.0),
+        (SettingsRoute::CursorMotion, 738.0, 418.0),
+        (SettingsRoute::Appearance, 738.0, 418.0),
+        (SettingsRoute::Appearance, 584.0, 348.0),
+    ] {
+        let (mut runtime, instance, view) = setup();
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(route);
+        }
+        let cx = view_cx_at(width, height);
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        let limit = messages_view_state(&runtime, view)
+            .scroll_plan()
+            .expect("a measured list")
+            .limit();
+        for top in 0..=limit {
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!();
+                };
+                state.page_scroll = top;
+            }
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let context = format!("{} {width}×{height} screen {top}", route.label());
+            let (floor, preview) = compiled
+                .paint
+                .iter()
+                .find_map(|node| match &node.content {
+                    UiContent::SettingsPreview(spec) => {
+                        Some((spec.minimum_height(48.0), node.rect.height))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{context}: the preview is pinned"));
+            assert!(
+                preview + 0.01 >= floor,
+                "{context}: the {preview}pt preview is under its {floor}pt floor"
+            );
+            let (plan, shown) = messages_view_state(&runtime, view)
+                .scroll_shown()
+                .expect("a measured list");
+            assert!(
+                shown.len() >= 2
+                    || shown.end == plan.len()
+                    || plan.span(shown.start..shown.start + 2)
+                        > plan.room() + (preview - floor) + 0.01,
+                "{context}: one stop where the preview could yield for two"
+            );
+        }
+    }
+}
+
+/// UP AND DOWN WALK THE PAGE (ruling 264): from a control in the list the
+/// keyboard moves to the next or the previous one wherever it is, and the
+/// list follows it; past the ends it stays put; with the keyboard outside the
+/// list, Down scrolls a row.
+#[test]
+fn up_and_down_walk_the_page_controls_and_the_list_follows() {
+    let (mut runtime, instance, view) = setup();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.navigate(SettingsRoute::Appearance);
+    }
+    let cx = view_cx_at(738.0, 418.0);
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    let controls: Vec<UiKey> = messages_view_state(&runtime, view)
+        .scroll_plan()
+        .expect("a measured list")
+        .controls()
+        .map(|(_, key)| key.clone())
+        .collect();
+    assert!(controls.len() > 4, "{controls:?}");
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::FocusChanged(Some(controls[0].clone())),
+        )
+        .unwrap();
+    let focus =
+        |runtime: &NativeRuntime| messages_view_state(runtime, view).common.last_focus.clone();
+    for expected in controls.iter().skip(1) {
+        runtime
+            .dispatch(instance, view, AppEvent::StepFocus(1))
+            .unwrap();
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert_eq!(focus(&runtime).as_ref(), Some(expected));
+        assert!(
+            compiled.semantic(expected).is_some(),
+            "the list follows the keyboard to {expected:?}"
+        );
+    }
+    runtime
+        .dispatch(instance, view, AppEvent::StepFocus(1))
+        .unwrap();
+    assert_eq!(
+        focus(&runtime).as_ref(),
+        controls.last(),
+        "Down past the end stays"
+    );
+    for expected in controls.iter().rev().skip(1) {
+        runtime
+            .dispatch(instance, view, AppEvent::StepFocus(-1))
+            .unwrap();
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert_eq!(focus(&runtime).as_ref(), Some(expected));
+        assert!(compiled.semantic(expected).is_some());
+    }
+
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::FocusChanged(Some(UiKey::new("settings/search"))),
+        )
+        .unwrap();
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    runtime
+        .dispatch(instance, view, AppEvent::ScrollLines(-10_000))
+        .unwrap();
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    runtime
+        .dispatch(instance, view, AppEvent::StepFocus(1))
+        .unwrap();
+    assert_eq!(
+        messages_view_state(&runtime, view).page_scroll,
+        1,
+        "Down with the keyboard outside the list scrolls a row"
+    );
+}
+
+/// A SAVE NEVER MOVES THE ROW UNDER THE POINTER. On a compact window the
+/// status bar a change brings up takes room from the list, and the list keeps
+/// the control the person just used in view — reached by the keyboard, or
+/// changed by an action alone; a wider page keeps the bar's room, so the list
+/// does not move at all.
+#[test]
+fn the_status_bar_never_scrolls_the_edited_row_away() {
+    for (width, height, by_focus) in [
+        (724.0, 488.0, true),
+        (724.0, 488.0, false),
+        (1_074.0, 684.0, true),
+    ] {
+        let (mut runtime, instance, view) = setup();
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::CursorMotion);
+        }
+        let cx = view_cx_at(width, height);
+        // The controls of the stops a screen shows: the peek under them runs
+        // on into the room the bar takes, so a bar that comes takes only peek.
+        let screen = |runtime: &NativeRuntime| {
+            let (plan, shown) = messages_view_state(runtime, view)
+                .scroll_shown()
+                .expect("a measured list");
+            plan.controls()
+                .filter(|(stop, _)| shown.contains(stop))
+                .map(|(_, key)| key.as_str().to_string())
+                .collect::<BTreeSet<_>>()
+        };
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        let before = screen(&runtime);
+        let (plan, shown) = messages_view_state(&runtime, view)
+            .scroll_shown()
+            .expect("a measured list");
+        // The last control the first screen shows.
+        let edited = plan
+            .controls()
+            .filter(|(stop, _)| shown.contains(stop))
+            .map(|(_, key)| key.clone())
+            .last()
+            .expect("a control on the first screen");
+        let event = if by_focus {
+            AppEvent::FocusChanged(Some(edited.clone()))
+        } else {
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(
+                    edited
+                        .as_str()
+                        .replace("settings/control/", "settings/set/"),
+                ),
+                value: None,
+            })
+        };
+        runtime.dispatch(instance, view, event).unwrap();
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.feedback = Some("Applied".to_string());
+            state.last_undo = Some(UndoOffer::showing(1, "Applied"));
+        }
+        let after = compile_settings_view(&runtime, instance, view, &cx);
+        assert!(
+            after.semantic(&UiKey::new("settings/status")).is_some(),
+            "{width}×{height}: the status bar is up"
+        );
+        assert!(
+            after.semantic(&edited).is_some(),
+            "{width}×{height}: {edited:?} stays in view"
+        );
+        if SettingsWidth::for_viewport(width) != SettingsWidth::Compact {
+            assert_eq!(
+                screen(&runtime),
+                before,
+                "{width}×{height}: the list keeps the bar's room and does not move"
+            );
+        }
+    }
+}
+
+/// A GROWN WINDOW RE-CLAMPS THE LIST: scrolled to its end in a small window,
+/// the list in a taller one starts where its last screen is full, and the
+/// next event adopts that scroll.
+#[test]
+fn a_grown_window_reclamps_the_scroll_to_a_full_last_screen() {
+    let (mut runtime, instance, view) = setup();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.navigate(SettingsRoute::TextFonts);
+        state.page_scroll = usize::MAX;
+    }
+    let small = view_cx_at(584.0, 348.0);
+    let _ = compile_settings_view(&runtime, instance, view, &small);
+    let small_limit = messages_view_state(&runtime, view)
+        .scroll_plan()
+        .expect("a measured list")
+        .limit();
+    assert!(small_limit > 0);
+    let tall = view_cx_at(1_074.0, 1_400.0);
+    let compiled = compile_settings_view(&runtime, instance, view, &tall);
+    let (plan, shown) = messages_view_state(&runtime, view)
+        .scroll_shown()
+        .expect("a measured list");
+    assert_eq!(
+        shown.end,
+        plan.len(),
+        "the grown window shows the list's end"
+    );
+    assert!(
+        shown.start == 0 || plan.view(shown.start - 1).end < plan.len(),
+        "the last screen is full: {shown:?} of {}",
+        plan.len()
+    );
+    assert!(compiled.semantic(&UiKey::new("settings/list")).is_some());
+    runtime
+        .dispatch(instance, view, AppEvent::ScrollLines(0))
+        .unwrap();
+    assert_eq!(messages_view_state(&runtime, view).page_scroll, shown.start);
+}
+
+/// Serious Mode hides the playful rainbow on Top Settings, so it hides the
+/// rainbow wash behind every Settings page too: the page that announces it is
+/// hiding playful effects no longer sits on one.
+#[test]
+fn serious_mode_paints_the_settings_canvas_plain() {
+    let (runtime, instance, view) = setup();
+    for (serious, surface) in [(false, StyleRef::Hero), (true, StyleRef::Plain)] {
+        let mut cx = view_cx();
+        cx.motion.serious = serious;
+        let tree = runtime.render(instance, view, &cx).unwrap();
+        let UiContent::Group(spec) = &tree.root.content else {
+            panic!("the Settings root is a group");
+        };
+        assert_eq!(spec.role, SemanticRole::Application);
+        assert_eq!(spec.style, surface, "serious mode {serious}");
+    }
+}
+
+fn action(id: &str, value: Option<SemanticInput>) -> AppEvent {
+    AppEvent::Action(ActionInvocation {
+        id: ActionId::new(id),
+        value,
+    })
+}
+
+fn patch_edits(outcome: &crate::native_app::DispatchOutcome) -> Vec<(String, Option<String>)> {
+    outcome
+        .effects
+        .iter()
+        .filter_map(|effect| match effect {
+            AppEffect::ConfigPatch { patch, .. } => Some(patch),
+            _ => None,
+        })
+        .flat_map(|patch| patch.edits.iter())
+        .map(|edit| (edit.key.clone(), edit.value.clone()))
+        .collect()
+}
+
+/// Arriving on the Wallpaper page opens nothing: on macOS a visit with no
+/// wallpaper set used to raise the modal file picker, from the sidebar and
+/// from `open app settings /wallpaper` alike. Only the button opens it.
+#[test]
+fn visiting_the_wallpaper_page_opens_no_picker() {
+    let (mut runtime, instance, view) = setup();
+    let visit = runtime
+        .dispatch(instance, view, action("settings/route/wallpaper", None))
+        .unwrap();
+    assert!(
+        !visit
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, AppEffect::ChooseWallpaperImage)),
+        "a visit opens no picker"
+    );
+    let press = runtime
+        .dispatch(instance, view, action("settings/wallpaper/choose", None))
+        .unwrap();
+    assert!(
+        press
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, AppEffect::ChooseWallpaperImage)),
+        "the button does"
+    );
+}
+
+/// The Wallpaper page names the file, says on its own line why it did not
+/// load, and carries the dim and text tint rows that used to be Manual-only.
+#[test]
+fn the_wallpaper_page_names_the_file_and_the_failure_and_owns_dim_and_tint() {
+    let mut state = SettingsViewState::new(&Config::default());
+    state.navigate(SettingsRoute::Wallpaper);
+    let path = "/Users//someone/Library/Mobile Documents/com~apple~CloudDocs/Pictures/notes.txt";
+    state
+        .raw_values
+        .insert(prefs::EDIT_WALLPAPER.to_string(), path.to_string());
+    state.assets = std::sync::Arc::new(crate::app_config::ConfigAssetCatalog {
+        wallpaper: crate::app_config::WallpaperAsset::Invalid {
+            source_id: path.into(),
+            bounded_reason: "not a decodable image".into(),
+        },
+        ..crate::app_config::ConfigAssetCatalog::default()
+    });
+    for (width, height) in [(744.0_f32, 420.0_f32), (1_200.0, 820.0)] {
+        let compiled = settings_route_at(&state, &view_cx_at(width, height));
+        let context = format!("Wallpaper at {width}×{height}");
+        let current = compiled
+            .semantic(&UiKey::new("settings/wallpaper/current"))
+            .unwrap_or_else(|| panic!("{context}: the status"));
+        assert!(current.label.contains(path), "{context}: {}", current.label);
+        assert_eq!(
+            painted_text(&compiled, "settings/wallpaper/current/visual"),
+            "notes.txt",
+            "{context}: the file by its name"
+        );
+        let problem = painted_copy_lines(&compiled, "settings/wallpaper/problem").join(" ");
+        assert_eq!(
+            problem, "Couldn't load this image: not a decodable image",
+            "{context}"
+        );
+        for key in ["wallpaper_dim", "wallpaper_text_tint"] {
+            assert!(
+                compiled
+                    .semantic(&UiKey::new(format!("settings/control/{key}")))
+                    .is_some(),
+                "{context}: {key} has a row"
+            );
+            // An image that did not load draws nothing to dim or tint.
+            let label = compiled
+                .semantic(&UiKey::new(format!("settings/label/{key}")))
+                .map(|node| node.label.clone())
+                .unwrap_or_default();
+            assert!(
+                label.contains("image didn't load"),
+                "{context}: {key} says why it does nothing: {label}"
+            );
+        }
+        assert!(
+            compiled
+                .paint_audit_lines()
+                .iter()
+                .all(|line| !line.contains("overflow=true")),
+            "{context}: nothing is cut off\n{}",
+            compiled.paint_audit_lines().join("\n")
+        );
+    }
+    // Negative control: a loaded image leaves the rows active.
+    state.assets = std::sync::Arc::new(crate::app_config::ConfigAssetCatalog {
+        wallpaper: crate::app_config::WallpaperAsset::Ready {
+            source_id: path.into(),
+            w: 1,
+            h: 1,
+            rgba: std::sync::Arc::from(vec![0_u8; 4]),
+            fp: 1,
+        },
+        ..crate::app_config::ConfigAssetCatalog::default()
+    });
+    let compiled = settings_route_at(&state, &view_cx_at(1_200.0, 820.0));
+    for key in ["wallpaper_dim", "wallpaper_text_tint"] {
+        let label = compiled
+            .semantic(&UiKey::new(format!("settings/label/{key}")))
+            .map(|node| node.label.clone())
+            .unwrap_or_default();
+        assert!(!label.contains("Inactive"), "{key}: {label}");
+    }
+    // The rows live on the Wallpaper page, not the Appearance page.
+    assert!(!settings_field_is_visible(
+        prefs::EDIT_WALLPAPER_DIM,
+        false,
+        false
+    ));
+    assert!(settings_field_is_visible(
+        prefs::EDIT_WALLPAPER_DIM,
+        false,
+        true
+    ));
+}
+
+fn painted_text(compiled: &crate::native_ui::CompiledUi, key: &str) -> String {
+    compiled
+        .paint
+        .iter()
+        .find_map(|node| match &node.content {
+            UiContent::Text(spec) if node.key.as_str() == key => Some(spec.text.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{key} paints text"))
+}
+
+/// THE WINDOW PAGE'S TAB COLOR ROW SHOWS THE COLOR IT NAMES: the row that
+/// goes to Tab Color wears the chip the hex field wears, at the regular and
+/// the compact widths, and an unset color wears none (the system pill has no
+/// one colour that would be true).
+#[test]
+fn the_window_tab_color_row_shows_the_color_it_names() {
+    use crate::widget::DrawPrim;
+    let orange = [0xE6, 0x7A, 0x00];
+    let key = format!("settings/control/{}", prefs::EDIT_ACTIVE_TAB_COLOR);
+    for (width, height) in [(1_200.0_f32, 820.0_f32), (474.0, 1_400.0)] {
+        for source in ["active_tab_color = \"#E67A00\"\n", ""] {
+            let snapshot = VersionedConfigService::new(source.to_string())
+                .unwrap()
+                .snapshot();
+            let mut state = SettingsViewState::from_snapshot(&snapshot).unwrap();
+            state.navigate(SettingsRoute::WindowTabs);
+            let compiled = settings_route_at(&state, &view_cx_at(width, height));
+            let at = format!("{width}x{height} {source:?}");
+            let node = compiled
+                .paint
+                .iter()
+                .find(|node| node.key.as_str() == key)
+                .unwrap_or_else(|| panic!("{at}: the row's control is painted"));
+            let UiContent::Button(button) = &node.content else {
+                panic!("{at}: the Window row is a button: {:?}", node.content);
+            };
+            let hit = compiled
+                .hits
+                .iter()
+                .find(|hit| hit.key.as_str() == key)
+                .unwrap_or_else(|| panic!("{at}: the row is live"));
+            assert_eq!(hit.action.as_str(), "settings/route/tab-color", "{at}");
+            let set = !source.is_empty();
+            assert_eq!(button.spec.chip, set.then_some(orange), "{at}");
+            let prims = compiled.tray(aterm_render::Theme::default(), 13.0).prims;
+            let rect = node.rect;
+            let painted = prims.iter().any(|prim| {
+                matches!(prim, DrawPrim::Panel { x, y, w, h, fill, .. }
+                    if fill[..3] == orange
+                        && *x >= rect.x && *y >= rect.y
+                        && x + w <= rect.right() && y + h <= rect.bottom())
+            });
+            assert_eq!(
+                painted, set,
+                "{at}: the chip is painted in the row's control"
+            );
+        }
+    }
+}
+
+/// At the shipped default size (and at 80×24) the wheel, Brightness and
+/// the hex field share one screen: before any color is set, and after a
+/// pick, with the Undo bar taking its row of the page.
+#[test]
+fn tab_color_shows_the_wheel_and_what_it_sets_on_one_screen() {
+    // The shipped 102x29 window, and 80x24's live viewport (584x348), where a
+    // pick's Undo bar used to switch the page to its stacked layout and
+    // scroll the wheel away.
+    for (width, height) in [(744.0_f32, 420.0_f32), (584.0, 348.0)] {
+        for source in ["", "active_tab_color = \"#E67A00\"\n"] {
+            let snapshot = VersionedConfigService::new(source.to_string())
+                .unwrap()
+                .snapshot();
+            let mut state = SettingsViewState::from_snapshot(&snapshot).unwrap();
+            state.navigate(SettingsRoute::TabColor);
+            if !source.is_empty() {
+                let status = "Selected tab color set to #E67A00";
+                state.feedback = Some(status.to_string());
+                state.last_undo = Some(UndoOffer::showing(1, status));
+            }
+            let compiled = settings_route_at(&state, &view_cx_at(width, height));
+            let context = format!("{width}×{height} with {source:?}");
+            let list = compiled
+                .semantic(&UiKey::new("settings/tab-color/list"))
+                .unwrap_or_else(|| panic!("{context}: the list"))
+                .rect;
+            for key in [
+                "settings/tab-color/wheel",
+                "settings/tab-color/brightness",
+                "settings/control/active_tab_color",
+            ] {
+                let rect = compiled
+                    .semantic(&UiKey::new(key))
+                    .unwrap_or_else(|| panic!("{context}: {key} is on the first screen"))
+                    .rect;
+                assert!(
+                    rect.y >= list.y - 0.5 && rect.bottom() <= list.bottom() + 0.5,
+                    "{context}: {key} lies whole inside the list: {rect:?} in {list:?}"
+                );
+            }
+        }
+    }
+    // THE WHEEL STAYS UNDER THE POINTER: on one config, the Undo bar a pick
+    // brings up moves and resizes nothing of the picker (80x24 used to open
+    // with a 179pt wheel that became a 161pt one 35pt higher on the first
+    // pick, so a second click at the same spot chose another color).
+    for (width, height) in [(744.0_f32, 420.0_f32), (584.0, 348.0)] {
+        let snapshot = VersionedConfigService::new("active_tab_color = \"#33CC66\"\n".to_string())
+            .unwrap()
+            .snapshot();
+        let mut state = SettingsViewState::from_snapshot(&snapshot).unwrap();
+        state.navigate(SettingsRoute::TabColor);
+        let rects = |state: &SettingsViewState| {
+            let compiled = settings_route_at(state, &view_cx_at(width, height));
+            [
+                "settings/tab-color/wheel",
+                "settings/tab-color/brightness",
+                "settings/control/active_tab_color",
+            ]
+            .map(|key| {
+                compiled
+                    .semantic(&UiKey::new(key))
+                    .unwrap_or_else(|| panic!("{width}×{height}: {key}"))
+                    .rect
+            })
+        };
+        let before = rects(&state);
+        let status = "Selected tab color set to #33CC66";
+        state.feedback = Some(status.to_string());
+        state.last_undo = Some(UndoOffer::showing(1, status));
+        assert_eq!(
+            rects(&state),
+            before,
+            "{width}×{height}: the Undo bar moves nothing of the picker"
+        );
+    }
+    // The default reads in words, never a config word.
+    let state = SettingsViewState::new(&Config::default());
+    let field = state.field_by_key(prefs::EDIT_ACTIVE_TAB_COLOR).unwrap();
+    assert_eq!(field.placeholder, "Automatic (default)");
+    assert_eq!(
+        default_value_label(prefs::EDIT_ACTIVE_TAB_COLOR),
+        Some("Automatic")
+    );
+}
+
+/// Tab lands on the wheel as on any control: it reports focus, and its
+/// painter draws the focus ring.
+#[test]
+fn the_tab_color_wheel_reports_and_shows_keyboard_focus() {
+    let mut state = SettingsViewState::new(&Config::default());
+    state.navigate(SettingsRoute::TabColor);
+    let cx = view_cx_at(1_200.0, 820.0);
+    let mut tree = settings_tree(
+        &state,
+        &UpdateState::from_status(1, "0.1.0", None, false).projection(),
+        &PackagesState::unobserved().projection(),
+        &MessagesState::empty(),
+        &HarnessState::unobserved().projection(),
+        &cx,
+    );
+    let wheel = UiKey::new("settings/tab-color/wheel");
+    tree.apply_interaction(Some(&wheel), None, None, true);
+    let compiled = tree.compile(cx.viewport).unwrap();
+    let semantic = compiled.semantic(&wheel).expect("the wheel");
+    assert!(
+        semantic
+            .state
+            .is_some_and(|state| state.focused && state.focus_visible),
+        "{:?}",
+        semantic.state
+    );
+    let painted = compiled
+        .paint
+        .iter()
+        .find(|node| node.key == wheel)
+        .expect("the wheel paints");
+    assert!(
+        matches!(&painted.content, UiContent::Custom(spec) if spec.focus_visible),
+        "the painter is told to ring it"
+    );
+    // Elsewhere, no ring.
+    let compiled = settings_route_at(&state, &cx);
+    assert!(
+        compiled
+            .semantic(&wheel)
+            .and_then(|node| node.state)
+            .is_some_and(|state| !state.focused)
+    );
+}
+
+/// The Tab Color page is usable without a pointer: the wheel takes a hex
+/// value, the ordinary hex row under it writes the key, brightness darkens
+/// the chosen color, and Reset is offered only when a color is set.
+#[test]
+fn tab_color_takes_hex_text_brightness_and_resets_only_a_set_color() {
+    let (mut runtime, instance, view) = setup();
+    runtime
+        .dispatch(instance, view, action("settings/route/tab-color", None))
+        .unwrap();
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx());
+    let wheel = compiled
+        .semantic(&UiKey::new("settings/tab-color/wheel"))
+        .expect("the wheel");
+    assert!(
+        matches!(wheel.value, SemanticValue::Text(_)),
+        "the wheel accepts a value"
+    );
+    assert!(wheel.state.is_some_and(|state| state.enabled));
+    let row = compiled
+        .semantic(&UiKey::new("settings/control/active_tab_color"))
+        .expect("the hex row");
+    assert_eq!(row.role, SemanticRole::TextField);
+    assert!(
+        compiled
+            .semantic(&UiKey::new("settings/tab-color/brightness"))
+            .and_then(|node| node.state)
+            .is_some_and(|state| !state.enabled),
+        "brightness waits for a color"
+    );
+    assert!(
+        compiled
+            .semantic(&UiKey::new("settings/reset/active_tab_color"))
+            .is_none(),
+        "the row offers Reset only once a color is written"
+    );
+
+    let set = runtime
+        .dispatch(
+            instance,
+            view,
+            action(
+                "settings/set/active_tab_color",
+                Some(SemanticInput::Text("#FF8800".to_string())),
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        patch_edits(&set),
+        vec![("active_tab_color".to_string(), Some("#FF8800".to_string()))]
+    );
+
+    // Brightness keeps the hue: #FF8800 at half brightness.
+    let snapshot = VersionedConfigService::new(String::new())
+        .unwrap()
+        .replace_external("active_tab_color = \"#FF8800\"\n".to_string())
+        .unwrap();
+    let (mut runtime, instance, view) = setup();
+    runtime
+        .dispatch(instance, view, AppEvent::ConfigChanged(snapshot))
+        .unwrap();
+    let darker = runtime
+        .dispatch(
+            instance,
+            view,
+            action(
+                "settings/tab-color/brightness",
+                Some(SemanticInput::Number(0.5)),
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        patch_edits(&darker),
+        vec![("active_tab_color".to_string(), Some("#804400".to_string()))]
+    );
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        panic!("Settings view")
+    };
+    assert_eq!(
+        state.common.last_focus.as_ref().map(UiKey::as_str),
+        Some("settings/tab-color/brightness")
+    );
+}
+
+/// A color that is not hex stays where it was typed, marked, with the reason
+/// in words; it never reaches the config file to be refused there.
+#[test]
+fn an_invalid_color_keeps_its_draft_and_says_why() {
+    let (mut runtime, instance, view) = setup();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!()
+        };
+        state.navigate(SettingsRoute::Appearance);
+    }
+    let outcome = runtime
+        .dispatch(
+            instance,
+            view,
+            action(
+                "settings/set/foreground",
+                Some(SemanticInput::Text("orange".to_string())),
+            ),
+        )
+        .unwrap();
+    assert!(patch_edits(&outcome).is_empty(), "nothing is written");
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        panic!("Settings view")
+    };
+    // The status says only that it was not saved (so it offers no Undo);
+    // the reason is under the row.
+    assert_eq!(state.feedback.as_deref(), Some("Foreground was not saved"));
+    assert_eq!(
+        state
+            .field_errors
+            .get(prefs::EDIT_FOREGROUND)
+            .map(String::as_str),
+        Some("Foreground needs a hex color like #D0D0D0; \"orange\" was not saved")
+    );
+    assert_eq!(
+        state
+            .field_inputs
+            .get(prefs::EDIT_FOREGROUND)
+            .map(|input| input.value()),
+        Some("orange")
+    );
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx());
+    assert!(
+        compiled
+            .semantic(&UiKey::new("settings/control/foreground"))
+            .and_then(|node| node.state)
+            .is_some_and(|state| state.invalid),
+        "the field is marked"
+    );
+    let label = &compiled
+        .semantic(&UiKey::new("settings/label/foreground"))
+        .unwrap()
+        .label;
+    assert!(
+        !label.contains("Runtime fallback"),
+        "the saved value is not the one at fault: {label}"
+    );
+}
+
+/// Both padding rows are sliders whether or not the top edge was ever set,
+/// and only the top edge's row states the top edge's numbers.
+#[test]
+fn both_padding_rows_stay_sliders_set_or_unset() {
+    for source in ["", "window_padding_top = 6\n"] {
+        let snapshot = VersionedConfigService::new(source.to_string())
+            .unwrap()
+            .snapshot();
+        let mut state = SettingsViewState::from_snapshot(&snapshot).unwrap();
+        state.navigate(SettingsRoute::WindowTabs);
+        let compiled = settings_route_at(&state, &view_cx());
+        for key in ["window_padding", "window_padding_top"] {
+            assert_eq!(
+                compiled
+                    .semantic(&UiKey::new(format!("settings/control/{key}")))
+                    .unwrap_or_else(|| panic!("{key} in {source:?}"))
+                    .role,
+                SemanticRole::Slider,
+                "{key} with {source:?}"
+            );
+        }
+    }
+}
+
+/// The Appearance page leads with the Theme group, the same Color theme and
+/// Window appearance rows and pickers as Top Settings, and ends with the
+/// Effects group where Robi's switch now lives. (One theme always here: a
+/// theme that follows the system leads with its slots, as Top Settings'.)
+#[test]
+fn the_appearance_page_leads_with_theme_and_offers_robi() {
+    let (mut runtime, instance, view) = theme_pair_runtime("theme = \"Nord\"\n", true);
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!()
+        };
+        state.navigate(SettingsRoute::Appearance);
+    }
+    let cx = view_cx();
+    let mut reached = BTreeSet::new();
+    let mut first = Vec::new();
+    each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
+        let controls = keys_with_prefix(compiled, "settings/control/");
+        if top == 0 {
+            first = controls.clone();
+        }
+        reached.extend(controls);
+    });
+    assert_eq!(
+        first.first().map(String::as_str),
+        Some("settings/control/theme"),
+        "{first:?}"
+    );
+    for key in ["theme", "window_theme", "robi", "matrix_rain.enabled"] {
+        assert!(
+            reached.contains(&format!("settings/control/{key}")),
+            "{key}: {reached:?}"
+        );
+    }
+    assert!(
+        !reached.contains("settings/control/split_focus_mark"),
+        "the split pane mark is the Window page's"
+    );
+    let picker = runtime
+        .dispatch(instance, view, action("settings/set/window_theme", None))
+        .unwrap();
+    assert!(patch_edits(&picker).is_empty());
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        panic!("Settings view")
+    };
+    assert_eq!(
+        state
+            .choice_picker
+            .as_ref()
+            .map(|picker| picker.key.as_str()),
+        Some(prefs::EDIT_WINDOW_THEME),
+        "the same picker as Top Settings"
+    );
+}
+
+/// What `prims[..upto]` paint under the point `(x, y)`: every panel there,
+/// alpha-blended in paint order over black, inside the clips in force.
+fn painted_backdrop_at(prims: &[crate::widget::DrawPrim], upto: usize, x: f32, y: f32) -> [u8; 3] {
+    use crate::widget::DrawPrim;
+    let mut color = [0.0_f32; 3];
+    let mut clips: Vec<(f32, f32, f32, f32)> = Vec::new();
+    let inside =
+        |(cx, cy, cw, ch): (f32, f32, f32, f32)| x >= cx && x < cx + cw && y >= cy && y < cy + ch;
+    for prim in &prims[..upto] {
+        match prim {
+            DrawPrim::ClipPush { x, y, w, h } => clips.push((*x, *y, *w, *h)),
+            DrawPrim::ClipPop => {
+                clips.pop();
+            }
+            DrawPrim::Panel {
+                x: px,
+                y: py,
+                w,
+                h,
+                fill,
+                ..
+            } if inside((*px, *py, *w, *h)) && clips.iter().all(|clip| inside(*clip)) => {
+                let alpha = f32::from(fill[3]) / 255.0;
+                for (channel, value) in color.iter_mut().enumerate() {
+                    *value = *value * (1.0 - alpha) + f32::from(fill[channel]) * alpha;
+                }
+            }
+            _ => {}
+        }
+    }
+    color.map(|value| value.round() as u8)
+}
+
+/// Every word painted inside the paint node `key`, with the contrast it has
+/// against what is painted under it.
+fn painted_text_contrast(
+    compiled: &crate::native_ui::CompiledUi,
+    prims: &[crate::widget::DrawPrim],
+    key: &str,
+) -> Vec<(String, f32)> {
+    use crate::widget::DrawPrim;
+    let Some(rect) = compiled
+        .paint
+        .iter()
+        .find(|node| node.key.as_str() == key)
+        .map(|node| node.rect)
+    else {
+        return Vec::new();
+    };
+    prims
+        .iter()
+        .enumerate()
+        .filter_map(|(index, prim)| {
+            let DrawPrim::Text {
+                x,
+                baseline,
+                s,
+                px,
+                color,
+                ..
+            } = prim
+            else {
+                return None;
+            };
+            let inside = *x >= rect.x - 0.5
+                && *x <= rect.right()
+                && *baseline >= rect.y
+                && *baseline <= rect.bottom() + 0.5;
+            if !inside {
+                return None;
+            }
+            let under = painted_backdrop_at(prims, index, x + 1.0, baseline - px * 0.35);
+            let alpha = f32::from(color[3]) / 255.0;
+            let ink: [u8; 3] = std::array::from_fn(|channel| {
+                (f32::from(under[channel]) * (1.0 - alpha) + f32::from(color[channel]) * alpha)
+                    .round() as u8
+            });
+            Some((
+                s.clone(),
+                crate::native_appearance::contrast_ratio(ink, under),
+            ))
+        })
+        .collect()
+}
+
+/// LIGHT-THEME CONTRAST OF THE MESSAGES CHROME: on GitHub Light every resting
+/// word the filters and the count line paint — the count, the no-match line,
+/// each chip and segment not chosen, the tag pop-up — holds 4.5:1 against what
+/// is painted under it, the wallpaper wash included; and every resting tag
+/// chip paints an opaque fill and an edge of its own, so it reads as a button
+/// on the wash. (A chosen chip is inked in the accent, floored at 3:1 against
+/// its own wash; its rim and wash say it is chosen.)
+#[test]
+fn messages_chrome_meets_contrast_on_github_light() {
+    use crate::widget::DrawPrim;
+    let light = {
+        let parts = aterm_types::scheme::builtin("GitHub Light")
+            .expect("a builtin scheme")
+            .to_theme_parts();
+        aterm_render::Theme {
+            fg: parts.fg,
+            bg: parts.bg,
+            cursor: parts.cursor,
+            selection: parts.selection,
+        }
+    };
+    for (width, height) in [(1_200.0, 820.0), (1_074.0, 686.0), (738.0, 420.0)] {
+        let (mut runtime, instance, view) = setup_with_these_messages(sample_messages());
+        for filtered in [false, true] {
+            if filtered {
+                // Problems under a tag that has none: the no-match line.
+                messages_action(
+                    &mut runtime,
+                    instance,
+                    view,
+                    "settings/messages/filter/warn",
+                );
+                messages_action(
+                    &mut runtime,
+                    instance,
+                    view,
+                    "settings/messages/filter/tag/update",
+                );
+            }
+            let at = format!("{width}x{height} filtered={filtered}");
+            let compiled =
+                compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+            let prims = compiled.tray(light, 13.0).prims;
+            let resting = |key: &str| {
+                compiled
+                    .semantic(&UiKey::new(key))
+                    .is_some_and(|node| node.state.as_ref().is_none_or(|state| !state.selected))
+            };
+            let mut keys: Vec<&str> = compiled
+                .semantics
+                .iter()
+                .map(|node| node.key.as_str())
+                .filter(|key| {
+                    (key.starts_with("settings/messages/filter/") && resting(key))
+                        || *key == "settings/messages/status"
+                        || *key == "settings/messages/no-match"
+                        || *key == MESSAGES_TAG_MENU
+                })
+                .collect();
+            keys.sort_unstable();
+            assert!(keys.contains(&"settings/messages/status"), "{at}: {keys:?}");
+            assert_eq!(
+                keys.contains(&"settings/messages/no-match"),
+                filtered,
+                "{at}: the no-match line exactly when nothing is shown"
+            );
+            for key in &keys {
+                let words = painted_text_contrast(&compiled, &prims, key);
+                assert!(!words.is_empty(), "{at}: {key} paints its words");
+                for (text, ratio) in words {
+                    assert!(
+                        ratio >= 4.5,
+                        "{at}: {key} paints {text:?} at {ratio:.2}:1 on GitHub Light"
+                    );
+                }
+                if !key.starts_with(MESSAGES_TAG_CHIPS) {
+                    continue;
+                }
+                let rect = compiled
+                    .paint
+                    .iter()
+                    .find(|node| node.key.as_str() == *key)
+                    .expect("a painted chip")
+                    .rect;
+                let near = |a: f32, b: f32| (a - b).abs() < 0.6;
+                assert!(
+                    prims.iter().any(|prim| matches!(
+                        prim,
+                        DrawPrim::Panel { x, y, w, fill, .. }
+                            if near(*x, rect.x) && near(*y, rect.y) && near(*w, rect.width)
+                                && fill[3] == 255
+                    )),
+                    "{at}: the resting chip {key} paints an opaque fill"
+                );
+                assert!(
+                    prims.iter().any(|prim| matches!(
+                        prim,
+                        DrawPrim::Stroke { x, y, .. }
+                            if near(*x, rect.x + 0.5) && near(*y, rect.y + 0.5)
+                    )),
+                    "{at}: the resting chip {key} paints an edge"
+                );
+            }
+        }
+    }
+}
+
+/// A COPY THAT CAN'T UPDATE ITSELF OFFERS NOTHING THAT PRETENDS TO. Run from a
+/// plain binary (or a disk image, a translocated download, a dev build), the
+/// page's one action is greyed and says why, a press sends no check and says
+/// the same, the palette's "Updates: Check" is greyed with it; the switches'
+/// rows and caption say they take effect only in an installed copy; there is
+/// no empty release-notes card; the subtitle promises nothing and is the same
+/// at every width; and the status card's spoken name has no doubled period.
+#[test]
+fn a_copy_that_cannot_update_offers_no_live_update_button() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let mut status = update_status(false);
+    status.installable = false;
+    let update = UpdateState::from_status(1, "0.1.0", Some(&status), false)
+        .with_install_posture(Some(aterm_update::which_copy::InstallPosture::NotABundle));
+    let (mut runtime, instance, view) = setup_with_update(update);
+    go_to_route(&mut runtime, instance, view, SettingsRoute::SoftwareUpdate);
+    let mut subtitles = BTreeSet::new();
+    for (width, height) in [(1_200.0, 820.0), (738.0, 420.0), (560.0, 336.0)] {
+        let at = format!("{width}x{height}");
+        let cx = view_cx_at(width, height);
+        let mut button = None;
+        let mut caption = None;
+        let mut switch = None;
+        each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
+            compiled.validate_parity().unwrap();
+            if let Some(node) = compiled.semantic(&UiKey::new("updates/install-now")) {
+                button.get_or_insert(node.clone());
+            }
+            if let Some(hero) = compiled.semantic(&UiKey::new("updates/hero")) {
+                assert!(!hero.label.contains(".."), "{at}: {:?}", hero.label);
+            }
+            assert!(
+                compiled
+                    .semantics
+                    .iter()
+                    .all(|node| !node.key.as_str().starts_with("updates/release-notes")),
+                "{at}: no release notes are coming, so no card for them"
+            );
+            if let Some(subtitle) = compiled
+                .semantics
+                .iter()
+                .find(|node| node.key.as_str().starts_with("settings/page-subtitle/"))
+            {
+                subtitles.insert(subtitle.label.clone());
+            }
+            if let Some(node) = compiled.semantic(&UiKey::new("updates/automatic/caption")) {
+                caption.get_or_insert(node.label.clone());
+            }
+            if let Some(node) = compiled.semantic(&UiKey::new(format!(
+                "settings/control/{}",
+                prefs::EDIT_UPDATE_ENABLED
+            ))) {
+                switch.get_or_insert(node.label.clone());
+            }
+        });
+        let button = button.unwrap_or_else(|| panic!("{at}: the action is drawn"));
+        assert!(
+            button.state.as_ref().is_some_and(|state| !state.enabled),
+            "{at}: greyed"
+        );
+        assert_eq!(
+            button.description.as_deref(),
+            Some(UPDATE_CANT_INSTALL),
+            "{at}: and says why"
+        );
+        assert!(
+            button.rect.width < 220.0,
+            "{at}: a button's width, not the card's: {:?}",
+            button.rect
+        );
+        if let Some(caption) = caption {
+            assert_eq!(
+                caption, "These switches take effect in an installed copy of aterm.",
+                "{at}"
+            );
+        }
+        assert!(
+            switch.is_some_and(|label| label.contains("can\u{2019}t update itself")),
+            "{at}: the switch says it does nothing here"
+        );
+    }
+    assert_eq!(
+        subtitles.len(),
+        1,
+        "one subtitle at every width: {subtitles:?}"
+    );
+    assert!(
+        !subtitles
+            .iter()
+            .any(|subtitle| subtitle.contains("Update now")),
+        "{subtitles:?}"
+    );
+
+    let pressed = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new("updates/install-now"),
+                value: None,
+            }),
+        )
+        .unwrap();
+    assert!(
+        pressed
+            .effects
+            .iter()
+            .all(|effect| !matches!(effect, AppEffect::Update { .. })),
+        "no check is sent from a copy that never starts one"
+    );
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!();
+    };
+    assert_eq!(state.feedback.as_deref(), Some(UPDATE_CANT_INSTALL));
+    let check = runtime
+        .commands(instance, view)
+        .unwrap()
+        .into_iter()
+        .find(|command| command.id.as_str() == "updates/check")
+        .expect("the palette offers it on this route");
+    assert!(!check.enabled, "and greys it with the button");
+}
+
+/// A FILTER THAT ADMITS NOTHING SAYS SO. With messages in the log and the
+/// filters set so none passes, the page says no messages match and offers
+/// Show All, which lifts both filters; Copy All is greyed (and its command
+/// with it), and a press on it copies nothing.
+#[test]
+fn a_filter_that_matches_nothing_says_so_and_copies_nothing() {
+    let (mut runtime, instance, view) = setup_with_these_messages(sample_messages());
+    messages_action(
+        &mut runtime,
+        instance,
+        view,
+        "settings/messages/filter/warn",
+    );
+    messages_action(
+        &mut runtime,
+        instance,
+        view,
+        "settings/messages/filter/tag/update",
+    );
+    for (width, height) in [(1_200.0, 820.0), (738.0, 420.0), (474.0, 572.0)] {
+        let at = format!("{width}x{height}");
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+        compiled.validate_parity().unwrap();
+        assert!(message_rows(&compiled).is_empty(), "{at}");
+        assert_eq!(
+            compiled
+                .semantic(&UiKey::new("settings/messages/no-match"))
+                .map(|node| node.label.as_str()),
+            Some(aterm_messages::page::NO_MATCH),
+            "{at}"
+        );
+        assert!(
+            compiled
+                .hits
+                .iter()
+                .any(|hit| hit.key.as_str() == MESSAGES_SHOW_ALL),
+            "{at}: Show All is pressable"
+        );
+        assert!(
+            compiled
+                .semantic(&UiKey::new(MESSAGES_COPY_ALL))
+                .and_then(|node| node.state.as_ref())
+                .is_some_and(|state| !state.enabled),
+            "{at}: nothing shown, nothing to copy"
+        );
+    }
+    let copy = runtime
+        .commands(instance, view)
+        .unwrap()
+        .into_iter()
+        .find(|command| command.id.as_str() == MESSAGES_COPY_ALL)
+        .expect("the palette offers it on this route");
+    assert!(!copy.enabled);
+    let pressed = messages_action(&mut runtime, instance, view, MESSAGES_COPY_ALL);
+    assert!(
+        pressed
+            .iter()
+            .all(|effect| !matches!(effect, AppEffect::Clipboard { .. })),
+        "a press copies nothing: {pressed:?}"
+    );
+
+    messages_action(&mut runtime, instance, view, MESSAGES_SHOW_ALL);
+    assert!(messages_view_state(&runtime, view).messages_filter.is_all());
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 820.0));
+    assert!(!message_rows(&compiled).is_empty(), "every message is back");
+    assert!(
+        compiled
+            .semantic(&UiKey::new("settings/messages/no-match"))
+            .is_none()
+    );
+}
+
+/// ABOUT SAYS WHO AND WHERE ONCE. The hero's byline names the author, company
+/// and site in quiet text — it is not a link, Open Project Site is — and no
+/// second card repeats the site: the build information is the one card under
+/// the hero, at the page's width.
+#[test]
+fn about_names_its_site_once_and_the_byline_is_not_a_link() {
+    let (mut runtime, instance, view) = setup();
+    go_to_route(&mut runtime, instance, view, SettingsRoute::About);
+    for (width, height) in [(1_200.0, 820.0), (738.0, 420.0)] {
+        let at = format!("{width}x{height}");
+        let cx = view_cx_at(width, height);
+        each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
+            assert!(
+                compiled
+                    .semantics
+                    .iter()
+                    .all(|node| !node.key.as_str().starts_with("about/support")),
+                "{at}: no Project card"
+            );
+            if let Some(byline) = compiled
+                .paint
+                .iter()
+                .find(|node| !node.peek && node.key.as_str() == "about/byline")
+            {
+                assert!(
+                    matches!(&byline.content, UiContent::Text(spec) if spec.style == StyleRef::Quiet),
+                    "{at}: the byline is quiet text, not link-coloured"
+                );
+                assert!(
+                    compiled
+                        .semantic(&UiKey::new("about/byline"))
+                        .is_some_and(|node| node.action.is_none()),
+                    "{at}"
+                );
+            }
+        });
+    }
+}
+
+/// A COPY WITHOUT ITS PACKAGE TOOL SAYS ONE THING. Its headline names the
+/// missing tool and the detail says how to get one; nothing on the page
+/// promises that Check & Update Now works, or that switches take effect,
+/// where every button is greyed; and no "Signed updates" line stands under a
+/// tool that isn't there.
+#[test]
+fn a_copy_without_its_package_tool_does_not_contradict_itself() {
+    let (mut runtime, instance, view) = setup();
+    assert!(runtime.replace_settings_packages(missing_tool_packages_state(), 2));
+    go_to_route(&mut runtime, instance, view, SettingsRoute::Packages);
+    let mut words = String::new();
+    each_screen(
+        &mut runtime,
+        instance,
+        view,
+        &view_cx_at(1_200.0, 820.0),
+        |compiled, _| {
+            for node in &compiled.semantics {
+                if node.key.as_str().starts_with("packages/") {
+                    words.push_str(&node.label);
+                    words.push('\n');
+                }
+                if [
+                    "packages/check",
+                    "packages/install-default",
+                    "packages/uninstall-all",
+                ]
+                .contains(&node.key.as_str())
+                {
+                    assert!(node.state.as_ref().is_some_and(|state| !state.enabled));
+                }
+                // A switch with no effect here takes effect at no time.
+                if node.key.as_str().starts_with("settings/control/") {
+                    assert!(
+                        node.label.contains("no effect") && !node.label.contains("Applies"),
+                        "{}: {}",
+                        node.key.as_str(),
+                        node.label
+                    );
+                }
+            }
+        },
+    );
+    assert!(words.contains("Package tool missing"), "{words}");
+    assert!(
+        words.contains(crate::packages_screen::PACKAGE_TOOL_MISSING_DETAIL),
+        "{words}"
+    );
+    for promise in [
+        "still works",
+        "always works",
+        "works either way",
+        "Signed updates",
+        "take effect at once",
+    ] {
+        assert!(!words.contains(promise), "{promise:?} in {words}");
+    }
+    assert!(
+        words.contains("Unavailable in this copy of aterm"),
+        "{words}"
+    );
+}
+
+#[path = "settings_modified_tests.rs"]
+mod modified;
+
+/// The Display faces card is a group like FONT and RENDERING beside it: a
+/// small-capitals caption, its note closing it, and no author or licence
+/// line under each face; the credits are on About, and each switch's
+/// description carries its face's.
+#[test]
+fn display_face_credits_live_on_about_not_on_the_card() {
+    let mut state = SettingsViewState::new(&Config::default());
+    state.navigate(SettingsRoute::TextFonts);
+    let (card, _) = display_faces_card(
+        &state,
+        SettingsWidth::Wide,
+        view_cx_at(1_200.0, 820.0).viewport,
+        SettingsRoute::TextFonts,
+    );
+    let mut texts = Vec::new();
+    let mut keys = Vec::new();
+    fn walk(node: &UiNode, texts: &mut Vec<String>, keys: &mut Vec<String>) {
+        keys.push(node.key.as_str().to_string());
+        if let UiContent::Text(spec) = &node.content {
+            texts.push(spec.text.clone());
+        }
+        for child in &node.children {
+            walk(child, texts, keys);
+        }
+    }
+    walk(&card, &mut texts, &mut keys);
+    assert!(
+        texts.iter().any(|text| text == "DISPLAY FACES"),
+        "{texts:?}"
+    );
+    assert!(
+        keys.iter().all(|key| !key.contains("/credit/")),
+        "no credit line under a face: {keys:?}"
+    );
+    for face in aterm_render::DISPLAY_FACES {
+        assert!(
+            texts.iter().all(|text| !text.contains(face.face)),
+            "{} is not credited on the card",
+            face.label
+        );
+    }
+    let switch = node_by_key(
+        std::slice::from_ref(&card),
+        &format!(
+            "settings/display-face/{}",
+            aterm_render::DISPLAY_FACES[0].id
+        ),
+    )
+    .expect("the first face's switch");
+    let UiContent::Switch(control) = &switch.content else {
+        panic!("a switch")
+    };
+    assert!(
+        control
+            .spec
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains(aterm_render::DISPLAY_FACES[0].face)),
+        "{:?}",
+        control.spec.description
+    );
+
+    let mut about = SettingsViewState::new(&Config::default());
+    about.navigate(SettingsRoute::About);
+    let page = about_page(
+        &about,
+        &MessagesState::empty(),
+        SettingsWidth::Wide,
+        view_cx_at(1_200.0, 2_000.0).viewport,
+    );
+    for face in aterm_render::DISPLAY_FACES {
+        let row = format!("about/font-credits/row/{}", key_fragment(face.label));
+        assert!(node_by_key(&page, &row).is_some(), "{row} on About");
+    }
+}
+
+/// What sets each keyword toy off shows under its switch where the switch
+/// is listed outside its card: a search for what it reacts to finds the row
+/// with its note beneath it.
+#[test]
+fn the_keyword_toys_say_what_sets_them_off() {
+    for (query, key) in [("swear", SPARKLE_WORDS_KEY), ("kitty", KEYWORD_KITTIES_KEY)] {
+        let note = prefs::footnote_of(key).unwrap_or_else(|| panic!("{key} has a note"));
+        let mut state = SettingsViewState::new(&Config::default());
+        state.set_search(query.to_string());
+        let compiled = settings_route_at(&state, &view_cx_at(1_200.0, 820.0));
+        let control = compiled
+            .semantic(&UiKey::new(format!("settings/control/{key}")))
+            .unwrap_or_else(|| panic!("{query:?} lists {key}"))
+            .rect;
+        // The note is the row's own second line, under its control.
+        let lines: Vec<_> = compiled
+            .paint
+            .iter()
+            .filter(|node| {
+                node.key
+                    .as_str()
+                    .starts_with(&format!("settings/detail/{key}/"))
+            })
+            .collect();
+        let painted = lines
+            .iter()
+            .filter_map(|node| match &node.content {
+                UiContent::Text(spec) => Some(spec.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(painted, note, "{query:?}: the note under {key}");
+        assert!(
+            lines.iter().all(|line| line.rect.y >= control.y),
+            "{query:?}: the note sits in {key}'s row"
+        );
+    }
+}
+
+#[path = "settings_rows_tests.rs"]
+mod rows;
+
+/// Settings ▸ Harness's page, with this module's fixtures and readers.
+#[path = "native_settings_harness_tests.rs"]
+mod harness;
+
+/// Settings ▸ Harness ▸ AI CLIs' page, with this module's fixtures and
+/// readers.
+#[path = "native_settings_ai_tests.rs"]
+mod ai;
+
+/// A themes folder holding `files` (`(file name, text)`), and its catalog.
+fn theme_catalog_with(tag: &str, files: &[(&str, &str)]) -> Arc<crate::app_config::ThemeCatalog> {
+    let dir = std::env::temp_dir().join(format!(
+        "aterm-settings-theme-picker-{tag}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch themes folder");
+    for (name, text) in files {
+        std::fs::write(dir.join(name), text).expect("theme file");
+    }
+    let catalog = crate::app_config::ThemeCatalog::discover_in(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    Arc::new(catalog)
+}
+
+/// A Settings runtime whose view carries `themes`, with the theme picker
+/// open.
+fn theme_picker_runtime(
+    themes: Arc<crate::app_config::ThemeCatalog>,
+) -> (
+    NativeRuntime,
+    crate::native_app::AppInstanceId,
+    crate::native_app::ViewId,
+) {
+    let (mut runtime, instance, view) = setup();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        let mut assets = (*state.assets).clone();
+        assets.themes = themes;
+        state.assets = Arc::new(assets);
+    }
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(format!("settings/set/{}", prefs::EDIT_THEME)),
+                value: None,
+            }),
+        )
+        .unwrap();
+    (runtime, instance, view)
+}
+
+fn open_theme_picker(runtime: &NativeRuntime, view: crate::native_app::ViewId) -> &ChoicePicker {
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!();
+    };
+    state.choice_picker.as_ref().expect("theme picker open")
+}
+
+const MY_THEME: &str = "foreground = #c0caf5\nbackground = #1a1b26\n";
+const BROKEN_THEME: &str = "foreground = #c0caf5\nbackground = #1a1b26\ncursor-colour = #ffffff\n";
+
+/// SEL-10: the filter matches label, id, description and appearance by the
+/// search ladder, and the rows it leaves are the only ones drawn.
+#[test]
+fn theme_picker_filter_nord_leaves_only_nord_rows() {
+    let themes = theme_catalog_with("filter", &[("my-theme.conf", MY_THEME)]);
+    let (mut runtime, instance, view) = theme_picker_runtime(themes);
+    let everything = open_theme_picker(&runtime, view).shown.len();
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(THEME_FILTER_ACTION),
+                value: Some(SemanticInput::Text("nord".to_string())),
+            }),
+        )
+        .unwrap();
+    let picker = open_theme_picker(&runtime, view);
+    let labels: Vec<&str> = picker
+        .shown
+        .iter()
+        .map(|index| picker.options[*index].label.as_str())
+        .collect();
+    assert_eq!(labels, ["Nord"], "only Nord answers \"nord\"");
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 820.0));
+    let drawn: Vec<&str> = compiled
+        .semantics
+        .iter()
+        .filter(|node| {
+            node.key
+                .as_str()
+                .starts_with(&format!("settings/choice/{}/", prefs::EDIT_THEME))
+        })
+        .map(|node| node.label.as_str())
+        .collect();
+    assert_eq!(drawn, ["Nord"], "the page draws only what the filter left");
+
+    // Typing reaches the same filter; "light" matches by appearance, and the
+    // empty filter (negative control) shows every row again.
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.common.last_focus = Some(UiKey::new(THEME_FILTER_ACTION));
+    }
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::TextInput(TextInputEvent::SelectAll),
+        )
+        .unwrap();
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::TextInput(TextInputEvent::Commit("light".to_string())),
+        )
+        .unwrap();
+    let picker = open_theme_picker(&runtime, view);
+    assert!(picker.shown.len() > 1);
+    // Light themes, plus Follow system, whose light side is Default Light.
+    assert!(picker.shown.iter().all(|index| {
+        picker.options[*index].theme.as_ref().is_some_and(|theme| {
+            theme.appearance == Some(aterm_types::Appearance::Light)
+                || theme.section == ThemeSection::System
+        })
+    }));
+    for _ in 0.."light".len() {
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::TextInput(TextInputEvent::Backspace),
+            )
+            .unwrap();
+    }
+    assert_eq!(open_theme_picker(&runtime, view).shown.len(), everything);
+}
+
+/// SEL-9: a theme file that did not load is a disabled Needs-attention row
+/// with its reason and an Open file action; choosing it is refused on every
+/// path.
+#[test]
+fn an_invalid_theme_file_is_a_disabled_row_with_its_reason_and_choosing_it_is_refused() {
+    let themes = theme_catalog_with(
+        "invalid",
+        &[("my-theme.conf", MY_THEME), ("broken.conf", BROKEN_THEME)],
+    );
+    let (mut runtime, instance, view) = theme_picker_runtime(themes);
+    let picker = open_theme_picker(&runtime, view);
+    let index = picker
+        .options
+        .iter()
+        .position(|option| option.label == "broken")
+        .expect("the broken file is listed");
+    let option = &picker.options[index];
+    let theme = option.theme.as_ref().unwrap();
+    assert_eq!(theme.section, ThemeSection::NeedsAttention);
+    let reason = option.disabled_reason().expect("a reason").to_string();
+    assert!(reason.contains("cursor-colour"), "{reason}");
+    assert_eq!(
+        index,
+        picker.options.len() - 1,
+        "Needs attention is the last section"
+    );
+    picker.reveal(index);
+
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 820.0));
+    let row = compiled
+        .semantic(&UiKey::new(format!(
+            "settings/choice/{}/{index}",
+            prefs::EDIT_THEME
+        )))
+        .expect("the row is drawn");
+    assert!(!row.state.unwrap().enabled, "disabled");
+    assert!(
+        row.description
+            .as_deref()
+            .is_some_and(|d| d.contains(reason.as_str()))
+    );
+    let open_key = format!("settings/choice-open-file/{}/{index}", prefs::EDIT_THEME);
+    assert!(compiled.semantic(&UiKey::new(open_key.clone())).is_some());
+    let status = compiled
+        .semantic(&UiKey::new(format!(
+            "settings/themes/loaded/{}",
+            prefs::EDIT_THEME
+        )))
+        .expect("footer status");
+    assert_eq!(status.label, "1 of 2 theme files loaded; 1 needs attention");
+
+    // Choosing it (as assistive technology or `ctl` can, past the disabled
+    // paint) writes nothing and says why.
+    let effects = messages_action(
+        &mut runtime,
+        instance,
+        view,
+        &format!("settings/choice/{}/{index}", prefs::EDIT_THEME),
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, AppEffect::ConfigPatch { .. })),
+        "{effects:?}"
+    );
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!();
+    };
+    assert!(
+        state
+            .feedback
+            .as_deref()
+            .is_some_and(|feedback| feedback.contains(reason.as_str()))
+    );
+    // Negative control: a loaded row does write (over the unset theme, a
+    // pair that draws it on a side and keeps following the OS).
+    let mine = open_theme_picker(&runtime, view)
+        .options
+        .iter()
+        .position(|option| option.label == "my-theme")
+        .unwrap();
+    let effects = messages_action(
+        &mut runtime,
+        instance,
+        view,
+        &format!("settings/choice/{}/{mine}", prefs::EDIT_THEME),
+    );
+    let draws_mine = |value: Option<&str>| {
+        [
+            aterm_types::Appearance::Dark,
+            aterm_types::Appearance::Light,
+        ]
+        .into_iter()
+        .any(|side| {
+            crate::app_config::resolve_theme_name_value(value, side).as_deref() == Some("my-theme")
+        })
+    };
+    assert!(effects.iter().any(
+        |effect| matches!(effect, AppEffect::ConfigPatch { patch, .. }
+                if draws_mine(patch.edits[0].value.as_deref()))
+    ));
+
+    // Open file asks the host by id, never by path.
+    let (mut runtime, instance, view) = theme_picker_runtime(theme_catalog_with(
+        "invalid-open",
+        &[("broken.conf", BROKEN_THEME)],
+    ));
+    let index = open_theme_picker(&runtime, view)
+        .options
+        .iter()
+        .position(|option| option.label == "broken")
+        .unwrap();
+    let effects = messages_action(
+        &mut runtime,
+        instance,
+        view,
+        &format!("settings/choice-open-file/{}/{index}", prefs::EDIT_THEME),
+    );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        AppEffect::Themes { request: ThemesRequest::OpenFile { id }, .. } if id == "broken"
+    )));
+}
+
+/// SEL-12: a theme's label is its own name as written, never sentence-cased.
+#[test]
+fn a_user_theme_is_labelled_as_written() {
+    let themes = theme_catalog_with(
+        "labels",
+        &[
+            ("my-theme.conf", MY_THEME),
+            ("solarized_osaka.conf", MY_THEME),
+            (
+                "fancy-file.conf",
+                "name = Fancy Name\nforeground = #ffffff\nbackground = #000000\n",
+            ),
+        ],
+    );
+    let (runtime, instance, view) = theme_picker_runtime(themes);
+    let picker = open_theme_picker(&runtime, view);
+    let yours: Vec<(&str, Option<&str>)> = picker
+        .options
+        .iter()
+        .filter(|option| {
+            option
+                .theme
+                .as_ref()
+                .is_some_and(|theme| theme.section == ThemeSection::Yours)
+        })
+        .map(|option| (option.label.as_str(), option.value.as_deref()))
+        .collect();
+    assert!(yours.contains(&("my-theme", Some("my-theme"))), "{yours:?}");
+    assert!(
+        yours.contains(&("solarized_osaka", Some("solarized_osaka"))),
+        "{yours:?}"
+    );
+    assert!(
+        yours.contains(&("Fancy Name  ·  fancy-file", Some("fancy-file"))),
+        "a file's own name, with the id config stores: {yours:?}"
+    );
+    let index = picker
+        .options
+        .iter()
+        .position(|option| option.label == "my-theme")
+        .unwrap();
+    picker.reveal(index);
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 820.0));
+    let row = compiled
+        .semantic(&UiKey::new(format!(
+            "settings/choice/{}/{index}",
+            prefs::EDIT_THEME
+        )))
+        .unwrap();
+    assert_eq!(row.label, "my-theme", "announced as written");
+    // The Theme control itself paints the configured name as written too;
+    // an enum token (negative control) is still sentence-cased.
+    assert_eq!(
+        setting_choice_label(prefs::EDIT_THEME, "my-theme"),
+        "my-theme"
+    );
+    assert_eq!(
+        setting_choice_label(prefs::EDIT_CURSOR_STYLE, "my-theme"),
+        "My theme"
+    );
+}
+
+/// SEL-14: every loadable theme row carries its background and 16 colours,
+/// and an accessibility sentence with its contrast.
+#[test]
+fn theme_rows_carry_a_colour_strip_and_a_contrast_sentence() {
+    let (runtime, instance, view) = theme_picker_runtime(crate::app_config::ThemeCatalog::empty());
+    let picker = open_theme_picker(&runtime, view);
+    let index = picker
+        .options
+        .iter()
+        .position(|option| option.label == "Nord")
+        .unwrap();
+    picker.reveal(index);
+    let nord = aterm_types::scheme::builtin("Nord").unwrap();
+    let rgb = |color: aterm_types::Rgb| [color.r, color.g, color.b];
+    let expected: Vec<[u8; 3]> = std::iter::once(rgb(nord.background))
+        .chain(nord.ansi.iter().copied().map(rgb))
+        .collect();
+    let row = choice_option_node(
+        match runtime.view_state(view) {
+            Some(AppViewState::Settings(state)) => state,
+            _ => unreachable!(),
+        },
+        picker,
+        index,
+        200.0,
+    );
+    let UiContent::Button(control) = &row.content else {
+        panic!("a theme row is a button");
+    };
+    assert_eq!(control.spec.swatches, expected);
+    let description = control.spec.description.as_deref().unwrap();
+    assert!(
+        description.starts_with("Nord, dark, text contrast "),
+        "{description}"
+    );
+    assert!(description.contains("below 3:1"), "{description}");
+    // The strip lives inside the existing row height.
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 820.0));
+    let node = compiled
+        .semantic(&UiKey::new(format!(
+            "settings/choice/{}/{index}",
+            prefs::EDIT_THEME
+        )))
+        .unwrap();
+    assert_eq!(node.rect.height, scaled_control_height());
+    // Negative control: a non-theme picker's rows carry no strip.
+    let generic = ChoicePicker::new(
+        prefs::EDIT_WINDOW_THEME,
+        ["dark".to_string()],
+        "dark",
+        false,
+        true,
+        "auto",
+    );
+    assert!(
+        choice_option_button(&generic.options[0], 200.0, false)
+            .swatches
+            .is_empty()
+    );
+}
+
+/// SEL-10 (search): a theme's name finds the Theme control, and opening the
+/// picker from that search starts filtered to it.
+#[test]
+fn a_theme_name_finds_the_theme_control_and_seeds_the_picker_filter() {
+    let themes = theme_catalog_with("search", &[("harbour.conf", MY_THEME)]);
+    let field = prefs::editable_fields(&Config::default())
+        .into_iter()
+        .find(|field| field.key == prefs::EDIT_THEME)
+        .unwrap();
+    assert!(field_match_score(&field, "nord", &themes).is_some());
+    assert!(field_match_score(&field, "harbour", &themes).is_some());
+    // Negative controls: an unknown name, and a mere subsequence.
+    assert!(field_match_score(&field, "zebra", &themes).is_none());
+    assert!(field_match_score(&field, "nrd", &themes).is_none());
+
+    let (mut runtime, instance, view) = setup();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        let mut assets = (*state.assets).clone();
+        assets.themes = themes;
+        state.assets = Arc::new(assets);
+        state.set_search("nord".to_string());
+    }
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(format!("settings/set/{}", prefs::EDIT_THEME)),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!();
+    };
+    let picker = state.choice_picker.as_ref().unwrap();
+    assert_eq!(picker.filter_text(), "nord");
+    let nord = picker.shown[0];
+    assert_eq!(picker.options[nord].label, "Nord");
+    assert_eq!(
+        picker_candidate(state, prefs::EDIT_THEME),
+        Some("Nord"),
+        "the match is previewed"
+    );
+}
+
+/// A search that finds the theme row without naming a theme ("light
+/// theme", which two themes' descriptions say) opens a theme picker whole,
+/// on the saved choice, so opening it does not move the preview; a search
+/// that names one ("nord") still opens the slot's picker filtered to it.
+#[test]
+fn a_search_that_names_no_theme_opens_the_theme_picker_unfiltered() {
+    let open = |source: &str, search: &str, action: &str| {
+        let (mut runtime, instance, view) = setup();
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            let service = VersionedConfigService::new(source.to_string()).expect("fixture");
+            **state = SettingsViewState::from_snapshot(&service.snapshot()).expect("snapshot");
+            state.set_search(search.to_string());
+        }
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(action),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        let picker = state.choice_picker.as_ref().expect("a picker opened");
+        let saved = picker.options[picker.selected].value.clone();
+        (
+            picker.filter_text().to_string(),
+            picker.shown.len() == picker.options.len(),
+            picker_candidate(state, prefs::EDIT_THEME).map(str::to_string),
+            saved,
+        )
+    };
+    let dark_slot = format!("{THEME_SLOT_ACTION_PREFIX}dark");
+    let light_slot = format!("{THEME_SLOT_ACTION_PREFIX}light");
+    let color_theme = format!("settings/set/{}", prefs::EDIT_THEME);
+    // (The Color theme picker's Follow system row answers "follow system"
+    // by its own name, so only the slots take that search here.)
+    for (source, action, searches) in [
+        (
+            "",
+            dark_slot.as_str(),
+            &["light theme", "dark mode", "follow system"][..],
+        ),
+        (
+            "",
+            light_slot.as_str(),
+            &["light theme", "dark mode", "follow system"][..],
+        ),
+        (
+            "theme = \"Nord\"\n",
+            color_theme.as_str(),
+            &["light theme", "dark mode"][..],
+        ),
+    ] {
+        for search in searches {
+            let (filter, whole, candidate, saved) = open(source, search, action);
+            assert_eq!(filter, "", "{search:?} names no theme: {action}");
+            assert!(whole, "every theme is listed: {search:?} {action}");
+            assert_eq!(
+                candidate, saved,
+                "the saved theme is previewed: {search:?} {action}"
+            );
+        }
+    }
+    // Negative control: a theme's name still seeds the slot's picker.
+    let (filter, whole, candidate, _) = open("", "nord", &dark_slot);
+    assert_eq!(filter, "nord");
+    assert!(!whole);
+    assert_eq!(candidate.as_deref(), Some("Nord"));
+}
+
+/// SEL-17: the footer opens the themes folder and imports, through the
+/// host, by request alone.
+#[test]
+fn the_theme_picker_footer_opens_the_folder_and_imports_through_the_host() {
+    let (mut runtime, instance, view) =
+        theme_picker_runtime(crate::app_config::ThemeCatalog::empty());
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 820.0));
+    for key in [THEMES_FOLDER_ACTION, THEMES_IMPORT_ACTION] {
+        assert!(compiled.semantic(&UiKey::new(key)).is_some(), "{key}");
+    }
+    let effects = messages_action(&mut runtime, instance, view, THEMES_FOLDER_ACTION);
+    let operation = effects
+        .iter()
+        .find_map(|effect| match effect {
+            AppEffect::Themes {
+                request: ThemesRequest::OpenFolder,
+                reply,
+            } => Some(reply.operation),
+            _ => None,
+        })
+        .expect("asks the host to open the folder");
+    let effects = messages_action(&mut runtime, instance, view, THEMES_IMPORT_ACTION);
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        AppEffect::Themes {
+            request: ThemesRequest::Import,
+            ..
+        }
+    )));
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::ThemesFinished {
+                operation,
+                outcome: ThemesOutcome::Failed {
+                    message: "could not open the themes folder".to_string(),
+                },
+            },
+        )
+        .unwrap();
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!();
+    };
+    assert_eq!(
+        state.feedback.as_deref(),
+        Some("Could not open the themes folder")
+    );
+
+    // Compact has no footer row: the same actions are its last cells.
+    let (mut runtime, instance, view) =
+        theme_picker_runtime(crate::app_config::ThemeCatalog::empty());
+    // Lay the compact picker out once, then scroll it to its last cell.
+    let _ = compile_settings_view(&runtime, instance, view, &view_cx_at(320.0, 568.0));
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        // The keyboard on the last cell keeps the list there.
+        let picker = state.choice_picker.as_ref().unwrap();
+        picker.scroll_to(Some(picker.slots() - 1));
+        state.common.last_focus = Some(UiKey::new(THEMES_IMPORT_ACTION));
+    }
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(320.0, 568.0));
+    assert!(
+        compiled
+            .semantic(&UiKey::new(THEMES_IMPORT_ACTION))
+            .is_some(),
+        "compact pages Import… in last"
+    );
+    assert!(
+        compiled
+            .semantic(&UiKey::new(format!(
+                "settings/themes/footer/{}",
+                prefs::EDIT_THEME
+            )))
+            .is_none()
+    );
+}
+
+/// Every page of a theme picker holding all four sections, its filter and
+/// its footer (or trailing action cells) paints whole at desktop, phone and
+/// short-landscape sizes and every text scale, with no text overflow and
+/// nothing escaping the picker.
+#[test]
+fn every_theme_picker_page_paints_whole_with_its_sections_filter_and_footer() {
+    at_each_text_scale(
+        &[1.0, 1.5, 2.0],
+        "theme picker section audit",
+        every_theme_picker_page_paints_whole_at_scale,
+    );
+}
+
+fn every_theme_picker_page_paints_whole_at_scale(scale: f32) {
+    let themes = theme_catalog_with(
+        &format!("audit-{scale}"),
+        &[
+            ("my-theme.conf", MY_THEME),
+            ("broken.conf", BROKEN_THEME),
+            ("Nord.conf", MY_THEME),
+        ],
+    );
+    for (width, height) in [(1_200.0, 820.0), (286.5, 558.0), (568.0, 320.0)] {
+        let (mut runtime, instance, view) = theme_picker_runtime(Arc::clone(&themes));
+        let cx = view_cx_at(width, height);
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        // Screen by screen: each starts where the last one's rows ended (no
+        // highlight to scroll back to).
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.common.last_focus = None;
+        let mut first = 0;
+        for page in 0..64 {
+            open_theme_picker(&runtime, view).offset.set(first);
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let context = format!("theme picker page {page} at {width}x{height} {scale}x");
+            assert_zero_top_paint(&compiled, &context);
+            assert_picker_descendants_contained(&compiled, prefs::EDIT_THEME, &context);
+            let picker = open_theme_picker(&runtime, view);
+            let rows = picker.rows();
+            let window = picker.window(&rows);
+            if window.end >= rows.len() {
+                break;
+            }
+            assert!(window.end > first, "{context}: the screens move on");
+            first = window.end;
+        }
+    }
+}
+
+/// A Settings runtime over `source` (an `aterm.toml`), built-in themes only,
+/// whose last presentation saw the OS appearance `system_dark`.
+fn theme_pair_runtime(
+    source: &str,
+    system_dark: bool,
+) -> (
+    NativeRuntime,
+    crate::native_app::AppInstanceId,
+    crate::native_app::ViewId,
+) {
+    let (mut runtime, instance, view) = setup();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        **state = settings_state_with_themes(source, crate::app_config::ThemeCatalog::empty());
+        state.presented_motion.set(crate::native_app::ViewMotionCx {
+            system_dark,
+            ..crate::native_app::ViewMotionCx::default()
+        });
+    }
+    (runtime, instance, view)
+}
+
+/// Dispatch `action` and return the `theme` value its patch writes (`None`
+/// when it writes nothing to `theme`).
+fn theme_written_by(
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    action: &str,
+    value: Option<SemanticInput>,
+) -> Option<String> {
+    let outcome = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(action.to_string()),
+                value,
+            }),
+        )
+        .unwrap();
+    outcome.effects.iter().find_map(|effect| match effect {
+        AppEffect::ConfigPatch { patch, .. } => patch
+            .edits
+            .iter()
+            .find(|edit| edit.key == prefs::EDIT_THEME)
+            .and_then(|edit| edit.value.clone()),
+        _ => None,
+    })
+}
+
+fn settings_state(runtime: &NativeRuntime, view: crate::native_app::ViewId) -> &SettingsViewState {
+    let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        unreachable!();
+    };
+    state
+}
+
+/// The open picker's index for the row naming `id` (a built-in name).
+fn theme_row(runtime: &NativeRuntime, view: crate::native_app::ViewId, id: &str) -> usize {
+    open_theme_picker(runtime, view)
+        .options
+        .iter()
+        .position(|option| {
+            option
+                .theme
+                .as_ref()
+                .is_some_and(|theme| theme.id == id && theme.reason.is_none())
+        })
+        .unwrap_or_else(|| panic!("a {id} row"))
+}
+
+/// SEL-7/T9: turning Follow system on writes the theme on its own side and
+/// its pair on the other; off writes the side on screen.
+#[test]
+fn follow_system_prefs_switch_writes_the_pair_and_back_the_visible_side() {
+    let (mut runtime, instance, view) = theme_pair_runtime("theme = \"Gruvbox Dark\"\n", true);
+    assert_eq!(
+        theme_written_by(&mut runtime, instance, view, THEME_MODE_ACTION, None).as_deref(),
+        Some("dark:Gruvbox Dark,light:Gruvbox Light")
+    );
+    // An explicit "on" for a value already in that mode writes nothing.
+    let (mut runtime, instance, view) =
+        theme_pair_runtime("theme = \"dark:Dracula,light:GitHub Light\"\n", true);
+    assert_eq!(
+        theme_written_by(
+            &mut runtime,
+            instance,
+            view,
+            THEME_MODE_ACTION,
+            Some(SemanticInput::Bool(true))
+        ),
+        None
+    );
+    // Off on a dark OS keeps Dracula; on a light OS GitHub Light.
+    assert_eq!(
+        theme_written_by(&mut runtime, instance, view, THEME_MODE_ACTION, None).as_deref(),
+        Some("Dracula")
+    );
+    let (mut runtime, instance, view) =
+        theme_pair_runtime("theme = \"dark:Dracula,light:GitHub Light\"\n", false);
+    assert_eq!(
+        theme_written_by(&mut runtime, instance, view, THEME_MODE_ACTION, None).as_deref(),
+        Some("GitHub Light")
+    );
+    // The side switch decides what "visible" means: switched to Dark on a
+    // light OS, off writes Dracula.
+    let (mut runtime, instance, view) =
+        theme_pair_runtime("theme = \"dark:Dracula,light:GitHub Light\"\n", false);
+    assert_eq!(
+        theme_written_by(
+            &mut runtime,
+            instance,
+            view,
+            THEME_PREVIEW_SIDE_ACTION,
+            Some(SemanticInput::Text("dark".to_string()))
+        ),
+        None,
+        "the side switch is view state, never config"
+    );
+    assert_eq!(
+        theme_written_by(&mut runtime, instance, view, THEME_MODE_ACTION, None).as_deref(),
+        Some("Dracula")
+    );
+    // Unset already follows the system (it draws Default and Default
+    // Light): an explicit "on" writes nothing, and turning it off pins the
+    // side on screen, Default on a dark OS and Default Light on a light one.
+    let (mut runtime, instance, view) = theme_pair_runtime("", true);
+    assert_eq!(
+        theme_edit_by(
+            &mut runtime,
+            instance,
+            view,
+            THEME_MODE_ACTION,
+            Some(SemanticInput::Bool(true))
+        ),
+        None
+    );
+    assert_eq!(
+        theme_edit_by(&mut runtime, instance, view, THEME_MODE_ACTION, None),
+        Some(Some("Default".to_string()))
+    );
+    let (mut runtime, instance, view) = theme_pair_runtime("", false);
+    assert_eq!(
+        theme_edit_by(&mut runtime, instance, view, THEME_MODE_ACTION, None),
+        Some(Some("Default Light".to_string()))
+    );
+    // Back on from Default restores following with aterm's own pair, which
+    // is no key at all; from another theme it writes that theme's pair.
+    let (mut runtime, instance, view) = theme_pair_runtime("theme = \"Default\"\n", true);
+    assert_eq!(
+        theme_edit_by(&mut runtime, instance, view, THEME_MODE_ACTION, None),
+        Some(None)
+    );
+}
+
+/// Dispatch `action` and return its patch's `theme` edit: `None` when it
+/// writes nothing to `theme`, `Some(None)` when it removes the key.
+fn theme_edit_by(
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    action: &str,
+    value: Option<SemanticInput>,
+) -> Option<Option<String>> {
+    let outcome = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(action.to_string()),
+                value,
+            }),
+        )
+        .unwrap();
+    outcome.effects.iter().find_map(|effect| match effect {
+        AppEffect::ConfigPatch { patch, .. } => patch
+            .edits
+            .iter()
+            .find(|edit| edit.key == prefs::EDIT_THEME)
+            .map(|edit| edit.value.clone()),
+        _ => None,
+    })
+}
+
+/// An unset theme follows the system, and Top Settings says so: the Dark
+/// and Light slots show the pair it draws and the Follow system switch is
+/// on. Negative control: a plain name shows the one Color theme control
+/// with the switch off.
+#[test]
+fn an_unset_theme_shows_follow_system_on_with_its_pair() {
+    let cx = view_cx_at(1_200.0, 820.0);
+    let seen = |source: &str| {
+        let (mut runtime, instance, view) = theme_pair_runtime(source, true);
+        let mut seen: std::collections::BTreeMap<String, crate::native_ui::SemanticNode> =
+            std::collections::BTreeMap::new();
+        each_screen(&mut runtime, instance, view, &cx, |compiled, _| {
+            for node in &compiled.semantics {
+                seen.entry(node.key.as_str().to_string())
+                    .or_insert_with(|| node.clone());
+            }
+        });
+        seen
+    };
+    let unset = seen("");
+    assert_eq!(
+        unset.get(THEME_MODE_ACTION).map(|node| node.value.clone()),
+        Some(SemanticValue::Bool(true))
+    );
+    assert_eq!(
+        unset
+            .get(&theme_slot_action(aterm_types::Appearance::Dark))
+            .map(|node| node.value.clone()),
+        Some(SemanticValue::Text("Default".to_string()))
+    );
+    assert_eq!(
+        unset
+            .get(&theme_slot_action(aterm_types::Appearance::Light))
+            .map(|node| node.value.clone()),
+        Some(SemanticValue::Text("Default Light".to_string()))
+    );
+    assert!(!unset.contains_key(&format!("settings/control/{}", prefs::EDIT_THEME)));
+    let nord = seen("theme = \"Nord\"\n");
+    assert_eq!(
+        nord.get(THEME_MODE_ACTION).map(|node| node.value.clone()),
+        Some(SemanticValue::Bool(false))
+    );
+    assert!(nord.contains_key(&format!("settings/control/{}", prefs::EDIT_THEME)));
+}
+
+/// SEL-7: a slot writes only its own side, and the Default row there names
+/// Default rather than resetting the pair away.
+#[test]
+fn follow_system_prefs_slot_edit_keeps_the_other_side() {
+    let (mut runtime, instance, view) =
+        theme_pair_runtime("theme = \"dark:Gruvbox Dark,light:Gruvbox Light\"\n", true);
+    let opened = theme_written_by(
+        &mut runtime,
+        instance,
+        view,
+        &theme_slot_action(aterm_types::Appearance::Light),
+        None,
+    );
+    assert_eq!(opened, None, "opening a slot writes nothing");
+    let picker = open_theme_picker(&runtime, view);
+    assert_eq!(picker.slot, Some(aterm_types::Appearance::Light));
+    assert_eq!(
+        picker.options[picker.selected]
+            .theme
+            .as_ref()
+            .map(|theme| theme.id.as_str()),
+        Some("Gruvbox Light"),
+        "the slot opens on what it shows"
+    );
+    assert_eq!(
+        settings_state(&runtime, view).theme_preview_side,
+        Some(aterm_types::Appearance::Light),
+        "the preview turns to the side being edited"
+    );
+    let row = theme_row(&runtime, view, "Solarized Light");
+    assert_eq!(
+        theme_written_by(
+            &mut runtime,
+            instance,
+            view,
+            &format!("settings/choice/{}/{row}", prefs::EDIT_THEME),
+            None
+        )
+        .as_deref(),
+        Some("dark:Gruvbox Dark,light:Solarized Light")
+    );
+
+    // The dark slot's Default row writes `dark:Default`, keeping the light
+    // side; it is not the reset the always-mode picker makes of it.
+    let (mut runtime, instance, view) =
+        theme_pair_runtime("theme = \"dark:Gruvbox Dark,light:Gruvbox Light\"\n", true);
+    theme_written_by(
+        &mut runtime,
+        instance,
+        view,
+        &theme_slot_action(aterm_types::Appearance::Dark),
+        None,
+    );
+    // A slot names one side, so its picker offers no Follow system reset
+    // (which would unset both). Negative control: the always-mode picker
+    // does offer it.
+    let picker = open_theme_picker(&runtime, view);
+    assert!(
+        picker.options.iter().all(|option| option
+            .theme
+            .as_ref()
+            .is_none_or(|theme| theme.id != crate::app_config::UNSET_THEME)),
+        "a slot picker lists no Follow system row"
+    );
+    assert!(
+        theme_picker_rows(&settings_state(&runtime, view).assets.themes)
+            .iter()
+            .any(|option| option
+                .theme
+                .as_ref()
+                .is_some_and(|theme| theme.id == crate::app_config::UNSET_THEME)),
+        "the always-mode picker keeps the Follow system reset"
+    );
+    let row = theme_row(&runtime, view, "Default");
+    assert_eq!(
+        theme_written_by(
+            &mut runtime,
+            instance,
+            view,
+            &format!("settings/choice/{}/{row}", prefs::EDIT_THEME),
+            None
+        )
+        .as_deref(),
+        Some("dark:Default,light:Gruvbox Light")
+    );
+}
+
+/// SEL-7: the theme control itself, on a split, opens the side on screen,
+/// so a single pick can never silently replace the pair. Negative control:
+/// on a plain name the same pick writes the plain name.
+#[test]
+fn follow_system_prefs_single_pick_never_replaces_a_split() {
+    let choose = |source: &str, system_dark: bool| {
+        let (mut runtime, instance, view) = theme_pair_runtime(source, system_dark);
+        theme_written_by(
+            &mut runtime,
+            instance,
+            view,
+            &format!("settings/set/{}", prefs::EDIT_THEME),
+            None,
+        );
+        let slot = open_theme_picker(&runtime, view).slot;
+        let row = theme_row(&runtime, view, "Nord");
+        let written = theme_written_by(
+            &mut runtime,
+            instance,
+            view,
+            &format!("settings/choice/{}/{row}", prefs::EDIT_THEME),
+            None,
+        );
+        (slot, written)
+    };
+    let split = "theme = \"dark:Dracula,light:GitHub Light\"\n";
+    assert_eq!(
+        choose(split, true),
+        (
+            Some(aterm_types::Appearance::Dark),
+            Some("dark:Nord,light:GitHub Light".to_string())
+        )
+    );
+    assert_eq!(
+        choose(split, false),
+        (
+            Some(aterm_types::Appearance::Light),
+            Some("dark:Dracula,light:Nord".to_string())
+        )
+    );
+    assert_eq!(
+        choose("theme = \"Dracula\"\n", true),
+        (None, Some("Nord".to_string()))
+    );
+}
+
+/// APPEAR-6: the preview draws the side the OS appearance picks, and the
+/// side switch turns it to the other side without writing anything.
+#[test]
+fn follow_system_prefs_preview_draws_the_os_side_and_the_side_switch_turns_it() {
+    let (mut runtime, instance, view) =
+        theme_pair_runtime("theme = \"dark:Dracula,light:GitHub Light\"\n", true);
+    let dracula =
+        PreviewTerminalTheme::from_scheme(&aterm_types::scheme::builtin("Dracula").unwrap());
+    let github =
+        PreviewTerminalTheme::from_scheme(&aterm_types::scheme::builtin("GitHub Light").unwrap());
+    assert_eq!(
+        preview_terminal_theme(settings_state(&runtime, view), true),
+        dracula
+    );
+    // A plain activation flips to the other side.
+    theme_written_by(
+        &mut runtime,
+        instance,
+        view,
+        THEME_PREVIEW_SIDE_ACTION,
+        None,
+    );
+    assert_eq!(
+        preview_terminal_theme(settings_state(&runtime, view), true),
+        github
+    );
+    theme_written_by(
+        &mut runtime,
+        instance,
+        view,
+        THEME_PREVIEW_SIDE_ACTION,
+        Some(SemanticInput::Text("dark".to_string())),
+    );
+    assert_eq!(
+        preview_terminal_theme(settings_state(&runtime, view), true),
+        dracula
+    );
+}
+
+/// The card shows the mode the value is in: a split paints a Dark and a
+/// Light slot (with their names and the switch on), a plain name the Theme
+/// control (switch off); every layout paints whole at every text scale.
+#[test]
+fn follow_system_prefs_card_shows_the_mode_the_value_is_in() {
+    at_each_text_scale(
+        &[1.0, 1.5, 2.0],
+        "follow system card audit",
+        follow_system_card_at_scale,
+    );
+}
+
+fn follow_system_card_at_scale(scale: f32) {
+    // Every screen of the list paints whole; what the card says is read off
+    // all of them, since a short host scrolls the card's rows.
+    let screens = |source: &str, cx: &ViewCx<'_>, context: &str| {
+        let (mut runtime, instance, view) = theme_pair_runtime(source, true);
+        let mut seen: std::collections::BTreeMap<String, crate::native_ui::SemanticNode> =
+            std::collections::BTreeMap::new();
+        each_screen(&mut runtime, instance, view, cx, |compiled, page| {
+            assert_zero_top_paint(compiled, &format!("{context} screen {page}"));
+            for node in &compiled.semantics {
+                seen.entry(node.key.as_str().to_string())
+                    .or_insert_with(|| node.clone());
+            }
+        });
+        seen
+    };
+    for (width, height) in [
+        (1_200.0, 820.0),
+        (1_440.0, 900.0),
+        (390.0, 844.0),
+        (286.5, 558.0),
+    ] {
+        let context = format!("{width}x{height} {scale}x");
+        let cx = view_cx_at(width, height);
+        let seen = screens(
+            "theme = \"dark:Dracula,light:GitHub Light\"\n",
+            &cx,
+            &context,
+        );
+        let semantic = |key: &str| {
+            seen.get(key)
+                .unwrap_or_else(|| panic!("{context}: missing {key}"))
+        };
+        assert_eq!(
+            semantic(&theme_slot_action(aterm_types::Appearance::Dark)).value,
+            SemanticValue::Text("Dracula".to_string())
+        );
+        assert_eq!(
+            semantic(&theme_slot_action(aterm_types::Appearance::Light)).value,
+            SemanticValue::Text("GitHub Light".to_string())
+        );
+        assert_eq!(semantic(THEME_MODE_ACTION).value, SemanticValue::Bool(true));
+        // The side switch steers the preview, so it is drawn exactly when
+        // the preview is (a short host yields both; a desktop keeps both).
+        if width >= 1_200.0 {
+            assert!(semantic(THEME_PREVIEW_SIDE_ACTION).action.is_some());
+        }
+        assert_eq!(
+            seen.get(THEME_PREVIEW_SIDE_ACTION)
+                .is_some_and(|node| node.action.is_some()),
+            seen.contains_key("settings/top/theme/preview"),
+            "{context}"
+        );
+        assert!(
+            !seen.contains_key(&format!("settings/control/{}", prefs::EDIT_THEME)),
+            "{context}: no single-name control stands in front of a split"
+        );
+
+        let seen = screens("theme = \"Nord\"\n", &cx, &context);
+        assert_eq!(
+            seen.get(THEME_MODE_ACTION).map(|node| node.value.clone()),
+            Some(SemanticValue::Bool(false)),
+            "{context}"
+        );
+        assert!(seen.contains_key(&format!("settings/control/{}", prefs::EDIT_THEME)));
+        assert!(!seen.contains_key(&theme_slot_action(aterm_types::Appearance::Dark)));
+    }
+}
+
+/// A slot's picker is named for its side and paints whole wherever the
+/// theme picker does.
+#[test]
+fn follow_system_prefs_slot_picker_is_named_for_its_side_and_paints_whole() {
+    at_each_text_scale(
+        &[1.0, 2.0],
+        "follow system slot picker audit",
+        follow_system_slot_picker_at_scale,
+    );
+}
+
+fn follow_system_slot_picker_at_scale(scale: f32) {
+    for (width, height) in [(1_200.0, 820.0), (286.5, 558.0), (568.0, 320.0)] {
+        let context = format!("light slot picker at {width}x{height} {scale}x");
+        let (mut runtime, instance, view) =
+            theme_pair_runtime("theme = \"dark:Dracula,light:GitHub Light\"\n", true);
+        theme_written_by(
+            &mut runtime,
+            instance,
+            view,
+            &theme_slot_action(aterm_types::Appearance::Light),
+            None,
+        );
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+        assert_zero_top_paint(&compiled, &context);
+        assert_picker_descendants_contained(&compiled, prefs::EDIT_THEME, &context);
+        let header = compiled
+            .semantic(&UiKey::new(format!(
+                "settings/choice-header/{}",
+                prefs::EDIT_THEME
+            )))
+            .unwrap_or_else(|| panic!("{context}: picker header"));
+        // "Choose light theme": the side's name, in sentence case after the
+        // verb, never the shared field's.
+        let label = header.label.to_lowercase();
+        assert!(
+            label.contains("light theme") && !label.contains("color theme"),
+            "{context}: {}",
+            header.label
+        );
+    }
+}
+
+/// Whether `key` is a setting's control: a row's, or one of the theme
+/// card's ([`theme_card_control_key`]).
+fn setting_control_key(key: &str) -> bool {
+    key.starts_with("settings/control/") || theme_card_control_key(key)
+}
+
+/// Whether `key` is one of the theme card's own controls: its Dark and Light
+/// slots, preview side and Follow system switch.
+fn theme_card_control_key(key: &str) -> bool {
+    key.starts_with(THEME_SLOT_ACTION_PREFIX)
+        || key == THEME_MODE_ACTION
+        || key == THEME_PREVIEW_SIDE_ACTION
+}
+
+/// Every semantic node any screen of `route` (with `search` typed) shows.
+fn theme_route_nodes(
+    source: &str,
+    route: SettingsRoute,
+    search: &str,
+    cx: &ViewCx<'_>,
+) -> std::collections::BTreeMap<String, crate::native_ui::SemanticNode> {
+    let (mut runtime, instance, view) = theme_pair_runtime(source, true);
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.navigate(route);
+        state.search = search.to_string();
+    }
+    let mut seen = std::collections::BTreeMap::new();
+    each_screen(&mut runtime, instance, view, cx, |compiled, _| {
+        for node in &compiled.semantics {
+            seen.entry(node.key.as_str().to_string())
+                .or_insert_with(|| node.clone());
+        }
+    });
+    seen
+}
+
+/// A Follow-system pair is the Top Settings pair editor wherever the theme
+/// is listed — Appearance, Modified and Search — so both sides can be
+/// edited there, and nothing anywhere reads as the raw `dark:…,light:…`
+/// value. Negative control: one theme lists its Color theme row there.
+#[test]
+fn a_theme_pair_is_the_pair_editor_on_every_page_and_never_its_raw_value() {
+    let pair = "theme = \"dark:Nord,light:GitHub Light\"\n";
+    for (width, height) in [(1_200.0, 820.0), (390.0, 844.0)] {
+        let cx = view_cx_at(width, height);
+        for (route, search) in [
+            (SettingsRoute::Appearance, ""),
+            (SettingsRoute::Modified, ""),
+            (SettingsRoute::Home, "color theme"),
+        ] {
+            let context = format!("{route:?} {search:?} at {width}x{height}");
+            let seen = theme_route_nodes(pair, route, search, &cx);
+            for key in [
+                theme_slot_action(aterm_types::Appearance::Dark),
+                theme_slot_action(aterm_types::Appearance::Light),
+                THEME_MODE_ACTION.to_string(),
+            ] {
+                assert!(seen.contains_key(&key), "{context}: missing {key}");
+            }
+            assert_eq!(
+                seen.get(THEME_MODE_ACTION).map(|node| node.value.clone()),
+                Some(SemanticValue::Bool(true)),
+                "{context}"
+            );
+            for node in seen.values() {
+                let raw = |text: &str| text.contains("dark:") || text.contains("light:");
+                assert!(
+                    !raw(&node.label)
+                        && !matches!(&node.value, SemanticValue::Text(text) if raw(text)),
+                    "{context}: {:?} reads as the raw value: {:?} {:?}",
+                    node.key,
+                    node.label,
+                    node.value
+                );
+            }
+            // A changed side offers its own Reset back to aterm's own theme.
+            assert!(
+                seen.contains_key("settings/theme-slot-reset/dark")
+                    && seen.contains_key("settings/theme-slot-reset/light"),
+                "{context}"
+            );
+        }
+        let seen = theme_route_nodes("theme = \"Nord\"\n", SettingsRoute::Appearance, "", &cx);
+        assert!(seen.contains_key(&format!("settings/control/{}", prefs::EDIT_THEME)));
+        assert_eq!(
+            seen.get(THEME_MODE_ACTION).map(|node| node.value.clone()),
+            Some(SemanticValue::Bool(false))
+        );
+        // Modified says what Reset returns it to, in the picker's words.
+        let seen = theme_route_nodes("theme = \"Nord\"\n", SettingsRoute::Modified, "", &cx);
+        assert!(
+            seen.get(&format!("settings/label/{}", prefs::EDIT_THEME))
+                .is_some_and(|node| node.label.ends_with("Default: Follow system")),
+            "{:?}",
+            seen.get(&format!("settings/label/{}", prefs::EDIT_THEME))
+        );
+    }
+}
+
+/// A list's slot Reset puts aterm's own theme back on its side and keeps
+/// the other; back on aterm's own pair, the key goes.
+#[test]
+fn a_slot_reset_restores_its_side_and_unsets_the_default_pair() {
+    let (mut runtime, instance, view) =
+        theme_pair_runtime("theme = \"dark:Nord,light:GitHub Light\"\n", true);
+    assert_eq!(
+        theme_edit_by(
+            &mut runtime,
+            instance,
+            view,
+            "settings/theme-slot-reset/dark",
+            None
+        ),
+        Some(Some("dark:Default,light:GitHub Light".to_string()))
+    );
+    let (mut runtime, instance, view) =
+        theme_pair_runtime("theme = \"dark:Default,light:GitHub Light\"\n", true);
+    assert_eq!(
+        theme_edit_by(
+            &mut runtime,
+            instance,
+            view,
+            "settings/theme-slot-reset/light",
+            None
+        ),
+        Some(None)
+    );
+    // Nothing to put back: no write.
+    let (mut runtime, instance, view) = theme_pair_runtime("", true);
+    assert_eq!(
+        theme_edit_by(
+            &mut runtime,
+            instance,
+            view,
+            "settings/theme-slot-reset/dark",
+            None
+        ),
+        None
+    );
+    // A file that spells out the pair an unset theme draws (an older Follow
+    // system switch wrote it) is listed on Modified, so its slots offer the
+    // Reset that removes the key. Negative control: a side of a changed
+    // pair that is already aterm's own offers none.
+    let cx = view_cx_at(1_200.0, 820.0);
+    let redundant = "theme = \"dark:Default,light:Default Light\"\n";
+    let seen = theme_route_nodes(redundant, SettingsRoute::Modified, "", &cx);
+    assert!(
+        seen.contains_key("settings/theme-slot-reset/dark")
+            && seen.contains_key("settings/theme-slot-reset/light"),
+        "{:?}",
+        seen.keys()
+            .filter(|key| key.contains("theme"))
+            .collect::<Vec<_>>()
+    );
+    let (mut runtime, instance, view) = theme_pair_runtime(redundant, true);
+    assert_eq!(
+        theme_edit_by(
+            &mut runtime,
+            instance,
+            view,
+            "settings/theme-slot-reset/light",
+            None
+        ),
+        Some(None)
+    );
+    let seen = theme_route_nodes(
+        "theme = \"dark:Default,light:GitHub Light\"\n",
+        SettingsRoute::Modified,
+        "",
+        &cx,
+    );
+    assert!(seen.contains_key("settings/theme-slot-reset/light"));
+    assert!(!seen.contains_key("settings/theme-slot-reset/dark"));
+}
+
+/// A runtime whose one theme always (`Nord`) opens the full theme picker
+/// (Follow system, Dark, Light), laid out once at `cx`.
+fn full_theme_picker_at(
+    cx: &ViewCx<'_>,
+) -> (
+    NativeRuntime,
+    crate::native_app::AppInstanceId,
+    crate::native_app::ViewId,
+) {
+    let (mut runtime, instance, view) = theme_pair_runtime("theme = \"Nord\"\n", true);
+    let _ = compile_settings_view(&runtime, instance, view, cx);
+    theme_written_by(
+        &mut runtime,
+        instance,
+        view,
+        &format!("settings/set/{}", prefs::EDIT_THEME),
+        None,
+    );
+    let _ = compile_settings_view(&runtime, instance, view, cx);
+    (runtime, instance, view)
+}
+
+/// The theme picker heads its sections in the list where the room holds
+/// them (Follow system, Dark, Light), each section starting a row of its
+/// own; its footer says only what the theme files say.
+#[test]
+fn the_theme_picker_heads_its_sections_in_the_list() {
+    let cx = view_cx_at(1_200.0, 820.0);
+    let (mut runtime, instance, view) = full_theme_picker_at(&cx);
+    let mut headings = Vec::new();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.common.last_focus = None;
+        state.choice_picker.as_ref().unwrap().offset.set(0);
+    }
+    let mut first = 0;
+    for _ in 0..64 {
+        open_theme_picker(&runtime, view).offset.set(first);
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert_zero_top_paint(&compiled, "headed picker");
+        for node in &compiled.semantics {
+            if let Some(heading) = node
+                .key
+                .as_str()
+                .strip_prefix(&format!("settings/choice-section/{}/", prefs::EDIT_THEME))
+                && !headings.contains(&heading.to_string())
+            {
+                assert_eq!(node.role, SemanticRole::Heading);
+                headings.push(heading.to_string());
+            }
+        }
+        let footer = compiled
+            .semantics
+            .iter()
+            .find(|node| {
+                node.key.as_str() == format!("settings/themes/loaded/{}", prefs::EDIT_THEME)
+            })
+            .expect("footer status");
+        assert!(!footer.label.contains("Dark") && !footer.label.contains("Follow system"));
+        let picker = open_theme_picker(&runtime, view);
+        let rows = picker.rows();
+        let window = picker.window(&rows);
+        if window.end >= rows.len() {
+            break;
+        }
+        assert!(window.end > first, "the screens move on");
+        first = window.end;
+    }
+    assert_eq!(headings, ["follow-system", "dark", "light"]);
+    // Each section starts its own row: no row mixes two sections.
+    let picker = open_theme_picker(&runtime, view);
+    for row in picker.rows() {
+        if let PickerRow::Cells(cells) = row {
+            let sections: std::collections::BTreeSet<_> = cells
+                .map(|position| picker.cell_section(position))
+                .collect();
+            assert_eq!(sections.len(), 1);
+        }
+    }
+    // The shipped window's compact picker (two rows of choices) heads its
+    // sections too: its first screen names Follow system.
+    let cx = view_cx_at(738.0, 420.0);
+    let (mut runtime, instance, view) = full_theme_picker_at(&cx);
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::TextInput(TextInputEvent::Home { extend: false }),
+        )
+        .unwrap();
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    assert!(
+        compiled
+            .semantic(&UiKey::new(format!(
+                "settings/choice-section/{}/follow-system",
+                prefs::EDIT_THEME
+            )))
+            .is_some(),
+        "the shipped window's picker heads its sections"
+    );
+    assert_zero_top_paint(&compiled, "headed compact picker");
+}
+
+/// A wide but short window (167x36) seats a theme picker's filter in its
+/// header and lists the folder actions as cells, as the compact window does,
+/// so its list has room for a section heading over two rows of choices; a
+/// taller one keeps the full form, a filter row and a footer.
+#[test]
+fn a_short_wide_window_gives_the_theme_picker_room_for_its_headings() {
+    let section = format!("settings/choice-section/{}/", prefs::EDIT_THEME);
+    let footer = UiKey::new(format!("settings/themes/loaded/{}", prefs::EDIT_THEME));
+    let actions = [
+        format!("{THEME_SLOT_ACTION_PREFIX}dark"),
+        format!("{THEME_SLOT_ACTION_PREFIX}light"),
+        format!("settings/set/{}", prefs::EDIT_THEME),
+    ];
+    for (size, cx, short) in [
+        ("167x36", view_cx_at(1_193.0, 516.0), true),
+        ("150x48", view_cx_at(1_074.0, 684.0), false),
+        ("220x60", view_cx_at(1_564.0, 854.0), false),
+    ] {
+        for action in &actions {
+            let (mut runtime, instance, view) = setup();
+            let _ = compile_settings_view(&runtime, instance, view, &cx);
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: ActionId::new(action.as_str()),
+                        value: None,
+                    }),
+                )
+                .unwrap();
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            assert!(
+                open_theme_picker(&runtime, view).themes.is_some(),
+                "{size} {action}: a theme picker"
+            );
+            assert!(
+                compiled
+                    .semantics
+                    .iter()
+                    .any(|node| node.key.as_str().starts_with(&section)),
+                "{size} {action}: the list heads its sections"
+            );
+            assert_eq!(
+                compiled.semantic(&footer).is_none(),
+                short,
+                "{size} {action}: the footer row only where the room holds it"
+            );
+        }
+    }
+}
+
+/// What the theme picker's list paints never ends on a section heading: the
+/// rows that peek in under the window bring a heading only with some of its
+/// first row of cells, so no caption stands alone at the list's bottom (the
+/// shipped 102x29 window painted a bare THEME FILES there).
+#[test]
+fn a_theme_picker_list_never_ends_on_a_bare_heading() {
+    let section = format!("settings/choice-section/{}/", prefs::EDIT_THEME);
+    let row = format!("settings/choice-row/{}/", prefs::EDIT_THEME);
+    for (width, height) in [
+        (584.0, 350.0),
+        (738.0, 420.0),
+        (1_074.0, 684.0),
+        (1_193.0, 516.0),
+        (1_564.0, 854.0),
+    ] {
+        let cx = view_cx_at(width, height);
+        let (mut runtime, instance, view) = full_theme_picker_at(&cx);
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.common.last_focus = None;
+        }
+        let rows = open_theme_picker(&runtime, view).rows().len();
+        let mut headed = false;
+        for first in 0..rows {
+            open_theme_picker(&runtime, view).offset.set(first);
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let last = compiled
+                .paint
+                .iter()
+                .filter(|node| {
+                    node.key.as_str().starts_with(&section) || node.key.as_str().starts_with(&row)
+                })
+                .max_by(|a, b| a.rect.y.total_cmp(&b.rect.y))
+                .expect("the list paints rows");
+            headed |= compiled
+                .paint
+                .iter()
+                .any(|node| node.key.as_str().starts_with(&section));
+            assert!(
+                last.key.as_str().starts_with(&row),
+                "{width}x{height} from row {first}: the list ends on {}",
+                last.key.as_str()
+            );
+        }
+        assert!(headed, "{width}x{height}: the picker heads its sections");
+    }
+}
+
+/// Every screen of a headed theme picker names the section its choices are
+/// in: a window scrolled into a section carries the section's heading over
+/// its first row, so the list always starts on a heading. The 167x36 picker
+/// opened on GitHub Light showed three rows of light themes and no LIGHT.
+/// Negative control: without the carried heading, a window that starts
+/// inside a section paints a row of choices first.
+#[test]
+fn a_theme_picker_scrolled_into_a_section_names_it() {
+    let section = format!("settings/choice-section/{}/", prefs::EDIT_THEME);
+    let row = format!("settings/choice-row/{}/", prefs::EDIT_THEME);
+    let in_list = |key: &str| key.starts_with(&section) || key.starts_with(&row);
+    for (width, height) in [
+        (584.0, 350.0),
+        (738.0, 420.0),
+        (1_074.0, 684.0),
+        (1_193.0, 516.0),
+        (1_564.0, 854.0),
+    ] {
+        let cx = view_cx_at(width, height);
+        let (mut runtime, instance, view) = full_theme_picker_at(&cx);
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.common.last_focus = None;
+        }
+        let rows = open_theme_picker(&runtime, view).rows().len();
+        let mut inside = false;
+        for first in 0..rows {
+            open_theme_picker(&runtime, view).offset.set(first);
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let picker = open_theme_picker(&runtime, view);
+            assert!(picker.headed.get(), "{width}x{height}: a headed picker");
+            let rows = picker.rows();
+            inside |= matches!(rows[picker.window(&rows).start], PickerRow::Cells(_));
+            let top = compiled
+                .paint
+                .iter()
+                .filter(|node| in_list(node.key.as_str()))
+                .min_by(|a, b| a.rect.y.total_cmp(&b.rect.y))
+                .expect("the list paints rows");
+            assert!(
+                top.key.as_str().starts_with(&section),
+                "{width}x{height} from row {first}: the list starts on {}",
+                top.key.as_str()
+            );
+        }
+        assert!(
+            inside,
+            "{width}x{height}: some window starts inside a section"
+        );
+    }
+    // The saved theme deep in its section: the 167x36 picker opens on it
+    // under LIGHT.
+    let cx = view_cx_at(1_193.0, 516.0);
+    let (mut runtime, instance, view) = theme_pair_runtime("theme = \"GitHub Light\"\n", true);
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    theme_written_by(
+        &mut runtime,
+        instance,
+        view,
+        &format!("settings/set/{}", prefs::EDIT_THEME),
+        None,
+    );
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    let picker = open_theme_picker(&runtime, view);
+    let saved = picker
+        .options
+        .iter()
+        .position(|option| option.label == "GitHub Light")
+        .expect("GitHub Light");
+    assert!(
+        picker.is_visible(saved),
+        "the picker opens on the saved theme"
+    );
+    let rows = picker.rows();
+    assert!(
+        matches!(rows[picker.window(&rows).start], PickerRow::Cells(_)),
+        "the window starts inside the Light section"
+    );
+    assert!(
+        compiled
+            .paint
+            .iter()
+            .any(|node| node.key.as_str() == format!("{section}light")),
+        "the Light section is named"
+    );
+}
+
+/// The list scrolls (a thumb, a List role) only while what the filter
+/// leaves takes more than its room: a filter that leaves a few themes, or
+/// none, paints no thumb. Negative control: unfiltered, it scrolls.
+#[test]
+fn a_filtered_theme_picker_scrolls_only_when_its_matches_do_not_fit() {
+    let cx = view_cx_at(1_200.0, 820.0);
+    let (mut runtime, instance, view) = full_theme_picker_at(&cx);
+    let thumb = format!("settings/choice-scroll/{}", prefs::EDIT_THEME);
+    let list = format!("settings/choice-list/{}", prefs::EDIT_THEME);
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    assert!(compiled.semantic(&UiKey::new(thumb.clone())).is_some());
+    assert_eq!(
+        compiled
+            .semantic(&UiKey::new(list.clone()))
+            .map(|node| node.role),
+        Some(SemanticRole::List)
+    );
+    for filter in ["gruvbox", "zzzq"] {
+        theme_written_by(
+            &mut runtime,
+            instance,
+            view,
+            THEME_FILTER_ACTION,
+            Some(SemanticInput::Text(filter.to_string())),
+        );
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert!(
+            compiled.semantic(&UiKey::new(thumb.clone())).is_none(),
+            "{filter}: no thumb"
+        );
+        assert_eq!(
+            compiled
+                .semantic(&UiKey::new(list.clone()))
+                .map(|node| node.role),
+            Some(SemanticRole::Group),
+            "{filter}"
+        );
+    }
+}
+
+/// A compact theme picker lists Open themes folder, Import… and All
+/// themes… as its last cells, and the keyboard reaches them: End lands on
+/// the last, and the list scrolls to show them (at a phone's portrait and
+/// landscape sizes alike).
+#[test]
+fn the_compact_theme_pickers_action_cells_are_reachable_by_keyboard() {
+    for (width, height) in [(390.0, 844.0), (286.5, 558.0), (568.0, 320.0)] {
+        let context = format!("{width}x{height}");
+        let cx = view_cx_at(width, height);
+        let (mut runtime, instance, view) = full_theme_picker_at(&cx);
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::TextInput(TextInputEvent::End { extend: false }),
+            )
+            .unwrap();
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        for key in [
+            THEMES_FOLDER_ACTION,
+            THEMES_IMPORT_ACTION,
+            THEMES_BROWSE_KEY,
+        ] {
+            assert!(
+                compiled.semantic(&UiKey::new(key)).is_some(),
+                "{context}: {key} on glass"
+            );
+        }
+        assert_eq!(
+            settings_state(&runtime, view)
+                .common
+                .last_focus
+                .as_ref()
+                .map(UiKey::as_str),
+            Some(THEMES_BROWSE_KEY),
+            "{context}: End lands on the last cell"
+        );
+        assert!(
+            compiled
+                .semantic(&UiKey::new(THEMES_BROWSE_KEY))
+                .is_some_and(|node| node.action.as_ref().map(ActionId::as_str)
+                    == Some(route_action(SettingsRoute::Themes).as_str())),
+            "{context}: All themes… opens Settings ▸ Themes"
+        );
+        // Up from the action cells goes back to the themes; Home to the top.
+        runtime
+            .dispatch(instance, view, AppEvent::StepFocus(-1))
+            .unwrap();
+        assert!(
+            settings_state(&runtime, view)
+                .common
+                .last_focus
+                .as_ref()
+                .is_some_and(|focus| focus.as_str() != THEMES_BROWSE_KEY),
+            "{context}"
+        );
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::TextInput(TextInputEvent::Home { extend: false }),
+            )
+            .unwrap();
+        assert_eq!(
+            settings_state(&runtime, view)
+                .common
+                .last_focus
+                .as_ref()
+                .map(UiKey::as_str),
+            Some(format!("settings/choice/{}/0", prefs::EDIT_THEME).as_str()),
+            "{context}"
+        );
+        assert_zero_top_paint(
+            &compile_settings_view(&runtime, instance, view, &cx),
+            &context,
+        );
+    }
+}
+
+/// SETTINGS ▸ THEMES, the Theme Showcase.
+#[path = "native_settings_showcase_tests.rs"]
+mod showcase;
+
+fn activate(
+    runtime: &mut NativeRuntime,
+    instance: crate::native_app::AppInstanceId,
+    view: crate::native_app::ViewId,
+    action: &str,
+) -> Vec<AppEffect> {
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(action),
+                value: None,
+            }),
+        )
+        .unwrap()
+        .effects
+}
+
+/// The Appearance page's Theme row carries a permanent Browse themes…
+/// (Settings ▸ Themes) at every width, picker open or not; the compact theme
+/// picker pages Browse in as its third trailing cell.
+#[test]
+fn appearance_theme_row_always_offers_the_theme_showcase() {
+    let (mut runtime, instance, view) = setup();
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: route_action(SettingsRoute::Appearance),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let browse = UiKey::new(THEMES_BROWSE_ROW_KEY);
+    for (width, height) in [(1_200.0, 820.0), (390.0, 844.0), (320.0, 568.0)] {
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+        let node = compiled
+            .semantic(&browse)
+            .unwrap_or_else(|| panic!("{width}×{height}: Browse themes…"));
+        assert_eq!(
+            node.action.as_ref(),
+            Some(&route_action(SettingsRoute::Themes)),
+            "{width}×{height}"
+        );
+    }
+    // The Top theme card keeps its quick picker alone.
+    let (runtime_home, instance_home, view_home) = setup();
+    let home = compile_settings_view(&runtime_home, instance_home, view_home, &view_cx());
+    assert!(home.semantic(&browse).is_none());
+
+    // The compact theme picker: Folder, Import…, Browse all themes….
+    activate(
+        &mut runtime,
+        instance,
+        view,
+        &format!("settings/set/{}", prefs::EDIT_THEME),
+    );
+    let _ = compile_settings_view(&runtime, instance, view, &view_cx_at(390.0, 844.0));
+    let state = settings_state(&runtime, view);
+    let picker = state
+        .choice_picker
+        .as_ref()
+        .expect("the theme picker opened");
+    assert_eq!(THEME_PICKER_ACTION_CELLS, 3);
+    assert_eq!(picker.trailing.get(), THEME_PICKER_ACTION_CELLS);
+    let cell = theme_action_cell_node(state, 2, 200.0);
+    assert_eq!(cell.key.as_str(), THEMES_BROWSE_KEY);
+    let UiContent::Button(button) = &cell.content else {
+        panic!("the Browse cell is a button")
+    };
+    assert_eq!(button.action, route_action(SettingsRoute::Themes));
+}
+
+/// THE LAST SCREEN'S PEEK DRAWS NO HALF A BUTTON: at 102x29 the last screen
+/// of Software Update fills its top with the bottom of the status card, and
+/// that card's buttons, cut in half by the list's top edge, used to be drawn
+/// there legible but dead. A control in a peek over the top is whole and
+/// live, or not drawn. Over a run of window heights, every last screen whose
+/// status card peeks: CONTROL, the first screen draws the buttons whole and
+/// live, and the run holds such a screen at all.
+#[test]
+fn the_update_page_never_draws_a_cut_control_over_its_top() {
+    let mut peeked = 0;
+    for height in (360..=560).step_by(4) {
+        let mut state = SettingsViewState::new(&Config::default());
+        state.navigate(SettingsRoute::SoftwareUpdate);
+        let cx = view_cx_at(738.0, height as f32);
+        let first = settings_route_at(&state, &cx);
+        let Some(limit) = state.result_page_limit.get().filter(|limit| *limit > 0) else {
+            continue;
+        };
+        state.page_scroll = limit;
+        let last = settings_route_at(&state, &cx);
+        let Some(hero) = last
+            .paint
+            .iter()
+            .find(|node| node.key.as_str() == "updates/hero")
+        else {
+            continue;
+        };
+        peeked += 1;
+        assert!(hero.peek && hero.clip.y > hero.rect.y, "{height}: {hero:?}");
+        for key in ["updates/install-now", "updates/messages"] {
+            let painted = first
+                .paint
+                .iter()
+                .find(|node| node.key.as_str() == key)
+                .unwrap_or_else(|| panic!("{height}: {key} is drawn on the first screen"));
+            assert_eq!(painted.clip, painted.rect, "{height}: {key} is whole");
+            assert!(
+                first.semantic(&UiKey::new(key)).is_some(),
+                "{height}: {key} is live"
+            );
+        }
+        let cut_controls: Vec<&str> = last
+            .paint
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.content,
+                    UiContent::Button(_)
+                        | UiContent::Switch(_)
+                        | UiContent::Slider(_)
+                        | UiContent::TextField(_)
+                ) && node.clip.y > node.rect.y + 0.5
+            })
+            .map(|node| node.key.as_str())
+            .collect();
+        assert!(cut_controls.is_empty(), "{height}: {cut_controls:?}");
+    }
+    assert!(
+        peeked > 0,
+        "some last screen shows the status card's bottom"
+    );
+}
+
+/// The owner's sudo off-switch press records its DIRECTION on the view for the
+/// park after the injected owner answers yes; the park consumes that one-use answer
+/// when it persists the marker.
+#[test]
+fn an_askpass_off_switch_press_records_its_direction_for_the_park() {
+    use crate::native_settings::{MACOS_ACCESS_ASKPASS_OFF, MACOS_ACCESS_ASKPASS_ON};
+    let press = |runtime: &mut NativeRuntime, instance, view, action: &'static str| {
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(action),
+                    value: None,
+                }),
+            )
+            .unwrap();
+    };
+    let (mut runtime, instance, view) = setup();
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        state.navigate(SettingsRoute::Security);
+        state.arm_consent_gestures(ConsentGestures::confirming());
+    }
+    // "Turn Off" records off = true, drained once.
+    press(&mut runtime, instance, view, MACOS_ACCESS_ASKPASS_OFF);
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        assert_eq!(
+            state.take_askpass_off_request().map(|(off, _)| off),
+            Some(true)
+        );
+        assert_eq!(state.take_askpass_off_request(), None, "drained");
+        // The host settles confirmed requests before the next independent press.
+        state.owner_quiet.lock().unwrap().settle_confirmed();
+    }
+    // "Allow" records off = false.
+    press(&mut runtime, instance, view, MACOS_ACCESS_ASKPASS_ON);
+    {
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        assert_eq!(
+            state.take_askpass_off_request().map(|(off, _)| off),
+            Some(false)
+        );
+    }
+}
+
+#[test]
+fn askpass_settings_waits_for_marker_publication_before_reporting_success() {
+    let (mut runtime, instance, view) = setup();
+    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        unreachable!();
+    };
+    state.navigate(SettingsRoute::Security);
+    state.arm_consent_gestures(ConsentGestures::confirming());
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(MACOS_ACCESS_ASKPASS_ON),
+                value: None,
+            }),
+        )
+        .unwrap();
+    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        unreachable!();
+    };
+    assert_eq!(
+        state.take_askpass_off_request().map(|(off, _)| off),
+        Some(false)
+    );
+    assert!(
+        !state
+            .feedback
+            .as_deref()
+            .is_some_and(|line| line.contains("allowed again")),
+        "the request is only queued; no marker write has completed: {:?}",
+        state.feedback
+    );
+}
+
+#[test]
+fn askpass_settings_one_owner_answer_is_not_replaced_by_a_queued_direction() {
+    let mut runtime = NativeRuntime::new();
+    let instance = runtime
+        .insert_instance(NativeApp::Settings(Box::new(SettingsApp::new(
+            UpdateState::from_status(1, "0.1.0", None, false),
+        ))))
+        .unwrap();
+    let mut views = ViewStore::default();
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(OwnerQuiet::default()));
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let view = views.insert_native(instance).unwrap();
+        let mut state = SettingsViewState::new(&Config::default());
+        state.navigate(SettingsRoute::Security);
+        state.arm_consent_gestures(ConsentGestures::confirming());
+        state.arm_owner_quiet(std::sync::Arc::clone(&shared));
+        runtime
+            .attach_view(view, instance, AppViewState::Settings(Box::new(state)))
+            .unwrap();
+        ids.push(view);
+    }
+    for (view, action) in [
+        (ids[0], MACOS_ACCESS_ASKPASS_OFF),
+        (ids[0], MACOS_ACCESS_ASKPASS_ON),
+        (ids[1], MACOS_ACCESS_ASKPASS_ON),
+    ] {
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(action),
+                    value: None,
+                }),
+            )
+            .unwrap();
+    }
+    let Some(AppViewState::Settings(first)) = runtime.view_state_mut(ids[0]) else {
+        unreachable!();
+    };
+    assert_eq!(
+        first.take_askpass_off_request().map(|(off, _)| off),
+        Some(true)
+    );
+    let Some(AppViewState::Settings(second)) = runtime.view_state_mut(ids[1]) else {
+        unreachable!();
+    };
+    assert_eq!(
+        second.take_askpass_off_request(),
+        None,
+        "a queued press in another view cannot ask or replace the pending answer"
     );
 }

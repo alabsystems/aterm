@@ -3,70 +3,23 @@
 
 //! Line representation for scrollback storage.
 //!
-//! Lines can be stored in different formats depending on tier:
-//! - Hot: Full Line with content + RLE-compressed attributes
-//! - Warm/Cold: Serialized bytes (compressed)
-//!
-//! ## RLE Attribute Compression
-//!
-//! Terminal lines often have runs of cells with identical attributes (e.g.,
-//! a prompt in one color, then text in another). RLE compression stores
-//! `(style, count)` pairs instead of per-cell styles.
-//!
-//! Typical compression: 80-column line with 3 color regions → 3 runs vs 80 cells.
+//! Hot-tier lines hold text plus RLE-compressed attributes (`(style, count)`
+//! runs instead of per-cell styles); the warm and cold tiers hold them serialized
+//! and compressed.
 
 use aterm_alloc::SmallVec;
 use aterm_rle::Rle;
 use std::sync::Arc;
 
-/// Maximum inline storage for line content (avoids heap allocation for short lines).
+/// Inline storage for line content (no heap allocation for short lines).
 ///
-/// Tuned down from 128 (perf-memory): the hot tier stores `Line` structs
-/// contiguously in a `VecDeque`, so the inline buffer is paid on *every* stored
-/// line regardless of its actual length. 128 bytes inline made `Line` 304 bytes
-/// even for a 5-char prompt. A 32-byte inline buffer keeps short prompts/words
-/// allocation-free while shrinking the stored `Line` struct dramatically; longer
-/// lines spill to a right-sized heap `Vec` (one allocation of exactly `len`).
-/// This is a pure storage-location change — `as_bytes()`/`len()` and
-/// serialization return byte-identical results either way.
+/// The hot tier stores `Line` structs contiguously, so the inline buffer is paid
+/// on every line: 32 bytes keeps short prompts allocation-free (128 made `Line`
+/// 304 bytes); longer lines spill to an exactly sized heap `Vec`.
 const INLINE_SIZE: usize = 32;
 
-// ============================================================================
-// Cell Attributes for RLE Compression
-// ============================================================================
-
-/// Compressed cell attributes for RLE storage.
-///
-/// This is a compact representation of cell styling that can be efficiently
-/// RLE-encoded. It captures the essential visual attributes:
-/// - Foreground color (packed)
-/// - Background color (packed)
-/// - Cell flags (bold, italic, underline, etc.)
-///
-/// ## Memory Layout
-///
-/// ```text
-/// ┌─────────────────────────────────────────────────────────────┐
-/// │ fg: u32 (4 bytes) - Packed foreground color                 │
-/// │   Format: 0xTT_RRGGBB where TT = type (default/indexed/rgb) │
-/// ├─────────────────────────────────────────────────────────────┤
-/// │ bg: u32 (4 bytes) - Packed background color                 │
-/// │   Format: 0xTT_RRGGBB where TT = type (default/indexed/rgb) │
-/// ├─────────────────────────────────────────────────────────────┤
-/// │ flags: u16 (2 bytes) - Visual attribute flags               │
-/// │   Bits 0-7: bold, dim, italic, underline, blink, inverse... │
-/// └─────────────────────────────────────────────────────────────┘
-/// Total: 10 bytes per unique style (vs 8 bytes per cell uncompressed)
-/// ```
-///
-/// ## Compression Benefit
-///
-/// An 80-column line with plain text: 80 cells × 8 bytes = 640 bytes
-/// With RLE (1 style run): ~15 bytes (10 bytes style + 5 bytes overhead)
-///
-/// An 80-column prompt line with 3 color regions:
-/// - Uncompressed: 640 bytes
-/// - RLE: ~45 bytes (3 runs × 10 bytes + overhead)
+/// Compact cell styling for RLE storage: packed foreground and background
+/// colours and visual flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CellAttrs {
     /// Packed foreground color.
@@ -128,20 +81,13 @@ impl CellAttrs {
     }
 }
 
-// ── Strict-gate access idiom for the attrs RLE ─────────────────────────────
-//
-// All attrs access below goes through `self.attrs.as_deref().map_or(&[],
-// Rle::runs)` — the METHOD PASSED AS A FUNCTION ITEM to an Option combinator
-// (exactly the shape `Line::hyperlinks` uses with `SmallVec::as_slice`, which
-// the gate proves). A direct `rle.run_count()` / `rle.runs()` / `rle.get(..)`
-// call gets MIR-inlined into the calling function together with the `Vec`
-// internals it wraps, and the strict gate's hardened-unsafe check then fails
-// closed on std's unsafe blocks inside the inlined body (whose SAFETY
-// comments it cannot resolve across crates). The fn-item-through-`map_or`
-// spelling keeps the callee a plain (non-inlined) cross-crate call —
-// Conditional, like every other dependency call — with identical results:
-// `runs.len()` IS `run_count()` (its exact definition), and a linear walk of
-// `runs` yields exactly `Rle::get`'s value (see `get_attr`).
+// Strict-gate access idiom for the attrs RLE: all access goes through `attr_runs`
+// (`map_or(&[], Rle::runs)`, a method passed as a fn item, as `Line::hyperlinks`
+// does with `SmallVec::as_slice`). A direct `rle.runs()` / `rle.get(..)` call is
+// MIR-inlined with the `Vec` internals it wraps, and the strict gate's
+// hardened-unsafe check fails closed on std's unsafe blocks there. The fn-item
+// spelling keeps the callee a plain cross-crate call; `runs.len()` is
+// `run_count()`, and a linear walk of `runs` gives `Rle::get`'s value.
 
 fn attr_runs(attrs: Option<&Rle<CellAttrs>>) -> &[aterm_rle::Run<CellAttrs>] {
     attrs.map_or(&[], Rle::runs)
@@ -153,8 +99,8 @@ mod line_codec;
 mod line_codec_block;
 #[cfg(test)]
 pub(crate) use line_codec_block::take_records_walked;
-// Re-exported publicly (B.3.2): the block codec is the on-the-wire form for
-// `TerminalCheckpoint` grid bodies and must be callable from aterm-core.
+// The line codec is public: it is the wire form of `TerminalCheckpoint` grid
+// bodies, used by aterm-grid and aterm-core.
 pub(crate) use line_codec::{MAX_DECODE_PAGE_LINES, count_page_lines, serialize_pages};
 pub use line_codec::{
     deserialize_lines, deserialize_lines_strict, deserialize_lines_strict_dropping_over_cap_links,
@@ -178,74 +124,44 @@ pub use underline_color_span::UnderlineColorSpan;
 mod image_span;
 pub use image_span::ImageSpan;
 
-/// A scrollback line.
-///
-/// Contains the text content, RLE-compressed attributes, and metadata.
-///
-/// ## Attribute Compression
-///
-/// When lines scroll off the visible grid into scrollback, we preserve their
-/// styling via RLE compression. This stores runs of identical attributes
-/// instead of per-cell data.
-///
-/// Example: A line with "Hello " (green) + "World" (default):
-/// - Text: "Hello World" (11 bytes)
-/// - Attrs: [(green, 6), (default, 5)] (~24 bytes for 2 runs)
-/// - vs uncompressed: 11 cells × 8 bytes = 88 bytes
+/// A scrollback line: text, RLE-compressed attributes, flags, and sidecar spans
+/// (hyperlinks, underline colours, images).
 #[derive(Debug, Default)]
 pub struct Line {
-    /// Line content (UTF-8 text).
+    /// Line content bytes (normally UTF-8; see `as_str`).
     content: LineContent,
-    /// RLE-compressed cell attributes (colors and flags per character).
-    /// None if all cells have default attributes (optimization for plain text).
+    /// RLE-compressed cell attributes; `None` when every cell is default.
     ///
-    /// Boxed: plain-text lines have no attrs, so the common path pays an 8-byte
-    /// niche pointer instead of carrying the 56-byte `Rle` inline. Styled lines
-    /// (the rarer case) pay one extra heap allocation. The hot tier stores
-    /// `Line` structs in a `VecDeque`, so shrinking the struct directly reduces
-    /// resident scrollback memory.
+    /// Boxed: plain-text lines pay a niche pointer instead of an inline `Rle`, and
+    /// the hot tier stores `Line`s contiguously, so struct size is resident memory.
     attrs: Option<Box<Rle<CellAttrs>>>,
     /// Line flags.
     flags: LineFlags,
-    /// Hyperlink spans (typically None or 1-3 spans per line).
-    ///
-    /// Boxed: most lines have no hyperlinks, so the common path pays an 8-byte
-    /// niche pointer instead of an 88-byte inline `SmallVec`. When present, the
-    /// boxed `SmallVec<HyperlinkSpan, 2>` still keeps ≤2 spans inline.
+    /// Hyperlink spans. Boxed: most lines have none, so the common path pays a
+    /// niche pointer instead of an inline `SmallVec`; the box keeps ≤2 spans
+    /// inline.
     hyperlinks: Option<Box<SmallVec<HyperlinkSpan, 2>>>,
-    /// Underline-colour spans (SGR 58), coalesced runs of a shared packed
-    /// colour. `None` for the overwhelming common case (no SGR 58) — same
-    /// boxed-niche rationale as `hyperlinks`. A sidecar (rather than a
-    /// `CellAttrs` field) keeps the hot RLE-attr wire format frozen; underline
-    /// colour is rare enough that the per-styled-run cost of widening every
-    /// attr run would not pay for itself.
+    /// Underline-colour spans (SGR 58): coalesced runs of one packed colour,
+    /// boxed like `hyperlinks`. A sidecar rather than a `CellAttrs` field keeps
+    /// the attr wire format fixed and costs nothing per styled run.
     underline_colors: Option<Box<SmallVec<UnderlineColorSpan, 2>>>,
-    /// Inline-image spans (iTerm2 OSC 1337 `File=` and the sixel path that
-    /// reuses the same placement): one span per contiguous run of columns
-    /// painting one footprint row, each holding the SHARED payload `Arc`.
-    /// `None` for every line that carries no image — same boxed-niche rationale
-    /// as `hyperlinks`.
+    /// Inline-image spans: one per run of columns painting one footprint row, each
+    /// holding the shared payload `Arc`; boxed like `hyperlinks`.
     ///
-    /// This field is why a picture survives the scrollback boundary at all: the
-    /// live grid stores an `ImageRef` per covered CELL in a side table the row
-    /// leaves behind when it scrolls off, so a line with nowhere to keep one
-    /// loses the picture at the top of the screen and shows a hole where it was.
-    /// One inline slot: a line carries the row of ONE placement in every case
-    /// that is not an overwrite.
+    /// Without this a picture would not survive scrolling off: the live grid keeps
+    /// per-cell `ImageRef`s in a side table the row leaves behind. One inline slot:
+    /// a line carries one placement's row unless an overwrite split it.
     images: Option<Box<SmallVec<ImageSpan, 1>>>,
 }
 
 impl Clone for Line {
-    // Hand-written ONLY so the skip can attach (a derive cannot carry it);
-    // the body is exactly the derive expansion — field-wise clone.
+    // Hand-written only so the skip can attach (a derive cannot carry it); the
+    // body is the derive expansion.
     //
-    // Skip: deep-cloning a line is allocation-total — every field clone
-    // (String / Box / SmallVec) has no panic path of its own and can abort
-    // only on allocation failure, the idiomatic-alloc-panic class this
-    // campaign skips (`hex_encode` precedent). The absent std
-    // `Clone::clone` callees inside are unbindable for the fail-closed
-    // verifier; with the skip, callers demote to an expected-absent-callee
-    // assumption row instead of inheriting an unprovable fatal.
+    // Skip: a deep clone is allocation-total (each field clone fails only on
+    // allocation failure, the idiomatic-alloc class), and its std `Clone::clone`
+    // callees are unbindable for the verifier. With the skip, callers get an
+    // expected-absent-callee assumption row instead of an unprovable fatal.
     #[cfg_attr(trust_verify, trust::skip)]
     fn clone(&self) -> Self {
         Self {
@@ -298,17 +214,13 @@ impl Line {
         }
     }
 
-    /// Shared body of the text constructors: the "don't store what is
-    /// all-default / empty" normalization, applied to already-built content.
-    ///
-    /// Factored so the borrowing and owning forms cannot drift — they differ
-    /// only in how `content` was produced.
+    /// Shared body of the text constructors: stores no all-default attrs or empty
+    /// hyperlinks, so the borrowing and owning forms cannot drift.
     fn from_parts(
         content: LineContent,
         attrs: Rle<CellAttrs>,
         hyperlinks: Vec<HyperlinkSpan>,
     ) -> Self {
-        // Optimization: if empty or all attrs are default, don't store them
         let is_all_default = attrs.run_count() == 0
             || (attrs.run_count() == 1
                 && attrs.runs().first().is_some_and(|r| r.value.is_default()));
@@ -319,7 +231,6 @@ impl Line {
             Some(Box::new(attrs))
         };
 
-        // Optimization: if no hyperlinks, don't allocate
         let hyperlinks = if hyperlinks.is_empty() {
             None
         } else {
@@ -338,17 +249,13 @@ impl Line {
 
     /// Create a line with text and RLE-compressed attributes.
     ///
-    /// This is the primary constructor when converting from grid Row to scrollback Line.
     /// The attrs RLE should have the same length as the character count in text.
     #[must_use]
     pub fn with_attrs(text: &str, attrs: Rle<CellAttrs>) -> Self {
         Self::from_parts(LineContent::from_bytes(text.as_bytes()), attrs, Vec::new())
     }
 
-    /// Create a line with text, attributes, and hyperlinks.
-    ///
-    /// This is the full constructor for preserving hyperlinks from the visible grid
-    /// when lines scroll into scrollback.
+    /// Create a line with text, attributes, and hyperlinks preserved from the grid.
     #[must_use]
     pub fn with_hyperlinks(
         text: &str,
@@ -358,15 +265,11 @@ impl Line {
         Self::from_parts(LineContent::from_bytes(text.as_bytes()), attrs, hyperlinks)
     }
 
-    /// [`with_hyperlinks`](Self::with_hyperlinks) taking OWNERSHIP of the text.
+    /// [`with_hyperlinks`](Self::with_hyperlinks) taking ownership of the text.
     ///
-    /// The row→line materialization sites all build the text into a `String`
-    /// they drop immediately afterwards, so the borrowing form makes every line
-    /// over 32 bytes (any full-width output row) allocate a second buffer,
-    /// memcpy into it, and free the first. Handing the buffer over instead
-    /// makes that one allocation and zero copies, on the per-line path every
-    /// row pays as it ages out of the ring. The stored bytes — and therefore
-    /// serialization, search, and `memory_used()` — are identical.
+    /// Row-to-line conversion builds the text into a `String` it then drops;
+    /// handing it over saves a second allocation and copy for every line over 32
+    /// bytes. The stored bytes are identical.
     #[must_use]
     pub fn with_hyperlinks_owned(
         text: String,
@@ -392,14 +295,10 @@ impl Line {
     #[must_use]
     pub fn get_attr(&self, char_idx: usize) -> CellAttrs {
         let idx = u32::try_from(char_idx).unwrap_or(u32::MAX);
-        // Linear walk of the runs slice instead of `rle.get(idx)`: identical
-        // result — `Rle::get` locates the run whose cumulative-length range
-        // contains `idx` (None past `total_length == sum(run.length)`, the
-        // Rle-maintained invariant) — but via the strict-gate-provable slice
-        // shape (see `attr_runs`). The `saturating_add` can never fire under
-        // that same invariant (the true cumulative sum fits in u32). Runs per
-        // line are few (one per style change), so the scan stays cheap on the
-        // paths that call this per cell.
+        // Linear walk of the runs instead of `rle.get(idx)`: the same run (default
+        // past the total length) in the gate-provable slice shape (see
+        // `attr_runs`). The `saturating_add` never fires: the cumulative sum fits
+        // in u32 by the Rle invariant. Runs per line are few.
         let mut run_start: u32 = 0;
         for run in attr_runs(self.attrs.as_deref()) {
             let run_end = run_start.saturating_add(run.length);
@@ -411,16 +310,12 @@ impl Line {
         CellAttrs::DEFAULT
     }
 
-    /// Sequential attr reader over this line's RLE runs (audit E6a).
+    /// Sequential attr reader over this line's runs.
     ///
-    /// [`get_attr`](Self::get_attr) rescans the runs from the START on every
-    /// call, so a per-cell materialization walk pays O(cols × runs) — the
-    /// accidental attr term the scrolled-frame audit flagged. The cursor
-    /// remembers the last run and its cumulative start: monotone
-    /// non-decreasing indices (a left-to-right cell walk) advance it forward
-    /// in amortized O(1) — O(runs) TOTAL per line — and a backward index
-    /// rewinds to the start (correct, just unaccelerated). Byte-identical to
-    /// `get_attr` at every index.
+    /// [`get_attr`](Self::get_attr) rescans from the start on every call, so a
+    /// per-cell walk costs O(cols × runs). The cursor remembers the last run:
+    /// non-decreasing indices cost O(runs) per line in total, and a backward index
+    /// rewinds. Same result as `get_attr` at every index.
     #[must_use]
     pub fn attr_cursor(&self) -> AttrRunCursor<'_> {
         AttrRunCursor {
@@ -438,16 +333,12 @@ impl Line {
         self.attrs.is_some()
     }
 
-    /// Get hyperlink URL at column, if any.
-    ///
-    /// Returns the URL of the hyperlink at the given column position,
-    /// or None if no hyperlink exists at that column.
+    /// Get the hyperlink URL at a column, if any.
     #[must_use]
     pub fn get_hyperlink(&self, col: u16) -> Option<&Arc<str>> {
-        // Iterate the plain slice (via `hyperlinks()`) with an explicit loop:
-        // identical result to the previous `.iter().find(..).map(..)`, but the
-        // strict Trust gate proves slice iteration directly, whereas the
-        // MIR-inlined `SmallVec::iter` internals fail its hardened-unsafe check.
+        // Explicit loop over the plain slice: the strict gate proves slice
+        // iteration, while the MIR-inlined `SmallVec::iter` internals fail its
+        // hardened-unsafe check.
         for span in self.hyperlinks()? {
             if span.contains(col) {
                 return Some(&span.url);
@@ -456,18 +347,14 @@ impl Line {
         None
     }
 
-    /// Get the full hyperlink span at column, if any.
-    ///
-    /// Returns the span (including URL and OSC 8 ID) at the given column,
-    /// or None if no hyperlink exists at that column.
+    /// Get the full hyperlink span (URL and OSC 8 ID) at a column, if any.
     #[must_use]
     #[allow(
         clippy::manual_find,
         reason = "explicit slice loop is the lowerable form for the strict Trust gate; the `.iter().find(..)` rewrite MIR-inlines SmallVec::iter internals its hardened-unsafe check fails on"
     )]
     pub fn get_hyperlink_span(&self, col: u16) -> Option<&HyperlinkSpan> {
-        // Explicit slice loop for the same strict-gate reason as
-        // `get_hyperlink` (identical result to `.iter().find(..)`).
+        // Explicit slice loop (see `get_hyperlink`).
         for span in self.hyperlinks()? {
             if span.contains(col) {
                 return Some(span);
@@ -480,10 +367,9 @@ impl Line {
     #[must_use]
     #[inline]
     pub fn has_hyperlinks(&self) -> bool {
-        // Closure-free match over the plain slice: identical to the previous
-        // `.as_ref().is_some_and(|h| !h.is_empty())`, but slice `is_empty` is a
-        // primitive the gate proves, while the MIR-inlined `SmallVec::is_empty`
-        // (→ `Vec::len`) internals fail its hardened-unsafe check.
+        // Closure-free match over the plain slice: slice `is_empty` is a primitive
+        // the gate proves, while the MIR-inlined `SmallVec::is_empty` internals
+        // fail its hardened-unsafe check.
         match self.hyperlinks() {
             Some(spans) => !spans.is_empty(),
             None => false,
@@ -494,8 +380,7 @@ impl Line {
     #[must_use]
     #[inline]
     pub fn hyperlink_count(&self) -> usize {
-        // Closure-free match over the plain slice (see `has_hyperlinks`):
-        // identical to the previous `.map_or(0, |h| h.len())`.
+        // Closure-free match (see `has_hyperlinks`).
         match self.hyperlinks() {
             Some(spans) => spans.len(),
             None => 0,
@@ -509,25 +394,18 @@ impl Line {
         self.hyperlinks.as_deref().map(SmallVec::as_slice)
     }
 
-    /// Drop every hyperlink span, and nothing else: the text, the attrs, the
-    /// flags (`WRAPPED` included), the underline colours and the images stay
-    /// exactly as they were, so the line reads and renders the same with no
-    /// link under it.
+    /// Drop every hyperlink span and nothing else: text, attrs, flags, underline
+    /// colours and images stay, so the line renders the same with no link under it.
     ///
-    /// Why this exists: a self-update carries each screen line as one record
-    /// whose size the wire bounds (`16 KiB + cols * 512` bytes), and a line of
-    /// a few OSC 8 links with 8 KiB URLs is past that bound on its own. With
-    /// no way to drop only the links, the producer's one answer was to carry
-    /// that whole screen blank (the 2026-09-22/23 update audit, plan P2-4);
-    /// with it, only the link destinations of that one line are lost. The
-    /// cleared line serializes exactly like a line that never had a link
-    /// (`hyperlinks` goes back to `None`, not an empty vector), so the result
-    /// is canonical on the wire.
+    /// A self-update carries each screen line as one record the wire bounds
+    /// (`16 KiB + cols * 512` bytes), and a few OSC 8 links with 8 KiB URLs exceed
+    /// that; dropping only the links loses that line's link destinations rather
+    /// than the whole screen. `hyperlinks` goes back to `None`, so the line
+    /// serializes exactly like one that never had a link.
     ///
     /// ENSURES: !self.has_hyperlinks()
-    // Skip: the residual row is drop glue for the replaced Option<Box<SmallVec>>
-    // sidecar (std/alloc internals through SmallVec — the drop-glue lane), as
-    // for `set_underline_colors`. Field replacement only; unit-tested.
+    // Skip: drop glue for the replaced Option<Box<SmallVec>> sidecar (std/alloc
+    // internals, the drop-glue lane). Field replacement only; unit-tested.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn clear_hyperlinks(&mut self) {
         self.hyperlinks = None;
@@ -543,9 +421,7 @@ impl Line {
     /// Set the underline-colour spans, preserving them when this line scrolls
     /// into (and back out of) scrollback. Empty input stores `None` so the
     /// common no-SGR-58 case keeps its niche pointer and serializes as v3.
-    // Skip: the residual row is drop glue for the replaced Option<Box<SmallVec>>
-    // sidecar (std/alloc internals through SmallVec — the drop-glue lane).
-    // Field replacement only; unit-tested round-trip.
+    // Skip: sidecar drop glue (see `clear_hyperlinks`).
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn set_underline_colors(&mut self, spans: Vec<UnderlineColorSpan>) {
         self.underline_colors = if spans.is_empty() {
@@ -558,8 +434,7 @@ impl Line {
     /// Get the packed underline colour (`0xTT_XXXXXX`) at a column, if any.
     #[must_use]
     pub fn get_underline_color(&self, col: u16) -> Option<u32> {
-        // Explicit slice loop (same strict-gate rationale as `get_hyperlink`):
-        // identical result to `.iter().find(..).map(..)`.
+        // Explicit slice loop (see `get_hyperlink`).
         for span in self.underline_colors()? {
             if span.contains(col) {
                 return Some(span.color);
@@ -573,7 +448,7 @@ impl Line {
     #[inline]
     #[cfg(test)]
     pub fn has_underline_colors(&self) -> bool {
-        // Closure-free match over the plain slice (see `has_hyperlinks`).
+        // Closure-free match (see `has_hyperlinks`).
         match self.underline_colors() {
             Some(spans) => !spans.is_empty(),
             None => false,
@@ -585,7 +460,7 @@ impl Line {
     #[inline]
     #[cfg(test)]
     pub fn underline_color_count(&self) -> usize {
-        // Closure-free match over the plain slice (see `hyperlink_count`).
+        // Closure-free match (see `has_hyperlinks`).
         match self.underline_colors() {
             Some(spans) => spans.len(),
             None => 0,
@@ -599,13 +474,9 @@ impl Line {
         self.images.as_deref().map(SmallVec::as_slice)
     }
 
-    /// Set the inline-image spans, preserving a placement when this line scrolls
-    /// into (and back out of) scrollback. Empty input stores `None` so the
-    /// overwhelming common case — a line with no picture on it — keeps its niche
-    /// pointer and serializes exactly as it did before images existed.
-    // Skip: the residual row is drop glue for the replaced Option<Box<SmallVec>>
-    // sidecar (std/alloc internals through SmallVec — the drop-glue lane).
-    // Field replacement only; unit-tested round-trip.
+    /// Set the inline-image spans, kept when this line scrolls into and back out of
+    /// scrollback. Empty input stores `None`, keeping the niche pointer.
+    // Skip: sidecar drop glue (see `clear_hyperlinks`).
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn set_images(&mut self, spans: Vec<ImageSpan>) {
         self.images = if spans.is_empty() {
@@ -623,8 +494,7 @@ impl Line {
     )]
     #[cfg(test)]
     pub fn get_image(&self, col: u16) -> Option<&ImageSpan> {
-        // Explicit slice loop for the same strict-gate reason as
-        // `get_hyperlink` (identical result to `.iter().find(..)`).
+        // Explicit slice loop (see `get_hyperlink`).
         for span in self.images()? {
             if span.contains(col) {
                 return Some(span);
@@ -637,7 +507,7 @@ impl Line {
     #[must_use]
     #[inline]
     pub fn has_images(&self) -> bool {
-        // Closure-free match over the plain slice (see `has_hyperlinks`).
+        // Closure-free match (see `has_hyperlinks`).
         match self.images() {
             Some(spans) => !spans.is_empty(),
             None => false,
@@ -648,7 +518,7 @@ impl Line {
     #[must_use]
     #[inline]
     pub fn image_count(&self) -> usize {
-        // Closure-free match over the plain slice (see `hyperlink_count`).
+        // Closure-free match (see `has_hyperlinks`).
         match self.images() {
             Some(spans) => spans.len(),
             None => 0,
@@ -690,10 +560,8 @@ impl Line {
     /// ENSURES: self.is_wrapped() == wrapped
     #[inline]
     pub fn set_wrapped(&mut self, wrapped: bool) {
-        // Inherent `insert`/`remove` (not the `|=`/`-=` op traits): the
-        // operator call sites render the std TRAIT path, which misses the
-        // locally-bundled impl body and mints an absent-callee row; the
-        // inherent methods resolve directly. Same bits, same result.
+        // Inherent `insert`/`remove`, not `|=`/`-=`: the operator path resolves to
+        // the std trait and mints an absent-callee row.
         if wrapped {
             self.flags.insert(LineFlags::WRAPPED);
         } else {
@@ -701,14 +569,12 @@ impl Line {
         }
     }
 
-    /// A clone for the rewrap passthrough (RFL-4a): identical content, attrs
-    /// and sidecars, with the line FLAGS reset to the freshly-rebuilt state
-    /// (`WRAPPED` false). That is exactly the flag state the rewrap's `build_line`
-    /// gives every output line, so a passed-through line is indistinguishable
-    /// from a rebuilt one (the flags are `pub(crate)`, which is why this
-    /// lives here and not at the call site).
-    // Skip: field-wise clone plus a flag reset — the idiomatic-alloc class
-    // `Clone for Line` above already skips, nothing new can panic here.
+    /// A clone for the rewrap passthrough: identical content, attrs and sidecars,
+    /// with the line flags reset (`WRAPPED` false), as the rewrap's `build_line`
+    /// leaves the first row of a rebuilt line. Lives here because the flags are
+    /// `pub(crate)`.
+    // Skip: field-wise clone plus a flag reset, the idiomatic-alloc class
+    // `Clone for Line` already skips.
     #[cfg_attr(trust_verify, trust::skip)]
     #[must_use]
     pub fn cloned_for_rewrap(&self) -> Line {
@@ -719,9 +585,8 @@ impl Line {
 
     /// Get content as a string slice (returns None if not valid UTF-8).
     #[must_use]
-    // Skip: `str::from_utf8` is the hardened strict-reject class; `.ok()` is
-    // the fail-closed contract (non-UTF-8 content reads as None, bytes stay
-    // byte-exact via `as_bytes`). Display-side accessor.
+    // Skip: `str::from_utf8` is the hardened strict-reject class; non-UTF-8 content
+    // reads as None and stays byte-exact via `as_bytes`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn as_str(&self) -> Option<&str> {
         std::str::from_utf8(self.as_bytes()).ok()
@@ -729,11 +594,9 @@ impl Line {
 
     /// Calculate memory used by this line.
     ///
-    /// All sums below are spelled `saturating_add`/`saturating_mul`: every
-    /// operand is the byte size of memory this process actually holds, so the
-    /// true total always fits in `usize` and the saturation can never fire on
-    /// a real path — it just discharges the strict L0 gate's unconstrained-
-    /// input overflow counterexamples.
+    /// Saturating throughout: every operand is memory this process holds, so the
+    /// sum always fits; saturation only discharges the strict gate's overflow
+    /// obligations.
     #[must_use]
     pub fn memory_used(&self) -> usize {
         let base = std::mem::size_of::<Self>();
@@ -741,14 +604,9 @@ impl Line {
             LineContent::Inline(_) => 0, // Already counted in size_of
             LineContent::Heap(v) => v.capacity(),
         };
-        // Closure-free shapes below (`attr_runs` fn-item access + match, not
-        // `map_or` closures): identical folds, but the strict gate's
-        // hardened-unsafe check fails closed on the callee internals that
-        // direct calls MIR-inline into closures (see `attr_runs`).
+        // Closure-free shapes below, for the strict gate (see `attr_runs`).
         let attrs_mem = if self.attrs.is_some() {
-            // Boxed: the Rle struct lives on the heap (not counted in
-            // size_of::<Line>), plus the runs Vec it owns. `runs.len()` IS
-            // `run_count()` (its exact definition).
+            // Boxed: the Rle struct and its runs Vec are both on the heap.
             std::mem::size_of::<Rle<CellAttrs>>().saturating_add(
                 attr_runs(self.attrs.as_deref())
                     .len()
@@ -758,10 +616,8 @@ impl Line {
             0
         };
         let hyperlinks_mem = match self.hyperlinks() {
-            // Boxed: the SmallVec lives on the heap (not counted in
-            // size_of::<Line>). We additionally count:
-            // - Spilled heap allocation (if > 2 spans)
-            // - Arc<str> heap allocations for URLs
+            // The boxed SmallVec (heap, not in size_of::<Line>), spans spilled past
+            // 2, and the URL and id strings.
             Some(spans) => {
                 let boxed = std::mem::size_of::<SmallVec<HyperlinkSpan, 2>>();
                 let heap_spans = if spans.len() > 2 {
@@ -786,9 +642,8 @@ impl Line {
             }
             None => 0,
         };
-        // Underline-colour spans: boxed SmallVec (heap when present) plus any
-        // spilled runs past the 2 kept inline. Each span is Copy (no owned
-        // allocations), so no per-span heap walk is needed (unlike hyperlinks).
+        // Underline-colour spans: the boxed SmallVec plus runs spilled past the 2
+        // inline. Spans are Copy, so there is no per-span heap to walk.
         let underline_colors_mem = match self.underline_colors() {
             Some(spans) => {
                 let boxed = std::mem::size_of::<SmallVec<UnderlineColorSpan, 2>>();
@@ -803,15 +658,8 @@ impl Line {
             }
             None => 0,
         };
-        // Inline images: the boxed SmallVec plus, per span, the struct and THIS
-        // ROW's share of the shared payload (`ImageSpan::memory_used`). The
-        // share is the whole point — a footprint's rows all hold the same `Arc`,
-        // so charging each of them the full raster would tell the byte budget a
-        // 1 MiB picture costs `rows` MiB and evict history that is not resident,
-        // while charging none of them would hide a wall of images from the very
-        // budget that bounds scrollback memory. Summed over a retained
-        // footprint the shares recover the payload exactly once, so dropping a
-        // line drops exactly its share.
+        // Inline images: the boxed SmallVec plus each span's struct and row share
+        // of the payload (see `ImageSpan::memory_used`).
         let images_mem = match self.images() {
             Some(spans) => {
                 let boxed = std::mem::size_of::<SmallVec<ImageSpan, 1>>();
@@ -834,16 +682,13 @@ impl Line {
     #[must_use]
     #[cfg(test)]
     pub fn attr_run_count(&self) -> usize {
-        // `runs.len()` IS `run_count()` (its exact definition), via the
-        // strict-gate-provable fn-item access shape (see `attr_runs`); the
-        // `None` arm's `&[]` has len 0, matching the previous `map_or(0, ..)`.
+        // `runs.len()` is `run_count()`, via the gate-provable access (see `attr_runs`).
         attr_runs(self.attrs.as_deref()).len()
     }
 }
 
-/// Sequential run-cursor over a [`Line`]'s attribute RLE — see
-/// [`Line::attr_cursor`]. Borrows the line's runs; cheap to construct (no
-/// allocation), one per materialized row.
+/// Sequential run cursor over a [`Line`]'s attribute RLE (see
+/// [`Line::attr_cursor`]); borrows the runs, no allocation.
 #[derive(Debug)]
 pub struct AttrRunCursor<'a> {
     runs: &'a [aterm_rle::Run<CellAttrs>],
@@ -854,16 +699,13 @@ pub struct AttrRunCursor<'a> {
 }
 
 impl AttrRunCursor<'_> {
-    /// The attribute at `char_idx` — byte-identical to
-    /// [`Line::get_attr`] at every index, amortized O(1) for monotone
-    /// non-decreasing indices. Same overflow discipline as `get_attr`: the
-    /// `saturating_add` can never fire under the Rle total-length invariant.
+    /// The attribute at `char_idx`, identical to [`Line::get_attr`]; amortized
+    /// O(1) for non-decreasing indices.
     #[must_use]
     pub fn attr_at(&mut self, char_idx: usize) -> CellAttrs {
         let idx = u32::try_from(char_idx).unwrap_or(u32::MAX);
         if idx < self.run_start {
-            // Backward query: rewind (rare — the materialize walk is
-            // monotone; correctness over speed here).
+            // Backward query: rewind (rare; the materialize walk is monotone).
             self.i = 0;
             self.run_start = 0;
         }
@@ -897,9 +739,8 @@ impl std::fmt::Display for Line {
     // Display only — the byte-exact content stays in `as_bytes`.
     #[cfg_attr(trust_verify, trust::skip)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `write_str` instead of `write!(f, "{}", ..)`: identical output, but
-        // no `format_args!` expansion (whose embedded unsafe `fmt::Arguments`
-        // construction the strict Trust gate cannot lower and fails closed on).
+        // `write_str`, not `write!`: no `format_args!` expansion for the strict
+        // gate to fail closed on.
         f.write_str(&String::from_utf8_lossy(self.as_bytes()))
     }
 }

@@ -2,33 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! W2 (linear-corrected weight compensation) — machine-checked invariants for
-//! the text-blend seam: [`aterm_render::blend_text`], its perceptual alpha
-//! remap [`aterm_render::correct_alpha`], and the texel-level gate
+//! The text-blend seam: [`aterm_render::blend_text`], its perceptual alpha
+//! remap [`aterm_render::correct_alpha`], and the texel gate
 //! [`aterm_render::correction_applies`].
 //!
-//! ## Two-tier proof
-//!
-//! * **Tier-0 (abstract, model-checked by the Trust `ty` compiler)** — the
-//!   `TextBlendGate` derived model (`aterm_spec::derive::text_blend_gate_model`)
-//!   carries the `CorrectionGated` invariant: the remap fires ONLY in
-//!   corrected mode, on an interior (non-endpoint) coverage texel, with a
-//!   non-degenerate luminance gap. `targo --unverified test -p aterm-spec`
-//!   (`derived_text_blend_gate_proves_and_catches_degenerate_divide`) runs the
-//!   real `ty` binary over the bounded state space: it PROVES the invariant at
-//!   `Buggy=0` and CATCHES the ungated (div-by-near-zero) variant at `Buggy=1`.
-//! * **Tier-1 (concrete, this file)** — the gate's domain is tiny
-//!   (`bool × u8 × bool`), so we enumerate it COMPLETELY, and additionally
-//!   bind it to the shipping byte-level seam: whenever `blend_text` in some
-//!   mode differs from plain linear, `correction_applies` must hold for that
-//!   texel — over every coverage byte and both degenerate and non-degenerate
-//!   colour pairs, with non-vacuity controls.
-//!
-//! The FLOAT-VALUED laws of the remap (range, monotonicity, degenerate guard,
-//! endpoint anchoring) cannot be stated in the ty expression language (no
-//! multiplication/`pow`), so — per the repo's box-drawing-rounding precedent —
-//! they are proven here by deliberate exhaustive lattice sweeps under plain
-//! `targo --unverified test`.
+//! The ty-checked twin is the `TextBlendGate` model
+//! (`aterm_spec::derive::text_blend_gate_model`, invariant `CorrectionGated`:
+//! the remap fires only in corrected mode, on an interior coverage texel, with
+//! a non-degenerate luminance gap; `Buggy = 1` is the ungated divide). This
+//! file enumerates the gate's whole `bool × u8 × bool` domain and binds it to
+//! `blend_text`. The remap's float laws (range, monotonicity, degenerate guard,
+//! endpoints) are beyond the ty expression language (no multiplication or
+//! `pow`), so they are swept exhaustively here.
 
 use aterm_render::{TEXT_BLEND_EPS, blend_text, correct_alpha, correction_applies};
 
@@ -54,7 +39,7 @@ fn ref_luminance(rgb: u32) -> f32 {
 fn colour_lattice() -> Vec<u32> {
     let bytes = [0u32, 1, 63, 127, 128, 191, 254, 255];
     let mut v: Vec<u32> = bytes.iter().map(|&b| (b << 16) | (b << 8) | b).collect();
-    // Chromatic corners + the theme-ish defaults the renderer actually blends.
+    // Chromatic corners and colours the renderer blends.
     v.extend_from_slice(&[
         0x00ff_0000,
         0x0000_ff00,
@@ -70,11 +55,9 @@ fn colour_lattice() -> Vec<u32> {
     v
 }
 
-/// PROVE (1) endpoint exactness: `t == 0` leaves the destination bytes
-/// untouched and `t == 255` yields the exact fg bytes, in BOTH modes, for
-/// every fg/bg pair on the lattice — including pixels with a dirty high byte
-/// (the blit's framebuffer mask). The early returns run before any float
-/// math, so this is bit-precise, not merely within a tolerance.
+/// `t == 0` returns the destination bytes and `t == 255` the fg bytes, exactly,
+/// in both modes for every lattice pair, with dirty high bytes masked. The
+/// early returns run before any float math.
 #[test]
 fn endpoint_exactness_both_modes() {
     let lattice = colour_lattice();
@@ -101,12 +84,9 @@ fn endpoint_exactness_both_modes() {
     assert!(cases > 1000, "endpoint sweep too thin ({cases} cases)");
 }
 
-/// GOLDEN: a 50%-coverage white texel on black must
-/// land at ~sRGB 128 in the default linear-corrected mode — the apparent
-/// weight of a gamma-space (CoreText-like) blend — while pure linear puts it
-/// at ~sRGB 188 (the thin/washed dark-mode text this item fixes). The linear
-/// assertion doubles as the NEGATIVE CONTROL: it shows the pre-fix behaviour
-/// really is ~188, so the corrected assertion is non-vacuous.
+/// A 50%-coverage white texel on black lands at ~sRGB 128 in the default
+/// corrected mode (the apparent weight of a gamma-space, CoreText-like blend)
+/// and at ~sRGB 188 in pure linear, the negative control.
 #[test]
 fn golden_half_coverage_white_on_black() {
     let corrected = blend_text(0x0000_0000, 0x00ff_ffff, 0x0000_0000, 128, true);
@@ -125,12 +105,9 @@ fn golden_half_coverage_white_on_black() {
     }
 }
 
-/// PROVE (2) the remapped alpha is in `[0, 1]` and MONOTONE NONDECREASING in
-/// the raw coverage for any fg/bg luminance pair, over an exhaustive lattice:
-/// all 33×33 luminance pairs (i/32, including equal and near-equal) × all 256
-/// coverage steps. Also anchors the endpoints (`a=0 → ~0`, `a=1 → ~1`) and
-/// includes the NON-VACUITY control: the remap genuinely moves midtone
-/// coverage (white-on-black 50% shifts by more than 0.1).
+/// The remapped alpha is in `[0, 1]` and nondecreasing in raw coverage for all
+/// 33×33 luminance pairs (i/32) × 256 coverage steps, anchored at both ends,
+/// and it moves midtones (50% white-on-black by more than 0.1).
 #[test]
 fn corrected_alpha_range_monotone_and_anchored() {
     for i in 0..=32u32 {
@@ -151,9 +128,8 @@ fn corrected_alpha_range_monotone_and_anchored() {
                 );
                 prev = ac;
             }
-            // Endpoint anchors: identity at the ends up to the sRGB round-trip's
-            // float error (the BYTE-exact endpoints are blend_text's early
-            // returns, proven in endpoint_exactness_both_modes).
+            // Identity at the ends, up to the sRGB round-trip's float error
+            // (`blend_text`'s early returns make the bytes exact).
             assert!(
                 correct_alpha(fg_l, bg_l, 0.0).abs() < 1e-3,
                 "a=0 must map near 0 @ fg_l={fg_l} bg_l={bg_l}"
@@ -164,8 +140,7 @@ fn corrected_alpha_range_monotone_and_anchored() {
             );
         }
     }
-    // Non-vacuity: the remap is not the identity — 50% white-on-black moves
-    // from 0.502 to ~0.216 (the whole point of the mode).
+    // Non-vacuity: 50% white-on-black moves from 0.502 to ~0.216.
     let moved = correct_alpha(1.0, 0.0, 0.5);
     assert!(
         (0.5 - moved) > 0.1,
@@ -173,12 +148,9 @@ fn corrected_alpha_range_monotone_and_anchored() {
     );
 }
 
-/// PROVE (3) the degenerate guard: a luminance gap under [`TEXT_BLEND_EPS`]
-/// returns the raw coverage BIT-EXACTLY (no division ever runs), and at the
-/// byte level the corrected mode is then IDENTICAL to plain linear for every
-/// coverage value. Uses both trivially-equal pairs and a genuinely tricky one
-/// — pure red vs the gray of equal luminance — validated degenerate by an
-/// independent reference luminance.
+/// A luminance gap under [`TEXT_BLEND_EPS`] returns the raw coverage bit for
+/// bit (no division runs), so corrected mode then equals plain linear at every
+/// coverage, including pure red against the gray of equal luminance.
 #[test]
 fn degenerate_guard_reduces_to_linear() {
     // Float level: |fg_l - bg_l| < eps ⇒ identity, bit-for-bit.
@@ -201,8 +173,8 @@ fn degenerate_guard_reduces_to_linear() {
             }
         }
     }
-    // Byte level: pure red vs its equal-luminance gray. Guard the fixture with
-    // the independent reference so the pair really is inside the eps window.
+    // Byte level: pure red vs its equal-luminance gray, checked degenerate by
+    // the independent reference.
     let (red, gray) = (0x00ff_0000u32, 0x007f_7f7fu32);
     assert!(
         (ref_luminance(red) - ref_luminance(gray)).abs() < TEXT_BLEND_EPS,
@@ -217,15 +189,13 @@ fn degenerate_guard_reduces_to_linear() {
     }
 }
 
-/// Tier-1 CONFORMANCE BIND for the `TextBlendGate` ty model: (a) the pure gate
-/// itself, enumerated over its COMPLETE `bool × u8 × bool` domain, satisfies
-/// the model's `CorrectionGated` invariant; (b) the shipping byte-level seam
-/// obeys the gate — whenever `blend_text` differs from plain linear, the gate
-/// is open for that texel. With positive (non-vacuity) and negative controls.
+/// Conformance to the `TextBlendGate` ty model: (a) the gate over its complete
+/// `bool × u8 × bool` domain satisfies `CorrectionGated`; (b) whenever
+/// `blend_text` differs from plain linear, the gate is open for that texel.
 #[test]
 fn correction_gate_conformance() {
-    // (a) Complete enumeration of the gate: the SAME invariant the ty model
-    // carries (applies ⇒ corrected ∧ interior ∧ ¬degenerate).
+    // (a) The model's invariant over the whole gate domain:
+    // applies ⇒ corrected ∧ interior ∧ ¬degenerate.
     let mut opened = 0usize;
     for corrected in [false, true] {
         for cov in 0..=255u16 {
@@ -241,12 +211,12 @@ fn correction_gate_conformance() {
             }
         }
     }
-    // Non-vacuity: the gate does open (for every interior texel exactly once).
+    // Non-vacuity: the gate opens once for every interior texel.
     assert_eq!(opened, 254, "gate must open for all 254 interior coverages");
 
-    // (b) Bind to the real seam: `blend_text` may differ from linear ONLY when
-    // the gate is open. White-on-black is the non-degenerate pair; red vs its
-    // equal-luminance gray is the degenerate one (validated above).
+    // (b) `blend_text` differs from linear only when the gate is open.
+    // White-on-black is non-degenerate; red vs its equal-luminance gray is
+    // degenerate.
     let pairs = [
         (0x00ff_ffffu32, 0x0000_0000u32, false), // fg, bg, degenerate
         (0x00ff_0000, 0x007f_7f7f, true),
@@ -271,8 +241,8 @@ fn correction_gate_conformance() {
             }
         }
     }
-    // Positive control: corrected mode really rewrites midtone texels on the
-    // non-degenerate pair (an all-equal sweep would prove nothing).
+    // Positive control: corrected mode rewrites midtone texels on the
+    // non-degenerate pair.
     assert!(
         differing > 100,
         "corrected mode must visibly reweight the white-on-black ramp ({differing} texels differed)"

@@ -2,33 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Read-only buffer access trait for unified navigation.
-//!
-//! `BufferAccess` provides a common interface for reading buffer content,
-//! enabling navigation logic to operate on any text surface: terminal grid,
-//! editor Rope buffer, or future navigable surfaces.
+//! Read-only buffer access trait for navigation.
 
-/// Read-only buffer access for navigation commands.
+/// Read-only buffer access for navigation commands, so navigation logic (aterm-vi) runs on
+/// `dyn BufferAccess`; the terminal grid implements it.
 ///
-/// Both the terminal grid and the editor's Rope buffer implement this trait,
-/// allowing navigation logic to operate on `dyn BufferAccess` without
-/// coupling to concrete types.
-///
-/// Line coordinates use `i32` to support scrollback. Line 0 is the top line
-/// of the live screen whatever [`display_offset`](Self::display_offset) is: a
-/// scrolled-back viewport does not move what a line names. Negative values
-/// count back into scrollback history from there (-1 is the newest history
-/// line).
+/// Line 0 is the top line of the live screen whatever
+/// [`display_offset`](Self::display_offset) is; negative lines count back into scrollback
+/// (-1 is the newest history line).
 pub trait BufferAccess {
-    /// Read the character at the given position.
-    ///
-    /// Returns `None` if the position is out of bounds. Returns `Some(' ')`
-    /// for empty cells.
+    /// The character at a position: `None` out of bounds, `Some(' ')` for an empty cell.
     fn char_at(&self, line: i32, col: u16) -> Option<char>;
 
-    /// Length of the given line (last non-empty column + 1).
-    ///
-    /// Returns 0 for empty lines or out-of-bounds line numbers.
+    /// Length of the line (last non-empty column + 1); 0 for an empty or out-of-bounds line.
     fn line_len(&self, line: i32) -> u16;
 
     /// Total number of lines in the buffer (visible + scrollback/content).
@@ -40,35 +26,22 @@ pub trait BufferAccess {
     /// Number of columns in the viewport.
     fn cols(&self) -> u16;
 
-    /// Extract the full text of a line.
-    ///
-    /// Returns `None` if the line number is out of bounds.
+    /// The full text of a line, or `None` if out of bounds.
     fn line_text(&self, line: i32) -> Option<String>;
 
-    /// Whether the cell at the given position is the first half of a wide character.
-    ///
-    /// Default implementation returns `false` (no wide characters). Override
-    /// for terminal grids that track wide character state.
+    /// Whether the cell is the first half of a wide character. Default: `false`.
     fn is_wide(&self, _line: i32, _col: u16) -> bool {
         false
     }
 
-    /// WIDE-CONTINUATION flags for one whole line, one entry per column:
-    /// `true` where the cell is the SECOND half of a double-width character.
+    /// Wide-continuation flags for one line, one per column: `true` where the cell is the
+    /// second half of a double-width character (which stores a literal `' '`, so a character
+    /// classifier such as vi's word motions must skip it).
     ///
-    /// Batched on purpose. A double-width char stores a literal `' '` in its
-    /// continuation cell, so any consumer that classifies characters — vi's
-    /// word motions, most obviously — reads a CJK run as alternating glyph and
-    /// space and chops it into single-glyph "words". Probing that per column
-    /// through [`Self::is_wide`] would re-materialize a scrollback row once per
-    /// cell, which is exactly the quadratic the callers' line caches exist to
-    /// avoid; returning the whole line lets them pay ONE materialization and
-    /// cache the answer beside the text.
-    ///
-    /// The default derives the flags from [`Self::is_wide`], which is correct
-    /// for any implementation but pays that per-cell cost — implementations
-    /// with row-level flags should override it. `None` means "no information",
-    /// and callers must treat every cell as a non-continuation.
+    /// Batched so a caller materializes a scrollback row once rather than once per cell through
+    /// [`Self::is_wide`]. The default derives the flags from `is_wide` at that per-cell cost;
+    /// implementations with row-level flags override it. `None` means no information: treat
+    /// every cell as a non-continuation.
     fn line_wide_continuations(&self, line: i32) -> Option<Vec<bool>> {
         let cols = self.cols();
         if cols == 0 {
@@ -81,21 +54,13 @@ pub trait BufferAccess {
         )
     }
 
-    /// Current display offset (0 = live view, >0 = scrolled back).
-    ///
-    /// Default implementation returns 0 (no scrollback offset). Override
-    /// for terminal grids that support scrollback navigation.
+    /// Current display offset (0 = live view, >0 = scrolled back). Default: 0.
     fn display_offset(&self) -> i32 {
         0
     }
 
-    /// Whether the given line is a soft-wrapped continuation of the previous line.
-    ///
-    /// Returns `true` when the line's content started on the previous row and
-    /// wrapped due to reaching the column limit. Used by vi `^` (FirstOccupied)
-    /// to walk backward to the logical line start.
-    ///
-    /// Default implementation returns `false` (no soft wrapping).
+    /// Whether the line is a soft-wrapped continuation of the previous line (vi `^` walks
+    /// back through these to the logical line start). Default: `false`.
     fn is_line_wrapped(&self, _line: i32) -> bool {
         false
     }

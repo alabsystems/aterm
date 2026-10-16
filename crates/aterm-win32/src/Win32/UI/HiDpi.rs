@@ -1,0 +1,19 @@
+// Copyright (c) Microsoft Corporation.
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// Derived from windows-sys 0.61.2 src/Windows/Win32/UI/HiDpi/mod.rs. GENERATED
+// by aterm-win32-oracle: the 7 of its 62 names that aterm's Windows cells read
+// or that those name, with their feature gates dropped and their paths pointed
+// into this crate. Do not edit; regenerate. See ../../../LICENSE-MIT and
+// ../../../LICENSE-APACHE for the upstream licenses.
+
+//! `Win32::UI::HiDpi`.
+
+pub type DPI_AWARENESS_CONTEXT = *mut core::ffi::c_void;
+pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE: DPI_AWARENESS_CONTEXT = -3i32 as _;
+pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: DPI_AWARENESS_CONTEXT = -4i32 as _;
+pub const MDT_EFFECTIVE_DPI: MONITOR_DPI_TYPE = 0i32;
+pub type MONITOR_DPI_TYPE = i32;
+pub type PROCESS_DPI_AWARENESS = i32;
+pub const PROCESS_PER_MONITOR_DPI_AWARE: PROCESS_DPI_AWARENESS = 2i32;

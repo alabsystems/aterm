@@ -12,14 +12,18 @@
 //!   from `session_status`'s sweep — the main thread);
 //! * the operator's approval check (`crate::operator_host::approval_gate`,
 //!   behind `looks_like_approval` for the refusal sites in `control.rs`, and
-//!   the operator Classifier / `manage` baseline that announce boxes);
-//! * the Claude Code footer (`crate::claude_footer`: `composer_bottom` +
-//!   `footer::mode_row`, and `footer::launch_card` while a process's model
-//!   or effort is unnamed — every frame on the main thread);
-//! * the Claude Code lights (`crate::claude_lights`: `lights::read_screen`
-//!   every frame and at a toggle — the main thread), which the footer reads
-//!   too, with `upgrade::composer_is_empty`, every frame while a live
-//!   upgrade's note stands for the pane.
+//!   the operator Classifier / `manage` baseline that announce boxes), and
+//!   its ready check's read of agy's composer (`operator_host::agy_at_rest`);
+//! * the Claude Code footer (`crate::claude_footer`: the composer's frame
+//!   (`aterm_phase::phase::FrameReach`) + `footer::mode_row_under`, and
+//!   `footer::launch_card` while a process's model or effort is unnamed —
+//!   on each rebuild of a pane's text whose changed rows it reads, on the
+//!   main thread);
+//! * the Claude Code lights (`crate::claude_lights`: `lights::reading_under`
+//!   with the footer's reading, and `lights::read_screen` at a toggle — the
+//!   main thread), which the footer reads too, with
+//!   `upgrade::composer_is_empty`, every frame while a live upgrade's note
+//!   stands for the pane.
 //!
 //! The
 //! reader is pure functions over the screen's rows, and a screen is whatever

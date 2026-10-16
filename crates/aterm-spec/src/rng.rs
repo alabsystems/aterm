@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The generator behind every generated-input test: xorshift64 (shifts 13, 7,
-//! 17) from a fixed seed, so a failing case reproduces from its seed and case
-//! index. One copy, here, beside [`crate::wait`]; a test that draws inputs
-//! draws them from [`XorShift`].
+//! The generator behind every generated-input test: xorshift64 (shifts 13, 7, 17) from a fixed
+//! seed, so a failing case reproduces from its seed and case index.
 
 /// xorshift64 over a non-zero state.
 #[derive(Clone, Debug)]

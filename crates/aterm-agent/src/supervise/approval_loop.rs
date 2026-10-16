@@ -149,6 +149,14 @@
 //!    of the loop's in it; under `recommended` before the answering Enter's
 //!    keys, as on main.
 //!
+//! **Autopilot off is hands off here too.** A box decided where the
+//! session's `autopilot` word reads `off` — the bare `meta` its decision
+//! made, or one more on a host that keeps the word
+//! ([`Session::autopilot_read`]) — is neither pressed nor escalated, and the
+//! loop parks until the word changes ([`Session::park_while_off`]). The
+//! harness's own loops alone (`watch`, the hosted loop): a manager's one
+//! look (`supervise`) is the manager's.
+//!
 //! **HOW it is answered is resolved per dialog** (`decide_box`): the
 //! session's `questions` word over the global `answer_questions` and
 //! `question_priority` ([`Session::question_policy`], the one resolver the
@@ -187,7 +195,10 @@
 //!   on a skip or `ERR busy …`, which wrote nothing). Text that reads as the
 //!   policy's with no such memory — a person's, or the loop's own after a
 //!   restart — is a person's, and handed over: a lost memory is a stall,
-//!   never an answer (the model's `OwnTextRemembered`).
+//!   never an answer (the model's `OwnTextRemembered`). The memory is the
+//!   dialog's: it goes with the dialog, at the worker's next busy read or at
+//!   a look that reads no dialog up, so the same question asked again in a
+//!   new dialog is written afresh (ATERM-KI-1015-1 F4).
 //! * **The exact read-back.** After the one `send` the field must read the
 //!   text back byte for byte on the reader's one-space join (ticked, on a
 //!   multi-select) before the press returns [`Press::Typed`]; the Enter is a
@@ -210,6 +221,17 @@
 //! * **Never an Enter in a multi-select's field** (c3c on 2.1.283: it
 //!   unticks the row and the dialog answers "did not answer"): the focus is
 //!   moved off it onto `Next`/`Submit` first, and the Enter goes there.
+//!
+//! **CODEX'S QUESTION** takes the policy text as the NOTE of `None of the
+//! above` ([`Session::press_codex_note`], measured on 0.163.0): arrows onto
+//! that answer (its digit would answer at once), Tab, the text in one fenced
+//! `send`, then Enter once a read shows the field holding exactly it. The
+//! same memory holds it, keyed by the question's words
+//! (`policy::question::roles_question_key`); a field that never read open
+//! after the Tab latches the question's fallback ([`QuestionMemory::fell_back`])
+//! to its recommended answer; and the Enter on a note goes once per question
+//! ([`QuestionMemory::note_entered`]). Esc and a Tab in the open field clear
+//! the note, so neither is ever pressed there.
 //!
 //! A person's input after the loop's text (R1) makes the dialog's end theirs:
 //! the loop may still press Enter on its own text once they are quiet, the
@@ -310,8 +332,8 @@ const MAX_UNSETTLED_WAITS: u32 = 3;
 const QUESTION_STANDIN_QUIET: Duration = Duration::from_secs(10);
 
 /// What the loop remembers of the question dialog it is answering (module
-/// docs, "A question dialog"): cleared when the worker works again
-/// ([`Session::look`]).
+/// docs, "A question dialog"): cleared when the worker works again, or a look
+/// reads it at its composer with no dialog up ([`Session::look`]).
 #[derive(Debug, Default)]
 pub(super) struct QuestionMemory {
     /// The question the first-key wait (O4) was spent on ([`question_key`]).
@@ -369,8 +391,16 @@ pub(super) struct QuestionMemory {
     /// because the text would not fit the pane
     /// ([`super::super::policy::question::falls_back`]). Such a tab stays on
     /// that path until answered: its own toggle is never read back as a
-    /// person's check, and its answer is never handed over half done.
+    /// person's check, and its answer is never handed over half done. A
+    /// question read by its answers' roles (Codex's, by
+    /// [`super::super::policy::question::roles_question_key`]) is latched
+    /// here when its notes field did not read open after the loop's Tab
+    /// ([`Session::press_codex_note`]).
     pub(super) fell_back: std::collections::BTreeSet<String>,
+    /// The question read by its answers' roles whose note the loop's Enter
+    /// submitted ([`Session::press_codex_note`]): a read that shows it still
+    /// holding the note is the Enter not taken, never one to send again.
+    pub(super) note_entered: Option<String>,
 }
 
 impl QuestionMemory {
@@ -561,12 +591,74 @@ enum Hold {
 /// One field of a bare `meta` reply, found by key: `None` when the reply has
 /// no such field or it is unset (`-`), else the value, pct-decoded.
 fn meta_word(stdout: &str, key: &str) -> Option<String> {
-    let line = stdout.lines().find(|l| l.starts_with("OK"))?;
+    let line = stdout.lines().find(|l| crate::is_ok_reply(l))?;
     let prefix = format!("{key}=");
     let raw = line
         .split_whitespace()
         .find_map(|w| w.strip_prefix(prefix.as_str()))?;
     (raw != "-" && !raw.is_empty()).then(|| super::super::report::pct_decode(raw))
+}
+
+/// Whether a bare `meta` reply names the field `key` at all, set or unset
+/// (`key=-`): a host that keeps it.
+fn meta_names(stdout: &str, key: &str) -> bool {
+    let prefix = format!("{key}=");
+    stdout
+        .lines()
+        .find(|l| crate::is_ok_reply(l))
+        .is_some_and(|line| line.split_whitespace().any(|w| w.starts_with(&prefix)))
+}
+
+/// THE SESSION'S AUTOPILOT WORD as the loop last read it (`autopilot=` on a
+/// bare `meta` reply, the word aterm-gui keeps: `meta set autopilot
+/// off|cruise|land`), noted at EVERY bare `meta` the loop reads
+/// ([`Session::note_meta`]: the start-up reconcile, a box's cwd, a
+/// question's `questions` word) and read on purpose only where a decision
+/// would act ([`Session::autopilot_read`]). What it decides: the turn-end
+/// policy's mode ([`TurnEndReading::autopilot`]) and, at `off`, the loop's
+/// park ([`Session::park_while_off`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct AutopilotWord {
+    /// The last bare `meta` reply named `autopilot=` (set or `-`): the host
+    /// keeps the word, so it is worth a read. A host that names none (an
+    /// older build) can hold no word: nothing is asked of it, and the
+    /// table's `[harness] autopilot` decides every session there.
+    kept: bool,
+    /// The session's own word, as the last reply that was read named it;
+    /// `None` — unset, a word this build cannot read ([`Autopilot::parse`]),
+    /// or no reply read yet — is the table's
+    /// ([`SupervisorConfig::autopilot_for`]). A read the server refused
+    /// changes nothing ([`Self::refused`]).
+    word: Option<Autopilot>,
+    /// A bare `meta` was read since the decision in hand began
+    /// ([`Self::begin`]): its word is the decision's, and no second round
+    /// trip is made for it.
+    fresh: bool,
+}
+
+impl AutopilotWord {
+    /// A decision begins: the word last read is no longer this decision's own.
+    pub(super) fn begin(&mut self) {
+        self.fresh = false;
+    }
+
+    /// A bare `meta` reply read: whether the host keeps the word, and the word.
+    fn note(&mut self, meta: &str) {
+        self.kept = meta_names(meta, "autopilot");
+        self.word = meta_word(meta, "autopilot")
+            .as_deref()
+            .and_then(Autopilot::parse);
+        self.fresh = true;
+    }
+
+    /// A bare `meta` the server refused: it says nothing of the word, so the
+    /// word last read stands — a session the owner turned `off` is never
+    /// handed back to the table's `cruise` by one refusal (failing open);
+    /// with no word ever read, the table's decides. The decision in hand
+    /// makes no second round trip for it.
+    fn refused(&mut self) {
+        self.fresh = true;
+    }
 }
 
 /// A question's identity for the first-key wait and the re-ask cap: its
@@ -841,7 +933,7 @@ impl<C: Ctl> Session<'_, C> {
     /// (`reads.bash`) the worker's environment and, when read from the
     /// session ([`WorkerSource::Session`]), its Bash tool's shell startup
     /// ([`ApprovalCtx::shell`]); for a box Claude Code draws no ask reason on
-    /// (`reads.asks`) the bare-tool ask rules of the worker's own settings
+    /// (`reads.asks`) the ask rules and PreToolUse hooks of the worker's own settings
     /// ([`ApprovalCtx::owner_asks`]); the footer's mode, the process's
     /// home/uid/`$TMPDIR`, and the approve level and trust roots `opts` sets.
     fn approval_ctx(
@@ -858,9 +950,10 @@ impl<C: Ctl> Session<'_, C> {
                 return Err(Fail::Lost(format!("meta failed: {}", r.stderr.trim())));
             }
             if r.ok() {
-                self.note_cwd(&r.stdout);
+                self.note_meta(&r.stdout);
             } else {
                 self.cwd = None;
+                self.autopilot.refused();
             }
         }
         let env = self.approval_env.clone();
@@ -884,7 +977,7 @@ impl<C: Ctl> Session<'_, C> {
         if opts.policy.withheld.read_outside_cwd {
             ctx.read_roots.clear();
         }
-        ctx.bypass_mode = self.footer == Some(FooterMode::Bypass);
+        ctx.bypass_mode = self.footer == Some(crate::harness::lights::Mode::Bypass);
         ctx.approve = opts.policy.approve;
         ctx.answer_questions = opts.policy.answer_questions;
         ctx.model_fallback = opts.policy.model_fallback.is_some();
@@ -922,7 +1015,7 @@ impl<C: Ctl> Session<'_, C> {
             if asks {
                 ctx.owner_asks = match (&worker, cwd.as_deref()) {
                     (Ok(w), Some(cwd)) => {
-                        crate::supervise::policy::claude_settings::bare_asks(w, cwd)
+                        crate::supervise::policy::claude_settings::owner_asks(w, cwd)
                     }
                     (Err(why), _) => Err(format!("its environment is unknown: {why}")),
                     (Ok(_), None) => Err("its directory is unknown (meta cwd=-)".to_string()),
@@ -940,7 +1033,7 @@ impl<C: Ctl> Session<'_, C> {
     /// the `ATERM_PARENT_SESSION_ID` every aterm session hands its shell: a
     /// process whose variable names another session, or none, is not taken
     /// for the worker. `Err` says what could not be read or did not hold.
-    pub(super) fn worker_env(&mut self) -> Result<WorkerEnv, String> {
+    pub(crate) fn worker_env(&mut self) -> Result<WorkerEnv, String> {
         let stable = self
             .sid
             .as_deref()
@@ -1059,11 +1152,13 @@ impl<C: Ctl> Session<'_, C> {
             .is_some_and(|p| p.kind == PromptKind::Bash);
         // A box Claude Code draws no ask reason on: the agent's own settings
         // say whether an ask rule sent it (`policy::approval::settings_ask`).
-        let asks = reading.program == aterm_phase::Program::Claude
-            && reading
+        let asks = match reading.program {
+            Program::Claude => reading
                 .prompt
                 .as_ref()
-                .is_some_and(|p| !unvoiced_tools(p).is_empty());
+                .is_some_and(|p| !unvoiced_tools(p).is_empty()),
+            Program::Codex | Program::Agy | Program::Muse | Program::Generic => false,
+        };
         let fresh_cwd = reading.prompt.as_ref().is_some_and(needs_cwd)
             || asks
             || bash && matches!(self.approval_env.worker, WorkerSource::Session);
@@ -1137,12 +1232,21 @@ impl<C: Ctl> Session<'_, C> {
                     .question_dialog
                     .as_ref()
                     .map(|d| (question_key(d, &screen.rows), d.focus()));
-                ctx.question_own = this
+                // A question read by its answers' roles (Codex's) is
+                // remembered by its words: the note the loop wrote into it,
+                // and its fallback latch (`press_codex_note`).
+                let key = this.as_ref().map(|(k, _)| k.clone()).or_else(|| {
+                    prompt
+                        .question_dialog
+                        .is_none()
+                        .then(|| super::super::policy::question::roles_question_key(prompt))
+                });
+                ctx.question_own = key
                     .as_ref()
-                    .and_then(|(k, _)| self.question.typed.get(k).copied());
-                ctx.question_fell_back = this
+                    .and_then(|k| self.question.typed.get(k).copied());
+                ctx.question_fell_back = key
                     .as_ref()
-                    .is_some_and(|(k, _)| self.question.fell_back.contains(k));
+                    .is_some_and(|k| self.question.fell_back.contains(k));
                 // The latch: the word at the loop's first key on this dialog
                 // is the dialog's; a word changed since is a person's call
                 // (decision 13).
@@ -1284,12 +1388,14 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The question dialog in hand is done (the worker works again, read
-    /// busy): what the loop remembered of it is forgotten, and a dialog the
-    /// loop's own keys answered is told once ([`Self::tell_answered`], at
-    /// `seq`), never one a person took part in (`theirs`) or one the policy
-    /// still held when it ended (`question_held`). Called at the turn's first
-    /// busy read ([`Self::await_turn_from`]) and, as the fallback, at the
-    /// look's worked edge ([`Self::look`]).
+    /// busy, or sits at its composer with no dialog up): what the loop
+    /// remembered of it is forgotten, and a dialog the loop's own keys
+    /// answered is told once ([`Self::tell_answered`], at `seq`), never one a
+    /// person took part in (`theirs`) or one the policy still held when it
+    /// ended (`question_held`). Called at the turn's first busy read
+    /// ([`Self::await_turn_from`]) and, as the fallback, at the look's worked
+    /// edge, and at a look that reads no dialog up ([`Self::look`]: a dialog
+    /// gone with no answer of the loop's, its text forgotten with it).
     pub(super) fn question_done(
         &mut self,
         seq: u64,
@@ -1326,13 +1432,68 @@ impl<C: Ctl> Session<'_, C> {
             return Err(Fail::Lost(format!("meta failed: {}", r.stderr.trim())));
         }
         if !r.ok() {
+            self.autopilot.refused();
             return Ok(global);
         }
-        self.note_cwd(&r.stdout);
+        self.note_meta(&r.stdout);
         Ok(match meta_word(&r.stdout, "questions") {
             None => global,
             Some(word) => session_word(&word),
         })
+    }
+
+    /// What a bare `meta` reply says of the session that the loop keeps: its
+    /// working directory ([`Self::note_cwd`]) and its autopilot word
+    /// ([`AutopilotWord`]).
+    pub(super) fn note_meta(&mut self, meta: &str) {
+        self.note_cwd(meta);
+        self.autopilot.note(meta);
+    }
+
+    /// The session's Autopilot as the loop last read it: its own word, else
+    /// the table's `[harness] autopilot` ([`SupervisorConfig::autopilot_for`]).
+    pub(super) fn autopilot(&self, opts: &SuperviseOpts) -> Autopilot {
+        opts.policy.autopilot_for(self.autopilot.word)
+    }
+
+    /// [`Self::autopilot`] for a decision about to act: read fresh — one bare
+    /// `meta` — unless a bare `meta` was read since the decision began
+    /// ([`AutopilotWord::begin`]; the box's cwd, the question's word: that
+    /// reply's word is the decision's) or the host keeps no word (nothing to
+    /// read: the table's decides). A refused read keeps the word last read
+    /// ([`AutopilotWord::refused`]: the table's only where none ever was);
+    /// one not served is the outage it is.
+    pub(super) fn autopilot_read(&mut self, opts: &SuperviseOpts) -> Result<Autopilot, Fail> {
+        if self.autopilot.kept && !self.autopilot.fresh {
+            self.read_autopilot_word()?;
+        }
+        Ok(self.autopilot(opts))
+    }
+
+    /// A busy-read action is a new decision too: a CLI watcher can spend
+    /// hours in one turn while the owner changes the session's word. Read it
+    /// at that boundary, before a survey key, a switch step or a host step.
+    /// A refused read leaves the remembered word intact for parking, but
+    /// proves no admission for this action. Older hosts that keep no word
+    /// still use the table without an unsupported round trip.
+    pub(super) fn autopilot_allows_busy(&mut self, opts: &SuperviseOpts) -> Result<bool, Fail> {
+        self.autopilot.begin();
+        let known = !self.autopilot.kept || self.read_autopilot_word()?;
+        Ok(known && self.autopilot(opts) != Autopilot::Off)
+    }
+
+    /// One bare metadata read: whether the host actually answered it.
+    fn read_autopilot_word(&mut self) -> Result<bool, Fail> {
+        let r = self.call(&["meta"])?;
+        if self.unserved(&r) {
+            return Err(Fail::Lost(format!("meta failed: {}", r.stderr.trim())));
+        }
+        if r.ok() {
+            self.note_meta(&r.stdout);
+        } else {
+            self.autopilot.refused();
+        }
+        Ok(r.ok())
     }
 
     /// One row of the approval ledger.
@@ -1477,11 +1638,23 @@ impl<C: Ctl> Session<'_, C> {
             self.wait(&["seq", &seq.to_string()], wait)?;
             return Ok(Step::Again { settle: false });
         }
+        self.autopilot.begin();
         let decision = self.decide_box(&turn.screen, opts, allow)?;
         // The `status` that named the program says the worker is not reading
         // its input: this box is neither pressed nor escalated; the next look
         // holds (`stall.rs`).
         if self.stall_in_hand(review) {
+            return Ok(Step::Again { settle: false });
+        }
+        // AUTOPILOT OFF, by the session's word as this decision read it (the
+        // bare `meta` the decision made, or one more where the host keeps the
+        // word): the box is neither pressed nor escalated — it is the
+        // person's, as on any session nobody supervises — and the loop parks
+        // until the word changes ([`Self::park_while_off`]), then reads and
+        // decides the screen afresh. The harness's loops alone: a manager's
+        // one look (`supervise`) is the manager's.
+        if review.unattended() && self.autopilot_read(opts)? == Autopilot::Off {
+            self.park_while_off(seq, deadline, opts, review)?;
             return Ok(Step::Again { settle: false });
         }
         // A person at the keyboard wins: an answer the policy has is held
@@ -1721,15 +1894,25 @@ impl<C: Ctl> Session<'_, C> {
             Act::Approve {
                 guard,
                 choice: Choice::Digit(n),
-            } => self.press_one_guarded(&p, guard, &n.to_string(), &turn.screen)?,
+            } => {
+                self.press_one_guarded(&p, guard, &n.to_string(), &turn.screen, Fence::WhereKnown)?
+            }
             Act::Approve {
                 guard,
                 choice: Choice::Focus { steps, label },
             } => {
-                // The grant row's keys are fenced on the judged read's person
-                // count as well: the host's claim is asked for between that
-                // read and the first key, and a person may key meanwhile.
-                let person = turn.screen.human_seq.filter(|_| reset);
+                // Fence every folder-trust key on the judged read's person
+                // count too. A person may key between the read and the arrow
+                // or Enter, even after their earlier gesture's grace expired.
+                // Neither a young verdict nor a first sighting proves that
+                // earlier gesture launched this dialog: ordinary grace still
+                // applies. The grant row retains the same count fence.
+                // A person's own key after an accepted arrow can still land
+                // on the new focus.
+                let person = turn
+                    .screen
+                    .human_seq
+                    .filter(|_| reset || p.kind == PromptKind::Trust);
                 self.press_focused(&p, *steps, label, "enter", guard, &turn.screen, person)?
             }
             Act::Approve {
@@ -1740,6 +1923,10 @@ impl<C: Ctl> Session<'_, C> {
                 choice: Choice::Answer(answer),
                 ..
             } => self.press_question(answer, &turn.screen, grace)?,
+            Act::Approve {
+                choice: Choice::Note { text },
+                ..
+            } => self.press_codex_note(*text, &turn.screen, grace)?,
             Act::Decline { refusal, text } => {
                 self.press_decline(*refusal, text, &turn.screen, grace)?
             }

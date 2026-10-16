@@ -3155,11 +3155,10 @@ mod tests {
         let before = fs::read(&initialized.path).unwrap();
 
         // Ridden out through `settle_busy` like the first attempt above: the
-        // full-suite pool can land this call inside a peer's lock window, and
-        // on 2026-09-22 the merge contract reported the journal BUSY here where
-        // the assertion wanted the stale-inspection refusal. The helper retries
-        // only the busy refusal, so the first real answer is still what the
-        // assertion sees.
+        // full-suite pool can land this call inside a peer's lock window, which
+        // reports the journal BUSY here where the assertion wants the
+        // stale-inspection refusal. The helper retries only the busy refusal,
+        // so the first real answer is still what the assertion sees.
         let error = settle_busy(|| host.initialize(stale.clone(), &disk, &disk)).unwrap_err();
         assert!(
             error.contains("changed after recovery inspection"),
@@ -3637,11 +3636,11 @@ mod tests {
     fn cross_process_same_journal_generation_has_one_winner() {
         const CHILD: &str = "ATERM_JOURNAL_COMMIT_TEST_CHILD";
         // Every wait below is for something that must happen — a child test
-        // process of this whole binary starting (seconds of exec under a
-        // loaded gate), the parent's go, the peer's lock hold ending — so each
-        // is a hang detector, never a latency budget (they were 10 s and 3 s,
-        // and all three cross-process tests went red together under a 24-way
-        // CPU load on 2026-09-29).
+        // process of this whole binary starting (seconds of exec on a loaded
+        // machine), the parent's go, the peer's lock hold ending — so each is
+        // a hang detector, never a latency budget (bounds of 10 s and 3 s
+        // failed all three cross-process tests together under a 24-way CPU
+        // load).
         const HANG: std::time::Duration = std::time::Duration::from_secs(60);
         const URI: &str = "file:///tmp/cross-process-draft.md";
         if let Ok(role) = std::env::var(CHILD) {

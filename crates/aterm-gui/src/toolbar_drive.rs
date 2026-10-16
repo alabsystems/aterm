@@ -75,7 +75,6 @@ mod macos {
     use winit::application::ApplicationHandler;
     use winit::event_loop::{ActiveEventLoop, EventLoop};
     use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::{Window, WindowId as WinitWindowId};
 
     use super::{FINDING, HUNG, NOT_RUN, PASS};
@@ -932,17 +931,11 @@ mod macos {
             );
             return NOT_RUN;
         };
-        let ns_view = {
-            let Ok(h) = win.window_handle() else {
-                crate::logging::stderr_line!("objc-toolbar-drive: NOT RUN — no window handle");
-                return NOT_RUN;
-            };
-            let RawWindowHandle::AppKit(a) = h.as_raw() else {
-                crate::logging::stderr_line!("objc-toolbar-drive: NOT RUN — not an AppKit window");
-                return NOT_RUN;
-            };
-            Id::from_ptr(a.ns_view.as_ptr().cast())
-        };
+        let ns_view = crate::platform::ns_view_of(win);
+        if ns_view.is_null() {
+            crate::logging::stderr_line!("objc-toolbar-drive: NOT RUN — no content view");
+            return NOT_RUN;
+        }
         // SAFETY: `ns_view` is winit's live content view; both accessors are
         // read-only.
         let ns_window = unsafe { s_id(ns_view, sel!(window)) };

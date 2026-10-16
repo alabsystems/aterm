@@ -1,0 +1,41 @@
+# serde corpus `lexicon`: one case per line, `<id> TAB ok|err TAB <answer>`.
+# ok: the value written back out; err: the error's Display. \n \t \r \\ and
+# \u{..} escape control characters; an ok longer than 4096 bytes is its
+# FNV-1a digest and length. docs/AUDIT-third-party-2026-10-15.md, SP.3.
+bundled/lexicon	ok	fnv1a64:13c756fe43704e88 len=23804
+bundled/tricks	ok	fnv1a64:91b3d55dd4b57243 len=229127
+entry/base	ok	spaced ["frak=Profanity", "fraked=Profanity", "fraking=Profanity", "frakker=Profanity"] cjk ["ねこ=Feline"] species [] conflicts []
+entry/empty	ok	spaced [] cjk [] species [] conflicts ["configured language \\"en\\" names nothing in this vocabulary: it un-gated nothing (the codes are the bare lowercase ones the data uses)", "configured language \\"ja\\" names nothing in this vocabulary: it un-gated nothing (the codes are the bare lowercase ones the data uses)"]
+trick/base	ok	[TrickRow { kind: Trick(Sit), lang: "en", words: ["sit", "stay"], address: ["wait"], gated: false, cjk: false, unglued: [] }, TrickRow { kind: Vocative, lang: "en", words: ["kitty"], address: [], gated: false, cjk: false, unglued: [] }, TrickRow { kind: Filler, lang: "en", words: ["please"], address: [], gated: false, cjk: false, unglued: [] }]
+trick/empty	ok	[]
+entry/unknown-key	err	lexicon TOML parse error: TOML parse error at line 11, column 1\n   |\n11 | region = "us"\n   | ^^^^^^\nunknown field `region`, expected one of `class`, `lang`, `mode`, `stems`, `suffixes`, `forms`, `cjk`, `ambiguous`, `species`, `notes`\n
+entry/unknown-key/root	err	lexicon TOML parse error: TOML parse error at line 1, column 1\n  |\n1 | version = 1\n  | ^^^^^^^\nunknown field `version`, expected `entry`\n
+entry/unknown-key/skipped-field	err	lexicon TOML parse error: TOML parse error at line 11, column 1\n   |\n11 | user = true\n   | ^^^^\nunknown field `user`, expected one of `class`, `lang`, `mode`, `stems`, `suffixes`, `forms`, `cjk`, `ambiguous`, `species`, `notes`\n
+entry/unknown-key/renamed-field	err	lexicon TOML parse error: TOML parse error at line 10, column 1\n   |\n10 | _notes = "corpus"\n   | ^^^^^^\nunknown field `_notes`, expected one of `class`, `lang`, `mode`, `stems`, `suffixes`, `forms`, `cjk`, `ambiguous`, `species`, `notes`\n
+entry/missing-key/class	err	lexicon TOML parse error: TOML parse error at line 1, column 1\n  |\n1 | [[entry]]\n  | ^^^^^^^^^\nmissing field `class`\n
+entry/missing-key/defaulted-mode	ok	spaced ["frak=Profanity", "fraked=Profanity", "fraking=Profanity", "frakker=Profanity"] cjk ["ねこ=Feline"] species [] conflicts []
+entry/missing-key/defaulted-lang	ok	spaced ["frak=Profanity", "fraked=Profanity", "fraking=Profanity", "frakker=Profanity"] cjk ["ねこ=Feline"] species [] conflicts ["configured language \\"en\\" names nothing in this vocabulary: it un-gated nothing (the codes are the bare lowercase ones the data uses)"]
+entry/wrong-type/stems-string	err	lexicon TOML parse error: TOML parse error at line 5, column 12\n  |\n5 | stems    = "frak"\n  |            ^^^^^^\ninvalid type: string "frak", expected a sequence\n
+entry/wrong-type/cjk-string	err	lexicon TOML parse error: TOML parse error at line 8, column 12\n  |\n8 | cjk      = "no"\n  |            ^^^^\ninvalid type: string "no", expected a boolean\n
+entry/wrong-type/class-int	err	lexicon TOML parse error: TOML parse error at line 2, column 12\n  |\n2 | class    = 1\n  |            ^\ninvalid type: integer `1`, expected a string\n
+entry/wrong-type/notes-array	err	lexicon TOML parse error: TOML parse error at line 10, column 12\n   |\n10 | notes    = ["corpus"]\n   |            ^^^^^^^^^^\ninvalid type: sequence, expected a string\n
+entry/table-for-array/entry	err	lexicon TOML parse error: TOML parse error at line 12, column 8\n   |\n12 | [entry.second]\n   |        ^^^^^^\nunknown field `second`, expected one of `class`, `lang`, `mode`, `stems`, `suffixes`, `forms`, `cjk`, `ambiguous`, `species`, `notes`\n
+entry/wrong-type/ambiguous-string	err	lexicon TOML parse error: TOML parse error at line 9, column 12\n  |\n9 | ambiguous= "no"\n  |            ^^^^\ninvalid type: string "no", expected a boolean\n
+entry/wrong-type/suffixes-int	err	lexicon TOML parse error: TOML parse error at line 6, column 17\n  |\n6 | suffixes = ["", 1]\n  |                 ^\ninvalid type: integer `1`, expected a string\n
+entry/gated/ambiguous-unconfigured-lang	ok	spaced [] cjk ["ねこ=Feline"] species [] conflicts ["configured language \\"en\\" names nothing in this vocabulary: it un-gated nothing (the codes are the bare lowercase ones the data uses)"]
+entry/gated/plain-unconfigured-lang	ok	spaced ["frak=Profanity", "fraked=Profanity", "fraking=Profanity", "frakker=Profanity"] cjk ["ねこ=Feline"] species [] conflicts ["configured language \\"en\\" names nothing in this vocabulary: it un-gated nothing (the codes are the bare lowercase ones the data uses)"]
+entry/zero/cjk-int	err	lexicon TOML parse error: TOML parse error at line 8, column 12\n  |\n8 | cjk      = -0\n  |            ^^\ninvalid type: integer `0`, expected a boolean\n
+entry/float/cjk-nan	err	lexicon TOML parse error: TOML parse error at line 8, column 12\n  |\n8 | cjk      = nan\n  |            ^^^\ninvalid type: floating point `NaN`, expected a boolean\n
+entry/array-for-table/inline-row	ok	spaced ["frak=Profanity"] cjk [] species [] conflicts ["configured language \\"ja\\" names nothing in this vocabulary: it un-gated nothing (the codes are the bare lowercase ones the data uses)"]
+exception/unknown-key	err	lexicon TOML parse error: TOML parse error at line 5, column 1\n  |\n5 | source = "x"\n  | ^^^^^^\nunknown field `source`, expected one of `word`, `lang`, `meaning`\n
+exception/missing-key/word	err	lexicon TOML parse error: TOML parse error at line 1, column 1\n  |\n1 | [[exception]]\n  | ^^^^^^^^^^^^^\nmissing field `word`\n
+exception/missing-key/renamed-lang	ok	spaced ["frak=Profanity", "fraked=Profanity", "fraking=Profanity", "frakker=Profanity"] cjk ["ねこ=Feline"] species [] conflicts []
+exception/wrong-type/meaning-int	err	lexicon TOML parse error: TOML parse error at line 4, column 11\n  |\n4 | meaning = 1\n  |           ^\ninvalid type: integer `1`, expected a string\n
+trick/unknown-key	err	lexicon TOML parse error: TOML parse error at line 7, column 1\n  |\n7 | loud = true\n  | ^^^^\nunknown field `loud`, expected one of `id`, `lang`, `words`, `address`, `gated`, `cjk`, `unglued`, `notes`\n
+trick/unknown-key/vocative	err	lexicon TOML parse error: TOML parse error at line 16, column 1\n   |\n16 | extra = 1\n   | ^^^^^\nunknown field `extra`, expected one of `lang`, `words`, `gated`, `cjk`, `unglued`, `notes`\n
+trick/unknown-key/root	err	lexicon TOML parse error: TOML parse error at line 14, column 3\n   |\n14 | [[noise]]\n   |   ^^^^^\nunknown field `noise`, expected one of `trick`, `vocative`, `filler`\n
+trick/missing-key/id	err	lexicon TOML parse error: TOML parse error at line 1, column 1\n  |\n1 | [[trick]]\n  | ^^^^^^^^^\nmissing field `id`\n
+trick/missing-key/defaulted-words	ok	[TrickRow { kind: Trick(Sit), lang: "en", words: [], address: ["wait"], gated: false, cjk: false, unglued: [] }, TrickRow { kind: Vocative, lang: "en", words: ["kitty"], address: [], gated: false, cjk: false, unglued: [] }, TrickRow { kind: Filler, lang: "en", words: ["please"], address: [], gated: false, cjk: false, unglued: [] }]
+trick/wrong-type/gated-string	err	lexicon TOML parse error: TOML parse error at line 6, column 12\n  |\n6 | gated    = "false"\n  |            ^^^^^^^\ninvalid type: string "false", expected a boolean\n
+trick/wrong-type/address-string	err	lexicon TOML parse error: TOML parse error at line 5, column 12\n  |\n5 | address  = "wait"\n  |            ^^^^^^\ninvalid type: string "wait", expected a sequence\n
+trick/unknown-trick-id	ok	[TrickRow { kind: Vocative, lang: "en", words: ["kitty"], address: [], gated: false, cjk: false, unglued: [] }, TrickRow { kind: Filler, lang: "en", words: ["please"], address: [], gated: false, cjk: false, unglued: [] }]

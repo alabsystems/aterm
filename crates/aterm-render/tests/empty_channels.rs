@@ -1,17 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// THE NO-OP LAW, one row per effect channel of `RenderInput` (CPU path): an
-// EMPTY channel — untouched, explicitly emptied, pushed-then-cleared, or an
-// atlas with nothing drawn from it — is byte-identical to the frame rendered
-// before the channel existed, and `clear_overlays` (the `image plain` capture)
-// strips a populated channel back to that bare frame, clearing every Vec and
+// The no-op law, one row per effect channel of `RenderInput` (CPU path): an empty
+// channel (untouched, explicitly emptied, pushed-then-cleared, or an atlas with nothing
+// drawn from it) renders byte-identically to the bare frame, and `clear_overlays` (the
+// `image plain` capture) strips a populated channel back to it, clearing every Vec and
 // nulling every atlas Arc.
-//
-// These were nine copy-pasted tests, one per channel file (`cat_sprites`,
-// `free_overlay`, `glow_halo`, `glow_under` ×2, `ink`, `nova`, `rain_render`,
-// `word_decorations`). Each row keeps its own screen text, its own empty
-// states and its own populated payload.
 
 use std::sync::Arc;
 
@@ -30,7 +24,7 @@ struct Channel {
     name: &'static str,
     /// What the 3x12 terminal shows.
     text: &'static [u8],
-    /// Every EMPTY state of the channel, labelled: each must render the bare
+    /// Every empty state of the channel, labelled: each must render the bare
     /// frame byte for byte.
     empties: &'static [(&'static str, Setter)],
     /// A populated channel for the `clear_overlays` leg (`None`: no such leg).
@@ -96,7 +90,7 @@ fn halo(row: u16, x: u16, y: u16, w: u16, h: u16, color: u32) -> RainHalo {
     }
 }
 
-/// An ADDITIVE glow quad (see `GlowQuad::alpha`).
+/// An additive glow quad (see `GlowQuad::alpha`).
 fn glow(row: u16, x: u16, y: u16, w: u16, h: u16, color: u32) -> GlowQuad {
     GlowQuad {
         row,

@@ -8,9 +8,8 @@ use super::message_reporters::KEY_FILE_ACCESS;
 use aterm_containment::consent::{FdaProbe, FdaState, ProbeLabel};
 use std::time::{Duration, Instant};
 
-/// Real App/card glue with synthetic published observations. The cache's
-/// own concurrent publication and invalidation are checked in
-/// control_privacy; these fixtures can never invoke a live OS probe.
+/// Real App/card glue over synthetic published observations; never a live OS probe. The
+/// cache's own publication and invalidation are tested in `control_privacy`.
 pub(super) fn windowed(probe: FdaProbe) -> App {
     let mut app = App::headless_for_test();
     app.headless = false;
@@ -32,7 +31,7 @@ fn denied() -> FdaProbe {
     }
 }
 
-/// Whether the grant is on record (R17 is a record, never a row).
+/// Whether the grant is on record (a grant is a record, never a row).
 pub(super) fn grant_recorded(app: &App) -> bool {
     app.messages
         .log()
@@ -90,10 +89,8 @@ fn pending_launch_retains_the_opened_marker_until_access_is_observed() {
     assert_eq!(app.next_macos_access_card_deadline(now), None);
 }
 
-/// A watch whose evidence goes PENDING, then denied, never records a
-/// grant it did not observe: the grant is recorded only on a completed
-/// `granted` read, the moment it is read (there is no slot to wait for,
-/// so no older observation can be replayed as a confirmation later).
+/// A watch whose evidence goes pending, then denied, records no grant: a grant is recorded only
+/// from a completed `granted` read, so no older observation replays as a confirmation.
 #[test]
 fn pending_and_withdrawn_access_never_publish_an_old_confirmation() {
     let now = Instant::now();
@@ -236,7 +233,6 @@ fn settings_gesture_restarts_a_settled_watch_with_fresh_evidence() {
         "the prior cached grant cannot acknowledge the new Settings gesture"
     );
     assert!(app.next_macos_access_card_deadline(now).is_some());
-    // Publish a fresh observation through the cache's real reader seam.
     app.consent = ConsentState::with_cached_probe_for_test(granted());
     app.tick_macos_access_card(now);
     assert_eq!(app.consent_card.phase(), CardPhase::Settled);

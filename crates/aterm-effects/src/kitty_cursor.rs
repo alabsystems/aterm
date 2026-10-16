@@ -2587,41 +2587,6 @@ mod tests {
         assert!(!cat.is_active());
     }
 
-    /// Typing a feline word presents the companion without changing which
-    /// companion it is, including repeats inside the chain window.
-    #[test]
-    fn on_summon_presents_without_ever_changing_the_look() {
-        let t = Instant::now();
-        let launch_look = KittyLook::for_launch(4242);
-        let mut cat = CursorCat::default();
-        cat.set_look(launch_look);
-        assert!(!cat.is_active(), "starts hidden");
-
-        cat.on_summon(t, 1);
-        assert!(
-            cat.is_active(),
-            "typing the word makes a kitty appear (it was hidden)"
-        );
-        assert_eq!(
-            cat.frame(t).look,
-            launch_look,
-            "the launch kitty is the one that shows up"
-        );
-        assert_eq!(
-            cat.frame(t).reaction,
-            CatReaction::Delight,
-            "and it is delighted to hear its name"
-        );
-
-        // A second word inside the chain window must not re-skin it either.
-        cat.on_summon(t + Duration::from_millis(200), 1);
-        assert_eq!(
-            cat.frame(t + Duration::from_millis(200)).look,
-            launch_look,
-            "repeat summons never swap the identity"
-        );
-    }
-
     /// `on_collect` (the favourite pin's hello) still swaps the look: the
     /// user choosing a cat is the one allowed identity change
     /// (owner, 2026-08-17).

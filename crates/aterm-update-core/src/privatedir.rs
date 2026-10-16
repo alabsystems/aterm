@@ -3,11 +3,10 @@
 
 //! Creating and hardening a per-user private directory under Application Support.
 //!
-//! Mirrors `aterm-gui`'s `control_auth::ensure_private_dir`, reusing the *same*
-//! ownership predicate ([`aterm_types::fs_restricted::dir_safe_for_private_write`])
-//! so the two cannot drift on what "private" means: owned by us, mode `0700`, never
-//! group/other-writable. Fail closed — a foreign-owned or shared directory is
-//! refused rather than written into.
+//! Shares the ownership predicate ([`aterm_types::fs_restricted::dir_safe_for_private_write`])
+//! with `aterm-gui`'s control-socket hardening, so the two cannot drift on what private means:
+//! owned by us, mode `0700`, never group/other-writable. A foreign-owned or shared directory
+//! is refused rather than written into.
 
 use std::io;
 #[cfg(unix)]
@@ -21,20 +20,16 @@ fn our_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
-/// Create `dir` (and parents), force mode `0700`, then verify it is owned by us
-/// and not group/other-writable — refusing a foreign-owned or shared directory
-/// (fail closed) exactly as `control_auth::ensure_private_dir` does.
+/// Create `dir` (and parents), force mode `0700`, then verify it is owned by us and not
+/// group/other-writable, refusing a foreign-owned or shared directory.
 #[cfg(unix)]
-// Skip: set_permissions/format on the 0700 support dir — hardened
-// permission_change class; creation-time mode + owner check are exactly
-// what this fn enforces (the update-atpkg private-dir hardening). The
-// capability-contract lane will replace this with dirfd-relative proofs.
+// Skip: set_permissions/format on the 0700 dir; the mode and owner checks are what this fn
+// enforces.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
-    // Refuse a symlink at the target BEFORE touching it: create_dir_all/set_permissions
-    // follow a link, so a same-user process that pre-created `Updates` as a symlink to
-    // (say) ~/Documents could otherwise capture our chmod, our writes, and — worse —
-    // `Staging::clear()`'s recursive delete. lstat and fail closed (F16).
+    // Refuse a symlink before touching the target: create_dir_all and set_permissions follow
+    // it, so a link pre-created by a same-user process would capture our chmod, our writes and
+    // the updater's recursive deletes.
     if let Ok(md) = std::fs::symlink_metadata(dir)
         && md.file_type().is_symlink()
     {
@@ -44,17 +39,13 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
         ));
     }
     std::fs::create_dir_all(dir)?;
-    // Only a mode that is not already `0700` is written. A `chmod(2)` to the mode a
-    // directory already has still moves its `st_ctime` (measured on APFS, 2026-09-15), and
-    // tippy snapshots the ctime of every ancestor of the executable it runs: re-hardening an
-    // unchanged atpkg prefix on each store-lock acquisition aborted every tippy running from
-    // the store with "ancestor … changed identity or contents" at each `repair` and `gc`.
-    // The lstat below still proves the final mode, whichever branch ran.
+    // Write the mode only when it differs: a same-mode `chmod(2)` still moves `st_ctime` on
+    // APFS, and tippy refuses to run when an ancestor of its executable changed identity, so
+    // re-hardening the atpkg prefix on every store-lock acquisition broke tippy from the store.
     if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.mode() & 0o7777 == 0o700) {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    // Re-check with lstat (NOT metadata, which would follow a link swapped in after
-    // creation): the final component must be a real, we-owned, non-shared directory.
+    // lstat, not metadata, which would follow a link swapped in after creation.
     let meta = std::fs::symlink_metadata(dir)?;
     if !meta.file_type().is_dir() {
         return Err(io::Error::new(
@@ -79,24 +70,16 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Windows variant: create the directory and verify the final component is a
-/// real directory (the symlink refusal is kept — `symlink_metadata` works here
-/// too). Per-user `%LOCALAPPDATA%` ACLs are the confidentiality boundary; POSIX
-/// mode/owner semantics are not applicable, so the uid/`0700` hardening above
-/// has no analogue. (The updater is inert on Windows; this is compile-only
-/// honesty, not a claim of parity.)
+/// Windows variant: create the directory and refuse a final component that is not a real
+/// directory. Per-user `%LOCALAPPDATA%` ACLs are the confidentiality boundary; there is no
+/// uid/`0700` analogue.
 #[cfg(windows)]
-// Skip: set_permissions/format on the 0700 support dir — hardened
-// permission_change class; creation-time mode + owner check are exactly
-// what this fn enforces (the update-atpkg private-dir hardening). The
-// capability-contract lane will replace this with dirfd-relative proofs.
+// Skip: format over the refusal messages; the reparse-point checks are what this fn enforces.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
-    // Refuse a reparse point at the target BEFORE touching it, mirroring the unix
-    // fail-closed shape (F16): a pre-created link must not capture our writes. This must
-    // reject a directory JUNCTION as well as a symlink — a junction needs no admin and
-    // reports `is_symlink() == false` (it carries IO_REPARSE_TAG_MOUNT_POINT), so a
-    // symlink-only check lets an attacker-pre-created junction redirect our shim/link writes.
+    // Refuse a reparse point before touching the target. A junction needs no admin and
+    // reports `is_symlink() == false`, so a symlink-only check would let a pre-created one
+    // redirect our writes.
     if let Ok(md) = std::fs::symlink_metadata(dir)
         && is_reparse_point(&md)
     {
@@ -110,8 +93,7 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     }
     std::fs::create_dir_all(dir)?;
     let meta = std::fs::symlink_metadata(dir)?;
-    // Re-check after create_dir_all closes a TOCTOU where a junction is swapped in between
-    // the pre-check and here: the final component must be a real directory, not a reparse point.
+    // Re-check after create_dir_all: a junction swapped in since the pre-check is refused.
     if !meta.file_type().is_dir() || is_reparse_point(&meta) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -124,8 +106,8 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether `md` (from `symlink_metadata`) is any reparse point — a symlink OR a directory
-/// junction. `FILE_ATTRIBUTE_REPARSE_POINT` (0x400) catches both, unlike `is_symlink()`.
+/// Whether `md` (from `symlink_metadata`) is a symlink or a directory junction:
+/// `FILE_ATTRIBUTE_REPARSE_POINT` catches both, unlike `is_symlink()`.
 #[cfg(windows)]
 fn is_reparse_point(md: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -137,10 +119,8 @@ fn is_reparse_point(md: &std::fs::Metadata) -> bool {
 mod tests {
     use super::*;
 
-    /// A directory already `0700` and ours is left EXACTLY alone — no `chmod(2)`, so its
-    /// `st_ctime` does not move (a same-mode chmod moves it on APFS, and tippy reads the
-    /// ctime of every ancestor of the executable it runs; measured 2026-09-15) — while a
-    /// mode that drifted is still forced back to `0700`, and a symlink is still refused.
+    /// A private directory is left alone (its `st_ctime` does not move), a drifted mode is
+    /// forced back to `0700`, and a symlink is refused.
     #[test]
     fn an_already_private_dir_is_not_rewritten_and_a_drifted_one_is_hardened() {
         let dir = std::env::temp_dir().join(format!("atuc-privatedir-{}", std::process::id()));

@@ -44,8 +44,7 @@ mod test_support;
 #[cfg(test)]
 mod write_test_helpers;
 
-// Re-export crate types visible to all grid submodules so moved files
-// can use `super::X` paths for frequently-used types.
+// Crate types re-exported so grid submodules can use `super::X`.
 pub(in crate::grid) use crate::GenerationTracker;
 pub(in crate::grid) use crate::row_u16;
 pub(in crate::grid) use crate::{Cell, CellFlags, PackedColor, PackedColors};
@@ -55,7 +54,7 @@ pub(in crate::grid) use crate::{HorizontalMargins, PAGE_SIZE, PageStore, ScrollR
 pub(in crate::grid) use crate::{LineSize, Row};
 
 // Test counter re-exports so grid submodules can use `super::count_*`.
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 pub(in crate::grid) use crate::test_counters::{
     count_reflow_passthrough_lines, count_reflow_row_op, count_ring_fast_materialize,
     count_row_to_line_cell, count_row_to_line_op, count_rows_only_resize_migrated_rows,

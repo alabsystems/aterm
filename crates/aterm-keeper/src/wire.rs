@@ -1,24 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE AKP1 WIRE (`docs/DESIGN-pty-keeper-2026-09-26.md` §5.2): fixed 8-byte
-//! headers read before any variable byte, bounded bodies, at most one
-//! descriptor per frame riding the header.
+//! The AKP1 wire (`docs/DESIGN-pty-keeper-2026-09-26.md` §5.2): fixed 8-byte headers read
+//! before any variable byte, bounded bodies, at most one descriptor per frame riding the header.
 //!
 //! ```text
 //! header  "AKP1" | kind u8 | flags u8 | body length u16be
 //! body    kind-specific, fixed fields first, every variable part length-first
 //! ```
 //!
-//! GROWTH RULE (LAW L3 of the seamless handoff): a frame may only grow. A
-//! reader takes the fields it knows from the front of a body and ignores the
-//! rest, so a newer writer's longer frame is read by an older reader, and a
-//! body SHORTER than its kind's fixed fields is refused. Kinds are never
-//! renumbered; an unknown kind is refused by name, never guessed at.
+//! The growth rule: a frame may only grow. A reader takes the fields it knows from the front of a
+//! body and ignores the rest, so an older reader reads a newer writer's longer frame, and a body
+//! shorter than its kind's fixed fields is refused. Kinds are never renumbered; an unknown kind
+//! is refused by name.
 //!
-//! This module is pure bytes: no socket, no descriptor. The descriptor a
-//! REGISTER or an OFFER carries travels beside the header (`fdpass`), and the
-//! codec only says which kinds may carry one ([`Kind::carries_fd`]).
+//! This module is pure bytes. The descriptor a REGISTER or an OFFER carries travels beside the
+//! header (`fdpass`); the codec only says which kinds may carry one ([`Kind::carries_fd`]).
 
 use crate::identity::IdentityPolicy;
 
@@ -28,7 +25,8 @@ pub const MAGIC: [u8; 4] = *b"AKP1";
 pub const HEADER_LEN: usize = 8;
 /// The protocol version this build speaks (in HELLO and WELCOME).
 pub const PROTO: u16 = 1;
-/// The largest opaque tag a record may carry (sid, identity label, topics…).
+/// The largest opaque tag a record may carry (sid, owner, identity label,
+/// channel flags…), fixed at REGISTER: what changes after it rides META.
 pub const MAX_TAG: usize = 1024;
 /// The largest opaque META (the Repaint rung's scalar state).
 pub const MAX_META: usize = 4096;
@@ -48,9 +46,8 @@ pub const FLAG_FD: u8 = 0x01;
 /// HELLO capability bit: this peer sends BYE on its quit path (§5.4 row 2). A
 /// peer without it is judged as a pre-keeper build (row 3) when it ends.
 pub const CAP_SENDS_BYE: u8 = 0x01;
-/// HELLO capability bit: this is a window's LINK (re)connecting to register
-/// what it holds — not a launch. It is offered nothing and does not reset the
-/// relaunch brake; a window's boot HELLO, which does take offers, omits it.
+/// HELLO capability bit: a window's link (re)connecting to register what it holds, not a launch.
+/// It is offered nothing and does not reset the relaunch brake; the boot HELLO omits it.
 pub const CAP_LINK: u8 = 0x02;
 
 /// The frame kinds. Numbers are the wire's and never change.
@@ -76,7 +73,7 @@ pub enum Kind {
     Orphans = 9,
     /// Either way: an empty request, or the keeper's text reply.
     Status = 10,
-    /// W→K: an updated window asks an older keeper to restart when safe (P5).
+    /// W→K: an updated window asks an older keeper to restart when safe (the keeper ignores it).
     RestartWhenSafe = 11,
     /// W→K: offer me the orphans now (a live sibling answering ORPHANS).
     Adopt = 12,
@@ -198,8 +195,8 @@ pub struct Birth {
     pub micros: u32,
 }
 
-/// A registered master's FIXED header: the fields the keeper reads. Everything
-/// else about a session rides the opaque tag and META, which it never decodes.
+/// A registered master's fixed header: the fields the keeper reads. Everything else about a
+/// session rides the opaque tag and META, which it never decodes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MasterHeader {
     /// The master's `st_rdev`: its identity across processes (F10).
@@ -215,15 +212,13 @@ pub struct MasterHeader {
 /// The encoded size of a [`MasterHeader`].
 pub const MASTER_HEADER_LEN: usize = 8 + 4 + 8 + 4 + 8;
 
-/// WHERE A WINDOW'S CRASH MARKER IS (§5.4 row 3's cross-check): the window's
-/// log directory and the start its marker is named with. The keeper never takes
-/// a file name from the window: it builds
-/// `crash-marker-<pid>-<nanos>-<app|other>.log` itself, with the pid the KERNEL
-/// named for the connection, so a HELLO can point the keeper at no file but
-/// that window's own marker. The window holds the marker's owner lock for its
-/// whole life and its exit path unlinks it (`aterm-gui`'s `crash_signal`), so
-/// after the window's death the marker's absence says its exit path ran, and a
-/// marker whose lock is free says it did not.
+/// Where a window's crash marker is (§5.4 row 3's cross-check): its log directory and the start
+/// its marker is named with. The keeper takes no file name from the window: it builds
+/// `crash-marker-<pid>-<nanos>-<app|other>.log` with the pid the kernel named for the
+/// connection, so a HELLO can point it at no file but that window's own marker. The window holds
+/// the marker's owner lock for its life and its exit path unlinks it (`aterm-gui`'s
+/// `crash_signal`), so after its death a missing marker says the exit path ran, and a marker
+/// whose lock is free says it did not.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarkerRef {
     /// The window's start, nanoseconds since the epoch, as its marker's name
@@ -285,12 +280,10 @@ pub enum Frame {
         proto: u16,
         offers: u16,
         version: String,
-        /// The identity the keeper requires of its peers (grown after 0.101:
-        /// an older keeper's WELCOME ends before it, and is `None`, as is a
-        /// policy byte this build does not know). A window that checks code
-        /// registers nothing with a keeper that does not state `Designated`
-        /// (§5.7): a keeper at the same-uid floor offers a crashed window's
-        /// masters to any same-uid process.
+        /// The identity the keeper requires of its peers; `None` when an older keeper's WELCOME
+        /// ends before it or the byte is unknown. A window that checks code registers nothing
+        /// with a keeper that does not state `Designated` (§5.7): a keeper at the same-uid floor
+        /// offers a crashed window's masters to any same-uid process.
         identity: Option<IdentityPolicy>,
     },
     Register {

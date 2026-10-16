@@ -6,7 +6,7 @@
 
 use super::super::*;
 
-// Performance Tests (O(n * cols) verification)
+// Op-count scaling (O(n * cols)).
 
 /// scroll_up captures cells into `DeferredLine`s without `row_to_line`
 /// conversion; draining scrollback materializes them in linear ops.
@@ -72,7 +72,7 @@ fn scroll_up_linear_time() {
     );
 }
 
-/// Verify reflow scales linearly with the number of rows.
+/// Reflow scales linearly with the number of rows.
 #[test]
 fn reflow_linear_time() {
     fn build_wrapped_grid(rows: u16, cols: u16) -> Grid {
@@ -121,7 +121,7 @@ fn reflow_linear_time() {
     );
 }
 
-/// Verify reflow scales linearly with column count.
+/// Reflow scales linearly with column count.
 #[test]
 fn reflow_linear_time_columns() {
     fn build_filled_grid(rows: u16, cols: u16) -> Grid {
@@ -200,7 +200,6 @@ fn scroll_up_handles_many_rows() {
         }
         let scroll_ops = take_row_to_line_ops();
 
-        // Drain lazy buffer to trigger materialization.
         grid.drain_lazy_buffer();
         let drain_ops = take_row_to_line_ops();
 
@@ -210,7 +209,6 @@ fn scroll_up_handles_many_rows() {
     let (small_scroll, small_drain) = measure_scroll_and_drain(25);
     let (large_scroll, large_drain) = measure_scroll_and_drain(125);
 
-    // Lazy promotion: zero ops at scroll time.
     assert_eq!(
         small_scroll, 0,
         "scroll_up(1) x 25 should defer row_to_line (lazy promotion), got {small_scroll} ops"
@@ -220,7 +218,6 @@ fn scroll_up_handles_many_rows() {
         "scroll_up(1) x 125 should defer row_to_line (lazy promotion), got {large_scroll} ops"
     );
 
-    // Materialization ops scale linearly.
     assert!(
         small_drain > 0,
         "drain after 25 scrolls should perform row_to_line ops, got 0"
@@ -237,7 +234,7 @@ fn scroll_up_handles_many_rows() {
     );
 }
 
-/// Verify row_to_line conversion is O(cols).
+/// row_to_line conversion is O(cols).
 #[test]
 fn row_to_line_linear_in_columns() {
     fn measure_row_to_line_cells(cols: u16) -> usize {
@@ -307,7 +304,6 @@ fn scroll_single_line_constant_time() {
         grid.scroll_up(1);
         let scroll_ops = take_row_to_line_ops();
 
-        // Drain lazy buffer to trigger materialization.
         grid.drain_lazy_buffer();
         let drain_ops = take_row_to_line_ops();
 
@@ -337,15 +333,14 @@ fn scroll_single_line_constant_time() {
         "drain after scroll_up(1) on 1000-row grid should perform row_to_line ops, got 0"
     );
 
-    // Single-line materialization should be O(1) w.r.t. grid size — same cost
-    // regardless of whether grid has 100 or 1000 rows.
+    // One line's materialization costs the same at 100 or 1000 rows.
     assert!(
         large_drain <= small_drain * 2,
         "Single-line drain should be O(1): 100-row grid {small_drain} ops, 1000-row grid {large_drain} ops (10x grid size should not increase ops)"
     );
 }
 
-/// Verify row_to_line_with_hyperlinks extracts hyperlink spans correctly.
+/// row_to_line_with_hyperlinks extracts hyperlink spans.
 #[test]
 fn row_to_line_extracts_hyperlinks() {
     use std::sync::Arc;
@@ -414,7 +409,7 @@ fn row_to_line_extracts_hyperlinks() {
     );
 }
 
-/// Verify row_to_line_with_hyperlinks handles empty rows without hyperlinks.
+/// row_to_line_with_hyperlinks on a row without hyperlinks.
 #[test]
 fn row_to_line_no_hyperlinks() {
     let mut grid = Grid::new(1, 10);

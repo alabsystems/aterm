@@ -39,20 +39,26 @@
 //! For a new or changed bounded state machine:
 //!
 //! 1. **Model** it with `ty_model!` (operators `+ - > <= == && ||`, `if`/`else`;
-//!    name a single action `Step`/`Push`/`Emit`, never `Append`). Register it in
-//!    `xref::model_registry()` and give each invariant a `Buggy` branch that
-//!    breaks it: `tests/non_vacuity_ratchet.rs` sweeps only registered models, and
-//!    a `refines` anchor resolves only a registered machine.
+//!    name a single action `Step`/`Push`/`Emit`, never `Append`). Writing it
+//!    registers it (`xref::model_registry()`; a hand-built `Model` takes
+//!    `#[aterm_spec::model]`). Give each `invariant` a `Buggy` branch that
+//!    breaks it (`tests/non_vacuity.rs` sweeps every registered model); state
+//!    the explored box as `bound`s, ranges over one variable each. A claim no
+//!    mutant breaks yet is `uncaught`: debt, counted by `spec-check models`.
+//!    A configuration the real code also runs under (an owner's cap, a
+//!    handoff) is a `scenario`, swept beside the committed one.
+//!    `spec-check` (`aterm_spec::check`) holds the registry to `ty`.
 //! 2. **Tier 0**: `verify::prove_and_catch_scalar(&m, "label")` or
 //!    `verify::check_model_tiered(&m, "label")` in `tests/derived_*.rs`.
-//!    `Err(NotRun)` is reported, never counted a pass.
+//!    `Err(NotRun)` (a function-valued model outside a checker run) is never
+//!    a pass: `spec-check models` holds those under `ty`.
 //! 3. **Tier 1**: in the crate's `tests/conformance_*.rs`, drive the real code,
 //!    project its state onto the model and check real transitions against it,
 //!    with a negative control. Anchor the real fns with
 //!    `#[cfg_attr(any(test, feature = "spec-anchors"), aterm_spec::refines(…))]`.
 //! 4. **Progress** (it lands, drains, answers): state a `derive::Liveness` with
-//!    named fairness, register it in `xref::liveness_registry`, and discharge it
-//!    with `verify::liveness_proves_and_catches_tiered`; copy
+//!    named fairness, register it with `#[aterm_spec::liveness(its_model)]`, and
+//!    discharge it with `verify::liveness_proves_and_catches_tiered`; copy
 //!    `native_update_apply_ladder_liveness`.
 //!
 //! Models to copy: `ring_model`, `subscribe_model`, `cursor_model`
@@ -431,6 +437,24 @@ pub struct Action {
 pub struct Invariant {
     pub name: &'static str,
     pub expr: Expr,
+    /// What it states, which decides what the non-vacuity sweep asks of it.
+    pub kind: InvariantKind,
+}
+
+/// What an invariant states. `ty_model!` spells each with its own keyword.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvariantKind {
+    /// `invariant`: a design claim, which some mutant of the model must break
+    /// or it asserts nothing (`verify::sweep_faults`).
+    Claim,
+    /// `bound`: the box the checkers walk, which no mutant is expected to
+    /// break. It must be a range over one variable ([`Model::malformed_bounds`]),
+    /// so a design claim cannot pass as one.
+    Bound,
+    /// `uncaught`: a design claim no mutant breaks yet. It is proved and, at
+    /// Tier 1, checked on real states, but nothing shows it can fail;
+    /// `spec-check models` counts them so the debt stays in view.
+    Uncaught,
 }
 
 /// A named LIVENESS obligation over a derived [`Model`]: `[]<>goal` — on every
@@ -446,9 +470,10 @@ pub struct Invariant {
 /// Why a companion value rather than a [`Model`] field: a model is one
 /// literal written in more than a hundred places, and a liveness obligation is
 /// rare and always hand-stated (its fairness is an assumption someone must own).
-/// It is registered with its model in `xref::liveness_registry`, which is how the
-/// workspace sweep finds it. [`crate::interp::nonprogress_under`] discharges it
-/// in-process; [`Liveness::to_tla`] / [`Liveness::to_cfg_with`] emit the same
+/// `#[liveness(model_fn)]` on its constructor registers it with its model in
+/// `xref::liveness_registry` (the model joins the model registry too), which is
+/// how the workspace sweep finds it. [`crate::interp::nonprogress_under`]
+/// discharges it in-process; [`Liveness::to_tla`] / [`Liveness::to_cfg_with`] emit the same
 /// property for `ty`, which checks `PROPERTY` formulas under the spec's declared
 /// `WF_vars` / `SF_vars` fairness.
 #[derive(Debug, Clone)]
@@ -994,155 +1019,458 @@ impl Model {
     pub fn check_invariant_in(&self, inv: &Invariant, env: &BTreeMap<&'static str, i64>) -> bool {
         inv.expr.eval(env).as_bool()
     }
+
+    /// The `Buggy` values the model's mutants are written for: 1 for a model
+    /// that declares the dial, and every other literal it is compared with
+    /// (`Buggy == 3`). Each dial is a defect the model was written to catch.
+    // Skip: a recursive walk into a BTreeSet. Spec tooling.
+    #[cfg_attr(trust_verify, trust::skip)]
+    #[must_use]
+    pub fn mutant_dials(&self) -> Vec<i64> {
+        fn walk(e: &Expr, out: &mut std::collections::BTreeSet<i64>) {
+            match e {
+                Expr::Eq(a, b) | Expr::Neq(a, b) => match (&**a, &**b) {
+                    (Expr::ConstRef("Buggy"), Expr::Int(k))
+                    | (Expr::Int(k), Expr::ConstRef("Buggy")) => {
+                        out.insert(*k);
+                    }
+                    _ => {
+                        walk(a, out);
+                        walk(b, out);
+                    }
+                },
+                Expr::ConstRef("Buggy") => {
+                    out.insert(1);
+                }
+                Expr::Int(_) | Expr::Var(_) | Expr::ConstRef(_) | Expr::Bool(_) => {}
+                Expr::Add(a, b)
+                | Expr::Sub(a, b)
+                | Expr::Gt(a, b)
+                | Expr::Le(a, b)
+                | Expr::Or(a, b)
+                | Expr::And(a, b)
+                | Expr::Iff(a, b)
+                | Expr::InRange(a, b)
+                | Expr::Except(_, a, b) => {
+                    walk(a, out);
+                    walk(b, out);
+                }
+                Expr::If(a, b, c) | Expr::Forall(_, a, b, c) | Expr::Comprehension(_, a, b, c) => {
+                    walk(a, out);
+                    walk(b, out);
+                    walk(c, out);
+                }
+                Expr::FnAccess(_, a) => walk(a, out),
+            }
+        }
+        let mut out = std::collections::BTreeSet::new();
+        if self.consts.iter().any(|(name, _)| *name == "Buggy") {
+            out.insert(1);
+        }
+        for action in &self.actions {
+            if let Some(guard) = &action.guard {
+                walk(guard, &mut out);
+            }
+            for update in &action.updates {
+                walk(&update.expr, &mut out);
+            }
+        }
+        for invariant in &self.invariants {
+            walk(&invariant.expr, &mut out);
+        }
+        out.into_iter().filter(|dial| *dial > 0).collect()
+    }
+
+    /// Whether the model has function-valued state, which only `ty` can
+    /// check: the in-process interpreter evaluates scalar models alone.
+    #[must_use]
+    pub fn is_function_valued(&self) -> bool {
+        !self.fn_vars.is_empty()
+    }
+
+    /// Why each declared bound is not a range, one line per fault: a bound
+    /// is a conjunction of atoms comparing ONE state variable (`<=`, `>`)
+    /// with literals and constants, leaving each variable it bounds more than
+    /// one value. A relation between variables, a pin (`x <= 0`) or a bound
+    /// over the `Buggy` dial is a design claim and needs its own mutant.
+    // Skip: BTreeMap/String building over the model's bounds. Spec tooling.
+    #[cfg_attr(trust_verify, trust::skip)]
+    #[must_use]
+    pub fn malformed_bounds(&self) -> Vec<String> {
+        self.invariants
+            .iter()
+            .filter(|inv| inv.kind == InvariantKind::Bound)
+            .flat_map(|inv| {
+                not_range_bounds(&inv.expr, &self.consts)
+                    .into_iter()
+                    .map(move |why| format!("{}::{}: {why}", self.name, inv.name))
+            })
+            .collect()
+    }
+}
+
+/// The value of `e` under `consts`, or `None` when it mentions a state
+/// variable. `Buggy` is not a constant here: it is the mutant dial, and a bound
+/// over it (`x <= Buggy`) pins the variable at the committed config.
+fn constant_value(e: &Expr, consts: &[(&str, i64)]) -> Option<i64> {
+    match e {
+        Expr::Int(n) => Some(*n),
+        Expr::ConstRef(name) if *name != "Buggy" => consts
+            .iter()
+            .find_map(|&(constant, value)| (constant == *name).then_some(value)),
+        Expr::Add(a, b) => Some(constant_value(a, consts)? + constant_value(b, consts)?),
+        Expr::Sub(a, b) => Some(constant_value(a, consts)? - constant_value(b, consts)?),
+        _ => None,
+    }
+}
+
+/// A range atom: ONE state variable compared with a constant expression,
+/// either way round, as `(variable, lowest allowed, highest allowed)`.
+fn range_atom(
+    e: &Expr,
+    consts: &[(&str, i64)],
+) -> Option<(&'static str, Option<i64>, Option<i64>)> {
+    let k = |e: &Expr| constant_value(e, consts);
+    match e {
+        Expr::Le(a, b) => match (&**a, &**b) {
+            (Expr::Var(x), bound) => Some((*x, None, Some(k(bound)?))),
+            (bound, Expr::Var(x)) => Some((*x, Some(k(bound)?), None)),
+            _ => None,
+        },
+        Expr::Gt(a, b) => match (&**a, &**b) {
+            (Expr::Var(x), bound) => Some((*x, Some(k(bound)? + 1), None)),
+            (bound, Expr::Var(x)) => Some((*x, None, Some(k(bound)? - 1))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Why `e` is not a range bound: each conjunct that is not a range atom, and
+/// each variable its atoms pin to one value or none. Model variables count up
+/// from zero, so an upper bound of zero, or a lower bound meeting the upper,
+/// says "this never moves": a claim about the design, not the extent of the
+/// space.
+// Skip: BTreeMap/String building. Spec tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn not_range_bounds(e: &Expr, consts: &[(&str, i64)]) -> Vec<String> {
+    fn conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match e {
+            Expr::And(a, b) => {
+                conjuncts(a, out);
+                conjuncts(b, out);
+            }
+            atom => out.push(atom),
+        }
+    }
+    let mut atoms = Vec::new();
+    conjuncts(e, &mut atoms);
+    let mut bad = Vec::new();
+    let mut extent: BTreeMap<&str, (i64, Option<i64>)> = BTreeMap::new();
+    for atom in atoms {
+        let Some((x, low, high)) = range_atom(atom, consts) else {
+            bad.push(format!("`{}` is not a range atom", atom.to_tla()));
+            continue;
+        };
+        let (lo, hi) = extent.entry(x).or_insert((0, None));
+        *lo = (*lo).max(low.unwrap_or(0));
+        *hi = match (*hi, high) {
+            (Some(h), Some(n)) => Some(h.min(n)),
+            (h, n) => h.or(n),
+        };
+    }
+    for (x, (lo, hi)) in extent {
+        if let Some(hi) = hi
+            && hi <= lo
+        {
+            bad.push(format!("`{x}` is pinned to {lo}..={hi}"));
+        }
+    }
+    bad
 }
 
 // ---- The model catalog: the *_model() data constructors, split by family ----
-// The `pub use` re-exports keep every `crate::derive::*_model` path (and the
-// xref registry) flat.
+// The `pub use` re-exports keep every `crate::derive::*_model` path flat.
+#[cfg(feature = "anchors")]
 mod models_agent_verdict;
+#[cfg(feature = "anchors")]
 mod models_atpkg_contention_release;
+#[cfg(feature = "anchors")]
 mod models_atpkg_flip_quiet;
+#[cfg(feature = "anchors")]
 mod models_atpkg_full_pass;
+#[cfg(feature = "anchors")]
 mod models_atpkg_head_watch_hosts;
+#[cfg(feature = "anchors")]
 mod models_atpkg_index_probe;
+#[cfg(feature = "anchors")]
 mod models_atpkg_index_publish;
+#[cfg(feature = "anchors")]
 mod models_atpkg_pass_stamps;
+#[cfg(feature = "anchors")]
 mod models_atpkg_pending_wait;
+#[cfg(feature = "anchors")]
 mod models_atpkg_published_spacing;
+#[cfg(feature = "anchors")]
 mod models_atpkg_session_index;
+#[cfg(feature = "anchors")]
 mod models_atpkg_session_index_retry;
+#[cfg(feature = "anchors")]
 mod models_atpkg_vendor_pending;
+#[cfg(feature = "anchors")]
 mod models_broadcast_checkpoint;
+#[cfg(feature = "anchors")]
 mod models_broadcast_head;
+#[cfg(feature = "anchors")]
 mod models_chrome_regrow;
+#[cfg(feature = "anchors")]
 mod models_consent;
+#[cfg(feature = "anchors")]
 mod models_console_life;
+#[cfg(feature = "anchors")]
 mod models_control_bind_retry;
+#[cfg(feature = "anchors")]
 mod models_control_preparation;
+#[cfg(feature = "anchors")]
 mod models_core;
+#[cfg(feature = "anchors")]
 mod models_crash_journal;
+#[cfg(feature = "anchors")]
 mod models_desktop_alert_debt;
+#[cfg(feature = "anchors")]
 mod models_driver_geometry;
+#[cfg(feature = "anchors")]
 mod models_effects;
+#[cfg(feature = "anchors")]
 mod models_exceptions_digest;
+#[cfg(feature = "anchors")]
 mod models_exceptions_ends;
+#[cfg(feature = "anchors")]
 mod models_exceptions_once;
+#[cfg(feature = "anchors")]
 mod models_fabric_enable;
+#[cfg(feature = "anchors")]
 mod models_fabric_outbox_wake;
+#[cfg(feature = "anchors")]
 mod models_foreground_handback;
+#[cfg(feature = "anchors")]
 mod models_fx;
+#[cfg(feature = "anchors")]
 mod models_glyphs;
+#[cfg(feature = "anchors")]
 mod models_gui;
+#[cfg(feature = "anchors")]
 mod models_harness;
+#[cfg(feature = "anchors")]
 mod models_harness_goal;
+#[cfg(feature = "anchors")]
 mod models_harness_host;
+#[cfg(feature = "anchors")]
 mod models_harness_policy_writer;
+#[cfg(feature = "anchors")]
 mod models_harness_progress;
+#[cfg(feature = "anchors")]
 mod models_harness_state_collection;
+#[cfg(feature = "anchors")]
 mod models_input;
+#[cfg(feature = "anchors")]
 mod models_keeper;
+#[cfg(feature = "anchors")]
 mod models_lights;
+#[cfg(feature = "anchors")]
 mod models_main_stall_refusal;
+#[cfg(feature = "anchors")]
 mod models_misc;
+#[cfg(feature = "anchors")]
 mod models_native;
+#[cfg(feature = "anchors")]
 mod models_netprobe;
+#[cfg(feature = "anchors")]
 mod models_notify_follow;
+#[cfg(feature = "anchors")]
 mod models_operator;
+#[cfg(feature = "anchors")]
 mod models_output_retention;
+#[cfg(feature = "anchors")]
 mod models_paste_order;
+#[cfg(feature = "anchors")]
 mod models_pet_observation_admission;
+#[cfg(feature = "anchors")]
 mod models_program_queue;
+#[cfg(feature = "anchors")]
 mod models_program_resolution;
+#[cfg(feature = "anchors")]
 mod models_rainbow_composer_newline;
+#[cfg(feature = "anchors")]
 mod models_rainbow_continuity;
+#[cfg(feature = "anchors")]
 mod models_rainbow_short_wrap;
+#[cfg(feature = "anchors")]
 mod models_relaunch_prompt;
+#[cfg(feature = "anchors")]
 mod models_release;
+#[cfg(feature = "anchors")]
 mod models_release_publish_once;
+#[cfg(feature = "anchors")]
 mod models_render;
+#[cfg(feature = "anchors")]
 mod models_rendezvous_grant;
+#[cfg(feature = "anchors")]
 mod models_resize_render;
+#[cfg(feature = "anchors")]
 mod models_resize_row_reuse;
+#[cfg(feature = "anchors")]
 mod models_ribbon_follow;
+#[cfg(feature = "anchors")]
 mod models_ribbon_release_restoration;
+#[cfg(feature = "anchors")]
 mod models_ribbon_row_hold;
+#[cfg(feature = "anchors")]
 mod models_run_loop_waker;
+#[cfg(feature = "anchors")]
 mod models_same_caret_echo;
+#[cfg(feature = "anchors")]
 mod models_say_replay_budget;
+#[cfg(feature = "anchors")]
 mod models_screen_generation;
+#[cfg(feature = "anchors")]
 mod models_session;
+#[cfg(feature = "anchors")]
+mod models_session_log;
+#[cfg(feature = "anchors")]
 mod models_subscribe_announcement;
+#[cfg(feature = "anchors")]
 mod models_supervise;
+#[cfg(feature = "anchors")]
 mod models_supervise_accounts;
+#[cfg(feature = "anchors")]
 mod models_text_selection_lifecycle;
-mod models_title_summary;
+#[cfg(feature = "anchors")]
+mod models_tricks;
+#[cfg(feature = "anchors")]
 mod models_trust_facts;
+#[cfg(feature = "anchors")]
 mod models_typed_rekey;
+#[cfg(feature = "anchors")]
 mod models_update;
+#[cfg(feature = "anchors")]
 mod models_update_activation_observation;
+#[cfg(feature = "anchors")]
 mod models_update_carried_health;
+#[cfg(feature = "anchors")]
 mod models_update_check_coordination;
+#[cfg(feature = "anchors")]
 mod models_update_editor_carry;
+#[cfg(feature = "anchors")]
 mod models_update_environment_repair;
+#[cfg(feature = "anchors")]
 mod models_update_history_carry;
+#[cfg(feature = "anchors")]
 mod models_update_launched_dial_wait;
+#[cfg(feature = "anchors")]
 mod models_update_parallel_attach;
+#[cfg(feature = "anchors")]
 mod models_update_parent_diet;
+#[cfg(feature = "anchors")]
 mod models_update_precommit_input;
+#[cfg(feature = "anchors")]
 mod models_update_retired_intent;
+#[cfg(feature = "anchors")]
 mod models_update_roster_freshness;
+#[cfg(feature = "anchors")]
 mod models_update_settings_draft_carry;
+#[cfg(feature = "anchors")]
 mod models_update_successor_warm;
+#[cfg(feature = "anchors")]
 mod models_update_trial_give_back;
+#[cfg(feature = "anchors")]
 mod models_update_web_cache;
+#[cfg(feature = "anchors")]
 mod models_update_window_show;
 
+#[cfg(feature = "anchors")]
 pub use models_agent_verdict::claude_idle_at_composer_model;
+#[cfg(feature = "anchors")]
 pub use models_atpkg_contention_release::atpkg_contention_release_park_model;
+#[cfg(feature = "anchors")]
 pub use models_atpkg_flip_quiet::atpkg_flip_quiet_model;
+#[cfg(feature = "anchors")]
 pub use models_atpkg_full_pass::atpkg_full_pass_rule_model;
+#[cfg(feature = "anchors")]
 pub use models_atpkg_head_watch_hosts::atpkg_head_watch_hosts_model;
+#[cfg(feature = "anchors")]
 pub use models_atpkg_index_probe::{
     atpkg_index_pending_park_model, atpkg_index_probe_completion_cadence_model,
     atpkg_index_probe_cooldown_model, atpkg_index_shared_handoff_model,
     atpkg_index_successor_selection_model, atpkg_index_wake_highwater_model,
 };
+#[cfg(feature = "anchors")]
 pub use models_atpkg_index_publish::atpkg_index_publish_walk_model;
+#[cfg(feature = "anchors")]
 pub use models_atpkg_pass_stamps::atpkg_pass_stamps_model;
+#[cfg(feature = "anchors")]
 pub use models_atpkg_pending_wait::atpkg_pending_wait_model;
+#[cfg(feature = "anchors")]
 pub use models_atpkg_published_spacing::atpkg_published_spacing_model;
+#[cfg(feature = "anchors")]
 pub use models_atpkg_session_index::{
     atpkg_session_index_eligibility_model, atpkg_session_index_handoff_model,
 };
+#[cfg(feature = "anchors")]
 pub use models_atpkg_session_index_retry::atpkg_session_index_retry_model;
+#[cfg(feature = "anchors")]
 pub use models_atpkg_vendor_pending::atpkg_vendor_pending_check_model;
+#[cfg(feature = "anchors")]
 pub use models_broadcast_checkpoint::broadcast_cursor_checkpoint_model;
+#[cfg(feature = "anchors")]
 pub use models_broadcast_head::broadcast_head_subscription_model;
+#[cfg(feature = "anchors")]
 pub use models_chrome_regrow::{chrome_regrow_floor_liveness, chrome_regrow_floor_model};
+#[cfg(feature = "anchors")]
 pub use models_consent::{debugger_access_change_liveness, debugger_access_change_model};
+#[cfg(feature = "anchors")]
 pub use models_console_life::*;
+#[cfg(feature = "anchors")]
 pub use models_control_bind_retry::native_update_handoff_bind_retry_model;
+#[cfg(feature = "anchors")]
 pub use models_control_preparation::native_update_control_preparation_model;
+#[cfg(feature = "anchors")]
 pub use models_core::*;
+#[cfg(feature = "anchors")]
 pub use models_crash_journal::crash_journal_claim_model;
+#[cfg(feature = "anchors")]
 pub use models_desktop_alert_debt::desktop_alert_debt_model;
+#[cfg(feature = "anchors")]
 pub use models_driver_geometry::{driver_geometry_liveness, driver_geometry_model};
+#[cfg(feature = "anchors")]
 pub use models_effects::*;
+#[cfg(feature = "anchors")]
 pub use models_exceptions_digest::exceptions_digest_model;
+#[cfg(feature = "anchors")]
 pub use models_exceptions_ends::{exceptions_digest_ends_liveness, exceptions_digest_ends_model};
+#[cfg(feature = "anchors")]
 pub use models_exceptions_once::exceptions_once_model;
+#[cfg(feature = "anchors")]
 pub use models_fabric_enable::*;
+#[cfg(feature = "anchors")]
 pub use models_fabric_outbox_wake::{
     fabric_outbox_wake_model, fabric_reconnect_backoff_model, fabric_refill_retry_model,
 };
+#[cfg(feature = "anchors")]
 pub use models_foreground_handback::{
     foreground_handback_model, foreground_handback_ownership_model,
 };
+#[cfg(feature = "anchors")]
 pub use models_fx::*;
+#[cfg(feature = "anchors")]
 pub use models_glyphs::*;
+#[cfg(feature = "anchors")]
 pub use models_gui::*;
+#[cfg(feature = "anchors")]
 pub use models_harness::*;
+#[cfg(feature = "anchors")]
 pub use models_harness_goal::*;
+#[cfg(feature = "anchors")]
 pub use models_harness_host::{
     harness_codex_exit_witness_model, harness_commit_owed_model, harness_exit_record_model,
     harness_handoff_claim_model, harness_leave_model, harness_relaunch_on_exit_model,
@@ -1150,50 +1478,89 @@ pub use models_harness_host::{
     harness_restored_first_attempt_model, harness_upgrade_age_model, harness_upgrade_look_model,
     harness_worker_lifecycle_model,
 };
+#[cfg(feature = "anchors")]
 pub use models_harness_policy_writer::{
     harness_policy_one_writer_liveness, harness_policy_one_writer_model,
 };
+#[cfg(feature = "anchors")]
 pub use models_harness_progress::*;
+#[cfg(feature = "anchors")]
 pub use models_harness_state_collection::{
     harness_upgrade_state_collection_liveness, harness_upgrade_state_collection_model,
 };
+#[cfg(feature = "anchors")]
 pub use models_input::input_unread_gate_model;
+#[cfg(feature = "anchors")]
 pub use models_keeper::{
     keeper_death_judgement_model, keeper_relaunch_brake_model, pty_keeper_custody_model,
 };
+#[cfg(feature = "anchors")]
 pub use models_lights::*;
+#[cfg(feature = "anchors")]
 pub use models_main_stall_refusal::main_thread_stall_refusal_model;
+#[cfg(feature = "anchors")]
 pub use models_misc::*;
+#[cfg(feature = "anchors")]
 pub use models_native::*;
+#[cfg(feature = "anchors")]
 pub use models_netprobe::netprobe_shutdown_park_model;
+#[cfg(feature = "anchors")]
 pub use models_notify_follow::notify_follow_checkpoint_model;
+#[cfg(feature = "anchors")]
 pub use models_operator::*;
+#[cfg(feature = "anchors")]
 pub use models_output_retention::output_retention_model;
+#[cfg(feature = "anchors")]
 pub use models_paste_order::*;
+#[cfg(feature = "anchors")]
 pub use models_pet_observation_admission::*;
+#[cfg(feature = "anchors")]
 pub use models_program_queue::{
     claude_footer_model_model, claude_footer_watch_model, program_resolver_queue_model,
 };
+#[cfg(feature = "anchors")]
 pub use models_program_resolution::program_resolution_retry_model;
+#[cfg(feature = "anchors")]
 pub use models_rainbow_composer_newline::rainbow_composer_newline_gate_model;
+#[cfg(feature = "anchors")]
 pub use models_rainbow_continuity::*;
+#[cfg(feature = "anchors")]
 pub use models_rainbow_short_wrap::rainbow_short_wrap_park_model;
+#[cfg(feature = "anchors")]
 pub use models_relaunch_prompt::{relaunch_prompt_read_liveness, relaunch_prompt_read_model};
+#[cfg(feature = "anchors")]
 pub use models_release::*;
+#[cfg(feature = "anchors")]
 pub use models_release_publish_once::release_publish_once_model;
+#[cfg(feature = "anchors")]
 pub use models_render::*;
+#[cfg(feature = "anchors")]
 pub use models_rendezvous_grant::native_update_rendezvous_grant_model;
+#[cfg(feature = "anchors")]
 pub use models_resize_render::{repaint_nudge_liveness, repaint_nudge_model, resize_render_model};
+#[cfg(feature = "anchors")]
 pub use models_resize_row_reuse::resize_row_reuse_model;
+#[cfg(feature = "anchors")]
 pub use models_ribbon_follow::*;
+#[cfg(feature = "anchors")]
 pub use models_ribbon_release_restoration::*;
+#[cfg(feature = "anchors")]
 pub use models_ribbon_row_hold::*;
+#[cfg(feature = "anchors")]
 pub use models_run_loop_waker::run_loop_waker_model;
+#[cfg(feature = "anchors")]
 pub use models_same_caret_echo::*;
+#[cfg(feature = "anchors")]
 pub use models_say_replay_budget::say_replay_budget_model;
+#[cfg(feature = "anchors")]
 pub use models_screen_generation::observation_screen_generation_model;
+#[cfg(feature = "anchors")]
 pub use models_session::*;
+#[cfg(feature = "anchors")]
+pub use models_session_log::{session_log_ring_model, turn_tracker_model};
+#[cfg(feature = "anchors")]
 pub use models_subscribe_announcement::subscribe_announcement_order_model;
+#[cfg(feature = "anchors")]
 pub use models_supervise::{
     supervisor_box_ask_model, supervisor_break_offer_model, supervisor_claim_model,
     supervisor_codex_rate_nudge_liveness, supervisor_codex_rate_nudge_model,
@@ -1204,52 +1571,75 @@ pub use models_supervise::{
     supervisor_turn_end_model, supervisor_usage_wall_liveness, supervisor_usage_wall_model,
     upgrade_attended_turn_end_model, upgrade_refused_turn_end_model, upgrade_settle_turn_end_model,
 };
+#[cfg(feature = "anchors")]
 pub use models_supervise_accounts::{
     supervisor_account_rotation_liveness, supervisor_account_rotation_model,
     supervisor_limit_reset_claim_liveness, supervisor_limit_reset_confirmation_liveness,
     supervisor_limit_reset_model, supervisor_usage_probe_liveness, supervisor_usage_probe_model,
 };
+#[cfg(feature = "anchors")]
 pub use models_text_selection_lifecycle::text_selection_lifecycle_model;
-pub use models_title_summary::*;
+#[cfg(feature = "anchors")]
+pub use models_tricks::{trick_flash_lifecycle_model, trick_listener_purity_model};
+#[cfg(feature = "anchors")]
 pub use models_trust_facts::trust_facts_reuse_model;
+#[cfg(feature = "anchors")]
 pub use models_typed_rekey::typed_rekey_model;
+#[cfg(feature = "anchors")]
 pub use models_update::*;
+#[cfg(feature = "anchors")]
 pub use models_update_activation_observation::native_update_activation_observation_model;
+#[cfg(feature = "anchors")]
 pub use models_update_carried_health::native_update_carried_health_model;
+#[cfg(feature = "anchors")]
 pub use models_update_check_coordination::{
     native_update_boot_health_lock_model, native_update_check_join_model,
     native_update_check_receipt_model, native_update_check_wait_model,
     native_update_two_process_apply_model,
 };
+#[cfg(feature = "anchors")]
 pub use models_update_editor_carry::native_update_editor_carry_model;
+#[cfg(feature = "anchors")]
 pub use models_update_environment_repair::native_update_environment_repair_model;
+#[cfg(feature = "anchors")]
 pub use models_update_history_carry::native_update_history_carry_model;
+#[cfg(feature = "anchors")]
 pub use models_update_launched_dial_wait::{
     native_update_launched_dial_wait_liveness, native_update_launched_dial_wait_model,
 };
+#[cfg(feature = "anchors")]
 pub use models_update_parallel_attach::{
     native_update_successor_attach_liveness, native_update_successor_attach_model,
 };
+#[cfg(feature = "anchors")]
 pub use models_update_parent_diet::{
     native_update_speculative_sidecar_liveness, native_update_speculative_sidecar_model,
 };
+#[cfg(feature = "anchors")]
 pub use models_update_precommit_input::native_update_precommit_input_model;
+#[cfg(feature = "anchors")]
 pub use models_update_retired_intent::{
     native_update_failure_target_model, native_update_retired_intent_model,
 };
+#[cfg(feature = "anchors")]
 pub use models_update_roster_freshness::native_update_roster_freshness_model;
+#[cfg(feature = "anchors")]
 pub use models_update_settings_draft_carry::native_update_settings_draft_carry_model;
+#[cfg(feature = "anchors")]
 pub use models_update_successor_warm::{
     native_update_successor_warm_before_claim_liveness,
     native_update_successor_warm_before_claim_model,
 };
+#[cfg(feature = "anchors")]
 pub use models_update_trial_give_back::native_update_trial_give_back_model;
+#[cfg(feature = "anchors")]
 pub use models_update_web_cache::native_update_web_cache_model;
+#[cfg(feature = "anchors")]
 pub use models_update_window_show::native_update_window_show_model;
 
 /// Property-combinator generators: each returns a fully-formed, `Buggy`-gated
 /// [`Model`] (prove@Buggy=0, counterexample@Buggy=1) for a recurring property
-/// CLASS. A new property is a struct literal + one registry/harness line, not 50
+/// CLASS. A new property is a struct literal + a `#[model]` fn, not 50
 /// lines of `Expr` constructors. Every name (model / action / var / invariant) is
 /// threaded through, so the emitted TLA+ is whatever the author wants — six of the
 /// introspection models (M1 dispatch, M2 relay, S1 registry, the forward-handshake
@@ -1343,6 +1733,7 @@ pub mod props {
             ],
             invariants: vec![Invariant {
                 name: p.inv,
+                kind: InvariantKind::Claim,
                 expr: le(var(p.reg), var(p.live)),
             }],
         }
@@ -1411,6 +1802,7 @@ pub mod props {
             ],
             invariants: vec![Invariant {
                 name: p.inv,
+                kind: InvariantKind::Claim,
                 expr: or_(
                     eq(var(p.decided), int(0)),
                     or_(
@@ -1465,6 +1857,7 @@ pub mod props {
             ],
             invariants: vec![Invariant {
                 name: p.inv,
+                kind: InvariantKind::Claim,
                 expr: or_(eq(var(p.b), int(0)), eq(var(p.a), int(1))),
             }],
         }
@@ -1526,6 +1919,7 @@ pub mod props {
             }],
             invariants: vec![Invariant {
                 name: p.inv,
+                kind: InvariantKind::Claim,
                 expr: or_(eq(var(p.gate), int(0)), closed),
             }],
         }
@@ -1585,6 +1979,7 @@ pub mod props {
             ],
             invariants: vec![Invariant {
                 name: p.inv,
+                kind: InvariantKind::Claim,
                 expr: p.inv_expr,
             }],
         }
@@ -1661,8 +2056,11 @@ pub mod props {
                     updates: vec![],
                 },
             ],
+            // `waiting <= 1` bounds a flag; the design claim is the
+            // deadlock-freedom obligation the generator exists for.
             invariants: vec![Invariant {
                 name: p.inv,
+                kind: InvariantKind::Bound,
                 expr: le(var(p.waiting), int(1)),
             }],
         }
@@ -1748,8 +2146,308 @@ pub mod props {
             ],
             invariants: vec![Invariant {
                 name: p.inv,
+                kind: InvariantKind::Claim,
                 expr: or_(neq(var(p.decided), int(2)), all_hold),
             }],
+        }
+    }
+}
+
+/// GPU glyph atlas texture residency across shelf appends (`occupied_h' = occupied_h + 1`)
+/// and full repacks (`epoch' = epoch + 1`).
+///
+/// * At `Buggy = 0`, when `occupied_h > uploaded_h` within `tex_h`, syncing the
+///   atlas uploads the dirty row band `[uploaded_h .. occupied_h)` so
+///   `uploaded_h' = occupied_h` without re-minting the texture (`AtlasRowsSynchronized`
+///   holds at present). A dirty resident upload first waits for all outstanding
+///   frame readers; fresh textures and unchanged resident textures keep them.
+/// * At `Buggy = 1`, removing `map.len()` from the texture key without uploading
+///   the dirty row band skips the upload when `uploaded_h > 0`, leaving
+///   `uploaded_h < occupied_h` at present. The same branch omits the reader wait
+///   and records an upload conflict when a dirty resident texture has readers.
+#[must_use]
+#[cfg(feature = "anchors")]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn metal_atlas_residency_model() -> Model {
+    crate::ty_model! {
+        MetalAtlasResidency {
+            const MaxEpoch = 2;
+            const TexH = 3;
+            const MaxReaders = 3;
+            const Buggy = 0;
+
+            var epoch = 1;
+            var tex_h = 3;
+            var occupied_h = 1;
+            var uploaded_h = 1;
+            var presented = 0;
+            var readers = 0;
+            var upload_conflict = 0;
+
+            action AppendShelf when (occupied_h <= tex_h - 1) {
+                occupied_h = occupied_h + 1;
+                presented = 0;
+            }
+
+            action FullRepack when (epoch <= MaxEpoch - 1) {
+                epoch = epoch + 1;
+                occupied_h = 1;
+                uploaded_h = 0;
+                presented = 0;
+            }
+
+            action SubmitFrame when (presented == 1 && readers <= MaxReaders - 1) {
+                readers = readers + 1;
+            }
+
+            action GpuComplete when (readers > 0) {
+                readers = readers - 1;
+            }
+
+            action SyncAndPresent when (presented == 0) {
+                readers = if uploaded_h > 0 && occupied_h > uploaded_h {
+                    if Buggy == 1 { readers } else { 0 }
+                } else {
+                    readers
+                };
+                upload_conflict = if Buggy == 1
+                    && uploaded_h > 0 && occupied_h > uploaded_h && readers > 0
+                {
+                    1
+                } else {
+                    upload_conflict
+                };
+                uploaded_h = if uploaded_h == 0 {
+                    occupied_h
+                } else {
+                    if Buggy == 1 { uploaded_h } else { occupied_h }
+                };
+                presented = 1;
+            }
+
+            invariant AtlasRowsSynchronized:
+                presented == 0 || (uploaded_h == occupied_h && uploaded_h <= tex_h);
+
+            invariant NoAtlasUploadConflict:
+                upload_conflict == 0;
+        }
+    }
+}
+
+/// Three-slot GPU frame ring (`slot0_in_flight..slot2_in_flight`, `cursor` in `0..2`).
+///
+/// * At `Buggy = 0`, staging the next frame waits only if the target ring slot
+///   `cursor` is still in flight on the GPU, then marks `cursor` in flight and
+///   advances `cursor = (cursor + 1) % 3`, proving `NoOverwriteInFlight`.
+/// * At `Buggy = 1`, staging into `cursor` without awaiting that slot's prior
+///   GPU completion overwrites an in-flight buffer.
+#[must_use]
+#[cfg(feature = "anchors")]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn gpu_frame_ring_model() -> Model {
+    crate::ty_model! {
+        GpuFrameRing {
+            const Buggy = 0;
+
+            var slot0_in_flight = 0;
+            var slot1_in_flight = 0;
+            var slot2_in_flight = 0;
+            var cursor = 0;
+            var overwritten = 0;
+
+            action StageFrame when (
+                Buggy == 1
+                || (cursor == 0 && slot0_in_flight == 0)
+                || (cursor == 1 && slot1_in_flight == 0)
+                || (cursor == 2 && slot2_in_flight == 0)
+            ) {
+                overwritten = if (cursor == 0 && slot0_in_flight == 1)
+                    || (cursor == 1 && slot1_in_flight == 1)
+                    || (cursor == 2 && slot2_in_flight == 1)
+                {
+                    1
+                } else {
+                    overwritten
+                };
+                slot0_in_flight = if cursor == 0 { 1 } else { slot0_in_flight };
+                slot1_in_flight = if cursor == 1 { 1 } else { slot1_in_flight };
+                slot2_in_flight = if cursor == 2 { 1 } else { slot2_in_flight };
+                cursor = if cursor == 2 { 0 } else { cursor + 1 };
+            }
+
+            action GpuCompleteSlot0 when (slot0_in_flight == 1) {
+                slot0_in_flight = 0;
+            }
+
+            action GpuCompleteSlot1 when (slot1_in_flight == 1) {
+                slot1_in_flight = 0;
+            }
+
+            action GpuCompleteSlot2 when (slot2_in_flight == 1) {
+                slot2_in_flight = 0;
+            }
+
+            invariant NoOverwriteInFlight:
+                overwritten == 0;
+        }
+    }
+}
+
+/// Single-hold predictive echo reconciliation across `ExtractSnapshot`,
+/// `PtyEchoArrives`, `Reconcile`, and `PaintFrame`.
+///
+/// * At `Buggy = 0`, `Reconcile` reads from the already-extracted snapshot
+///   (`snap_echoed`), proving `NoBlankEchoFrame` (`snap_echoed == 1 || ghost_visible == 1`
+///   whenever a predicted char is in flight).
+/// * At `Buggy = 1`, `Reconcile` re-locks the session mutex and reads `live_echoed`
+///   after `PtyEchoArrives` interleaved between `ExtractSnapshot` (`snap_echoed == 0`)
+///   and `Reconcile` (`live_echoed == 1`), retiring the ghost (`ghost_visible = 0`)
+///   while `snap_echoed == 0` — catching the 1-frame blank-cell flicker.
+#[must_use]
+#[cfg(feature = "anchors")]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn single_hold_prediction_reconcile_model() -> Model {
+    crate::ty_model! {
+        SingleHoldPredictionReconcile {
+            const Buggy = 0;
+
+            var phase = 0;
+            var pred_in_flight = 1;
+            var live_echoed = 0;
+            var snap_echoed = 0;
+            var ghost_visible = 1;
+            var painted = 0;
+
+            action ExtractSnapshot when (phase == 0) {
+                snap_echoed = live_echoed;
+                phase = 1;
+            }
+
+            action PtyEchoArrives when (live_echoed == 0) {
+                live_echoed = 1;
+            }
+
+            action Reconcile when (phase == 1) {
+                ghost_visible = if Buggy == 1 {
+                    if live_echoed == 1 { 0 } else { 1 }
+                } else {
+                    if snap_echoed == 1 { 0 } else { 1 }
+                };
+                phase = 2;
+            }
+
+            action PaintFrame when (phase == 2) {
+                painted = 1;
+                phase = 3;
+            }
+
+            invariant NoBlankEchoFrame:
+                pred_in_flight == 0 || snap_echoed == 1 || ghost_visible == 1;
+        }
+    }
+}
+
+/// Local compaction around the spliced `mid` run in `Rle::split_range_*`.
+///
+/// Models a 3-slot neighborhood `(left_val, mid_val, right_val)` surrounded by
+/// compact outer neighbors `(outer_left_val != left_val, right_val != outer_right_val)`:
+/// * At `Buggy = 0`, `compact_around(mid)` merges `mid` with `left` if equal and
+///   with `right` if equal, establishing `NoAdjacentEqual` across the whole
+///   neighborhood in $O(1)$ without scanning the outer runs.
+/// * At `Buggy = 1`, omitting the right-neighbor check after a left merge leaves
+///   adjacent runs with identical values when `left_val == mid_val == right_val`
+///   (e.g. healing `[1, 2, 1]` by setting the middle run to `1`), caught by
+///   `NoAdjacentEqual`.
+#[must_use]
+#[cfg(feature = "anchors")]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn rle_local_compact_model() -> Model {
+    crate::ty_model! {
+        RleLocalCompactModel {
+            const Buggy = 0;
+
+            var left_val = 1;
+            var mid_val = 2;
+            var right_val = 1;
+            var merged_left = 0;
+            var merged_right = 0;
+            var compacted = 0;
+
+            action SpliceSameAsNeighbors when (compacted == 0 && mid_val > 1) {
+                mid_val = 1;
+            }
+
+            action SpliceDifferent when (compacted == 0 && mid_val == 2) {
+                mid_val = 3;
+            }
+
+            action CompactAroundMid when (compacted == 0) {
+                merged_left = if left_val == mid_val { 1 } else { 0 };
+                merged_right = if Buggy == 1 && left_val == mid_val {
+                    0
+                } else {
+                    if mid_val == right_val { 1 } else { 0 }
+                };
+                compacted = 1;
+            }
+
+            invariant NoAdjacentEqual:
+                compacted == 0
+                || ((left_val > mid_val || mid_val > left_val || merged_left == 1)
+                    && (mid_val > right_val || right_val > mid_val || merged_right == 1));
+        }
+    }
+}
+
+/// Printable ASCII pair fast path in `aterm_grapheme::find_first_cluster_end`.
+///
+/// Models a 2-character prefix `(c0_ascii, c1_ascii, c1_extend)`:
+/// * At `Buggy = 0`, the $O(1)$ fast path returns `cluster_end = 1` only when
+///   BOTH `c0_ascii == 1` and `c1_ascii == 1` (`c1_extend == 0`), falling back
+///   to the full UAX #29 scanner when `c1` is a non-ASCII combining mark
+///   (`c1_extend == 1`), proving `CombiningMarkNeverSplit`.
+/// * At `Buggy = 1`, returning `cluster_end = 1` after checking only `c0_ascii == 1`
+///   splits a base ASCII character from its following combining mark (`a\u{0301}`),
+///   caught by `CombiningMarkNeverSplit`.
+#[must_use]
+#[cfg(feature = "anchors")]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn ascii_grapheme_fast_path_model() -> Model {
+    crate::ty_model! {
+        AsciiGraphemeFastPath {
+            const Buggy = 0;
+
+            var c0_ascii = 1;
+            var c1_ascii = 1;
+            var c1_extend = 0;
+            var decided = 0;
+            var cluster_end = 0;
+
+            action SecondIsCombiningMark when (decided == 0 && c1_ascii == 1) {
+                c1_ascii = 0;
+                c1_extend = 1;
+            }
+
+            action SecondIsAscii when (decided == 0 && c1_ascii == 0) {
+                c1_ascii = 1;
+                c1_extend = 0;
+            }
+
+            action FindClusterEnd when (decided == 0) {
+                cluster_end = if Buggy == 1 {
+                    if c0_ascii == 1 { 1 } else { 2 }
+                } else {
+                    if c0_ascii == 1 && c1_ascii == 1 {
+                        1
+                    } else {
+                        if c1_extend == 1 { 2 } else { 1 }
+                    }
+                };
+                decided = 1;
+            }
+
+            invariant CombiningMarkNeverSplit:
+                decided == 0 || c1_extend == 0 || cluster_end == 2;
         }
     }
 }
@@ -1758,6 +2456,41 @@ pub mod props {
 mod tests {
     use super::*;
     use crate::tla_check::TlaSpec;
+
+    /// A pin and a bound over the `Buggy` dial are refused as bounds, while an
+    /// ordinary one- or two-sided range passes.
+    #[test]
+    fn a_bound_must_be_a_range() {
+        let var = || Box::new(Expr::Var("x"));
+        let int = |n| Box::new(Expr::Int(n));
+        let konst = |name| Box::new(Expr::ConstRef(name));
+        let consts = [("Cap", 3), ("Buggy", 0)];
+        let refused = |e: Expr| !not_range_bounds(&e, &consts).is_empty();
+
+        assert!(refused(Expr::Le(var(), int(0))), "x <= 0 pins x");
+        assert!(refused(Expr::Gt(int(1), var())), "1 > x pins x");
+        assert!(
+            refused(Expr::Le(var(), konst("Buggy"))),
+            "Buggy is the dial"
+        );
+        assert!(
+            refused(Expr::And(
+                Box::new(Expr::Gt(var(), int(0))),
+                Box::new(Expr::Le(var(), int(1))),
+            )),
+            "x > 0 && x <= 1 pins x to one"
+        );
+        assert!(
+            refused(Expr::Le(var(), Box::new(Expr::Var("y")))),
+            "a relation"
+        );
+
+        assert!(!refused(Expr::Le(var(), konst("Cap"))));
+        assert!(!refused(Expr::And(
+            Box::new(Expr::Gt(var(), int(0))),
+            Box::new(Expr::Le(var(), Box::new(Expr::Sub(konst("Cap"), int(1))))),
+        )));
+    }
 
     /// Guard the brittle `.replace()` in `to_cfg_deadlock_with`: the deadlock cfg
     /// flips CHECK_DEADLOCK to TRUE and the default cfg stays FALSE. If
@@ -2009,5 +2742,70 @@ mod tests {
             ),
             "quantified iff invariant: {tla}"
         );
+    }
+
+    #[test]
+    fn metal_atlas_residency_model_proves_and_catches_mutant() {
+        let m = metal_atlas_residency_model();
+        let states = crate::interp::prove_and_catch(&m);
+        assert!(states > 1, "must explore multiple states: {states}");
+        assert_eq!(
+            crate::interp::fired_actions(&m).len(),
+            m.actions.len(),
+            "all actions must fire at Buggy=0"
+        );
+        crate::verify::prove_and_catch_scalar(&m, "MetalAtlasResidency");
+    }
+
+    #[test]
+    fn gpu_frame_ring_model_proves_and_catches_mutant() {
+        let m = gpu_frame_ring_model();
+        let states = crate::interp::prove_and_catch(&m);
+        assert!(states > 1, "must explore multiple states: {states}");
+        assert_eq!(
+            crate::interp::fired_actions(&m).len(),
+            m.actions.len(),
+            "all actions must fire at Buggy=0"
+        );
+        crate::verify::prove_and_catch_scalar(&m, "GpuFrameRing");
+    }
+
+    #[test]
+    fn single_hold_prediction_reconcile_model_proves_and_catches_mutant() {
+        let m = single_hold_prediction_reconcile_model();
+        let states = crate::interp::prove_and_catch(&m);
+        assert!(states > 1, "must explore multiple states: {states}");
+        assert_eq!(
+            crate::interp::fired_actions(&m).len(),
+            m.actions.len(),
+            "all actions must fire at Buggy=0"
+        );
+        crate::verify::prove_and_catch_scalar(&m, "SingleHoldPredictionReconcile");
+    }
+
+    #[test]
+    fn rle_local_compact_model_proves_and_catches_mutant() {
+        let m = rle_local_compact_model();
+        let states = crate::interp::prove_and_catch(&m);
+        assert!(states > 1, "must explore multiple states: {states}");
+        assert_eq!(
+            crate::interp::fired_actions(&m).len(),
+            m.actions.len(),
+            "all actions must fire at Buggy=0"
+        );
+        crate::verify::prove_and_catch_scalar(&m, "RleLocalCompactModel");
+    }
+
+    #[test]
+    fn ascii_grapheme_fast_path_model_proves_and_catches_mutant() {
+        let m = ascii_grapheme_fast_path_model();
+        let states = crate::interp::prove_and_catch(&m);
+        assert!(states > 1, "must explore multiple states: {states}");
+        assert_eq!(
+            crate::interp::fired_actions(&m).len(),
+            m.actions.len(),
+            "all actions must fire at Buggy=0"
+        );
+        crate::verify::prove_and_catch_scalar(&m, "AsciiGraphemeFastPath");
     }
 }

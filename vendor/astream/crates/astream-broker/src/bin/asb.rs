@@ -202,8 +202,8 @@ use astream_broker::{
 // The ONE capability-file format and reader, `astream_cap::capfile`: what `mint`
 // prints and what `--cap-file` reads, by one set of rules.
 //
-// A default build has no `astream-cap` dependency — it would pull sha2 into the
-// zero-third-party broker — yet it still reads `--cap-file` (a malformed line is
+// A default build has no `astream-cap` dependency — capabilities are the opt-in
+// `cap` feature — yet it still reads `--cap-file` (a malformed line is
 // exit 2 naming file:line in every build; only the attach needs the MAC). So it
 // compiles that module's std-only source file in by path, rather than keeping a
 // second reader that could drift from the first.
@@ -929,14 +929,13 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// Connect over the chosen transport and attach every capability, in order.
+/// Connect over the chosen transport and attach every capability, in order, under
+/// one `Hello`.
 fn connect_attached(cli: &Cli, ep: &str, caps: &[Cap]) -> io::Result<(AnyClient, Closer)> {
     // Validate every flag (usage errors) before touching the network.
     let transport = cli.transport();
     let (mut c, closer) = connect(transport, ep)?;
-    for cap in caps {
-        c.attach(&cap.grant, &cap.tag)?;
-    }
+    c.attach_all(caps.iter().map(|cap| (cap.grant.as_str(), &cap.tag[..])))?;
     Ok((c, closer))
 }
 
@@ -1802,7 +1801,10 @@ fn run() -> io::Result<()> {
                     "<offset> must be below 2^63: `ack` publishes under producer sequence 2^63|<input offset>, and a larger offset has no sequence left to name",
                 );
             }
-            let body = format!("v=1 t={} re={offset} state={verdict}", now_millis());
+            // The body is DESIGN-aterm-fabric.md §4.2's `in/…` ack: the word rides
+            // `verdict=`, the one key an aterm asker decodes. (It rode `state=`, which no
+            // reader decoded, so a refusal arrived as an ack with no word.)
+            let body = format!("v=1 t={} re={offset} verdict={verdict}", now_millis());
             let (mut c, _) = connect_attached(&cli, &ep, &caps)?;
             // `<offset>` names a record the consumer acted on, so it must name a record
             // that EXISTS. The read-process-write advances the group past it in the same

@@ -350,7 +350,7 @@ mod tests {
         crate::tls::init_crypto();
         rustls::crypto::CryptoProvider::get_default()
             .cloned()
-            .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()))
+            .unwrap_or_else(|| Arc::new(crate::tls::provider()))
     }
 
     #[test]

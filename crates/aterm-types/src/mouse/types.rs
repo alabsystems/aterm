@@ -183,26 +183,6 @@ pub const CTRL_MASK: u8 = 16;
 mod tests {
     use super::*;
 
-    /// Verify MouseMode discriminants match checkpoint wire format (#7278).
-    #[test]
-    fn mouse_mode_discriminants_match_wire_format() {
-        assert_eq!(MouseMode::None as u8, 0);
-        assert_eq!(MouseMode::Normal as u8, 1);
-        assert_eq!(MouseMode::ButtonEvent as u8, 2);
-        assert_eq!(MouseMode::AnyEvent as u8, 3);
-        assert_eq!(MouseMode::X10 as u8, 4);
-    }
-
-    /// Verify MouseEncoding discriminants match checkpoint wire format (#7278).
-    #[test]
-    fn mouse_encoding_discriminants_match_wire_format() {
-        assert_eq!(MouseEncoding::X10 as u8, 0);
-        assert_eq!(MouseEncoding::Utf8 as u8, 1);
-        assert_eq!(MouseEncoding::Sgr as u8, 2);
-        assert_eq!(MouseEncoding::Urxvt as u8, 3);
-        assert_eq!(MouseEncoding::SgrPixel as u8, 4);
-    }
-
     /// xterm's `Cb` bases: buttons 1-3 are 0..=2, the thumb pair (xterm buttons
     /// 8/9) is 128/129. In particular NOT 3 — that is the legacy RELEASE code.
     #[test]

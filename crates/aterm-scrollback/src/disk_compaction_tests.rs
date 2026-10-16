@@ -2,13 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Compaction tests for `DiskColdTier` — extracted from `disk_tests.rs`.
+//! Compaction tests for `DiskColdTier`.
 
 use super::*;
 use aterm_tempfile::tempdir;
 
-/// Compaction triggers when dead space exceeds live data after truncation.
-/// Push 10 pages, truncate the front 6 (>50% dead), verify file size shrinks.
+/// Compaction fires once dead space exceeds live data and shrinks the file.
 #[test]
 fn disk_cold_compaction_triggers_on_truncate() {
     let dir = tempdir().unwrap();
@@ -26,8 +25,7 @@ fn disk_cold_compaction_triggers_on_truncate() {
     assert_eq!(cold.line_count(), 50);
     assert_eq!(cold.page_count(), 10);
 
-    // Truncate front 30 lines (6 pages). Dead space = 6 pages, live = 4 pages.
-    // 60% dead > 50% threshold → compaction fires.
+    // Truncate 6 of 10 pages: 60% dead fires compaction.
     cold.truncate_front_lines(30);
     assert_eq!(cold.line_count(), 20);
     assert_eq!(cold.page_count(), 4);
@@ -111,9 +109,8 @@ fn disk_cold_compaction_idempotent() {
     assert_eq!(cold.get_line(0).unwrap().unwrap().to_string(), "P7-Line0");
 }
 
-/// Regression: #5942 — compaction with front_offset > 0 must trim the consumed
-/// prefix from the first page. Without the fix, consumed lines reappear after
-/// compaction + reload because front_offset is not persisted on disk.
+/// Compaction with front_offset > 0 trims the consumed prefix from the first page:
+/// front_offset is not persisted, so untrimmed lines would reappear after reload.
 #[test]
 fn disk_cold_compaction_trims_front_offset() {
     let dir = tempdir().unwrap();
@@ -122,15 +119,14 @@ fn disk_cold_compaction_trims_front_offset() {
     let config = DiskColdConfig::new(&path);
     let mut cold = DiskColdTier::with_config(config).unwrap();
 
-    // Push 10 pages of 10 lines each (100 lines total).
     for i in 0..10 {
         let (c, n) = create_test_page(10, &format!("P{i}"));
         cold.push_compressed(&c, n).unwrap();
     }
     assert_eq!(cold.line_count(), 100);
 
-    // Truncate 63 lines: drops 6 full pages (60 lines), front_offset = 3 on page 6.
-    // 60% dead > 50% threshold → compaction fires automatically.
+    // Drops 6 full pages and leaves front_offset = 3 on page 6; 60% dead fires
+    // compaction.
     cold.truncate_front_lines(63);
     assert_eq!(cold.line_count(), 37);
 
@@ -138,8 +134,7 @@ fn disk_cold_compaction_trims_front_offset() {
     assert_eq!(cold.get_line(0).unwrap().unwrap().to_string(), "P6-Line3",);
     assert_eq!(cold.get_line(36).unwrap().unwrap().to_string(), "P9-Line9",);
 
-    // Reload from disk — the critical check: compaction must have physically
-    // trimmed the consumed prefix so counts match.
+    // Compaction physically trimmed the consumed prefix, so the header counts match.
     let (header_pages, header_lines) = read_header_counts(&path);
     assert_eq!(header_pages, 4, "4 surviving pages after compaction");
     assert_eq!(
@@ -155,15 +150,14 @@ fn disk_cold_compaction_trims_front_offset() {
     assert_eq!(cold.get_line(36).unwrap().unwrap().to_string(), "P9-Line9");
 }
 
-/// Regression: #5964 — crash during compaction leaves orphan `.dtrm.tmp` that
-/// must be cleaned up on the next `with_config()` load.
+/// A crash mid-compaction leaves an orphan `.dtrm.tmp`; the next `with_config()`
+/// load removes it.
 #[test]
 fn disk_cold_load_cleans_orphan_compact_temp_file() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("orphan-clean.dtrm");
     let tmp_path = path.with_extension("dtrm.tmp");
 
-    // Create a valid store with data.
     let config = DiskColdConfig::new(&path);
     let mut cold = DiskColdTier::with_config(config).unwrap();
     for i in 0..3 {
@@ -193,12 +187,7 @@ fn disk_cold_load_cleans_orphan_compact_temp_file() {
     assert_eq!(cold.get_line(14).unwrap().unwrap().to_string(), "P2-Line4");
 }
 
-/// Regression: a FAILED compaction must not leave the tier with
-/// mmap=None. compact() drops the mmap up front and only re-establishes it on
-/// success; on any error before the rename it must re-map the original file so
-/// cold reads keep working (mirroring write_back_truncation's recovery). Here we
-/// force the error deterministically by pre-creating a directory at the temp
-/// path, so File::create(tmp) fails right after the mmap is dropped.
+/// A failed compaction re-maps the original file so cold reads keep working.
 #[test]
 fn failed_compaction_keeps_cold_reads_working() {
     let dir = tempdir().unwrap();
@@ -213,20 +202,19 @@ fn failed_compaction_keeps_cold_reads_working() {
     }
     assert_eq!(cold.line_count(), 50);
 
-    // Block the compaction temp file: File::create fails on a path that is a
-    // directory, so compact() errors immediately after flush_and_drop_mmap().
+    // File::create fails on a directory, so compact() errors right after
+    // flush_and_drop_mmap().
     let tmp_path = path.with_extension("dtrm.tmp");
     std::fs::create_dir(&tmp_path).unwrap();
 
-    // Truncate the front 6 pages: dead (6) > live (4) → compaction fires and
-    // fails. truncate_front_lines swallows the compaction error by contract.
+    // dead (6 pages) > live (4): compaction fires and fails; truncate_front_lines
+    // swallows the error.
     cold.truncate_front_lines(30);
     assert_eq!(cold.line_count(), 20);
     assert_eq!(cold.page_count(), 4);
 
-    // The mmap must have been re-established on the failed-compact path: reads of
-    // the surviving pages (still at their original offsets in the untouched file)
-    // keep working instead of failing with "no memory map available".
+    // The mmap was re-established: surviving pages, still at their original
+    // offsets in the untouched file, stay readable.
     assert_eq!(
         cold.get_line(0).unwrap().unwrap().to_string(),
         "P6-Line0",

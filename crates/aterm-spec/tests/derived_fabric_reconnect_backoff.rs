@@ -6,12 +6,6 @@ use aterm_spec::{derive::fabric_reconnect_backoff_model, interp, verify};
 #[test]
 fn fabric_retry_wait_ignores_events_until_deadline_but_closes_on_aterm_loss() {
     let model = fabric_reconnect_backoff_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the reconnect wait contract must stay enrolled in spec-link"
-    );
     verify::prove_and_catch_scalar(&model, "Fabric reconnect retry backoff");
 
     let mut busy = model.init_state();

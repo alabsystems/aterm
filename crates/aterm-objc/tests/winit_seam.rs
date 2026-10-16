@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Census of the rows `vendor/winit`'s macOS backend registers, checked
+//! Census of the rows `crates/aterm-window`'s macOS backend registers, checked
 //! against the runtime's own authority.
 //!
-//! [`ROWS`] lists every declared method (all seventy-one are declared with
+//! [`ROWS`] lists every declared method (all sixty-five are declared with
 //! [`aterm_objc::declare_class!`]). Each row's authority is the live runtime:
 //! `protocol_getMethodDescription` for a delegate protocol,
 //! `class_getInstanceMethod` for an override of an AppKit class. The `winit`
@@ -21,7 +21,7 @@
 //!   `window_delegate.rs` rows from compiled Rust signatures through a mirror
 //!   class declared here.
 //!
-//! This file is a mirror, not the fork: it never loads the class `vendor/winit`
+//! This file is a mirror, not the fork: it never loads the class `crates/aterm-window`
 //! registers. `crates/aterm-gui/examples/objc_live_class_audit.rs` (an
 //! `[[example]]`, since libtest cannot host AppKit) enumerates the registered
 //! classes and finds each row's authority, but cannot see a deleted method;
@@ -73,13 +73,13 @@ enum Authority {
 
 /// One declared method of one winit class.
 struct Row {
-    /// `vendor/winit/src/platform_impl/macos/<file>:<line>`.
+    /// `crates/aterm-window/src/platform_impl/macos/<file>:<line>`.
     site: &'static str,
     /// The Objective-C selector, exactly as `#[method(...)]` spells it.
     sel: &'static str,
     /// Where the runtime keeps the truth.
     authority: Authority,
-    /// The encoding the PORT will register, from `vendor/winit`'s Rust
+    /// The encoding the PORT will register, from `crates/aterm-window`'s Rust
     /// signature TODAY. `B` is substituted with this target's `BOOL`.
     winit: &'static str,
 }
@@ -94,8 +94,8 @@ fn expand(spec: &str) -> String {
 ///
 /// A row whose authority is on this list and absent is reported unchecked on
 /// this host, never as agreement or failure.
-/// [`the_host_allowance_is_exactly_what_this_host_lacks`] makes an absent
-/// protocol not on the list fail by name.
+/// [`assert_host_lacking_is_the_allowance`] makes an absent protocol not on
+/// the list fail by name.
 const HOST_MAY_LACK: &[&str] = &["NSApplicationDelegate"];
 
 /// Whether the host's own frameworks registered `name`: false when absent, or
@@ -160,82 +160,76 @@ fn assert_host_lacking_is_the_allowance(host_lacking: &[(&str, &str, &str)]) {
 #[rustfmt::skip]
 const ROWS: &[Row] = &[
     // ---- ApplicationDelegate : NSObject <NSApplicationDelegate>
-    Row { site: "app_state.rs:143",  sel: "applicationDidFinishLaunching:", authority: Authority::Proto("NSApplicationDelegate"), winit: "v@:@" },
-    Row { site: "app_state.rs:148",  sel: "applicationWillTerminate:",      authority: Authority::Proto("NSApplicationDelegate"), winit: "v@:@" },
-    Row { site: "app_state.rs:153",  sel: "applicationShouldTerminate:",    authority: Authority::Proto("NSApplicationDelegate"), winit: "Q@:@" },
+    Row { site: "app_state.rs:148",  sel: "applicationDidFinishLaunching:", authority: Authority::Proto("NSApplicationDelegate"), winit: "v@:@" },
+    Row { site: "app_state.rs:153",  sel: "applicationWillTerminate:",      authority: Authority::Proto("NSApplicationDelegate"), winit: "v@:@" },
+    Row { site: "app_state.rs:158",  sel: "applicationShouldTerminate:",    authority: Authority::Proto("NSApplicationDelegate"), winit: "Q@:@" },
     // ---- WinitWindow : NSWindow
-    Row { site: "window.rs:221",    sel: "canBecomeMainWindow",            authority: Authority::Class("NSWindow"), winit: "B@:" },
-    Row { site: "window.rs:227",    sel: "canBecomeKeyWindow",             authority: Authority::Class("NSWindow"), winit: "B@:" },
+    Row { site: "window.rs:235",    sel: "canBecomeMainWindow",            authority: Authority::Class("NSWindow"), winit: "B@:" },
+    Row { site: "window.rs:241",    sel: "canBecomeKeyWindow",             authority: Authority::Class("NSWindow"), winit: "B@:" },
     // ---- WinitApplication : NSApplication
     // ---- WindowDelegate : NSObject <NSWindowDelegate, NSDraggingDestination>
-    Row { site: "window_delegate.rs:231", sel: "windowShouldClose:",                 authority: Authority::Proto("NSWindowDelegate"), winit: "B@:@" },
-    Row { site: "window_delegate.rs:238", sel: "windowWillClose:",                   authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:251", sel: "windowDidResize:",                   authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:258", sel: "windowWillStartLiveResize:",         authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:266", sel: "windowDidEndLiveResize:",            authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:273", sel: "windowDidMove:",                     authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:279", sel: "windowDidChangeBackingProperties:",  authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:295", sel: "windowDidBecomeKey:",                authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:303", sel: "windowDidResignKey:",                authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:328", sel: "windowWillEnterFullScreen:",         authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:355", sel: "windowWillExitFullScreen:",          authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:375", sel: "window:willUseFullScreenPresentationOptions:", authority: Authority::Proto("NSWindowDelegate"), winit: "Q@:@Q" },
-    Row { site: "window_delegate.rs:402", sel: "windowDidEnterFullScreen:",          authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:429", sel: "windowDidExitFullScreen:",           authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:460", sel: "windowDidFailToEnterFullScreen:",    authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:484", sel: "windowDidChangeOcclusionState:",     authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:493", sel: "windowDidChangeScreen:",             authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:197", sel: "windowShouldClose:",                 authority: Authority::Proto("NSWindowDelegate"), winit: "B@:@" },
+    Row { site: "window_delegate.rs:204", sel: "windowWillClose:",                   authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:217", sel: "windowDidResize:",                   authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:224", sel: "windowWillStartLiveResize:",         authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:232", sel: "windowDidEndLiveResize:",            authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:239", sel: "windowDidMove:",                     authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:245", sel: "windowDidChangeBackingProperties:",  authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:261", sel: "windowDidBecomeKey:",                authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:269", sel: "windowDidResignKey:",                authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:294", sel: "windowWillEnterFullScreen:",         authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:321", sel: "windowWillExitFullScreen:",          authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:336", sel: "windowDidEnterFullScreen:",          authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:362", sel: "windowDidExitFullScreen:",           authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:390", sel: "windowDidFailToEnterFullScreen:",    authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:399", sel: "windowDidChangeOcclusionState:",     authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
     // Returns `NSDragOperation` (`usize`), as `NSDraggingDestination` declares.
-    Row { site: "window_delegate.rs:533", sel: "draggingEntered:",                   authority: Authority::Proto("NSDraggingDestination"), winit: "Q@:@" },
-    Row { site: "window_delegate.rs:552", sel: "prepareForDragOperation:",           authority: Authority::Proto("NSDraggingDestination"), winit: "B@:@" },
-    Row { site: "window_delegate.rs:559", sel: "performDragOperation:",              authority: Authority::Proto("NSDraggingDestination"), winit: "B@:@" },
-    Row { site: "window_delegate.rs:575", sel: "concludeDragOperation:",             authority: Authority::Proto("NSDraggingDestination"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:581", sel: "draggingExited:",                    authority: Authority::Proto("NSDraggingDestination"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:593", sel: "observeValueForKeyPath:ofObject:change:context:", authority: Authority::Class("NSObject"), winit: "v@:@@@^v" },
+    Row { site: "window_delegate.rs:430", sel: "draggingEntered:",                   authority: Authority::Proto("NSDraggingDestination"), winit: "Q@:@" },
+    Row { site: "window_delegate.rs:449", sel: "prepareForDragOperation:",           authority: Authority::Proto("NSDraggingDestination"), winit: "B@:@" },
+    Row { site: "window_delegate.rs:456", sel: "performDragOperation:",              authority: Authority::Proto("NSDraggingDestination"), winit: "B@:@" },
+    Row { site: "window_delegate.rs:472", sel: "concludeDragOperation:",             authority: Authority::Proto("NSDraggingDestination"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:478", sel: "draggingExited:",                    authority: Authority::Proto("NSDraggingDestination"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:490", sel: "observeValueForKeyPath:ofObject:change:context:", authority: Authority::Class("NSObject"), winit: "v@:@@@^v" },
     // ---- View : NSView <NSTextInputClient>
-    Row { site: "view.rs:235", sel: "isFlipped",                    authority: Authority::Class("NSView"), winit: "B@:" },
-    Row { site: "view.rs:241", sel: "viewDidMoveToWindow",          authority: Authority::Class("NSView"), winit: "v@:" },
-    Row { site: "view.rs:247", sel: "frameDidChange:",              authority: Authority::None("an NSNotificationCenter callback registered by `WinitView::new`; no protocol declares it and no loaded class implements it — measured, not assumed. Upstream's Rust signature typed the argument `&NSEvent` when the notification centre passes an NSNotification (same `@`, wrong name); the port took it to `Id`, so the misnaming is closed and only the missing authority is left"), winit: "v@:@" },
-    Row { site: "view.rs:260", sel: "drawRect:",                    authority: Authority::Class("NSView"), winit: "v@:{CGRect={CGPoint=dd}{CGSize=dd}}" },
-    Row { site: "view.rs:273", sel: "acceptsFirstResponder",        authority: Authority::Class("NSResponder"), winit: "B@:" },
-    Row { site: "view.rs:286", sel: "touchBar",                     authority: Authority::Class("NSResponder"), winit: "@@:" },
-    Row { site: "view.rs:292", sel: "resetCursorRects",             authority: Authority::Class("NSView"), winit: "v@:" },
-    Row { site: "view.rs:332", sel: "hasMarkedText",                authority: Authority::Proto("NSTextInputClient"), winit: "B@:" },
-    Row { site: "view.rs:343", sel: "markedRange",                  authority: Authority::Proto("NSTextInputClient"), winit: "{_NSRange=QQ}@:" },
-    Row { site: "view.rs:355", sel: "selectedRange",                authority: Authority::Proto("NSTextInputClient"), winit: "{_NSRange=QQ}@:" },
-    Row { site: "view.rs:362", sel: "setMarkedText:selectedRange:replacementRange:", authority: Authority::Proto("NSTextInputClient"), winit: "v@:@{_NSRange=QQ}{_NSRange=QQ}" },
-    Row { site: "view.rs:475", sel: "unmarkText",                   authority: Authority::Proto("NSTextInputClient"), winit: "v@:" },
-    Row { site: "view.rs:511", sel: "validAttributesForMarkedText", authority: Authority::Proto("NSTextInputClient"), winit: "@@:" },
-    Row { site: "view.rs:522", sel: "attributedSubstringForProposedRange:actualRange:", authority: Authority::Proto("NSTextInputClient"), winit: "@@:{_NSRange=QQ}^{_NSRange=QQ}" },
-    Row { site: "view.rs:534", sel: "characterIndexForPoint:",      authority: Authority::Proto("NSTextInputClient"), winit: "Q@:{CGPoint=dd}" },
-    Row { site: "view.rs:543", sel: "firstRectForCharacterRange:actualRange:", authority: Authority::Proto("NSTextInputClient"), winit: "{CGRect={CGPoint=dd}{CGSize=dd}}@:{_NSRange=QQ}^{_NSRange=QQ}" },
-    Row { site: "view.rs:579", sel: "insertText:replacementRange:", authority: Authority::Proto("NSTextInputClient"), winit: "v@:@{_NSRange=QQ}" },
-    Row { site: "view.rs:607", sel: "doCommandBySelector:",         authority: Authority::Proto("NSTextInputClient"), winit: "v@::" },
-    Row { site: "view.rs:633", sel: "keyDown:",                     authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:712", sel: "keyUp:",                       authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:731", sel: "flagsChanged:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:738", sel: "insertTab:",                   authority: Authority::Proto("NSStandardKeyBindingResponding"), winit: "v@:@" },
-    Row { site: "view.rs:744", sel: "insertBackTab:",               authority: Authority::None("declared by no protocol and implemented by no loaded class — measured: NSStandardKeyBindingResponding declares its two siblings `insertTab:` and `cancelOperation:` and not this one, and NSResponder implements none of the three. The auditor DERIVES a shape for it from those siblings; this census only records that the runtime holds no description of its own"), winit: "v@:@" },
-    Row { site: "view.rs:752", sel: "cancelOperation:",             authority: Authority::Proto("NSStandardKeyBindingResponding"), winit: "v@:@" },
-    Row { site: "view.rs:826", sel: "mouseDown:",                   authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:833", sel: "mouseUp:",                     authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:840", sel: "rightMouseDown:",              authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:847", sel: "rightMouseUp:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:854", sel: "otherMouseDown:",              authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:861", sel: "otherMouseUp:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:870", sel: "mouseMoved:",                  authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:875", sel: "mouseDragged:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:880", sel: "rightMouseDragged:",           authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:885", sel: "otherMouseDragged:",           authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:890", sel: "mouseEntered:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:898", sel: "mouseExited:",                 authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:907", sel: "scrollWheel:",                 authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:967", sel: "magnifyWithEvent:",            authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:984", sel: "smartMagnifyWithEvent:",       authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:995", sel: "rotateWithEvent:",             authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:1014", sel: "pressureChangeWithEvent:",     authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:1030", sel: "_wantsKeyDownForEvent:",       authority: Authority::Class("NSResponder"), winit: "B@:@" },
-    Row { site: "view.rs:1037", sel: "acceptsFirstMouse:",           authority: Authority::Class("NSView"), winit: "B@:@" },
+    Row { site: "view.rs:237", sel: "isFlipped",                    authority: Authority::Class("NSView"), winit: "B@:" },
+    Row { site: "view.rs:243", sel: "viewDidMoveToWindow",          authority: Authority::Class("NSView"), winit: "v@:" },
+    Row { site: "view.rs:249", sel: "frameDidChange:",              authority: Authority::None("an NSNotificationCenter callback registered by `WinitView::new`; no protocol declares it and no loaded class implements it — measured, not assumed. Upstream's Rust signature typed the argument `&NSEvent` when the notification centre passes an NSNotification (same `@`, wrong name); the port took it to `Id`, so the misnaming is closed and only the missing authority is left"), winit: "v@:@" },
+    Row { site: "view.rs:262", sel: "drawRect:",                    authority: Authority::Class("NSView"), winit: "v@:{CGRect={CGPoint=dd}{CGSize=dd}}" },
+    Row { site: "view.rs:275", sel: "acceptsFirstResponder",        authority: Authority::Class("NSResponder"), winit: "B@:" },
+    Row { site: "view.rs:288", sel: "touchBar",                     authority: Authority::Class("NSResponder"), winit: "@@:" },
+    Row { site: "view.rs:294", sel: "resetCursorRects",             authority: Authority::Class("NSView"), winit: "v@:" },
+    Row { site: "view.rs:324", sel: "hasMarkedText",                authority: Authority::Proto("NSTextInputClient"), winit: "B@:" },
+    Row { site: "view.rs:335", sel: "markedRange",                  authority: Authority::Proto("NSTextInputClient"), winit: "{_NSRange=QQ}@:" },
+    Row { site: "view.rs:347", sel: "selectedRange",                authority: Authority::Proto("NSTextInputClient"), winit: "{_NSRange=QQ}@:" },
+    Row { site: "view.rs:354", sel: "setMarkedText:selectedRange:replacementRange:", authority: Authority::Proto("NSTextInputClient"), winit: "v@:@{_NSRange=QQ}{_NSRange=QQ}" },
+    Row { site: "view.rs:467", sel: "unmarkText",                   authority: Authority::Proto("NSTextInputClient"), winit: "v@:" },
+    Row { site: "view.rs:503", sel: "validAttributesForMarkedText", authority: Authority::Proto("NSTextInputClient"), winit: "@@:" },
+    Row { site: "view.rs:514", sel: "attributedSubstringForProposedRange:actualRange:", authority: Authority::Proto("NSTextInputClient"), winit: "@@:{_NSRange=QQ}^{_NSRange=QQ}" },
+    Row { site: "view.rs:526", sel: "characterIndexForPoint:",      authority: Authority::Proto("NSTextInputClient"), winit: "Q@:{CGPoint=dd}" },
+    Row { site: "view.rs:535", sel: "firstRectForCharacterRange:actualRange:", authority: Authority::Proto("NSTextInputClient"), winit: "{CGRect={CGPoint=dd}{CGSize=dd}}@:{_NSRange=QQ}^{_NSRange=QQ}" },
+    Row { site: "view.rs:571", sel: "insertText:replacementRange:", authority: Authority::Proto("NSTextInputClient"), winit: "v@:@{_NSRange=QQ}" },
+    Row { site: "view.rs:599", sel: "doCommandBySelector:",         authority: Authority::Proto("NSTextInputClient"), winit: "v@::" },
+    Row { site: "view.rs:625", sel: "keyDown:",                     authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:704", sel: "keyUp:",                       authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:723", sel: "flagsChanged:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:730", sel: "insertTab:",                   authority: Authority::Proto("NSStandardKeyBindingResponding"), winit: "v@:@" },
+    Row { site: "view.rs:736", sel: "insertBackTab:",               authority: Authority::None("declared by no protocol and implemented by no loaded class — measured: NSStandardKeyBindingResponding declares its two siblings `insertTab:` and `cancelOperation:` and not this one, and NSResponder implements none of the three. The auditor DERIVES a shape for it from those siblings; this census only records that the runtime holds no description of its own"), winit: "v@:@" },
+    Row { site: "view.rs:744", sel: "cancelOperation:",             authority: Authority::Proto("NSStandardKeyBindingResponding"), winit: "v@:@" },
+    Row { site: "view.rs:820", sel: "mouseDown:",                   authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:827", sel: "mouseUp:",                     authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:834", sel: "rightMouseDown:",              authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:841", sel: "rightMouseUp:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:848", sel: "otherMouseDown:",              authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:855", sel: "otherMouseUp:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:864", sel: "mouseMoved:",                  authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:869", sel: "mouseDragged:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:874", sel: "rightMouseDragged:",           authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:879", sel: "otherMouseDragged:",           authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:884", sel: "mouseEntered:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:892", sel: "mouseExited:",                 authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:901", sel: "scrollWheel:",                 authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:964", sel: "_wantsKeyDownForEvent:",       authority: Authority::Class("NSResponder"), winit: "B@:@" },
+    Row { site: "view.rs:971", sel: "acceptsFirstMouse:",           authority: Authority::Class("NSView"), winit: "B@:@" },
 ];
 
 /// A `&'static CStr` from a table entry. `class` and `protocol` take
@@ -355,7 +349,7 @@ fn every_site_points_at_the_line_that_declares_it() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 71, "every row's site was followed, none skipped");
+    assert_eq!(checked, 65, "every row's site was followed, none skipped");
 }
 
 /// Measures the key-binding facts behind the `insertBackTab:` row:
@@ -459,7 +453,7 @@ fn the_key_binding_family_is_measured_not_asserted() {
 }
 
 /// The table has not gone stale against the fork it describes; the count is
-/// re-derived from `vendor/winit`'s source. A moved fork fails loudly.
+/// re-derived from `crates/aterm-window`'s source. A moved fork fails loudly.
 #[test]
 fn the_table_still_covers_every_declared_method() {
     let base = fork_backend();
@@ -477,17 +471,17 @@ fn the_table_still_covers_every_declared_method() {
     assert_eq!(
         found,
         ROWS.len(),
-        "vendor/winit declares {found} methods across its five macOS classes \
+        "crates/aterm-window declares {found} methods across its five macOS classes \
          and this table has {}; the census is stale",
         ROWS.len()
     );
-    assert_eq!(ROWS.len(), 71);
+    assert_eq!(ROWS.len(), 65);
 
     // Per-file counts of `@sel(…)` rows, so a half-converted file is caught.
     let mut ported_total = 0;
     for (file, want) in [
-        ("window_delegate.rs", 23),
-        ("view.rs", 43),
+        ("window_delegate.rs", 21),
+        ("view.rs", 39),
         ("app_state.rs", 3),
         ("window.rs", 2),
     ] {
@@ -504,7 +498,7 @@ fn the_table_still_covers_every_declared_method() {
         );
         ported_total += ported;
     }
-    assert_eq!(ported_total, 71, "all 71 rows are declared by aterm_objc");
+    assert_eq!(ported_total, 65, "all 65 rows are declared by aterm_objc");
 
     // `app.rs` declares no methods (it swizzles `-[NSApplication sendEvent:]`,
     // covered by `the_swizzled_row_still_encodes_the_way_app_rs_types_it`). A
@@ -586,8 +580,8 @@ fn no_declared_winit_method_takes_a_block() {
     assert_eq!(
         bare,
         vec![
-            ("view.rs:247", "frameDidChange:", "v@:@".to_string()),
-            ("view.rs:744", "insertBackTab:", "v@:@".to_string()),
+            ("view.rs:249", "frameDidChange:", "v@:@".to_string()),
+            ("view.rs:736", "insertBackTab:", "v@:@".to_string()),
         ],
         "the set of rows no protocol or class declares changed"
     );
@@ -659,9 +653,9 @@ fn no_declared_row_disagrees_with_the_runtimes_own_authority() {
     assert_host_lacking_is_the_allowance(&host_lacking);
     assert_eq!(
         checked + host_lacking.len(),
-        69,
-        "sixty-nine of the seventy-one have an authority — all sixty-nine checked on a host \
-         whose AppKit registers NSApplicationDelegate, sixty-six where it does not"
+        63,
+        "sixty-three of the sixty-five have an authority — all sixty-three checked on a host \
+         whose AppKit registers NSApplicationDelegate, sixty where it does not"
     );
 
     let named: Vec<String> = disagreements
@@ -686,45 +680,6 @@ fn no_declared_row_disagrees_with_the_runtimes_own_authority() {
         "if BOOL and NSUInteger ever encoded alike the P3 row would have been \
          harmless and this whole census pointless"
     );
-}
-
-/// Every protocol a row names that this host does not register is on
-/// [`HOST_MAY_LACK`], and every name on the allowance is a real authority in
-/// the table.
-#[test]
-fn the_host_allowance_is_exactly_what_this_host_lacks() {
-    assert!(load_appkit(), "AppKit must load for this to mean anything");
-    assert!(
-        !class(c"NSApplication").is_null(),
-        "AppKit's classes are present, so an absent protocol is the host's doing"
-    );
-    let mut names: Vec<&str> = ROWS
-        .iter()
-        .filter_map(|r| match r.authority {
-            Authority::Proto(n) => Some(n),
-            _ => None,
-        })
-        .collect();
-    names.sort_unstable();
-    names.dedup();
-    let absent: Vec<&str> = names
-        .iter()
-        .copied()
-        .filter(|n| !host_registers(n))
-        .collect();
-    for n in &absent {
-        assert!(
-            HOST_MAY_LACK.contains(n),
-            "{n} is absent from this host's AppKit and not on the allowance"
-        );
-    }
-    for n in HOST_MAY_LACK {
-        assert!(
-            names.contains(n),
-            "{n} is on the allowance but is no row's authority"
-        );
-    }
-    eprintln!("winit_seam: this host's AppKit lacks {absent:?} of the authorities {names:?}");
 }
 
 /// The two rows next to it really ARE `BOOL`, which is what makes the one row
@@ -776,7 +731,7 @@ aterm_objc::declare_class! {
     /// A mirror of `window_delegate.rs`'s declared methods: the same selectors
     /// at the same Rust argument and return types.
     ///
-    /// `WinitWindowDelegate` itself lives in `vendor/winit` (which depends on
+    /// `WinitWindowDelegate` itself lives in `crates/aterm-window` (which depends on
     /// this crate) and cannot be instantiated here. The mirror checks that the
     /// Rust types produce the right encodings, not that `window_delegate.rs`
     /// writes those types; the live-class auditor covers that.
@@ -817,17 +772,6 @@ aterm_objc::declare_class! {
         @sel(windowWillExitFullScreen:)
         fn window_will_exit_fullscreen(&self, _sender: aterm_objc::Id) {}
 
-        /// The one `NSUInteger` row, and the only one whose argument is not an
-        /// object.
-        @sel(window:willUseFullScreenPresentationOptions:)
-        fn window_will_use_fullscreen_presentation_options(
-            &self,
-            _sender: aterm_objc::Id,
-            proposed: usize,
-        ) -> usize {
-            proposed
-        }
-
         @sel(windowDidEnterFullScreen:)
         fn window_did_enter_fullscreen(&self, _sender: aterm_objc::Id) {}
 
@@ -839,9 +783,6 @@ aterm_objc::declare_class! {
 
         @sel(windowDidChangeOcclusionState:)
         fn window_did_change_occlusion_state(&self, _sender: aterm_objc::Id) {}
-
-        @sel(windowDidChangeScreen:)
-        fn window_did_change_screen(&self, _sender: aterm_objc::Id) {}
 
         /// THE P3 ROW, at its new type. `usize`, not `bool`.
         @sel(draggingEntered:)
@@ -915,17 +856,17 @@ fn the_ported_signatures_encode_to_the_authority() {
     let expected = ROWS.iter().filter(mirrored).count();
     assert_eq!(checked, expected, "every mirrored row, none skipped");
     assert_eq!(
-        expected, 23,
-        "window_delegate.rs's 23 rows are what the mirror holds"
+        expected, 21,
+        "window_delegate.rs's 21 rows are what the mirror holds"
     );
 
     // The rows this test does not cover, as a number, so it cannot drift.
     let ported = ROWS.len();
-    assert_eq!(ported, 71, "all 71 rows are ported; see the header");
+    assert_eq!(ported, 65, "all 65 rows are ported; see the header");
     assert_eq!(
         ported - expected,
-        48,
-        "48 ported rows are checked against a REGISTERED class only by \
+        44,
+        "44 ported rows are checked against a REGISTERED class only by \
          crates/aterm-gui/examples/objc_live_class_audit.rs — if that gate ever \
          stops covering a class, this number is the size of the hole"
     );

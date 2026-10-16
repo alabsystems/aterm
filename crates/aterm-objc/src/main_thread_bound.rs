@@ -4,9 +4,9 @@
 //! A thread-affinity container, [`MainThreadBound<T>`], built from the
 //! [`MainThread`] witness and [`run_on_main`].
 //!
-//! `vendor/winit`'s `Window` must be `Send + Sync` while the `Retained`s it
-//! owns (`WinitWindow`, `WindowDelegate`) are `!Send`; this container lets a
-//! main-thread value live in a `Send` struct.
+//! `crates/aterm-window`'s `Window` must be `Send + Sync` while the
+//! `Retained`s it owns (`WinitWindow`, `WindowDelegate`) are `!Send`; this
+//! container lets a main-thread value live in a `Send` struct.
 //!
 //! # Obligations
 //!
@@ -50,8 +50,6 @@
 //! makes that happen on the main thread even when the container is dropped
 //! elsewhere (closing `S3`'s release end for values held here only; AppKit
 //! still releases its own references wherever it likes).
-//! `tests/main_thread_bound_drive.rs` contrasts a `NaiveBound<T>` with the
-//! same `unsafe impl Send` and an ordinary drop.
 //!
 //! A `T` without drop glue is dropped in place and never blocks. Otherwise an
 //! off-main drop blocks on the main queue, so it hangs silently if the main
@@ -86,16 +84,12 @@ use crate::dispatch::run_on_main;
 /// ```
 pub struct MainThreadBound<T>(ManuallyDrop<T>);
 
-// SAFETY: the value is born on the main thread (`new` takes a `MainThread`),
-// read only there (`get`/`get_mut`/`into_inner` take a `!Send` witness), and
-// dropped only there (`Drop` reschedules through `run_on_main`). What crosses
-// threads is an inert copy of `T`'s bytes. See the module docs for why a
-// `!Send` `T` cannot have originated elsewhere.
+// SAFETY: obligations 1-3 of the module docs: born, read and dropped only on
+// the main thread, so what crosses threads is an inert copy of `T`'s bytes.
 unsafe impl<T> Send for MainThreadBound<T> {}
 
-// SAFETY: `&T` is reachable only through `get` (witness) or `get_on_main` (runs
-// on the main thread), so every shared reference exists on the main thread;
-// `&mut T` needs `&mut self`. That is what `T: Sync` would otherwise supply.
+// SAFETY: every `&T` exists on the main thread and `&mut T` needs `&mut self`;
+// see the module docs.
 unsafe impl<T> Sync for MainThreadBound<T> {}
 
 impl<T> MainThreadBound<T> {
@@ -151,8 +145,8 @@ impl<T> MainThreadBound<T> {
 
     /// Run `f` against the value on the main thread and bring its result back.
     ///
-    /// Works from any thread (winit's `maybe_wait_on_main` uses it with a `!Send`
-    /// `WindowDelegate`).
+    /// Works from any thread (`crates/aterm-window` uses it with a `!Send`
+    /// `WindowDelegate` in `maybe_wait_on_main`).
     ///
     /// `R: Send`, and `f` takes a higher-ranked `&T` with no lifetime `R` can
     /// unify with, so a borrow of the value cannot come back:

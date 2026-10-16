@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: host-side tests of the message band's motion: the idle rule, a
-//! hidden window, the frame cadence, the host cost of one animation frame, the
-//! still looks, capture determinism, the `appstatus` face and the Settings ▸
-//! Messages page. Each test drives a headless `App` through the loop's seams:
-//! `band_motion_deadline` (folded by `about_to_wait` under
-//! `DeadlineOwner::MessageBandMotion`), `band_motion_due` (the timer wake's
-//! redraw list) and `prepare_band_motion` (the first step of a redraw).
+//! Host-side tests of the message band's motion: the idle rule, a hidden window, the frame
+//! cadence and cost, the still looks, capture determinism, the `appstatus` face and the
+//! Settings ▸ Messages page. Each drives a headless `App` through the loop's seams:
+//! `band_motion_deadline` (folded by `about_to_wait` under `DeadlineOwner::MessageBandMotion`),
+//! `band_motion_due` (the timer wake's redraw list) and `prepare_band_motion` (a redraw's
+//! first step).
 
 use std::time::{Duration, Instant};
 
@@ -226,9 +225,8 @@ fn repeated_event_and_park_queries_share_the_next_visible_transition() {
     assert_eq!(first_scan, 1);
     for event in 0..64 {
         if event % 4 == 0 {
-            // Terminal output or a typed key may cause an additional present
-            // in this same band frame. It must not force another look-ahead
-            // scan merely because terminal content changed.
+            // Terminal output or a key may add a present in this band frame; it must not
+            // force another look-ahead scan.
             app.prepare_band_motion(WID, t0);
         }
         assert_eq!(app.band_motion_deadline(t0), expected);
@@ -370,13 +368,11 @@ fn the_band_is_due_at_most_once_per_frame_whatever_wakes_the_loop() {
     );
 }
 
-/// One animation frame costs the band row and nothing else: across two frame
-/// instants the composed input differs only in the band row, so the renderer's
-/// row diff (`compute_dirty_rows`) repaints exactly that row, the same damage
-/// as a cursor blink. The layout is reused (a poisoned cached presentation
-/// survives `prepare_band_motion`), a frame changes the row's characters only
-/// in the glyph cell and the time slots (the rest is the meter surface under
-/// them), and no frame re-grids or resizes the PTY.
+/// One animation frame costs the band row and nothing else: across two frame instants the
+/// composed input differs only in the band row, so `compute_dirty_rows` repaints that row
+/// alone, like a cursor blink. The layout is reused (a poisoned cached presentation survives
+/// `prepare_band_motion`), a frame changes only the glyph cell and the time slots, and no
+/// frame re-grids or resizes the PTY.
 #[test]
 fn a_motion_frame_repaints_only_the_band_row_and_never_reruns_the_layout() {
     let mut app = on_screen_app();
@@ -429,8 +425,7 @@ fn a_motion_frame_repaints_only_the_band_row_and_never_reruns_the_layout() {
         }
     }
 
-    // The renderer's row damage between the two frames: the band row, nothing
-    // else.
+    // The renderer's row damage between the two frames: the band row, nothing else.
     let mut dirty = Vec::new();
     let decision =
         aterm_render::compute_dirty_rows(&before, &after, false, None, false, None, 24, &mut dirty);
@@ -539,7 +534,7 @@ fn every_still_gate_draws_static_frames_and_arms_no_frame_deadline() {
     }
 }
 
-// ---- (6) Captures ---------------------------------------------------------------
+// ---- (5) Captures ---------------------------------------------------------------
 
 /// A production capture is still and a pure function of its instant: a
 /// headless window prepares the still form in its own look, the same instant
@@ -593,7 +588,7 @@ fn a_headless_capture_is_still_and_a_pure_function_of_its_instant() {
     );
 }
 
-// ---- (7) The faces that must not move ---------------------------------------
+// ---- (6) The faces that must not move ---------------------------------------
 
 /// `appstatus` carries no motion: a live row's `phase=live` line is the same
 /// bytes 30 s apart (no elapsed, no ETA, no frame state leaks into it), and
@@ -615,9 +610,8 @@ fn appstatus_carries_no_motion_words() {
     assert_eq!(read(&app, now + Duration::from_secs(30)), first);
 }
 
-/// The page still lists records: a `Hold::LogOnly` message never reaches the
-/// glass, arms nothing, and appears on Settings ▸ Messages as `recorded`,
-/// worded "recorded, never on the band", newest first.
+/// A `Hold::LogOnly` message never reaches the glass and arms nothing, yet Settings ▸ Messages
+/// lists it as `recorded`, newest first, with its detail.
 #[test]
 fn the_messages_page_lists_log_only_records() {
     let mut app = on_screen_app();

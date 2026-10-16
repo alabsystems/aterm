@@ -696,8 +696,8 @@ mod tests {
     }
 
     /// The loop's longest wait, as it registers it: its one cadence (a check every
-    /// `INTERVAL_SECS`, backed off to a 40 min ceiling), +20 % jitter, +20 s of
-    /// post-wake settle — `cadence_bounds::LONGEST_WAIT`, 48 min 20 s.
+    /// `INTERVAL_SECS`, backed off to a 15 min ceiling), +20 % jitter, +3 s of
+    /// post-wake settle — `cadence_bounds::LONGEST_WAIT`, 18 min 3 s.
     const LONGEST: u64 = crate::cadence_bounds::LONGEST_WAIT.as_secs();
 
     /// The number every judgement of a waiting loop below rests on is the one the
@@ -714,7 +714,7 @@ mod tests {
                 .as_secs(),
             LONGEST
         );
-        assert_eq!(LONGEST, 48 * 60 + 20, "a 40 min ceiling, +20 %, +20 s");
+        assert_eq!(LONGEST, 18 * 60 + 3, "a 15 min ceiling, +20 %, +3 s");
     }
 
     /// THE CLASSIFIER, phase by phase. Each phase is judged against its OWN
@@ -749,10 +749,10 @@ mod tests {
             );
         }
         // A waiting loop is a stall only past twice the longest wait plus slack:
-        // 1 h 41 min 40 s of running time.
+        // 41 min 6 s of running time.
         assert_eq!(
             stall_threshold_secs(CheckerPhase::Waiting, LONGEST),
-            2 * (48 * 60 + 20) + 5 * 60
+            2 * (18 * 60 + 3) + 5 * 60
         );
         // The 4.6-day silence, as the watchdog would have seen it from its first
         // look: a thread parked in the lock wait is a stall within minutes.
@@ -807,7 +807,7 @@ mod tests {
         let new = watch.snapshot().unwrap();
         let new_deadline = stall_threshold_secs(new.phase, new.max_interval_secs);
         assert!(
-            new_deadline < old_deadline / 10,
+            new_deadline < old_deadline / 5,
             "the new phase needs a prompt look"
         );
         assert_eq!(wakes.load(Ordering::Relaxed), 2);

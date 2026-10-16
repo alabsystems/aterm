@@ -9,26 +9,19 @@ use std::ops::Range;
 
 use crate::grapheme::ColumnMap;
 
-/// The grid cells one line of text was read from: where each cell's text
-/// lies in the line, the column the cell is drawn at and how many columns it
-/// covers.
+/// The grid cells one line of text was read from: where each cell's text lies in
+/// the line, the column it is drawn at and how many columns it covers.
 ///
-/// A terminal's row reader builds it beside the row's text, pushing each cell
-/// as it appends that cell's text, and hands both to the index
-/// ([`TerminalSearch::index_numbered_cells_owned`]). The index then reports a
-/// match in the cells that hold it instead of re-measuring the text with a
-/// walk that assumes the line was written left to right in one go, which the
-/// grid does not promise. It folds a character into the cell before it only
-/// when that cell is the one before the cursor as the character arrives. Two
-/// regional indicators written into neighbouring cells out of order, or
-/// brought together by a delete-character, therefore stay two cells where a
-/// walk of the text pairs them into one flag. A VS16 base in a row's last
-/// column stays one cell wide where a walk widens it. Each moved every later
-/// match on the line off the cells it is drawn in.
+/// A row reader builds it beside the row's text and hands both to the index
+/// ([`TerminalSearch::index_numbered_cells_owned`]), which then reports a match in
+/// the cells that hold it. Re-measuring the text would assume it was written left to
+/// right in one go, which the grid does not promise: it folds a character into the
+/// previous cell only when that cell is just before the cursor. So two regional
+/// indicators written out of order (or brought together by a delete-character) stay
+/// two cells, and a VS16 base in a row's last column stays one cell wide.
 ///
-/// Stored as runs of cells of one shape (the same bytes and width, in
-/// consecutive columns), so a row of ASCII or of ideographs is one run, held
-/// inline: the rows of an ordinary scrollback cost no allocation.
+/// Stored as runs of cells of one shape (same bytes and width, consecutive columns),
+/// so a row of ASCII or of ideographs is one inline run and costs no allocation.
 ///
 /// [`TerminalSearch::index_numbered_cells_owned`]: crate::TerminalSearch::index_numbered_cells_owned
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -168,23 +161,18 @@ impl LineCells {
         }
     }
 
-    /// Append `text`, a row read with the grid cells it is drawn in
-    /// (`cells`), to `line`, whose cells these are, as the row of a
-    /// soft-wrapped run drawn from column `row_start` of the joined line:
-    /// `k * cols` for row `k` of the run.
+    /// Append `text`, a row read with the cells it is drawn in (`cells`), to `line`
+    /// (whose cells these are) as the row of a soft-wrapped run drawn from column
+    /// `row_start` of the joined line: `k * cols` for row `k`.
     ///
-    /// The run's stride is built in, never counted: the columns from where
-    /// the cells so far end up to `row_start` (the tail of the row before
-    /// that its text does not reach: cells never written or erased, the cell
-    /// a wide glyph left when it wrapped early, a whole blank row) are padded
-    /// with one-column spaces, which read as a break, and the row's own cells
-    /// follow at `row_start` plus the column the grid drew each in. Counting
-    /// a row's columns by re-measuring its text broke the stride wherever the
-    /// text measures wider than the row is (a VS16 base the grid kept one
-    /// cell wide in the last column) and moved every later column of the run
-    /// (ruling 2026-10-11, r15 content-4). The one join find's soft-wrap fold
-    /// and a double-click's word window both take (r16 selection-stride), so
-    /// a column of a run names the same cell to both.
+    /// The stride is built in, never counted. The columns from where the cells so far
+    /// end up to `row_start` (cells never written or erased, the cell a wide glyph left
+    /// when it wrapped early, a whole blank row) are padded with one-column spaces,
+    /// which read as a break, and the row's cells follow at `row_start` plus their grid
+    /// columns. Re-measuring the text would break the stride wherever it measures wider
+    /// than the row (a VS16 base kept one cell wide in the last column). Find's
+    /// soft-wrap fold and a double-click's word window both join this way, so a column
+    /// of a run names the same cell to both.
     pub fn append_wrapped_row(
         &mut self,
         line: &mut String,
@@ -277,10 +265,9 @@ impl LineCells {
         self.head.is_none()
     }
 
-    /// Where the text of the cell drawn over column `col` starts in the
-    /// line: the cell itself, read by its column, never by a walk of the
-    /// text. `None` where no cell is drawn: past the line's last cell, or in
-    /// a column no recorded cell covers.
+    /// Where the text of the cell drawn over column `col` starts in the line, read by
+    /// the cell's column, never by a walk of the text. `None` where no recorded cell
+    /// covers `col`.
     #[must_use]
     pub fn byte_at_column(&self, col: usize) -> Option<usize> {
         self.runs().find_map(|run| {
@@ -293,12 +280,11 @@ impl LineCells {
         })
     }
 
-    /// The bytes of the cells drawn over any of columns `start_col..end_col`
-    /// (`end_col` exclusive): from where the first such cell's text starts
-    /// to where the last one's ends, a cell the range covers only part of (a
-    /// wide glyph's half) taken whole, as a copy of those columns takes it.
-    /// Read by the cells' columns, never by a walk of the text. `None` when
-    /// no cell is drawn there.
+    /// The bytes of the cells drawn over any of columns `start_col..end_col`, from the
+    /// first such cell's start to the last one's end; a cell the range covers only
+    /// part of (a wide glyph's half) is taken whole, as a copy of those columns takes
+    /// it. Read by the cells' columns, never by a walk of the text. `None` when no
+    /// cell is drawn there.
     #[must_use]
     pub fn bytes_in_columns(&self, start_col: usize, end_col: usize) -> Option<Range<usize>> {
         let mut found: Option<Range<usize>> = None;
@@ -427,11 +413,9 @@ mod tests {
         );
     }
 
-    /// A soft-wrapped row joins at its stride, whatever its text measures:
-    /// a three-column row whose last cell holds a VS16 base the grid kept
-    /// one cell wide puts the next row's first cell at column 3, not 4, and
-    /// a row that stops short (or holds nothing) is padded out to it with
-    /// one-column spaces.
+    /// A soft-wrapped row joins at its stride, whatever its text measures: after a
+    /// three-column row ending in a one-cell VS16 base the next row starts at column 3,
+    /// not 4, and a short or empty row is padded out with one-column spaces.
     #[test]
     fn a_wrapped_row_joins_at_its_stride() {
         let mut row0 = LineCells::new();

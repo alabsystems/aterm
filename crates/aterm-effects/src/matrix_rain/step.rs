@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The rain driver's one frame: the sequencing every host runs around the
-//! PHOSPHOR engine. The suspended arm (the weather advances, nothing is drawn,
-//! the completion latch stays baselined), the per-frame policy (reduced motion,
+//! The rain driver's one frame, the sequencing every host runs around the
+//! engine: the suspended arm (the weather advances, nothing is drawn, the
+//! completion latch stays baselined), the per-frame policy (reduced motion,
 //! visibility), the weather's notes (agent output, the shell's Execute edge, a
 //! new command completion), the grid scan gated by the host's coherent
 //! snapshot, and the emission on the host's clock.
@@ -247,8 +247,7 @@ mod tests {
 
     /// With no engine running, both latches still observe: a command that
     /// started or finished while the rain was off is not news to the engine
-    /// an enable builds. A latch that only watches Execute replays the
-    /// completion.
+    /// an enable builds. Control: watching Execute alone replays the completion.
     #[test]
     fn a_surface_without_an_engine_keeps_both_latches_observing() {
         let mut l = RainLatches::default();

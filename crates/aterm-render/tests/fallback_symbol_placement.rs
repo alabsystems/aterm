@@ -1,24 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Where a SHRUNK fallback symbol sits, and how big an italic one is.
+//! Where a shrunk fallback symbol sits, and how big a styled one is.
 //!
-//! THE BUG THIS PINS, measured on a Linux aarch64 host on 2026-09-24 once the
-//! bundled font stack put Noto Sans Symbols 2 at the head of the symbol tier:
-//! its symbols have ~0.9 em advances, so `harmonize_fallback_raster` shrinks
-//! them into a 0.6 em cell — and it scaled `ymin` about the BASELINE. A glyph
-//! whose ink starts on the baseline (`⏺`, `⏸`) kept its floor and lost its
-//! top, so Claude Code's `⏺` tool bullet drew 11 px and ~2.5 px LOWER than the
-//! primary's `●` beside it. Under SGR 3 the synthetic shear was part of the
-//! mask the fit measured, so a box-filling `✔` / `★` shrank again in italic.
+//! Noto Sans Symbols 2's symbols have ~0.9 em advances, so `harmonize_fallback_raster`
+//! shrinks them into a 0.6 em cell. A symbol shrinks about its ink centre (a letter about
+//! the baseline), and bold/italic are applied after the fit so they cannot shrink it.
 //!
-//! The same FONTS on every host: the primary (JetBrains Mono) and the symbol
-//! face (Noto Sans Symbols 2) are the repository's bundled asset files,
-//! injected by bytes. Not the same RASTERIZER: macOS draws both through
-//! CoreText, whose raster box carries a pad around the ink and whose `●` is
-//! unhinted, and elsewhere they go through the portable rasterizers. So each
-//! assertion states a relation that holds under both, and says where a
-//! platform's raster bounds it.
+//! The fonts are the bundled assets on every host, but the rasterizer is not: macOS uses
+//! CoreText (a padded raster box, an unhinted `●`), elsewhere the portable rasterizers. Each
+//! assertion states a relation that holds under both.
 
 use aterm_render::{GlyphImage, Renderer, StyleBits, Theme};
 
@@ -111,10 +102,8 @@ fn styled_symbols_share_one_size(px: f32) {
         let (bold, italic) = (r.glyph_image(bold).clone(), r.glyph_image(italic).clone());
         let regular = r.glyph_key(ch);
         let regular = r.glyph_image(regular).clone();
-        // Neither style may vanish, and neither may leave the cell. A style
-        // that yielded to the box drew both exactly as the regular mask
-        // whenever the fitted ink filled the box's width — which the ink fit
-        // does to every symbol its width bounds (`⏺` from 14 px up).
+        // Neither style may vanish or leave the cell, even when the fitted ink fills the
+        // box's width (`⏺` from 14 px up).
         for (name, styled) in [("bold", &bold), ("italic", &italic)] {
             assert!(
                 styled.bytes() != regular.bytes() || styled.width() != regular.width(),
@@ -131,8 +120,7 @@ fn styled_symbols_share_one_size(px: f32) {
         let i = ink_rows(&italic).expect("italic has ink");
         let g = ink_rows(&regular).expect("regular has ink");
         let (bh, ih, gh) = (b.1 - b.0, i.1 - i.0, g.1 - g.0);
-        // Bold is deferred into the fit too: measuring the dilated ink shrank
-        // a box-filling symbol by the dilation (bold ⏺ 7 rows vs 9 at 14 px).
+        // Bold is deferred into the fit too, so the dilation cannot shrink the ink.
         assert!(
             (bh - gh).abs() <= 1,
             "{px} px {ch}: bold ink is {bh} rows tall, regular {gh} — the dilation shrank it"
@@ -161,11 +149,8 @@ fn renderer_with_math(px: f32) -> Renderer {
     r
 }
 
-/// THE REGRESSION the symbol centring introduced: centring EVERY shrunk
-/// fallback raster floated Noto Sans Math's letters 3-5 px above the baseline
-/// (`𝐖` ink rows 3..11 at 18 px, 4..16 at 26 px). A letter is TEXT: its shrink
-/// is anchored on the baseline, so its ink stands on the line the primary's
-/// `W` stands on.
+/// A shrunk fallback letter (Noto Sans Math) is text: its shrink is anchored on the
+/// baseline, so its ink stands on the line the primary's `W` stands on.
 #[test]
 fn a_shrunk_fallback_letter_stands_on_the_baseline() {
     for px in [14.0_f32, 18.0, 26.0] {
@@ -188,15 +173,10 @@ fn a_shrunk_fallback_letter_stands_on_the_baseline() {
     }
 }
 
-/// Claude Code's `⏺` tool bullet from Noto Sans Symbols 2 reads at the size
-/// of the primary's `●`: the symbol fit sizes the INK into the cell. Fitting
-/// the 0.9 em ADVANCE drew it at two thirds of `●` (6 rows vs 9 at 14 px), and
-/// fitting CoreText's padded raster BOX drew it at 5 rows against 9 at 12 px
-/// on macOS. It still never leaves the cell box — so it can match `●` only
-/// where `●` itself fits there: CoreText's unhinted `●` inks 9 rows across a
-/// 7 px cell at 12 px (measured on macOS 2026-09-25), taller than any disc the
-/// cell's width holds. The yardstick is `●`, capped at the `cell_w` rows a
-/// round disc in the cell box can have.
+/// `⏺` from Noto Sans Symbols 2 reads at the size of the primary's `●`: the symbol fit sizes
+/// the ink, not the advance or CoreText's padded box, into the cell. It never leaves the
+/// cell box, so the yardstick is `●` capped at `cell_w` rows (CoreText's unhinted `●` inks
+/// 9 rows across a 7 px cell at 12 px).
 #[test]
 fn a_fallback_media_disc_is_as_big_as_the_primary_disc() {
     for px in [12.0_f32, 14.0, 18.0, 26.0, 40.0] {

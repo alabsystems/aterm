@@ -664,8 +664,9 @@ pub struct GcReport {
     /// What the exec-root sweep could not remove, one sentence each.
     pub exec_root_errors: Vec<String>,
     /// `(program, build, who)` for every build this pass would have reclaimed but KEPT
-    /// because a run holds a lease on it ([`crate::lease`]) — a merge-contract run or a cut
-    /// that resolved it and has stages still to run — or because its leases could not be
+    /// because a run holds a lease on it ([`crate::lease`]) — a release cut, or a command
+    /// run under `aterm pkg lease`, that resolved it and has steps still to run — or
+    /// because its leases could not be
     /// read. Its own category: a kept build is disk the owner may wonder about, and the
     /// line says whose it is and that the next pass after the run takes it.
     pub leased: Vec<(String, u64, crate::lease::Holders)>,
@@ -703,7 +704,7 @@ pub struct GcReport {
 /// next pass.
 #[must_use]
 pub fn run(layout: &Layout, channel: Option<&Channel>) -> GcReport {
-    run_keeping_pinned_partials(layout, channel, &|_| None)
+    run_in(layout, None, channel, &|_| None, &running_executables)
 }
 
 /// [`run`], with the staging sweep sparing — per program — the `.part` AND the complete
@@ -733,6 +734,9 @@ pub fn run(layout: &Layout, channel: Option<&Channel>) -> GcReport {
 /// reclaimable by the standalone [`run`] — neither a killed download nor an aborted tuple
 /// ever permanently strands bytes.
 ///
+/// A vendor-direct program the caller pins nothing for keeps the asset of the head its
+/// lane last read and has not installed ([`pursued_asset`]).
+///
 /// Trust posture: `pinned_asset` only ever SHRINKS the sweep, never extends it — it can
 /// keep a file the pass was about to finish, but cannot make gc delete anything the plain
 /// sweep would not, follow a symlink (the regular-file check runs first), or touch other
@@ -743,7 +747,31 @@ pub fn run_keeping_pinned_partials(
     channel: Option<&Channel>,
     pinned_asset: &dyn Fn(&str) -> Option<String>,
 ) -> GcReport {
-    run_in(layout, None, channel, pinned_asset, &running_executables)
+    run_in(
+        layout,
+        None,
+        channel,
+        &|p: &str| pinned_asset(p).or_else(|| pursued_asset(layout, p)),
+        &running_executables,
+    )
+}
+
+/// The staging name a vendor-direct program is still working towards: the asset of the
+/// last head its lane read ([`ProgramStamp`]'s `last_head`) while that head is above the
+/// program's active build. A pass that did not read the head — offline, its one head GET
+/// unanswered, or a verb that visits other programs — resolves no asset for the program,
+/// and the pass-end sweep took the `.part` of a 368 MB muse transfer, or the verified
+/// archive a codesign deferral carried, so the next landing downloaded it all again. A
+/// head read past that version, or its install, ends the spare; [`run`] reclaims it too.
+///
+/// [`ProgramStamp`]: crate::vendor_direct::ProgramStamp
+fn pursued_asset(layout: &Layout, program: &str) -> Option<String> {
+    let spec = crate::vendor_direct::spec(program)?;
+    let head = crate::vendor_direct::ProgramStamp::read(layout, program)?.last_head?;
+    let active = crate::ops::active_builds(layout).get(program).copied();
+    (active < Some(head.build_id())).then(|| {
+        crate::vendor_direct::resolve::staging_asset(spec, head, crate::cli::current_triple())
+    })
 }
 
 /// [`run_keeping_pinned_partials`] confined to `programs`: only their superseded builds
@@ -764,7 +792,7 @@ pub fn run_for_programs(
         layout,
         Some(&|p: &str| programs.contains(p)),
         None,
-        pinned_asset,
+        &|p: &str| pinned_asset(p).or_else(|| pursued_asset(layout, p)),
         &running_executables,
     )
 }
@@ -908,7 +936,7 @@ fn run_in(
         // Reported only when the removal actually happened: the point of the line is to say
         // where the disk went, and a scratch dir we failed to unlink (a permissions problem,
         // a busy handle) did not go anywhere. The next pass enumerates it again.
-        if std::fs::remove_dir_all(&path).is_ok() {
+        if crate::store::remove_tree(&path).is_ok() {
             swept_scratch.entry(program).or_default().push(name);
         }
     }
@@ -1063,8 +1091,8 @@ fn lease_clear(
 /// stop gc for good.
 ///
 /// A process is only half of "in use". A run that resolved a build and runs its stages
-/// from it — the merge contract, a release cut — has no process there between two
-/// stages; it holds a LEASE instead ([`crate::lease`]), which the reclaim asks first
+/// from it — a release cut, a command under `aterm pkg lease` — has no process there
+/// between two steps; it holds a LEASE instead ([`crate::lease`]), which the reclaim asks first
 /// ([`lease_clear`]) and holds the gate of across the delete.
 struct InUse<'a> {
     layout: &'a Layout,
@@ -1142,7 +1170,7 @@ pub(crate) fn running_from_table(dir: &Path, running: &[PathBuf]) -> Option<Path
 /// module to hand to [`running_from`]. The three platform declarations below cover every
 /// target between them, but only as a three-way split, and a `crate::`-qualified reference
 /// must name a declaration that survives wherever the reference does: the foreign compile
-/// cells (`xtask gate cells-foreign`) type-check it off this host.
+/// cells (`verify cells`) type-check it off this host.
 pub(crate) fn process_table() -> Option<Vec<PathBuf>> {
     running_executables()
 }
@@ -1447,7 +1475,7 @@ mod tests {
                     std::fs::set_permissions(&d, std::fs::Permissions::from_mode(m)).unwrap();
                 }
             };
-            mode(0o555);
+            mode(0o500);
             let report = run(&l, None);
             mode(0o755);
             assert!(
@@ -2360,6 +2388,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
+    /// A pass that did not read a vendor program's head resolves no asset for it, and its
+    /// sweeps still spare the `.part` and the carried archive of the head the lane last
+    /// read and has not installed. A stale asset of an older head is swept. The control:
+    /// once that head is the active build, both go.
+    #[test]
+    fn an_unread_vendor_head_keeps_the_resume_state_of_the_head_it_pursues() {
+        use crate::vendor_direct::{ProgramStamp, Version, spec};
+        let l = layout("pursued-head");
+        let v = |text: &str| Version::parse(text).unwrap();
+        let asset = |version| {
+            let triple = crate::cli::current_triple();
+            crate::vendor_direct::resolve::staging_asset(spec("muse").unwrap(), version, triple)
+        };
+        let head = v("1.4.9-R6299");
+        let staging = l.staging_dir("muse");
+        std::fs::create_dir_all(&staging).unwrap();
+        let part = staging.join(format!("{}.part", asset(head)));
+        let carried = staging.join(asset(head));
+        let stale = format!("{}.part", asset(v("1.4.9-R6298")));
+        for p in [&part, &carried, &staging.join(&stale)] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        ProgramStamp::record_check(&l, "muse", 1_790_000_000, Some(head), None).unwrap();
+        let muse = BTreeSet::from(["muse".to_string()]);
+
+        let report = run_keeping_pinned_partials(&l, None, &|_| None);
+        assert!(part.exists(), "the pursued head's resume state survives");
+        assert!(carried.exists(), "…and its carried archive");
+        assert_eq!(
+            report.swept_staging,
+            vec![("muse".to_string(), vec![stale])]
+        );
+        let _ = run_for_programs(&l, &muse, &|_| None);
+        assert!(
+            part.exists() && carried.exists(),
+            "the scoped form spares them too"
+        );
+
+        seed(&l, "muse", head.build_id(), true);
+        let _ = run_keeping_pinned_partials(&l, None, &|_| None);
+        assert!(!part.exists(), "an installed head pursues nothing");
+        assert!(!carried.exists());
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
     /// THE ARCHIVE A HELD TOOLCHAIN FLIP WAITS ON SURVIVES EVERY GC (2026-09-26): an
     /// install's pass-end sweep, which resolved another program, and a plain `atpkg gc`,
     /// which resolved none, both keep it — and say so — while the record stands and names
@@ -2478,8 +2551,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A LEASED BUILD IS KEPT, AND SAID (gap #31). A merge-contract run pinned to a
-    /// superseded trust build holds a lease on it between its stages, when no process runs
+    /// A LEASED BUILD IS KEPT, AND SAID (gap #31). A release cut pinned to a
+    /// superseded trust build holds a lease on it between its steps, when no process runs
     /// from it: gc keeps it, the report names who holds it, and the first pass after the run
     /// reclaims it. A lease on one build keeps nothing else.
     #[test]
@@ -2493,7 +2566,7 @@ mod tests {
         let lease = crate::lease::take(
             &l.prefix,
             &subject,
-            "aterm-verify (pid 7) — the merge contract in /w",
+            "aterm-release (pid 7) — a release cut in /w",
             crate::lease::DEFAULT_WAIT,
         )
         .unwrap();
@@ -2506,7 +2579,7 @@ mod tests {
                 "trust".to_string(),
                 8590,
                 crate::lease::Holders::Held(vec![
-                    "aterm-verify (pid 7) — the merge contract in /w".to_string()
+                    "aterm-release (pid 7) — a release cut in /w".to_string()
                 ])
             )]
         );

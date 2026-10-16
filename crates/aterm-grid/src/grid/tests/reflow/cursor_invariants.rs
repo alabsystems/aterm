@@ -22,7 +22,7 @@ fn cursor_invariant_exhaustive_small_grids() {
                 for cursor_row in 0..rows {
                     for cursor_col in 0..old_cols {
                         let mut grid = Grid::new(rows, old_cols);
-                        // Write content on cursor row to exercise chunk_cells_to_rows
+                        // Content on the cursor row exercises `chunk_cells_to_rows`.
                         grid.set_cursor(cursor_row, 0);
                         let content_len = old_cols.min(26);
                         for i in 0..content_len {
@@ -32,7 +32,6 @@ fn cursor_invariant_exhaustive_small_grids() {
 
                         grid.resize(rows, new_cols);
 
-                        // The invariant: cursor within bounds
                         assert!(
                             grid.cursor_row() < rows,
                             "cursor row {} >= rows {} after resize({rows}, {new_cols}) \
@@ -60,8 +59,7 @@ fn cursor_invariant_exhaustive_small_grids() {
     );
 }
 
-/// A cursor on an empty row during shrink (the `content_len == 0` branch)
-/// stays valid for all grid sizes.
+/// A cursor on an empty row stays valid through a shrink, for all grid sizes.
 #[test]
 fn cursor_on_empty_row_shrink() {
     for rows in 1..=12u16 {
@@ -69,7 +67,6 @@ fn cursor_on_empty_row_shrink() {
             for new_cols in 1..old_cols {
                 for cursor_row in 0..rows {
                     let mut grid = Grid::new(rows, old_cols);
-                    // Leave all rows empty — cursor is on a blank row
                     grid.set_cursor(cursor_row, old_cols / 2);
 
                     grid.resize(rows, new_cols);
@@ -91,7 +88,7 @@ fn cursor_on_empty_row_shrink() {
     }
 }
 
-/// Cursor on an empty row during grow: same as above but for the grow path.
+/// The same for the grow path.
 #[test]
 fn cursor_on_empty_row_grow() {
     for rows in 1..=12u16 {
@@ -127,12 +124,10 @@ fn cursor_invariant_multi_resize_cycle() {
     ];
 
     let mut grid = Grid::new(5, 20);
-    // Fill row 0 with content
     grid.set_cursor(0, 0);
     for c in "ABCDEFGHIJKLMNOPQRST".chars() {
         grid.write_char(c);
     }
-    // Place cursor at row 2, col 10
     grid.set_cursor(2, 10);
 
     for &(rows, cols) in dimensions {
@@ -199,12 +194,11 @@ fn cursor_on_last_row_with_expanding_content_shrink() {
     let new_cols: u16 = 2;
 
     let mut grid = Grid::new(rows, old_cols);
-    // Fill the last row with content that will expand to 10 output rows
+    // The last row expands to 10 rows at 2 columns.
     grid.set_cursor(rows - 1, 0);
     for i in 0..old_cols {
         grid.write_char((b'A' + (i % 26) as u8) as char);
     }
-    // Cursor at last row, middle column
     grid.set_cursor(rows - 1, 10);
 
     grid.resize(rows, new_cols);
@@ -229,7 +223,6 @@ fn cursor_invariant_with_scrollback() {
     let cols: u16 = 10;
     let mut grid = Grid::with_scrollback(rows, cols, 50);
 
-    // Build scrollback
     for i in 0..20u16 {
         grid.set_cursor(rows - 1, 0);
         grid.write_char((b'A' + (i % 26) as u8) as char);
@@ -237,7 +230,6 @@ fn cursor_invariant_with_scrollback() {
     }
     assert!(grid.scrollback_lines() > 0);
 
-    // Cursor at various positions, shrink then grow
     for cursor_row in 0..rows {
         for cursor_col in [0u16, cols / 2, cols - 1] {
             let mut g = Grid::with_scrollback(rows, cols, 50);
@@ -248,13 +240,11 @@ fn cursor_invariant_with_scrollback() {
             }
             g.set_cursor(cursor_row, cursor_col);
 
-            // Shrink
             g.resize(rows, 3);
             assert!(g.cursor_row() < rows);
             assert!(g.cursor_col() < 3);
             g.assert_invariants();
 
-            // Grow
             g.resize(rows, 20);
             assert!(g.cursor_row() < rows);
             assert!(g.cursor_col() < 20);

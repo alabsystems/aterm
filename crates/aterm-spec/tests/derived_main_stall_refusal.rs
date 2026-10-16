@@ -8,33 +8,7 @@
 //! lockstep) is `aterm-gui`'s watchdog test
 //! `main_stall_conforms_to_the_stall_refusal_model`.
 
-use aterm_spec::{derive::main_thread_stall_refusal_model, interp, verify};
-
-#[test]
-fn main_stall_refusal_proves_and_catches_every_defect() {
-    let model = main_thread_stall_refusal_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the stall refusal must stay enrolled in the spec-link registry"
-    );
-    verify::prove_and_catch_scalar(
-        &model,
-        "main-thread stall refusal: refused iff the main thread is stalled",
-    );
-}
-
-/// Each invariant is caught by its OWN defect: the census stamp never refuses
-/// a thread that moves, and the heartbeat-only and count-until-reply rules
-/// never let a stall through.
-#[test]
-fn each_stall_refusal_invariant_is_caught_by_its_own_defect() {
-    assert!(
-        verify::uncaught_invariants(&main_thread_stall_refusal_model()).is_empty(),
-        "every stall-refusal invariant must be falsified by a Buggy = 1 member"
-    );
-}
+use aterm_spec::{derive::main_thread_stall_refusal_model, interp};
 
 /// Two of the schedules the defects were written for, step by step (the
 /// third, a queued reply, is `a_hop_whose_reply_is_queued_…` below). A

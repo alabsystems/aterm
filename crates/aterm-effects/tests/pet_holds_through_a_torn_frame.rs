@@ -1,33 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PET HOLDS THROUGH A TORN FRAME (2026-09-29).
+//! The pet holds through a torn frame.
 //!
-//! The owner reported the cursor kitty pet glitching while Claude Code ran
-//! (alt screen, DEC-2026 brackets) on a machine at load ~70, whose window
-//! shed effects 358 times in 31 h. A present the host makes while the
-//! program's bracket is still open (its 150 ms hold ran out, or the
-//! terminal's 1 s timeout cleared the mode) shows the cursor HIDDEN wherever
-//! Ink's partial write stopped: `CSI H` parks it at (0,0) before every
-//! repaint, and a transcript redraw walks it down the transcript rows
-//! (measured 2026-09-28: (18,57), then (29,0), with the composer on row 40).
-//! The pet read that write position as its caret: it chased it up the
-//! screen, crouched and leapt in place on the move sensor, and judged the
-//! caret's return as a line change.
+//! A present the host makes while a program's DEC-2026 bracket is still open (the
+//! 150 ms hold ran out, or the terminal's 1 s timeout cleared the mode) shows the
+//! cursor hidden wherever Ink's partial write stopped: `CSI H` parks it at (0,0)
+//! before every repaint, and a transcript redraw walks it down the transcript rows.
+//! Read as the caret, that write position pulls the pet up the screen, sets off the
+//! move sensor, and makes the caret's return read as a line change.
 //!
-//! These laws replay Claude Code's own recorded bytes through a real
-//! `Terminal` and the shipping `CompanionOwner`, fed by `TerminalFacts::read`
-//! and presented under the native host's frame hold, with each bracket split
-//! at the rows Ink writes and spread so the hold runs out mid-bracket.
-//! [`Contract::Shipping`] is the facts as the hosts hand them now: a hidden
-//! cursor on an unfinished frame reads as the last finished frame's caret.
-//! [`Contract::Raw`] hands that cursor over as a caret, as they did before.
-//! The brain's own repaint hold (`HIDDEN_HOLD_MAX`, 0.25 s), which no longer
-//! resigns to the hidden caret it holds, covers even the raw contract for
-//! the owner's 280 ms bracket; past it the raw contract brings the defect
-//! back, which is the negative control that keeps these laws from passing
-//! vacuously. Before this fix all three laws failed (the old brain perked on
-//! the owner's 280 ms bracket and leapt on a 1.3 s one).
+//! These laws replay Claude Code's recorded bytes through a real `Terminal` and the
+//! shipping `CompanionOwner`, fed by `TerminalFacts::read` and presented under the
+//! native host's frame hold, each bracket split at the rows Ink writes and spread so
+//! the hold runs out mid-bracket. Under [`Contract::Shipping`] a hidden cursor on an
+//! unfinished frame reads as the last finished frame's caret; [`Contract::Raw`]
+//! hands it over as a caret. The brain's own repaint hold (`HIDDEN_HOLD_MAX`,
+//! 0.25 s) covers even the raw contract for a 280 ms bracket; past it the raw
+//! contract brings the defect back, the negative control that keeps these laws from
+//! passing vacuously.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -54,13 +45,13 @@ const ROW: u16 = 37;
 const FRAME_MS: u64 = 16;
 /// `app_render.rs`'s `SYNC_HOLD_CAP`.
 const SYNC_HOLD_CAP: Duration = Duration::from_millis(150);
-/// The owner's measured bracket, and one past the terminal's 1 s timeout.
+/// A bracket length measured live, and one past the terminal's 1 s timeout.
 const OWNER_MS: u64 = 280;
 const PAST_TIMEOUT_MS: u64 = 1_300;
 
-/// Claude Code 2.1.278 under a PTY wrapper in a headless aterm (2026-09-21):
-/// a line typed at 12 cps with Option+Left/Right hops, End, and an
-/// `@`-mention popup. Every `O` line is one PTY read.
+/// Claude Code 2.1.278 under a PTY wrapper in a headless aterm: a line typed at 12
+/// cps with Option+Left/Right hops, End, and an `@`-mention popup. Every `O` line
+/// is one PTY read.
 const FIXTURES: [(&str, &str); 4] = [
     (
         "insert",
@@ -87,9 +78,9 @@ const SHOW: &[u8] = b"\x1b[?25h";
 /// How the host hands the pet a hidden cursor on an unfinished frame.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Contract {
-    /// `TerminalFacts::read` as it ships: the program's account rides.
+    /// `TerminalFacts::read` as it ships, `frame_unfinished` included.
     Shipping,
-    /// Before this fix: the write position handed over as the caret.
+    /// `frame_unfinished` cleared: the write position handed over as the caret.
     Raw,
 }
 
@@ -246,12 +237,10 @@ struct Host {
     painted: Option<(u16, u16)>,
     shots: Vec<Shot>,
     /// The last present's cell snapshot, keyed by the terminal's
-    /// `screen_mutations` when it was taken. The 16 ms train presents far
-    /// more often than output arrives, and an unchanged terminal snapshots
-    /// to the same cells, so a present with no output since reuses it:
-    /// the pet observes exactly what a fresh `cell_frame` would hand it
-    /// (checked equal, `snapshot_seq` included, at every present of this
-    /// file's eight laws, 2026-10-05; it halved their CPU).
+    /// `screen_mutations`. An unchanged terminal snapshots to the same cells, so a
+    /// present with no output since reuses it and the pet observes exactly what a
+    /// fresh `cell_frame` would hand it, `snapshot_seq` included; it halves this
+    /// file's CPU.
     input: Option<(u64, RenderInput)>,
 }
 
@@ -543,17 +532,16 @@ fn conform(model: &Model, seat: &Shot, shots: &[Shot]) -> Result<usize, String> 
     Ok(stepped)
 }
 
-/// THE OWNER'S SHAPE ON THE REAL BYTES: the take's own full-screen paint,
-/// sent again once the pet has settled beside the composer's caret, with the
-/// cursor hidden and the bracket held open 280 ms and then 1.3 s. Every
-/// present from the first torn one until a second after the close leaves
-/// the pet exactly where it sat, at the same opacity, with no reaction, and
-/// the torn path conforms to `ConsoleCursorHome` (hide, `RepaintMove` for
-/// every torn present, show).
+/// The take's own full-screen paint, sent again once the pet has settled beside the
+/// composer's caret, with the cursor hidden and the bracket held open 280 ms and
+/// then 1.3 s. Every present from the first torn one until a second after the close
+/// leaves the pet where it sat, at the same opacity, with no reaction, and the torn
+/// path conforms to `ConsoleCursorHome` (hide, `RepaintMove` per torn present,
+/// show).
 ///
-/// NEGATIVE CONTROL: the raw contract inside the brain's repaint hold holds
-/// too (the owner's 280 ms), and past it (1.3 s) the pet reacts to the write
-/// position and the model refuses the present that shows it.
+/// Negative control: the raw contract holds inside the brain's repaint hold (280
+/// ms); past it (1.3 s) the pet reacts to the write position and the model refuses
+/// the present that shows it.
 #[test]
 fn a_torn_full_repaint_neither_moves_nor_fades_the_settled_pet() {
     let model = console_cursor_home_model();
@@ -590,12 +578,9 @@ fn a_torn_full_repaint_neither_moves_nor_fades_the_settled_pet() {
             let broken = after.iter().find(|s| disturbed(&settled, s));
             let conformed = conform(&model, &settled, after);
             if contract == Contract::Raw && open_ms == PAST_TIMEOUT_MS {
-                // The raw write cursor must visibly disturb the seated pet and
-                // the model must refuse the present that shows it. How FAR it
-                // strays is not the control: on the full screen the live-edge
-                // hug that used to carry it off toward the footer is gated
-                // independently (`PetBrain::note_full_screen`), so what the
-                // raw contract still costs here is the perk at the write row.
+                // How far the pet strays is not the control: the full screen's
+                // live-edge hug is gated separately (`PetBrain::note_full_screen`),
+                // so the raw contract's cost here is the perk at the write row.
                 assert!(
                     broken.is_some() && conformed.is_err(),
                     "{label}: negative control: the write cursor must disturb the pet \
@@ -617,16 +602,13 @@ fn a_torn_full_repaint_neither_moves_nor_fades_the_settled_pet() {
     }
 }
 
-/// EVERY BRACKET OF THE TAKE, TORN: the whole recording with each read's
-/// brackets held open 280 ms, typing and all, and one take with them held
-/// 1.3 s (that stretches a take ~3.5x, so one is enough). From the first
-/// painted caret on, no torn present puts the body away from the composer,
-/// dims it, or starts a reaction. NEGATIVE CONTROL: the raw contract with
-/// the brackets past the repaint hold chases the write cursor off the
-/// composer and hops on it.
+/// Every bracket of the take torn: the whole recording with each read's brackets
+/// held open 280 ms, and one take at 1.3 s (which stretches a take ~3.5x). From the
+/// first painted caret on, no torn present puts the body away from the composer,
+/// dims it, or starts a reaction. Negative control: the raw contract past the
+/// repaint hold chases the write cursor off the composer.
 ///
-/// One `#[test]` per take (the four fixtures at 280 ms, the popup at 1.3 s,
-/// and the raw control), so libtest runs the six replays side by side.
+/// One `#[test]` per take, so libtest runs the six replays side by side.
 fn every_bracket_torn_keeps_the_pet_at_the_composer(
     fixture: usize,
     open_ms: u64,
@@ -725,11 +707,10 @@ fn every_bracket_torn_past_timeout_raw_chases_the_write_cursor() {
     every_bracket_torn_keeps_the_pet_at_the_composer(3, PAST_TIMEOUT_MS, Contract::Raw);
 }
 
-/// A FINISHED frame's hidden caret (no bracket: a build, a pager, a prompt
-/// redraw) keeps the brain's own repaint hold. Inside `HIDDEN_HOLD_MAX` the
-/// pet holds exactly and the caret's return to its painted cell is no move
-/// at all; held past the bound, the hidden caret is followed (CONTROL: the
-/// bound is real, and the hold above is not the pet ignoring the caret).
+/// A finished frame's hidden caret (no bracket: a build, a pager, a prompt redraw)
+/// keeps the brain's own repaint hold: inside `HIDDEN_HOLD_MAX` the pet holds and
+/// the caret's return to its painted cell is no move; held past the bound, the
+/// hidden caret is followed (the control).
 #[test]
 fn a_finished_frames_hidden_caret_is_held_for_a_repaint_and_then_followed() {
     let mut h = Host::start(FIXTURES[0].1, Contract::Shipping, 3_000);

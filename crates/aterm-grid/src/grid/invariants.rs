@@ -30,21 +30,13 @@ impl Grid {
         }
     }
 
-    /// Assert the O(1) grid invariants — `CursorInBounds`, `ScrollRegionValid` +
-    /// `DisplayOffsetValid`, the ring-buffer structure and `KeysCoverRetained`
-    /// — the subset of
-    /// [`Self::assert_invariants`] cheap enough to run on every `process` batch.
-    /// The O(cells) `WideCharConsistent` walk is
-    /// [`Self::assert_wide_char_consistent`], which the no-panic fuzzers
-    /// (aterm-core `fuzz_process_never_panics`) run after every step.
-    ///
-    /// Available in debug builds, tests, and the `testing` feature (the last so a
-    /// release-mode fuzz harness can still call it). INTEGRITY-SELFCHECK (M7) wires
-    /// it into `Terminal::process` under `#[cfg(debug_assertions)]`, so every debug
-    /// build continuously validates the grid at the public processing boundary — the
-    /// same checks the no-panic fuzzer asserts, now always-on in development. Zero
-    /// cost in release.
-    #[cfg(any(debug_assertions, test, feature = "testing"))]
+    /// Assert the O(1) grid invariants (`CursorInBounds`, `ScrollRegionValid` +
+    /// `DisplayOffsetValid`, the ring-buffer structure and `KeysCoverRetained`):
+    /// the subset of [`Self::assert_invariants`] cheap enough that debug builds
+    /// run it after every `Terminal::process` batch and resize. The O(cells)
+    /// `WideCharConsistent` walk is [`Self::assert_wide_char_consistent`], which
+    /// the no-panic fuzzers run after every step.
+    #[cfg(any(debug_assertions, test))]
     pub fn assert_structural_invariants(&self) {
         self.assert_cursor_in_bounds();
         self.assert_scroll_region_valid();
@@ -53,16 +45,9 @@ impl Grid {
     }
 
     /// KeysCoverRetained: `absolute_row_counter >= visible_rows +
-    /// scrollback_lines()` — every retained row has an absolute key at or
-    /// above 0. While it holds, the two maps of an absolute row name one row:
-    /// a shell's OSC 133 mark is RECORDED through `visible_to_absolute`
-    /// (`counter − visible + r`) and READ BACK (`line`, `blocks`, `blocktext`)
-    /// through `oldest_absolute_row()` (`counter − visible − scrollback`,
-    /// saturating at 0) plus the history count. Below it the read map
-    /// saturates and the write map does not, and every later mark reads back
-    /// as a row above its prompt (tab #1, 2026-10-01: a rows-only grow of a
-    /// grid with nothing evicted appended rows under a fixed counter).
-    #[cfg(any(debug_assertions, test, feature = "testing"))]
+    /// scrollback_lines()`, so the write and read maps of an absolute row name
+    /// one row (see `Grid::cover_retained_rows`).
+    #[cfg(any(debug_assertions, test))]
     fn assert_keys_cover_retained_rows(&self) {
         let retained =
             u64::from(self.storage.visible_rows).saturating_add(self.scrollback_lines() as u64);
@@ -74,7 +59,7 @@ impl Grid {
     }
 
     /// CursorInBounds: cursor.row < visible_rows && cursor.col < cols
-    #[cfg(any(debug_assertions, test, feature = "testing"))]
+    #[cfg(any(debug_assertions, test))]
     fn assert_cursor_in_bounds(&self) {
         assert!(
             self.storage.cursor.row < self.storage.visible_rows,
@@ -100,12 +85,10 @@ impl Grid {
     ///
     /// Panics if a visible wide cell lacks its continuation or sits in the
     /// last column.
-    #[cfg(any(debug_assertions, test, feature = "testing"))]
+    #[cfg(any(debug_assertions, test))]
     pub fn assert_wide_char_consistent(&self) {
-        // Walks each row's cell slice once (`Row::get` per cell re-derives the
-        // slice from its page every call, which dominated debug fuzz runs).
-        // Bounded by the grid's column count exactly as the per-cell `get`
-        // walk was: pairs (col, col + 1) with col + 1 < cols, both in the row.
+        // One walk of each row's cell slice (`Row::get` re-derives the slice
+        // from its page per call), over pairs (col, col + 1) with col + 1 < cols.
         let cols = usize::from(self.storage.cols);
         for row_idx in 0..self.storage.visible_rows {
             if let Some(row) = self.row(row_idx) {
@@ -140,19 +123,17 @@ impl Grid {
     /// by that cell's HAS_EXTRAS bit, or holds only truecolor fg/bg bytes (which
     /// a BCE blank owns through its RGB marker, without the bit).
     ///
-    /// An entry its cell does not claim is invisible to the readers that gate
-    /// on the bit, but a later write there with an extras style adopts it, and
-    /// `cell_extra`, `hyperlink_at` and checkpoint serialization read it
-    /// directly: an old combining mark, skin tone or link resurfaces on new
-    /// text. Every operation that blanks or replaces cells drops the entries
-    /// its cells no longer claim ([`Self::drop_unclaimed_extras`]). The no-panic
-    /// fuzzers (aterm-core `fuzz_process_never_panics`) run this after every
-    /// step, so an operation that forgets is found there. O(entries).
+    /// An unclaimed entry is invisible to readers that gate on the bit, but a
+    /// later extras-style write there adopts it, and `cell_extra`,
+    /// `hyperlink_at` and checkpoint serialization read it directly: an old
+    /// combining mark, skin tone or link resurfaces on new text. Every operation
+    /// that blanks or replaces cells calls [`Self::drop_unclaimed_extras`]; the
+    /// no-panic fuzzers run this after every step. O(entries).
     ///
     /// # Panics
     ///
     /// Panics on a visible entry whose cell lacks HAS_EXTRAS.
-    #[cfg(any(debug_assertions, test, feature = "testing"))]
+    #[cfg(any(debug_assertions, test))]
     pub fn assert_extras_claimed(&self) {
         let (rows, cols) = (self.storage.visible_rows, self.storage.cols);
         for (coord, extra) in self.storage.extras.iter() {
@@ -173,7 +154,7 @@ impl Grid {
     }
 
     /// ScrollRegionValid + DisplayOffsetValid.
-    #[cfg(any(debug_assertions, test, feature = "testing"))]
+    #[cfg(any(debug_assertions, test))]
     fn assert_scroll_region_valid(&self) {
         assert!(
             self.storage.scroll_region.top <= self.storage.scroll_region.bottom,
@@ -197,7 +178,7 @@ impl Grid {
 
     /// RowsNonEmpty + RingHeadValid + TotalLinesValid + TotalLinesMinimum:
     /// ring buffer structural invariants.
-    #[cfg(any(debug_assertions, test, feature = "testing"))]
+    #[cfg(any(debug_assertions, test))]
     fn assert_ring_buffer_valid(&self) {
         // The ring always has a row (the constructor enforces rows.max(1));
         // every `% rows.len()` depends on it.
@@ -226,9 +207,9 @@ impl Grid {
         );
         // ring_head advances only when scroll_up reuses rows at capacity;
         // reflow and erase_scrollback reset it. So ring_head > 0 implies every
-        // allocated row is retained. It does NOT imply the ring is at its cap:
-        // a rows-only grow's reveal or a ring-only limit raise lifts the cap
-        // under a wrapped ring, which is why every ring append linearizes first
+        // allocated row is retained, but not that the ring is at its cap: a
+        // rows-only grow's reveal or a ring-only limit raise lifts the cap under
+        // a wrapped ring, which is why every ring append linearizes first
         // (`GridStorage::linearize_ring`).
         assert!(
             self.storage.ring_head == 0 || self.storage.total_lines == self.storage.rows.len(),

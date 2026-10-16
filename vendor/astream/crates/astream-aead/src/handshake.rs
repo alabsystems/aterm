@@ -11,8 +11,8 @@
 //!
 //! # Construction (the NNpsk pattern) — WE own it
 //! We own the whole protocol: the message framing, the transcript binding, and
-//! HMAC-SHA256 / HKDF-SHA256, composed here over the workspace `sha2` exactly as
-//! `astream-cap` owns its HMAC. The ONE primitive we delegate is the raw X25519
+//! HMAC-SHA256 / HKDF-SHA256, composed here over the workspace's SHA-256
+//! (`astream-digest`) exactly as `astream-cap` owns its HMAC. The ONE primitive we delegate is the raw X25519
 //! scalar multiplication — hand-rolling constant-time curve25519 field arithmetic
 //! is where DIY crypto breaks — to the vetted `x25519-dalek`.
 //!
@@ -34,14 +34,14 @@
 //! PSK — no explicit confirmation message needed.
 
 use crate::{SealedStream, KEY_LEN};
-use sha2::{Digest, Sha256};
+use astream_digest::Sha256;
 use std::io::{self, Read, Write};
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
 const SHA256_BLOCK: usize = 64;
 const SHA256_OUT: usize = 32;
 
-/// HMAC-SHA256 (RFC 2104), composed over the workspace `sha2`. Ours, not a
+/// HMAC-SHA256 (RFC 2104), composed over `astream-digest`. Ours, not a
 /// dependency — the same stance `astream-cap` takes.
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; SHA256_OUT] {
     // Derive the block-sized key K0: hash an over-long key, else right-zero-pad.
@@ -66,9 +66,7 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; SHA256_OUT] {
     let mut h = Sha256::new();
     h.update(opad);
     h.update(inner);
-    let mut out = [0u8; SHA256_OUT];
-    out.copy_from_slice(&h.finalize());
-    out
+    h.finalize()
 }
 
 /// HKDF-SHA256 (RFC 5869) producing exactly 32 bytes (a single expand block,
@@ -269,6 +267,28 @@ mod tests {
         let okm = hkdf_sha256_32(&salt, &ikm, &info);
         let expected = hex("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf3");
         assert_eq!(okm.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn hkdf_sha256_matches_rfc5869_a2() {
+        // RFC 5869 Appendix A.2: an 80-byte salt is longer than the HMAC block, so
+        // Extract hashes it first — the path A.1's 13-byte salt never reaches.
+        let salt: Vec<u8> = (0x60u8..=0xaf).collect();
+        let ikm: Vec<u8> = (0x00u8..=0x4f).collect();
+        let info: Vec<u8> = (0xb0u8..=0xff).collect();
+        let okm = hkdf_sha256_32(&salt, &ikm, &info);
+        let expected = hex("b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c");
+        assert_eq!(okm.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn the_session_key_is_the_recorded_answer() {
+        // Recorded from this crate over the `sha2` crate (0.10.9) on 2026-10-15,
+        // before it moved to `astream-digest`, and unchanged over it: both ends of a handshake must derive
+        // this key, so the hash under it may change only if the key does not.
+        let key = derive_session_key(&[9u8; KEY_LEN], &[7u8; 32], &[1u8; 32], &[2u8; 32]);
+        let expected = hex("0d5a777ebe43ec2044188fa05d226c609e80df383b6cfce2b3cfa2bacbc64c24");
+        assert_eq!(key.as_slice(), expected.as_slice());
     }
 
     #[test]

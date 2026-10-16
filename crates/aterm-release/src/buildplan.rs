@@ -39,11 +39,12 @@
 //!     silently missing arch slice or missing atpkg/aterm-ctl/aterm-cli must
 //!     be impossible.
 
+use aterm_uds::spawnfd::{Command, command};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -124,8 +125,8 @@ pub struct BuildOutput {
     /// `aterm-<ver>-x86_64-probe.txt` — the x86_64 slice's `--diagnose` report under
     /// Rosetta ([`x86_64_probe_transcript`]), the record that the universal build RAN
     /// its Intel slice (docs/DESIGN-intel-just-works-2026-09-14.md §3.1). The site's
-    /// `data-intel-proof` (`publish/site-sync.py`) links it once the public release
-    /// carries it.
+    /// `data-intel-proof` (`ship site`, crates/aterm-release/src/site) links it once the
+    /// public release carries it.
     pub x86_64_probe: PathBuf,
 }
 
@@ -175,7 +176,7 @@ pub fn x86_64_probe_transcript(version: &str, report: &str) -> String {
 
 #[cfg(unix)]
 pub(crate) fn current_release_uid() -> Result<u32, String> {
-    let output = Command::new("/usr/bin/id")
+    let output = command("/usr/bin/id")
         .env_clear()
         .env("LC_ALL", "C")
         .arg("-u")
@@ -443,7 +444,7 @@ fn validate_release_rustup_shim_dir(
 /// Rustup's home for the compat lane: a non-empty `$RUSTUP_HOME`, else
 /// `<home>/.rustup` — atpkg's one rule ([`atpkg::seam::rustup_home_with`], which
 /// calls `atpkg::toolchain::rustup_home`, the file aterm-verify compiles by
-/// `#[path]` for the gate), which [`crate::gates`] resolves the rustup `trust`
+/// `#[path]` for its toolchain), which [`crate::gates`] resolves the rustup `trust`
 /// entry through as well. A set-but-empty variable is the default, not a
 /// relative path to refuse.
 fn release_rustup_home(home: &std::ffi::OsStr) -> Result<OsString, String> {
@@ -855,7 +856,7 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
     // `strip -x`: local symbols only — matches build-app.sh; a failure here
     // is tolerated (`|| true` in the script) because an unstripped binary
     // is merely bigger, never wrong.
-    let _ = Command::new("strip")
+    let _ = command("strip")
         .arg("-x")
         .arg(&shipped)
         .current_dir(&plan.repo_root)
@@ -880,7 +881,7 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
     // MUST be a Trust build (the row leads with `Trust`). Anything else means the toolchain
     // file was bypassed (broken rustup link, stale env) — that is a broken
     // toolchain, not a fallback, so the build refuses to continue.
-    let diagnose = match Command::new(&shipped)
+    let diagnose = match command(&shipped)
         .arg("--diagnose")
         .current_dir(&plan.repo_root)
         .output()
@@ -902,7 +903,7 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
         &plan.short_version,
         &[("final universal binary", &diagnose)],
     )?;
-    let version_output = Command::new(&shipped)
+    let version_output = command(&shipped)
         .arg("--version")
         .current_dir(&plan.repo_root)
         .output()
@@ -1095,14 +1096,9 @@ fn build_one(
     };
     let (driver_path, driver_name) = driver;
     // AT THE RELEASE'S OWN TIER — no `taskpolicy`. This is the one compile of the
-    // bytes MEASURE judges and the cut signs (build once, 2026-10-09): the release's
-    // critical path, under the machine's gate lock the release holds. At UTILITY a
-    // peer's default-QoS build starved exactly this compile when it was MEASURE's
-    // (0.100.0: 3943.6 s, `load 75.84 -> 53.53 on 18 cores`, the operator seeing it
-    // at 2-4% of one core; `--compile-qos inherited`, 2026-09-30, went with the
-    // gate's own release build). Under the release's lock the peers it competes
-    // with as an equal are builds, not a person's typing.
-    let mut cmd = Command::new(&driver_path);
+    // bytes `verify release` judges and the cut signs, on the release's critical path:
+    // at UTILITY any peer's default-QoS build starves it.
+    let mut cmd = command(&driver_path);
     cmd.current_dir("/");
     // Targo's explicit unverified lane, the exact sealed dependency source,
     // and offline resolution are one tested argument vector for both arches.
@@ -1197,7 +1193,7 @@ fn build_one(
         "==> {driver_name} build --release {}-p {pkg}  [{lane}]",
         target.map(|t| format!("--target {t} ")).unwrap_or_default()
     );
-    cmd.stdin(std::process::Stdio::null());
+    cmd.stdin(aterm_uds::spawnfd::Stdio::null());
     if let Some(log) = log {
         let mut file = File::create(log).map_err(|e| format!("create {}: {e}", log.display()))?;
         std::io::Write::write_all(&mut file, format!("{banner}\n").as_bytes())
@@ -1228,54 +1224,15 @@ fn build_one(
 /// build's slices may run at once.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn wait_with_peak(
-    child: std::process::Child,
+    mut child: aterm_uds::spawnfd::Child,
 ) -> std::io::Result<(std::process::ExitStatus, Option<u64>)> {
-    use std::os::unix::process::ExitStatusExt as _;
-    // `struct rusage` on every 64-bit Unix this crate builds on: two `timeval`s,
-    // then fourteen `long`s, `ru_maxrss` the first.
-    #[repr(C)]
-    struct Rusage {
-        utime: [i64; 2],
-        stime: [i64; 2],
-        maxrss: i64,
-        rest: [i64; 13],
-    }
-    unsafe extern "C" {
-        fn wait4(pid: i32, status: *mut i32, options: i32, rusage: *mut Rusage) -> i32;
-    }
-    let pid = i32::try_from(child.id()).map_err(std::io::Error::other)?;
-    let mut status = 0i32;
-    let mut usage = Rusage {
-        utime: [0; 2],
-        stime: [0; 2],
-        maxrss: 0,
-        rest: [0; 13],
-    };
-    loop {
-        // SAFETY: `pid` is our own unreaped child; `status` and `usage` are live,
-        // correctly laid-out locals the kernel writes for the duration of the call.
-        let reaped = unsafe { wait4(pid, &raw mut status, 0, &raw mut usage) };
-        if reaped == pid {
-            break;
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-    // Reaped here: dropping the handle must not wait again.
-    drop(child);
-    let unit: u64 = if cfg!(target_os = "macos") { 1 } else { 1024 };
-    let peak = u64::try_from(usage.maxrss)
-        .ok()
-        .filter(|b| *b > 0)
-        .map(|b| b * unit);
-    Ok((std::process::ExitStatus::from_raw(status), peak))
+    let usage = child.wait_with_rusage()?;
+    Ok((usage.status, Some(usage.maxrss).filter(|b| *b > 0)))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn wait_with_peak(
-    mut child: std::process::Child,
+    mut child: aterm_uds::spawnfd::Child,
 ) -> std::io::Result<(std::process::ExitStatus, Option<u64>)> {
     Ok((child.wait()?, None))
 }
@@ -1290,7 +1247,7 @@ fn require_rustup_target(triple: &str) -> Result<(), String> {
     let rustup_home = release_rustup_home(&home)?;
     let shim = release_rustup_shim_dir(&home)?;
     let rustup = shim.join("rustup");
-    let out = Command::new(&rustup)
+    let out = command(&rustup)
         .env_clear()
         .env("HOME", &home)
         .env("PATH", release_tool_path(&shim)?)
@@ -1327,7 +1284,7 @@ pub(crate) fn stable_rustc_commit() -> Result<String, String> {
     let home = std::env::var_os("HOME").ok_or("the stable compiler probe requires HOME")?;
     let shim = release_rustup_shim_dir(&home)?;
     let out = checked_output(
-        Command::new(shim.join("rustc"))
+        command(shim.join("rustc"))
             .env_clear()
             .env("HOME", &home)
             .env("PATH", release_tool_path(&shim)?)
@@ -1697,7 +1654,7 @@ fn verify_shipped_update_pin_slices(
             // `architecture` came through the exact allowlist above, so it is
             // both a safe filename component and a valid lipo selector.
             let thin = temp.0.join(architecture);
-            let mut command = Command::new("lipo");
+            let mut command = command("lipo");
             command
                 .arg(shipped)
                 .args(["-thin", architecture, "-output"])
@@ -1868,7 +1825,7 @@ fn verify_built_slice_update_pins(
     // stripped universal is checked again by `run`; neither probe executes the
     // x86_64 compatibility slice.
     let native = &slices[0];
-    let output = Command::new(native)
+    let output = command(native)
         .arg("--diagnose")
         .current_dir(repo_root)
         .output()
@@ -1981,7 +1938,7 @@ fn x86_64_slice_runs(
 ) -> Result<String, String> {
     crate::gates::rosetta_runs(run)?;
     std::fs::create_dir_all(home).map_err(|error| format!("create {}: {error}", home.display()))?;
-    let mut probe = Command::new("/usr/bin/arch");
+    let mut probe = command("/usr/bin/arch");
     probe
         .arg("-x86_64")
         .arg(universal)
@@ -2041,11 +1998,11 @@ pub(crate) fn slice_drives_a_session(
     slice: SliceArch,
     renderer: Renderer,
     scratch: &Path,
-    spawn: &mut dyn FnMut(&mut Command) -> std::io::Result<std::process::Child>,
+    spawn: &mut dyn FnMut(&mut Command) -> std::io::Result<aterm_uds::spawnfd::Child>,
     run: &mut dyn FnMut(&mut Command) -> std::io::Result<std::process::Output>,
     socket_wait: std::time::Duration,
 ) -> Result<(), String> {
-    struct Reap(std::process::Child);
+    struct Reap(aterm_uds::spawnfd::Child);
     impl Drop for Reap {
         fn drop(&mut self) {
             let _ = self.0.kill();
@@ -2076,7 +2033,7 @@ pub(crate) fn slice_drives_a_session(
             .current_dir(&home);
     };
 
-    let mut instance = Command::new("/usr/bin/arch");
+    let mut instance = command("/usr/bin/arch");
     instance
         .arg(slice.arch_flag())
         .arg(universal)
@@ -2088,9 +2045,9 @@ pub(crate) fn slice_drives_a_session(
         .args(["--no-reroute", "--control-sock"])
         .arg(&sock)
         .args(["--columns", "80", "--lines", "24"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null());
     hermetic(&mut instance);
     // Held until this function returns, and bound BEFORE the `Reap` so it drops
     // after it: the instance is killed and reaped first, then the lifeline is cut.
@@ -2125,7 +2082,7 @@ pub(crate) fn slice_drives_a_session(
 
     // The slice's own client, under `arch <slice>`, hermetic.
     let ctl = |args: &[&str]| {
-        let mut command = Command::new("/usr/bin/arch");
+        let mut command = command("/usr/bin/arch");
         command
             .arg(slice.arch_flag())
             .arg(universal)
@@ -2252,7 +2209,7 @@ fn lipo_or_copy(slices: &[PathBuf], out: &Path) -> Result<(), String> {
             make_executable(out)
         }
         many => {
-            let mut cmd = Command::new("lipo");
+            let mut cmd = command("lipo");
             cmd.arg("-create").args(many).arg("-output").arg(out);
             run_quiet(cmd, "lipo -create")?;
             make_executable(out)
@@ -2262,7 +2219,7 @@ fn lipo_or_copy(slices: &[PathBuf], out: &Path) -> Result<(), String> {
 
 /// `lipo -archs <bin>` → e.g. "x86_64 arm64".
 fn lipo_archs(bin: &Path) -> Result<String, String> {
-    let out = Command::new("lipo")
+    let out = command("lipo")
         .arg("-archs")
         .arg(bin)
         .output()
@@ -2294,7 +2251,7 @@ fn extract_dsym(
     let dsym = out_dir.join("aterm.dSYM");
     let _ = std::fs::remove_dir_all(&dsym);
     // Exit code + output deliberately ignored (see caveat above).
-    let _ = Command::new("dsymutil")
+    let _ = command("dsymutil")
         .arg(bin)
         .arg("-o")
         .arg(&dsym)
@@ -2334,7 +2291,7 @@ fn extract_dsym(
     // bundle structure so Xcode/symbolicators accept it after unzip).
     let zip = out_dir.join(format!("aterm-{short_version}-dSYM.zip"));
     let _ = std::fs::remove_file(&zip);
-    let mut cmd = Command::new("/usr/bin/ditto");
+    let mut cmd = command("/usr/bin/ditto");
     cmd.arg("-c")
         .arg("-k")
         .arg("--keepParent")
@@ -2348,11 +2305,7 @@ fn extract_dsym(
 /// `dwarfdump --uuid <path>` → the UUID token of every "UUID: <hex> (<arch>)"
 /// line, or None when dwarfdump is unavailable / produced nothing.
 fn dwarf_uuids(path: &Path) -> Option<Vec<String>> {
-    let out = Command::new("dwarfdump")
-        .arg("--uuid")
-        .arg(path)
-        .output()
-        .ok()?;
+    let out = command("dwarfdump").arg("--uuid").arg(path).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -2420,6 +2373,18 @@ mod tests {
     use std::io::Cursor;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_build_wait_keeps_status_and_measured_peak_rss() {
+        let child = aterm_uds::spawnfd::command("/bin/sh")
+            .args(["-c", "exit 23"])
+            .spawn()
+            .unwrap();
+        let (status, peak) = super::wait_with_peak(child).unwrap();
+        assert_eq!(status.code(), Some(23));
+        assert!(peak.is_some_and(|bytes| bytes > 0), "{peak:?}");
+    }
+
     use super::{
         BuildOutput, LC_SEGMENT_64, MACH_HEADER_64_LEN, MACH_MAGIC_64, MH_EXECUTE, PrivateSliceDir,
         RELEASE_SYSTEM_PATH, Renderer, SECTION_64_LEN, SEGMENT_COMMAND_64_LEN, SliceArch,
@@ -2445,7 +2410,7 @@ mod tests {
             stderr: b"bad CPU type in executable".to_vec(),
         };
         let bin = std::path::Path::new("/stage/ship/aterm");
-        let argv = |command: &std::process::Command| -> Vec<String> {
+        let argv = |command: &aterm_uds::spawnfd::Command| -> Vec<String> {
             std::iter::once(command.get_program())
                 .chain(command.get_args())
                 .map(|s| s.to_string_lossy().into_owned())
@@ -2560,7 +2525,7 @@ mod tests {
         // The fake instance: the real command's --control-sock operand becomes a file,
         // then it sleeps until reaped — standing in for the translated headless aterm.
         // Its sleep outlives `wait`, so it can only end by the reap.
-        let fake_instance = |command: &mut std::process::Command| {
+        let fake_instance = |command: &mut aterm_uds::spawnfd::Command| {
             let args: Vec<String> = command
                 .get_args()
                 .map(|a| a.to_string_lossy().into_owned())
@@ -2576,7 +2541,7 @@ mod tests {
             let rendered = format!("{command:?}");
             assert!(rendered.contains("env -i "), "{rendered}");
             let sock = &args[args.iter().position(|a| a == "--control-sock").unwrap() + 1];
-            std::process::Command::new("/bin/sh")
+            aterm_uds::spawnfd::command("/bin/sh")
                 .arg("-c")
                 .arg(format!("touch '{sock}'; exec sleep 120"))
                 .spawn()
@@ -2655,7 +2620,7 @@ mod tests {
         );
         // The signed arm64 drive wants the GPU: no `--cpu`, and after the turn one
         // pixel command starts the renderer and `metrics` must name it the GPU.
-        let arm64_instance = |command: &mut std::process::Command| {
+        let arm64_instance = |command: &mut aterm_uds::spawnfd::Command| {
             let args: Vec<String> = command
                 .get_args()
                 .map(|a| a.to_string_lossy().into_owned())
@@ -2663,7 +2628,7 @@ mod tests {
             assert_eq!(&args[..2], ["-arm64", "/stage/ship/aterm"]);
             assert!(!args.iter().any(|a| a == "--cpu"), "{args:?}");
             let sock = &args[args.iter().position(|a| a == "--control-sock").unwrap() + 1];
-            std::process::Command::new("/bin/sh")
+            aterm_uds::spawnfd::command("/bin/sh")
                 .arg("-c")
                 .arg(format!("touch '{sock}'; exec sleep 120"))
                 .spawn()
@@ -2727,7 +2692,7 @@ mod tests {
             SliceArch::X86_64,
             Renderer::Cpu,
             &dir,
-            &mut |_| std::process::Command::new("/usr/bin/false").spawn(),
+            &mut |_| aterm_uds::spawnfd::command("/usr/bin/false").spawn(),
             &mut |_| panic!("no turn without a socket"),
             wait,
         )
@@ -2744,7 +2709,7 @@ mod tests {
             SliceArch::X86_64,
             Renderer::Cpu,
             &dir,
-            &mut |_| std::process::Command::new("/bin/sleep").arg("30").spawn(),
+            &mut |_| aterm_uds::spawnfd::command("/bin/sleep").arg("30").spawn(),
             &mut |_| panic!("no turn without a socket"),
             std::time::Duration::from_millis(300),
         )

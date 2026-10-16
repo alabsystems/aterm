@@ -68,7 +68,6 @@ fn ed1_erases_above_the_cursor() {
 #[test]
 fn alt_screen_isolates_then_restores() {
     let s = run(b"main\x1b[?1049h\x1b[2J\x1b[1;1Halt\x1b[?1049l");
-    // after leaving the alt screen, the primary content is back
     assert_eq!(s.row(0), "main");
 }
 
@@ -95,8 +94,7 @@ fn wide_char_advances_cursor_by_two() {
 
 #[test]
 fn newline_advances_row_without_cr_in_default_mode() {
-    // bare LF moves down; in the engine's default it may or may not reset column.
-    // Assert only the row advance, which is unambiguous.
+    // Only the row advance is asserted: the column after a bare LF follows LNM.
     let s = run(b"ab\nc");
     assert_eq!(s.cursor().0, 1);
 }

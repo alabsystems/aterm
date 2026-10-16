@@ -1,28 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! D27 ADVERSARIAL REFUTATION: attacks on the claim "a candidate
-//! that loses any proved obligation, other than an audited retraction
-//! applicable to that candidate, is never admitted".
+//! D27 adversarial refutation: attacks on the claim "a candidate that loses any proved
+//! obligation, other than an audited retraction applicable to that candidate, is never
+//! admitted".
 //!
-//! Every test drives the REAL gate end to end where it can: `trust_compare::run`,
-//! the code behind `aterm-release trust compare`, over two run directories laid
-//! out as the lane leaves them (`.plan`, `<spec>.log`, `.rc`, `.oblig.tsv`), the
-//! real ledger parser, and real `git` (the gate's own `TrustGit`) in a real trust
-//! repository. Records come from the real reduction (`trust_oblig::reduce`) where
-//! the attack is in the report's shape. Each `refute_*` test is an attack that got
-//! a candidate admitted (PUBLISH-OK, exit 0) on 07b27fbe0, kept as a case the gate
-//! must refuse; each `holds_*` test is an attack that gate already withstood.
-//! The fixes: twins at one key told apart only by what both runs report of them
-//! and otherwise held to their worst case, a retraction applied only to the very
-//! obligation it names (`nth/of`), a function reported twice refused, the trust
-//! repository read with replace refs and grafts ignored and a cut history refused,
-//! a fix held only while the candidate keeps its reproducer and no revert of it,
-//! the seal's commit required, and a count never standing for obligations.
-//! Section 7 are attacks that got a candidate admitted on 08f84c266, through
-//! an aterm repository the ledger is committed in: a row
-//! applies only in the aterm tree it was audited in (but for the ledger itself)
-//! and at the site it was audited at (ledger v3).
+//! Each test drives the real gate end to end where it can: `trust_compare::run` (behind
+//! `aterm-release trust compare`) over two run directories laid out as the lane leaves them
+//! (`.plan`, `<spec>.log`, `.rc`, `.oblig.tsv`), the real ledger parser, and real `git` (the
+//! gate's `TrustGit`) in a real trust repository; records come from the real reduction
+//! (`trust_oblig::reduce`) where the attack is in the report's shape. Each `refute_*` test is
+//! an attack the gate must refuse, each `holds_*` one it withstands.
+//!
+//! The defences: twins at one key are told apart only by what both runs report of them and are
+//! otherwise held to their worst case; a retraction applies only to the obligation it names
+//! (`nth/of`); a function reported twice is refused; the trust repository is read with replace
+//! refs and grafts ignored, and a cut history refused; a fix holds only while the candidate
+//! keeps its reproducer and no revert of it; the seal's commit is required; a count never
+//! stands for obligations; and a row applies only in the aterm tree and at the site it was
+//! audited at (ledger v3), the ledger itself excepted.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,9 +26,7 @@ use std::path::{Path, PathBuf};
 use crate::trust_compare::{self, Args};
 use crate::trust_oblig::{self, LEDGER_MAGIC, Obligation, REPORT_SCHEMA, Record, Span};
 
-// ---------------------------------------------------------------------------
-// The two runs, as the lane leaves them
-// ---------------------------------------------------------------------------
+// --- the two runs, as the lane leaves them -----------------------------------
 
 const SEAL: &str = "a519d423f47ff6fb19d505012f210f13ad39f2f6f31cb3c3af5aff508551d0b2";
 const MAIN: &str = "61a997f0b92df5c78bb1ab075ca3044ceb871789c82c66db2743c03f9f537db1";
@@ -49,8 +43,7 @@ fn tmp(prefix: &str) -> aterm_tempfile::TempDir {
         .unwrap()
 }
 
-/// A whole-tree plan of one library, `alpha`, as `trust_compare`'s own tests
-/// write it, of aterm [`COMMIT`].
+/// A whole-tree plan of one library, `alpha`, of aterm [`COMMIT`].
 fn plan(prover: &str, driver_id: &str) -> String {
     plan_at(prover, driver_id, COMMIT)
 }
@@ -103,8 +96,7 @@ fn run_dir_at(
 #[derive(Default)]
 struct Gate<'a> {
     ledger_rows: Vec<String>,
-    /// A ledger already written (in an aterm repository): given instead of
-    /// `ledger_rows`.
+    /// A ledger already written (in an aterm repository), instead of `ledger_rows`.
     ledger_at: Option<&'a Path>,
     trust: Option<&'a Path>,
     base_commit: Option<&'a str>,
@@ -112,15 +104,14 @@ struct Gate<'a> {
     ratchet: Option<String>,
 }
 
-/// `aterm-release trust compare` over the two runs, as the candidate gate
-/// calls it: the ledger always given. The exit: 0 PUBLISH-OK, 1 refused, 2
-/// COULD NOT COMPARE. (The report goes to stdout: shown when a test fails.)
+/// `aterm-release trust compare` over the two runs as the candidate gate calls it, the ledger
+/// always given. Exit 0 PUBLISH-OK, 1 refused, 2 COULD NOT COMPARE; the report goes to stdout.
 fn gate(base: &aterm_tempfile::TempDir, cand: &aterm_tempfile::TempDir, g: &Gate<'_>) -> i32 {
     let side = tmp("d27-refute-ledger");
     let ledger = match g.ledger_at {
         Some(p) => p.to_path_buf(),
         None => {
-            let p = side.path().join("trust-gate-retractions.tsv");
+            let p = side.path().join("retractions.tsv");
             let mut text = format!("{LEDGER_MAGIC}\n");
             for r in &g.ledger_rows {
                 text.push_str(r);
@@ -131,7 +122,7 @@ fn gate(base: &aterm_tempfile::TempDir, cand: &aterm_tempfile::TempDir, g: &Gate
         }
     };
     let ratchet = g.ratchet.as_ref().map(|t| {
-        let p = side.path().join("trust-gate-ratchet.tsv");
+        let p = side.path().join("floors.tsv");
         fs::write(&p, t).unwrap();
         p
     });
@@ -147,9 +138,7 @@ fn gate(base: &aterm_tempfile::TempDir, cand: &aterm_tempfile::TempDir, g: &Gate
     })
 }
 
-// ---------------------------------------------------------------------------
-// Records and reports
-// ---------------------------------------------------------------------------
+// --- records and reports ----------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
 fn ob(
@@ -260,7 +249,7 @@ fn checkout() -> aterm_tempfile::TempDir {
     d
 }
 
-/// The lane's reduction of `text` (`aterm-release trust obligations`).
+/// The lane's reduction of `text` (`trust_oblig::reduce`).
 fn reduced(text: &str, repo: &Path) -> Result<Record, String> {
     let d = tmp("d27-refute-report");
     let p = d.path().join("report.ndjson");
@@ -268,9 +257,7 @@ fn reduced(text: &str, repo: &Path) -> Result<Record, String> {
     trust_oblig::reduce(&p, "alpha", repo, None)
 }
 
-// ---------------------------------------------------------------------------
-// A trust repository
-// ---------------------------------------------------------------------------
+// --- a trust repository -----------------------------------------------------
 
 const REPRO: &str = "crates/trust-vcgen/tests/false_proofs.rs";
 
@@ -335,9 +322,8 @@ fn driver_of(sha: &str) -> String {
     )
 }
 
-/// A ledger row (thirteen fields), audited where the runs measure (aterm
-/// [`COMMIT`]) against the published seal at trust `seal`, which reported it at
-/// X's span, line 6, of `file`.
+/// A ledger row (thirteen fields) audited at aterm [`COMMIT`], where the runs measure, against
+/// the published seal at trust `seal`, which reported it at X's span, line 6, of `file`.
 #[allow(clippy::too_many_arguments)]
 fn row(
     function: &str,
@@ -375,7 +361,7 @@ fn row_at(
     )
 }
 
-/// The one obligation X the ledger rows of the containment attacks name.
+/// The one obligation X the containment attacks' ledger rows name.
 fn x(status: &str) -> Record {
     record(vec![ob(
         "alpha::f",
@@ -401,21 +387,13 @@ fn x_row(seal: &str, commit: &str) -> String {
     )
 }
 
-// ===========================================================================
-// 1. KEY COLLISIONS
-// ===========================================================================
+// === 1. Key collisions ======================================================
 
-/// Two `vec![0u8; n]` in one function. MEASURED on the seal (321aaeda7,
-/// 2026-10-07, a 5-line probe: `let x = if a < 16 {a} else {16}; let y = if b > 0
-/// {b} else {1}; (vec![0u8; x], vec![0u8; y])`): the report locates BOTH
-/// obligations at the standard library's macro body, `alloc/src/macros.rs:47:8-
-/// 47:41`; `vc:d27twins__zeros:custom:0` (count `_8`, bounded) PROVED and
-/// `custom:1` (count `_10`) FAILED; the real judge (`trust obligations`) reduced
-/// them to two rows identical but for the status. Only the MIR local and the
-/// obligation id told them apart, and the reduction drops both, so they are ONE
-/// exact key and ONE ledger group, and the multiset compare pairs them as
-/// favourably as it can: a candidate that fails `_8`'s bound and proves `_10`'s
-/// — a gain offsetting a loss inside one key — is admitted.
+/// Two `vec![0u8; n]` in one function. Measured on the seal, the report locates both at the
+/// standard library's macro body (`alloc/src/macros.rs:47:8-47:41`), one proved and one
+/// failed, and the reduction leaves two rows identical but for the status: one exact key, one
+/// ledger group. A candidate failing the proved one and proving the failed one must not have
+/// the gain offset the loss.
 #[test]
 fn refute_out_of_tree_twins_swap_a_loss_for_a_gain() {
     let repo = checkout();
@@ -462,12 +440,9 @@ fn refute_out_of_tree_twins_swap_a_loss_for_a_gain() {
     );
 }
 
-/// The same within the tree: two obligations of one kind, ONE span and ONE
-/// description. MEASURED on the seal (the same probe, `let f = |j: usize| v[j] +
-/// v[j];`): the closure reports `slice_bounds_check` "slice bounds check" twice at
-/// 7:23-7:27 (`bounds_check:0` and `:2`) and twice at 7:30-7:34 (`:5`, `:6`). With
-/// mixed statuses, the seal proving the first and the candidate the second is
-/// admitted.
+/// The same within the tree: two obligations of one kind, span and description (the seal
+/// reports a closure's `v[j] + v[j]` this way, `slice_bounds_check` twice per site), with the
+/// seal proving the first and the candidate the second.
 #[test]
 fn refute_in_tree_same_site_twins_swap_a_loss_for_a_gain() {
     let repo = checkout();
@@ -511,14 +486,11 @@ fn refute_in_tree_same_site_twins_swap_a_loss_for_a_gain() {
     );
 }
 
-/// A retraction excuses a DIFFERENT obligation than the one it was audited for,
-/// and the stale check never fires. The seal proves two `checked` overflow
-/// obligations an inlined `RawVec` growth puts in one function, at distinct,
-/// identical-under-both-toolchains positions of `alloc/src/raw_vec.rs` (100 and
-/// 200). The ledger retracts X (nth 1, line 100). The candidate STILL PROVES X
-/// at line 100 (so the row is stale by the ledger's own rule) and LOSES Y at
-/// line 200, which no row names. Out of the tree the exact key drops the
-/// position, so the key owes one unit, X's row pays it, and Y's loss is admitted.
+/// A retraction must not excuse a different obligation than its own. The seal proves two
+/// `checked` overflow obligations an inlined `RawVec` growth puts in one function, at lines
+/// 100 and 200 of `alloc/src/raw_vec.rs`. The ledger retracts X (nth 1, line 100); the
+/// candidate still proves X (the row is stale) and loses Y, which no row names. Out of the
+/// tree the exact key drops the position, so X's row must not pay for Y.
 #[test]
 fn refute_a_retraction_excuses_its_twin_and_hides_its_own_staleness() {
     let d = tmp("d27-refute-trust");
@@ -584,17 +556,13 @@ fn refute_a_retraction_excuses_its_twin_and_hides_its_own_staleness() {
     );
 }
 
-// ===========================================================================
-// 2. KEY DRIFT
-// ===========================================================================
+// === 2. Key drift ===========================================================
 
-/// The ledger key's `nth` is a POSITION among same-text twins. A row audited for
-/// X when X was the function's only `a + 1` names nth 1. Later the tree gains
-/// another `a + 1` (Y) ABOVE X — an unrelated edit, no line of X's text changed.
-/// The row now names Y. The candidate loses Y (a genuine regression no one
-/// audited) and still proves X (so the audited row is stale): admitted. (The
-/// row here claims the tree measured as its audit's, as a re-stamp without a
-/// fresh audit would, and Y sits where X was: only its group's size tells.)
+/// The ledger key's `nth` is a position among same-text twins. A row audited for X when X was
+/// the function's only `a + 1` names nth 1; an unrelated edit then adds Y above X, and the row
+/// names Y. The candidate loses Y (unaudited) and still proves X. The row claims the measured
+/// tree as its audit's, as a re-stamp without a fresh audit would, and Y sits where X was:
+/// only the group's size tells.
 #[test]
 fn refute_an_inserted_twin_inherits_the_audited_rows_excuse() {
     let d = tmp("d27-refute-trust");
@@ -644,11 +612,9 @@ fn refute_an_inserted_twin_inherits_the_audited_rows_excuse() {
     );
 }
 
-// ===========================================================================
-// 3. DUPLICATED ROWS
-// ===========================================================================
+// === 3. Duplicated rows =====================================================
 
-/// The reduction takes a report that names one function twice, and keeps both.
+/// A report naming one function twice is refused by the reduction.
 #[test]
 fn refute_the_reduction_accepts_a_function_reported_twice() {
     let repo = checkout();
@@ -691,12 +657,9 @@ fn refute_the_reduction_accepts_a_function_reported_twice() {
     );
 }
 
-/// …and the gate admitted the candidate whose own report says the obligation the
-/// seal proved is NOT proved (once), beside a duplicate that is. "An obligation
-/// present on one side only -> fail closed": the candidate's extra row at the
-/// seal's key is present on one side only. (The reduction now refuses a function
-/// reported twice; the same two rows in ONE function record are what is left of
-/// the attack.)
+/// A candidate whose own report says the seal's proved obligation failed, beside a duplicate
+/// that proved, in one function record: its extra row at the seal's key is present on one side
+/// only, which fails closed.
 #[test]
 fn refute_a_duplicate_proved_row_hides_the_candidates_failed_one() {
     let repo = checkout();
@@ -741,15 +704,11 @@ fn refute_a_duplicate_proved_row_hides_the_candidates_failed_one() {
     );
 }
 
-// ===========================================================================
-// 4. COMMIT CONTAINMENT: the wrong repository, a shallow one
-// ===========================================================================
+// === 4. Commit containment: the wrong repository, a shallow one ============
 
-/// An origin trust repository: main M0 -> F (the fix) -> M1 -> C (the
-/// candidate); the seal S on its own branch after F, so S CONTAINS F, and the
-/// seal's proof of X was made by a toolchain holding the fix: F retracts
-/// nothing of the seal's. The documented rule: "a row whose commit the published
-/// seal already holds is wrong ... COULD NOT COMPARE".
+/// An origin trust repository: main M0 -> F (the fix) -> M1 -> C (the candidate), and the seal
+/// S on its own branch after F, so S contains F and F retracts nothing of the seal's. The rule:
+/// a row whose commit the published seal already holds is COULD NOT COMPARE.
 struct Origin {
     _d: aterm_tempfile::TempDir,
     root: PathBuf,
@@ -801,9 +760,8 @@ fn holds_a_row_already_in_the_seal_is_refused_in_a_full_repository() {
     assert_eq!(seal_holds_fix_gate(&o, &o.root), 2);
 }
 
-/// `--trust-repo` (default $HOME/trust) is a clone of main that never fetched the
-/// seal's branch: the seal's commit is unknown there, the "already in the seal"
-/// check is SKIPPED with a NOTE, and the row excuses the candidate's loss of X.
+/// `--trust-repo` (default $HOME/trust) is a clone of main that never fetched the seal's branch:
+/// the seal's commit is unknown there, which must not skip the "already in the seal" guard.
 #[test]
 fn refute_a_trust_repository_without_the_seal_commit_skips_the_seal_guard() {
     let o = origin();
@@ -828,10 +786,9 @@ fn refute_a_trust_repository_without_the_seal_commit_skips_the_seal_guard() {
     );
 }
 
-/// A SHALLOW `--trust-repo`: main cloned at depth 3 (C, M1, F) and the seal's
-/// commit fetched at depth 1 so it is known. `merge-base --is-ancestor F S` now
-/// answers NO (S's parents are cut), the row passes the seal guard, and
-/// `--is-ancestor F C` answers yes: the row excuses the loss.
+/// A shallow `--trust-repo`: main cloned at depth 3 (C, M1, F) and the seal's commit fetched at
+/// depth 1. There `merge-base --is-ancestor F S` answers no (S's parents are cut) and
+/// `--is-ancestor F C` yes, so the row would pass the seal guard and excuse the loss.
 #[test]
 fn refute_a_shallow_trust_repository_hides_a_fix_already_in_the_seal() {
     let o = origin();
@@ -860,10 +817,8 @@ fn refute_a_shallow_trust_repository_hides_a_fix_already_in_the_seal() {
     );
 }
 
-/// `git replace` in `--trust-repo` (git honours replace refs in
-/// `merge-base --is-ancestor`; GitCli does not set GIT_NO_REPLACE_OBJECTS): a
-/// candidate O that does NOT contain the fix is answered as containing it, and
-/// the row excuses O's loss.
+/// `git replace` in `--trust-repo` (git honours replace refs in `merge-base --is-ancestor`)
+/// must not make a candidate O lacking the fix read as containing it.
 #[test]
 fn refute_a_replace_ref_makes_a_candidate_contain_a_fix_it_lacks() {
     let d = tmp("d27-refute-replace");
@@ -882,7 +837,7 @@ fn refute_a_replace_ref_makes_a_candidate_contain_a_fix_it_lacks() {
         cand_commit: Some(&o),
         ..Gate::default()
     };
-    // Control: O does not contain F, the loss refuses.
+    // Control: O does not contain F, so the loss refuses.
     assert_eq!(gate(&b, &c, &g), 1);
     git(&t, &["replace", "--graft", &o, &f]);
     assert_ne!(
@@ -892,9 +847,8 @@ fn refute_a_replace_ref_makes_a_candidate_contain_a_fix_it_lacks() {
     );
 }
 
-/// Containment by ancestry ignores a REVERT: the candidate C sits after F and
-/// after `git revert F`, so it does not hold the fix; it loses X anyway (some
-/// other regression), and the row audited for F excuses it.
+/// Ancestry alone ignores a revert: the candidate C sits after F and after `git revert F`, so
+/// it does not hold the fix, and the row audited for F must not excuse its loss of X.
 #[test]
 fn refute_a_reverted_fix_still_excuses() {
     let d = tmp("d27-refute-revert");
@@ -923,9 +877,9 @@ fn refute_a_reverted_fix_still_excuses() {
     );
 }
 
-/// A GRAFT FILE in `--trust-repo` (`info/grafts`, which git still honours in
-/// `merge-base`) giving candidate O the fix F as a parent: ancestry there is not
-/// what the commits record, so a ledger with rows is not read there at all.
+/// A graft file in `--trust-repo` (`info/grafts`, which git honours in `merge-base`) giving
+/// candidate O the fix F as a parent: ancestry there is not what the commits record, so a
+/// ledger with rows is not read there at all.
 #[test]
 fn refute_a_graft_file_makes_a_candidate_contain_a_fix_it_lacks() {
     let d = tmp("d27-refute-graft");
@@ -1001,8 +955,8 @@ fn refute_a_revert_that_keeps_the_reproducer_still_excuses() {
     assert_eq!(gate(&b, &c, &g), 1, "ADMITTED: the candidate reverts F");
 }
 
-/// A fix undone by hand, its reproducer deleted with it: the candidate no longer
-/// holds what pins the fix, and its loss refuses.
+/// A fix undone by hand, its reproducer deleted with it: the candidate no longer holds what
+/// pins the fix, and its loss refuses.
 #[test]
 fn refute_a_fix_whose_reproducer_the_candidate_dropped_still_excuses() {
     let d = tmp("d27-refute-dropped");
@@ -1029,9 +983,9 @@ fn refute_a_fix_whose_reproducer_the_candidate_dropped_still_excuses() {
     );
 }
 
-/// CONTROL: through the same hardened git (no inherited `GIT_*`, no global or
-/// system config), a candidate that holds the fix and does not prove the
-/// obligation it retracts is still admitted — the ledger's one purpose.
+/// Control: through the same hardened git (no inherited `GIT_*`, no global or system config),
+/// a candidate that holds the fix and does not prove the obligation it retracts is admitted,
+/// the ledger's one purpose.
 #[test]
 fn holds_a_retraction_the_candidate_holds_still_excuses() {
     let d = tmp("d27-refute-control");
@@ -1050,8 +1004,7 @@ fn holds_a_retraction_the_candidate_holds_still_excuses() {
         ..Gate::default()
     };
     assert_eq!(gate(&b, &c, &g), 0);
-    // …and twins the candidate proves none of: the row's own is excused, the
-    // other twin is still lost.
+    // …and of twins the candidate proves neither: the row's own is excused, the other lost.
     let raw = "@sysroot/alloc/src/raw_vec.rs";
     let at = |x: &str, y: &str| {
         record(vec![
@@ -1103,19 +1056,14 @@ fn holds_a_retraction_the_candidate_holds_still_excuses() {
     assert_eq!(gate(&b, &c, &both), 0, "both twins retracted");
 }
 
-// ===========================================================================
-// 5. THE COUNT RULE STILL ADMITS
-// ===========================================================================
+// === 5. The count rule ======================================================
 
-/// The seal's own check of alpha gave no result this run (a seal-side failure:
-/// `error[E0308]`, exit 101), and the seal is on record (the ratchet, its own
-/// prover) proving 5 of alpha's 10. The candidate proves 5: rows 6-10, none of
-/// rows 1-5. No per-obligation comparison is made — the count admits it
-/// (OK-FLOOR), and the verdict says "the candidate proves every obligation the
-/// published seal proves".
+/// The seal's own check of alpha gave no result this run (`error[E0308]`, exit 101), and the
+/// ratchet records the seal proving 5 of alpha's 10. A candidate proving 5 (rows 6-10, none of
+/// rows 1-5) must not be admitted by the count without a per-obligation comparison.
 #[test]
 fn refute_a_seal_check_without_a_result_falls_back_to_the_count() {
-    // A second library, beta, compared alike on both sides, so the runs compare.
+    // A second library, beta, alike on both sides, so the runs compare.
     let with_beta = |prover: &str| {
         plan(prover, STUB).replace(
             "crate alpha\talpha@1.0.0\tgate\n",
@@ -1170,9 +1118,7 @@ fn refute_a_seal_check_without_a_result_falls_back_to_the_count() {
     );
 }
 
-// ===========================================================================
-// 6. ATTACKS THE GATE WITHSTOOD
-// ===========================================================================
+// === 6. Attacks the gate withstands =========================================
 
 /// Wildcards, prefixes and un-normalised fields in a ledger row: none excuses.
 #[test]
@@ -1196,7 +1142,7 @@ fn holds_no_wildcard_or_prefix_row_excuses() {
         row("alpha::f", ADD, "src/lib.rs", "a +", "1/1", d_, &s, &f),
         row("alpha::f", ADD, "src/lib.rs", "a + 1", "*", d_, &s, &f),
         row("alpha::f", ADD, "src/lib.rs", "a + 1", "1/*", d_, &s, &f),
-        // The v1 form (a bare place), and a place or a count out of form.
+        // The v1 form (a bare place), and a place or count out of form.
         row("alpha::f", ADD, "src/lib.rs", "a + 1", "1", d_, &s, &f),
         row("alpha::f", ADD, "src/lib.rs", "a + 1", "0/1", d_, &s, &f),
         row("alpha::f", ADD, "src/lib.rs", "a + 1", "01/1", d_, &s, &f),
@@ -1235,10 +1181,9 @@ fn holds_no_wildcard_or_prefix_row_excuses() {
         ),
         row("alpha::f", ADD, "src/lib.rs", "a  + 1", "1/1", d_, &s, &f),
         row("alpha::f", ADD, "@none", "a + 1", "1/1", d_, &s, &f),
-        // The site and the aterm commit a row was audited at (v3): a wildcard,
-        // no span, another span, another file's; a commit short, upper-case, a
-        // wildcard, or one the runs did not measure (with no repository holding
-        // the ledger to compare the trees in).
+        // The site and aterm commit (v3): a wildcard, no span, another span, another file's;
+        // a commit short, upper-case, a wildcard, or one the runs did not measure (with no
+        // repository holding the ledger to compare trees in).
         row_at(
             "alpha::f",
             ADD,
@@ -1482,8 +1427,7 @@ fn holds_a_truncated_record_report_or_log_is_never_a_pass() {
     let cut: String = text.lines().take(7).map(|l| format!("{l}\n")).collect();
     fs::write(c.path().join("alpha@1.0.0.log.oblig.tsv"), cut).unwrap();
     assert_ne!(gate(&b, &c, &Gate::default()), 0);
-    // A record whose header and end are rewritten to the rows that survived: the
-    // log's Summary still says 4.
+    // A record rewritten to the rows that survived: the log's Summary still says 4.
     let mut short = seal.clone();
     short.rows.truncate(2);
     fs::write(c.path().join("alpha@1.0.0.log.oblig.tsv"), short.to_text()).unwrap();
@@ -1515,9 +1459,7 @@ fn holds_a_truncated_record_report_or_log_is_never_a_pass() {
     assert!(reduced(&cut, repo.path()).is_err());
 }
 
-// ===========================================================================
-// 7. THE TREE A ROW WAS AUDITED IN
-// ===========================================================================
+// === 7. The tree a row was audited in =======================================
 
 /// A trust repository: the seal S, the fix F (its reproducer), the candidate C.
 struct TrustFix {
@@ -1538,10 +1480,9 @@ fn trust_fix() -> TrustFix {
     TrustFix { _d: d, t, s, f, cc }
 }
 
-/// An aterm repository holding the ledger where the gate reads it: commit
-/// `audited` with the files `then` and a ledger of no row, where the row was
-/// audited; then commit `measured` with the files `now` and the ledger holding
-/// `rows(audited)` — the commit both runs measure.
+/// An aterm repository holding the ledger where the gate reads it: commit `audited` (the files
+/// `then`, an empty ledger), then commit `measured` (the files `now`, the ledger holding
+/// `rows(audited)`), the commit both runs measure.
 struct Aterm {
     _d: aterm_tempfile::TempDir,
     ledger: PathBuf,
@@ -1587,8 +1528,8 @@ fn aterm(then: &[(&str, &str)], now: &[(&str, &str)], rows: impl Fn(&str) -> Vec
     }
 }
 
-/// The gate over the seal's and the candidate's records of `a.measured`, its
-/// ledger the one committed there, the candidate holding the fix.
+/// The gate over the seal's and the candidate's records of `a.measured`, with the ledger
+/// committed there and the candidate holding the fix.
 fn audited_gate(a: &Aterm, tr: &TrustFix, seal: &Record, cand: &Record) -> i32 {
     let b = run_dir_at(SEAL, &driver_of(&tr.s), seal, &a.measured);
     let c = run_dir_at(MAIN, &driver_of(&tr.cc), cand, &a.measured);
@@ -1618,8 +1559,8 @@ fn step_add(l: u32, st: &str) -> Obligation {
     )
 }
 
-/// A row audited for the `a + 1` the seal reported at line `l`, the
-/// `nth`-of-two (or of one) such in `alpha::step`, at aterm `aterm`.
+/// A row audited at aterm `aterm` for the `a + 1` the seal reported at line `l`, the `nth` of
+/// such in `alpha::step`.
 fn step_row(nth: &str, l: u32, aterm: &str, seal: &str, fix: &str) -> String {
     row_at(
         "alpha::step",
@@ -1648,10 +1589,9 @@ const AUDITED: &str = concat!(
     "}\n",
 );
 
-/// CONTROLS, in the tree the row was audited in (its row committed on top of
-/// the audited commit, nothing else changed): the candidate that loses X is
-/// excused, and one that still proves X while it loses Z makes the row STALE
-/// and loses Z (not compared: exit 2).
+/// Controls in the tree the row was audited in (the row committed on top, nothing else
+/// changed): a candidate losing X is excused; one still proving X while losing Z makes the row
+/// stale (exit 2).
 #[test]
 fn holds_a_row_in_the_tree_it_was_audited_in_excuses_only_its_own() {
     let tr = trust_fix();
@@ -1667,9 +1607,8 @@ fn holds_a_row_in_the_tree_it_was_audited_in_excuses_only_its_own() {
     assert_eq!(audited_gate(&a, &tr, &seal, &lose_z), 2);
 }
 
-/// THE REVIEWER'S FIRST CASE: X deleted and W, another `a + 1`, added at line
-/// 2, so the group is still two (W 1/2, Z 2/2). The candidate genuinely loses
-/// W, which nobody audited. Read EXCUSED, PUBLISH-OK, on 08f84c266.
+/// X deleted and W, another `a + 1`, added at line 2, so the group is still two (W 1/2,
+/// Z 2/2): the candidate loses W, which nobody audited.
 #[test]
 fn refute_a_look_alike_replaced_at_the_same_group_size_inherits_the_audited_rows_excuse() {
     let tr = trust_fix();
@@ -1695,8 +1634,7 @@ fn refute_a_look_alike_replaced_at_the_same_group_size_inherits_the_audited_rows
         1,
         "ADMITTED: the candidate loses W (line 2), added after the audit of X, which no longer exists"
     );
-    // W replaced X at X's own place, `a` now another value there: rank, size
-    // and site all agree.
+    // W replaces X at X's own place, `a` now another value there: rank, size and site agree.
     let in_place = AUDITED
         .replace(
             "    let x = b;\n",
@@ -1720,9 +1658,8 @@ fn seal_at_3_and_7() -> Record {
     record(vec![step_add(3, "proved"), step_add(7, "proved")])
 }
 
-/// THE REVIEWER'S SECOND CASE: Z moved above X (Z at line 3, X at 7). The row's
-/// rank and its very site now name Z, which the candidate loses while it still
-/// proves X. Read EXCUSED, PUBLISH-OK, on 08f84c266, and its staleness hidden.
+/// Z moved above X (Z at line 3, X at 7): the row's rank and site now name Z, which the
+/// candidate loses while it still proves X.
 #[test]
 fn refute_two_look_alikes_reordered_hand_the_row_to_the_other() {
     let tr = trust_fix();
@@ -1749,8 +1686,7 @@ fn refute_two_look_alikes_reordered_hand_the_row_to_the_other() {
     );
 }
 
-/// The `1/1` form: the function's only `a + 1` deleted and another added in its
-/// place. Read EXCUSED, PUBLISH-OK, on 08f84c266.
+/// The `1/1` form: the function's only `a + 1` deleted and another added in its place.
 #[test]
 fn refute_a_lone_look_alike_deleted_and_added_again_inherits_the_audited_rows_excuse() {
     let tr = trust_fix();
@@ -1771,11 +1707,10 @@ fn refute_a_lone_look_alike_deleted_and_added_again_inherits_the_audited_rows_ex
     );
 }
 
-/// WHY THE WHOLE TREE, NOT THE OBLIGATION'S FILE: an obligation located in a
-/// macro's body (`src/mac.rs`), or in the standard library, moves with an edit
-/// to its function's own file, which its file never sees. `alpha::step`'s one
-/// `inc!` is now of another value: the row's file, rank, size and site agree,
-/// and the obligation is not the one audited.
+/// Why the whole tree and not the obligation's file: an obligation located in a macro body
+/// (`src/mac.rs`) or the standard library moves with an edit to its function's own file, which
+/// its file never sees. Here `alpha::step`'s one `inc!` now takes another value: file, rank,
+/// size and site agree, and the obligation is not the one audited.
 #[test]
 fn refute_an_edit_to_the_function_moves_an_obligation_located_elsewhere() {
     let tr = trust_fix();
@@ -1879,11 +1814,10 @@ fn holds_a_v2_ledger_is_refused_whole() {
     assert_eq!(audited_gate(&a, &tr, &seal_at_3_and_7(), &lose_x), 2);
 }
 
-/// ANOTHER SEAL, THE SAME TREE: two bounds checks at one site of
-/// `alpha::sum`, told apart only by their MIR locals, which both runs report
-/// alike. The row was audited for `_8`'s, the first the seal S1 reported. The
-/// published seal is now S2, which reports `_10`'s first: the row's rank, size
-/// and site all name `_10`'s, which the candidate loses while it proves `_8`'s.
+/// Another seal, the same tree: two bounds checks at one site of `alpha::sum`, told apart only
+/// by their MIR locals. The row was audited for `_8`'s, the first seal S1 reported; the
+/// published seal S2 reports `_10`'s first, so the row's rank, size and site name `_10`'s,
+/// which the candidate loses while it proves `_8`'s.
 #[test]
 fn refute_another_seal_reorders_look_alikes_at_one_site() {
     let d = tmp("d27-refute-trust");
@@ -1946,6 +1880,6 @@ fn refute_another_seal_reorders_look_alikes_at_one_site() {
         1,
         "ADMITTED: the row audited `_8`'s against S1 names `_10`'s under S2"
     );
-    // CONTROL: re-audited against S2 (for `_10`'s, the first there), it applies.
+    // Control: re-audited against S2 (for `_10`'s, the first there), it applies.
     assert_eq!(gate_with(row(&s2)), 0);
 }

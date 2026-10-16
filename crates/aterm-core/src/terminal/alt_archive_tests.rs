@@ -2171,7 +2171,7 @@ mod chrome_after_adoption {
             .collect()
     }
 
-    /// A composer BOX (`╭─╮ │ > text │ ╰─╯`) and footer, `inner` wide.
+    /// A composer box (`╭─╮ │ > text │ ╰─╯`) and footer, `inner` wide.
     fn boxed_chrome(inner: usize) -> Vec<String> {
         vec![
             String::new(),
@@ -2216,8 +2216,8 @@ mod chrome_after_adoption {
         t
     }
 
-    /// Design test 1: after a restore on the alt screen, the app repainting the
-    /// restored screen archives nothing and is no rebaseline.
+    /// After a restore on the alt screen, the app repainting the restored screen
+    /// archives nothing and is no rebaseline.
     #[test]
     fn restore_then_an_identical_frame_archives_nothing() {
         let mut t = adopted(&worker_at(3).checkpoint());
@@ -2320,8 +2320,8 @@ mod chrome_after_adoption {
         }
     }
 
-    /// Design test 3: a width resize redraws the rules at the new width — a
-    /// different row text — and they are still chrome.
+    /// A width resize redraws the rules at the new width (a different row text), and
+    /// they are still chrome.
     #[test]
     fn a_width_resize_still_treats_rule_rows_as_chrome() {
         let mut a = AltArchive::new();
@@ -2337,7 +2337,7 @@ mod chrome_after_adoption {
         assert_eq!(b.texts(), range(tx, 0..20));
     }
 
-    /// The composer BOX: `│ > type here │` and its borders redrawn at a new width
+    /// The composer box: `│ > type here │` and its borders redrawn at a new width
     /// (padding and rules change, the words do not) are chrome too.
     #[test]
     fn a_composer_box_redrawn_at_a_new_width_is_chrome() {

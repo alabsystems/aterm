@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! E2E: a real `Turn` driven over an L3 loopback-TLS relay.
-//!
-//! Wires the full remote stack as production does: `RelayClient` -> a
-//! `dial_and_relay_pinned` driver -> rustls 1.3 with a channel-bound capability
-//! -> `accept_and_relay` listener -> the remote's control socket (a mock
-//! responder). The agent `Turn` drives a remote aterm byte-identically to a
-//! local one, with predicates evaluated on the remote host.
+//! E2E: a real `Turn` driven over an L3 loopback-TLS relay, wired as production
+//! does: `RelayClient` -> `dial_and_relay_pinned` -> TLS 1.3 with a channel-bound
+//! capability -> `accept_and_relay` -> the remote's control socket (a mock).
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -38,8 +34,8 @@ fn mock_reply(line: &str) -> &'static [u8] {
     }
 }
 
-/// A tiny control-protocol responder standing in for the remote's authoritative
-/// control socket: read request lines, answer each with [`mock_reply`].
+/// Stands in for the remote's control socket: answers each request line with
+/// [`mock_reply`].
 fn spawn_mock_remote(mut s: CtlStream) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut buf: Vec<u8> = Vec::new();
@@ -98,7 +94,7 @@ fn remote_turn_over_loopback_tls() {
         )
     });
 
-    // Drive a real Turn against the REMOTE — byte-identical to the local path.
+    // Drive a real Turn against the remote, as on the local path.
     let mut client = RelayClient::new(drv_client);
     let mut gov = SelfGovernor::disabled(8, 1, 1_000_000);
     gov.enable_self_write();

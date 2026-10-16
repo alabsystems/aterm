@@ -25,31 +25,33 @@
 //!   workspace stops the census). Every `COST: UNBOUNDED` marker in it maps to
 //!   a registered sink, and every registered sink defined inside it is marked.
 //! * OB-9 entry-point roots: each wasm root crate yields at least one public
-//!   fn (every `wasm_bindgen` export is a `pub fn`, a sound
-//!   over-approximation), so a parse regression cannot empty the surface.
+//!   fn (every export, aterm-wasm-abi's `#[export]` or aterm-gpu-web's
+//!   `#[wasm_bindgen]`, is a `pub fn`, a sound over-approximation), so a
+//!   parse regression cannot empty the surface.
 //! * OB-10 no entry point synchronously reaches an unbounded sink, via the
-//!   engine `term` field (`self.term.resize(..)`) or a direct sink call,
-//!   unless registered as a standing finding (OB-11), which is reported every
-//!   run.
-//! * OB-11 standing-finding registry coherence, both ways: every entry carries
-//!   a written finding and is re-detected this run (a fixed hazard makes a
-//!   stale entry red until removed); every detected hazard is registered.
+//!   engine `term` field (`self.term.resize(..)`) or a direct sink call.
 //! * OB-12 single-threaded tripwire: the shipped closure contains no
 //!   thread-spawn vocabulary (`thread::spawn(`, `thread::Builder`,
 //!   `Worker::new(`) outside test and native-only items. Shipping wasm
-//!   threads fails the build until lock order is extended to this process.
+//!   threads fails the census until lock order is extended to this process.
 //!
-//! Consumers: `tools/freeze-safety-gate/build.rs` and the `aterm-census` bin
-//! (`targo --unverified run -p aterm-census -- --wasm`).
+//! The closure over-approximates the browser bundle: the derivation does not
+//! evaluate cfg predicates, so a `[target.'cfg(..)'.dependencies]` edge counts
+//! on every platform (missing linked source is unsafe, scanning unlinked
+//! source is not). `aterm-uds` (via aterm-shell-integration's `cfg(any(unix,
+//! windows))` edge) and `aterm-objc` (via aterm-gpu's `cfg(target_os =
+//! "macos")` edge) are scanned though wasm32 never links them, which is why
+//! aterm-gpu's Metal `AcquireWorker` spawn carries a
+//! `#[cfg(not(target_arch = "wasm32"))]` gate that only OB-12 needs.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::lock_order::{mask_gated_items, mask_literals};
 use crate::{
-    CensusOutcome, GuiFn, UNBOUNDED_REGISTRY, UNBOUNDED_TERM_METHODS, callee_names,
-    collect_closure_markers, collect_rs_files, fn_defined_in, ident_ending_at, is_test_file,
-    parse_source_fns, scan_set, sink_dim, sink_file, strip_line_comment,
+    CensusOutcome, Floor, GuiFn, UNBOUNDED_REGISTRY, UNBOUNDED_TERM_METHODS, callee_names,
+    collect_closure_markers, collect_rs_files, ident_ending_at, is_test_file, parse_source_fns,
+    scan_set, sink_dim, sink_file, strip_line_comment,
 };
 
 /// The wasm renderer modules (cdylib crates loaded into the Electron renderer
@@ -72,38 +74,18 @@ const WASM_UNSHIPPED_GATES: &[&str] = &[
 /// from JS is a separate instance).
 const SPAWN_TOKENS: &[&str] = &["thread::spawn(", "thread::Builder", "Worker::new("];
 
-/// A registered standing finding: a known, deliberately unfixed synchronous
-/// unbounded reach. Re-detected every run (stale = red), reprinted as a
-/// candidate L0 hazard, and never subtracted from the walked surface.
-struct StandingWasmHazard {
-    /// The fn the hazard lives in (as defined at `def_file`).
-    fn_symbol: &'static str,
-    /// Repo-relative file holding the hazardous fn.
-    def_file: &'static str,
-    /// The written finding: what the hazard is, why it is a candidate
-    /// L0-analog, and its honest severity bounds.
-    finding: &'static str,
-}
-
-/// Empty: no export reaches the width reflow synchronously. A future
-/// deliberately-unfixed reach must be registered here with its written
-/// finding, or OB-10 is red.
-const WASM_STANDING_HAZARDS: &[StandingWasmHazard] = &[];
-
-/// The honest limits of this census, printed verbatim in every RED diagnostic
-/// (and quoted in docs/temporal-safety-gate.md so the docs cannot drift).
+/// The honest limits of this census, printed verbatim in every RED diagnostic.
 pub const WASM_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits of this census):
       - LEXICAL, name-based: the same fn segmenter and `<ident>(` call matching
         as the main-loop census; no type information. ENTRY POINTS are the root
-        crates' `pub fn`s — a sound over-approximation of the wasm_bindgen
-        export set (every export is a pub fn). Same-named fns merge.
+        crates' `pub fn`s — a sound over-approximation of the export set
+        (`#[export]` / `#[wasm_bindgen]`: every export is a pub fn).
+        Same-named fns merge.
       - THE TERMINAL HOP is the `term` naming discipline: a call
         `<...>.term.<m>(` / `term.<m>(` with `<m>` in the unbounded-method
         registry is the modeled engine hop (the wasm modules hold the engine as
-        a direct `term` field — there is no lock here to key on). Renaming the
-        field out of this vocabulary goes RED via OB-11 (the registered
-        standing findings would no longer be re-detected), forcing a re-audit
-        rather than rotting silently.
+        a direct `term` field — there is no lock here to key on). A field
+        renamed out of this vocabulary hides the hop from the walk.
       - SCOPE: the call graph covers the root crates' non-test src ONLY (masked
         to the shipped wasm32 surface: #[cfg(test)]/#[test]/
         #[cfg(not(target_arch = \"wasm32\"))] items blanked); deeper reaches are
@@ -118,12 +100,12 @@ pub const WASM_THREADING_POSTURE: &str =
     "    THREAD/LOCK POSTURE of the wasm process (why the LOCK-ORDER obligation is
     VACUOUS here — the evidence, re-verified every run by OB-12):
       - TARGET: wasm32-unknown-unknown (the only target these crates ship for;
-        tools/wasm-bench and the wasm cells build exactly that), with NO
+        the `wasm` perf lane and the wasm cells build exactly that), with NO
         `+atomics` target feature and no SharedArrayBuffer shared memory in any
         build config.
         std threads DO NOT EXIST at runtime on this target: there is no second
         thread of execution inside a module instance.
-      - Each wasm-bindgen module instance is bound to exactly ONE JS agent
+      - Each module instance is bound to exactly ONE JS agent
         (the page main thread, or the one Web Worker the host constructs the
         engine in — the crates' own docs describe that split at the JS
         message-passing level, never shared memory). A second instance in
@@ -253,16 +235,15 @@ fn append_wasm_why_and_repair(log: &mut String) {
          \x20        `abort_resize_offload()` — the same audited boundary vocabulary the\n\
          \x20        native census sanctions.\n\
          \x20     2. BOUND the work: a path that provably cannot reach the width reflow\n\
-         \x20        (e.g. `resize_no_reflow`), with the why written at the call site.\n\
-         \x20     3. STANDING FINDING (last resort, and NOT a waiver): register the site in\n\
-         \x20        WASM_STANDING_HAZARDS (crates/aterm-census/src/wasm_census.rs) WITH the\n\
-         \x20        written candidate-L0 finding — it is then reprinted as a hazard every\n\
-         \x20        run and goes stale-RED the day the code is actually fixed."
+         \x20        (e.g. `resize_no_reflow`), with the why written at the call site."
     );
 }
 
+/// The wasm census's verdict title.
+const WASM: &str = "wasm-process census";
+
 /// Run the wasm-process census over the checkout at `root`. A pure function
-/// of the source tree, safe inside a build script.
+/// of the source tree.
 pub fn run_wasm_census(root: &Path) -> CensusOutcome {
     let mut log = String::new();
     let mut failures = 0usize;
@@ -283,10 +264,9 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
                 "  ✗ FAIL [OB-8] SCAN-SET DERIVATION FAILED — the census cannot soundly \
                  determine the wasm-process closure from the workspace manifests, so it \
                  refuses to sweep a guessed scope (fail-closed).\n\
-                 \x20       {e}\n\
-                 wasm-process census: FAILED — 1 obligation violation(s)."
+                 \x20       {e}"
             );
-            return CensusOutcome::red(log);
+            return CensusOutcome::red(WASM, log, "1 obligation violation(s).");
         }
     };
     let _ = writeln!(
@@ -369,7 +349,7 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
         }
     }
     // Entry points: fully-public fns (a sound over-approximation of the
-    // `wasm_bindgen` exports).
+    // `#[export]` / `#[wasm_bindgen]` exports).
     let mut roots: Vec<usize> = Vec::new();
     for (idx, f) in fns.iter().enumerate() {
         let def = f.body.first().map(String::as_str).unwrap_or("");
@@ -401,11 +381,13 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
         let _ = writeln!(
             log,
             "  ✗ FAIL [OB-9] no public entry points resolved across any wasm root crate — \
-             the census walked nothing.\n\
-             wasm-process census: FAILED — {} obligation violation(s).",
-            failures + 1
+             the census walked nothing."
         );
-        return CensusOutcome::red(log);
+        return CensusOutcome::red(
+            WASM,
+            log,
+            format!("{} obligation violation(s).", failures + 1),
+        );
     }
 
     // BFS from every public entry point (same merged-name posture as the
@@ -443,77 +425,39 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
         path.join(" -> ")
     };
 
-    // Classify each synchronous unbounded reach as a registered standing
-    // finding (reported) or an OB-10 violation (red).
-    let mut matched_hazards: std::collections::BTreeSet<usize> = Default::default();
-    let mut standing_reported = 0usize;
-    let mut standing: Vec<String> = Vec::new();
+    // [OB-10] Every synchronous unbounded reach from an entry point is red.
     let mut hazard_hits = 0usize;
     for idx in 0..fns.len() {
         if !parent.contains_key(&idx) {
             continue;
         }
-        let file = fns[idx].span.rsplit_once(':').map(|(f, _)| f).unwrap_or("");
-        let registered = WASM_STANDING_HAZARDS
-            .iter()
-            .position(|h| h.fn_symbol == fns[idx].name && h.def_file == file);
         // (a) The modeled engine hop: `term.<unbounded>(`.
         for hz in wasm_term_hops(&fns[idx].body) {
-            if let Some(hi) = registered {
-                matched_hazards.insert(hi);
-                standing_reported += 1;
-                let h = &WASM_STANDING_HAZARDS[hi];
-                let block = format!(
-                    "  • STANDING FINDING [OB-10/OB-11] CANDIDATE L0-FREEZE (browser-tab \
-                     analog) — registered, reported every run, NOT a waiver:\n\
-                     \x20   PATH:  {}\n\
-                     \x20   SITE:  {} (fn `{}`)\n\
-                     \x20   CALL:  `.{}(..)` on the engine `term` field — SYNCHRONOUS on the \
-                     hosting JS event loop\n\
-                     \x20   LINE:  {}\n\
-                     \x20   SINK:  Terminal::{} -> Grid::resize -> resize_with_reflow_mode\n\
-                     \x20          [COST: UNBOUNDED({}) @ {}] -> take_scrollback_lines + \
-                     reflow_scrollback_lines\n\
-                     \x20   FINDING: {}",
-                    reconstruct(idx),
-                    fns[idx].span,
-                    fns[idx].name,
-                    hz.method,
-                    hz.line,
-                    hz.method,
-                    sink_dim("resize_with_reflow_mode"),
-                    sink_file("resize_with_reflow_mode"),
-                    h.finding,
-                );
-                let _ = writeln!(log, "{block}");
-                standing.push(block);
-            } else {
-                let _ = writeln!(
-                    log,
-                    "  ✗ FAIL [OB-10] L0-FREEZE OBLIGATION VIOLATED — a wasm entry point \
-                     synchronously reaches an\n\
-                     \x20        UNBOUNDED sink on the hosting JS event loop (browser-tab \
-                     freeze class).\n\
-                     \x20   PATH:  {}\n\
-                     \x20   SITE:  {} (fn `{}`)\n\
-                     \x20   CALL:  `.{}(..)` on the engine `term` field\n\
-                     \x20   LINE:  {}\n\
-                     \x20   SINK:  Terminal::{} -> Grid::resize -> resize_with_reflow_mode\n\
-                     \x20          [COST: UNBOUNDED({}) @ {}] -> take_scrollback_lines + \
-                     reflow_scrollback_lines",
-                    reconstruct(idx),
-                    fns[idx].span,
-                    fns[idx].name,
-                    hz.method,
-                    hz.line,
-                    hz.method,
-                    sink_dim("resize_with_reflow_mode"),
-                    sink_file("resize_with_reflow_mode"),
-                );
-                append_wasm_why_and_repair(&mut log);
-                failures += 1;
-                hazard_hits += 1;
-            }
+            let _ = writeln!(
+                log,
+                "  ✗ FAIL [OB-10] L0-FREEZE OBLIGATION VIOLATED — a wasm entry point \
+                 synchronously reaches an\n\
+                 \x20        UNBOUNDED sink on the hosting JS event loop (browser-tab \
+                 freeze class).\n\
+                 \x20   PATH:  {}\n\
+                 \x20   SITE:  {} (fn `{}`)\n\
+                 \x20   CALL:  `.{}(..)` on the engine `term` field\n\
+                 \x20   LINE:  {}\n\
+                 \x20   SINK:  Terminal::{} -> Grid::resize -> resize_with_reflow_mode\n\
+                 \x20          [COST: UNBOUNDED({}) @ {}] -> take_scrollback_lines + \
+                 reflow_scrollback_lines",
+                reconstruct(idx),
+                fns[idx].span,
+                fns[idx].name,
+                hz.method,
+                hz.line,
+                hz.method,
+                sink_dim("resize_with_reflow_mode"),
+                sink_file("resize_with_reflow_mode"),
+            );
+            append_wasm_why_and_repair(&mut log);
+            failures += 1;
+            hazard_hits += 1;
         }
         // (b) A direct call to a registered sink (no Terminal hop at all).
         for sink in UNBOUNDED_REGISTRY {
@@ -536,41 +480,6 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
                 failures += 1;
                 hazard_hits += 1;
             }
-        }
-    }
-
-    // [OB-11] Standing-finding registry coherence, both ways. (Every detected-
-    // but-unregistered hazard already failed OB-10 above.)
-    for (hi, h) in WASM_STANDING_HAZARDS.iter().enumerate() {
-        if h.finding.trim().is_empty() {
-            let _ = writeln!(
-                log,
-                "  ✗ FAIL [OB-11] standing finding `{}` ({}) has an EMPTY finding text — \
-                 every entry must carry the written candidate-L0 analysis.",
-                h.fn_symbol, h.def_file
-            );
-            failures += 1;
-        }
-        if !fn_defined_in(root, h.def_file, h.fn_symbol) {
-            let _ = writeln!(
-                log,
-                "  ✗ FAIL [OB-11] standing finding `{}` is registered at {} but `fn {}` is \
-                 no longer defined there — STALE entry; re-audit (update def_file if it \
-                 moved, or remove the entry).",
-                h.fn_symbol, h.def_file, h.fn_symbol
-            );
-            failures += 1;
-        } else if !matched_hazards.contains(&hi) {
-            let _ = writeln!(
-                log,
-                "  ✗ FAIL [OB-11] standing finding `{}` ({}) was NOT re-detected this run — \
-                 either the hazard was FIXED (remove the entry: the finding is closed) or \
-                 the hop vocabulary rotted (e.g. the engine field is no longer named \
-                 `term`) — re-audit; a standing finding may not silently stop describing \
-                 the code.",
-                h.fn_symbol, h.def_file
-            );
-            failures += 1;
         }
     }
 
@@ -604,29 +513,15 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
         if hazard_hits > 0 {
             let _ = write!(log, "{WASM_PRECISION_NOTE}");
         }
-        let _ = writeln!(
+        return CensusOutcome::red(
+            WASM,
             log,
-            "wasm-process census: FAILED — {failures} obligation violation(s) ({hazard_hits} \
-             unregistered synchronous unbounded reach(es)). This census blocks BOTH \
-             `targo --unverified run -p aterm-census -- --wasm` and the build of \
-             tools/freeze-safety-gate."
+            format!(
+                "{failures} obligation violation(s) ({hazard_hits} synchronous unbounded \
+                 reach(es))."
+            ),
         );
-        return CensusOutcome::red(log);
     }
-    let _ = writeln!(
-        log,
-        "wasm-process census: GREEN — {} fn(s) walked from {} public entry point(s) across {} \
-         wasm root crate(s); {} standing finding(s); no UNregistered synchronous reach \
-         to an UNBOUNDED sink; {}/{} registered sink(s) inside this closure marked; 0 \
-         thread-spawn token(s) in the shipped closure, so it stays single-threaded and \
-         the lock-order obligation is VACUOUS here.",
-        parent.len(),
-        roots.len(),
-        WASM_ROOT_CRATES.len(),
-        standing_reported,
-        sinks_in_closure,
-        UNBOUNDED_REGISTRY.len(),
-    );
     let _ = writeln!(
         log,
         "    scope: lexical name-based walk of the wasm root crates' shipped src + the \
@@ -634,17 +529,38 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
          closure (precision limits: docs/temporal-safety-gate.md).",
         scan.scan_dirs.len()
     );
-    CensusOutcome {
-        ok: true,
-        log,
-        standing,
-    }
+    let summary = format!(
+        "{} fn(s) walked from {} public entry point(s) across {} wasm root crate(s); no \
+         synchronous reach to an UNBOUNDED sink; {}/{} registered sink(s) inside this \
+         closure marked; 0 thread-spawn token(s) in the shipped closure, so it stays \
+         single-threaded and the lock-order obligation is VACUOUS here.",
+        parent.len(),
+        roots.len(),
+        WASM_ROOT_CRATES.len(),
+        sinks_in_closure,
+        UNBOUNDED_REGISTRY.len(),
+    );
+    let engines = WASM_ENGINE_CRATES
+        .iter()
+        .filter(|dir| scan.scan_dirs.iter().any(|d| d == *dir))
+        .count();
+    CensusOutcome::green(WASM, log, summary).with_floors(vec![Floor::at_least(
+        "engine crates (aterm-core, aterm-grid) in the derived wasm closure",
+        engines,
+        WASM_ENGINE_CRATES.len(),
+        "the closure no longer reaches the engine the modules embed, so its sinks' \
+         markers go unswept; the derivation lost a dependency edge",
+    )])
 }
+
+/// The engine crates every wasm module embeds: the derived closure must keep
+/// reaching them, or the engine's sink markers fall out of the sweep.
+const WASM_ENGINE_CRATES: &[&str] = &["crates/aterm-core/src", "crates/aterm-grid/src"];
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan_set::test_fixtures::{repo_root, synth_tree};
+    use crate::scan_set::test_fixtures::synth_tree;
 
     fn body(src: &str) -> Vec<String> {
         src.lines().map(|l| l.to_string()).collect()
@@ -800,16 +716,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         assert!(out.ok, "expected GREEN, got:\n{}", out.log);
         assert!(
-            out.log.contains("0 standing finding(s);"),
-            "the offloaded shape must report ZERO standing findings; log:\n{}",
-            out.log
-        );
-        assert!(
-            !out.log.contains("STANDING FINDING"),
-            "no standing-finding block may print on the fixed shape; log:\n{}",
-            out.log
-        );
-        assert!(
             out.log.contains("VACUOUS") && out.log.contains("wasm32-unknown-unknown"),
             "the threading posture must be printed on GREEN; log:\n{}",
             out.log
@@ -848,8 +754,8 @@ mod tests {
     fn synthetic_new_unregistered_reach_is_red_ob10_with_path() {
         let mut files = synth_wasm_base();
         files.extend(synth_fixed_roots());
-        // A NEW public export whose helper synchronously resizes: not in the
-        // standing registry -> must be RED with the path.
+        // A NEW public export whose helper synchronously resizes: RED with
+        // the path.
         files.push((
             "crates/aterm-gpu-web/src/extra.rs".to_string(),
             "pub fn set_columns(&mut self, cols: u16) {\n    apply_cols(self, cols);\n}\n\
@@ -893,9 +799,6 @@ mod tests {
             out.log
         );
     }
-
-    // The OB-11 stale-entry path cannot be driven synthetically while
-    // `WASM_STANDING_HAZARDS` is an empty const.
 
     #[test]
     fn synthetic_unmasked_spawn_in_closure_is_red_ob12_and_gated_spawn_is_not() {
@@ -949,166 +852,6 @@ mod tests {
             out.log.contains("[OB-8] SCAN-SET DERIVATION FAILED"),
             "log:\n{}",
             out.log
-        );
-    }
-
-    // Real-tree obligations.
-
-    /// No export reaches the width reflow synchronously and the standing
-    /// registry is empty. The live tree is walked by
-    /// `tools/freeze-safety-gate`'s build, not here.
-    #[test]
-    fn no_wasm_standing_hazard_is_registered() {
-        assert!(
-            WASM_STANDING_HAZARDS.is_empty(),
-            "a wasm standing hazard was registered; the sync hop came back — re-audit"
-        );
-    }
-
-    #[test]
-    fn standing_hazards_resolve_on_this_tree() {
-        // Any future entry must carry its analysis and resolve at its def site.
-        let root = repo_root();
-        for h in WASM_STANDING_HAZARDS {
-            assert!(
-                !h.finding.trim().is_empty(),
-                "standing finding `{}` must carry the written analysis",
-                h.fn_symbol
-            );
-            assert!(
-                fn_defined_in(&root, h.def_file, h.fn_symbol),
-                "standing finding `{}` is not defined in {} — stale entry",
-                h.fn_symbol,
-                h.def_file
-            );
-        }
-    }
-
-    /// The derived wasm-process closure, pinned. A legitimate dependency change
-    /// updates the pin; an unexpected delta means the graph or derivation
-    /// drifted. Engine edges use `default-features = false`, so the disk tier
-    /// and its libc/zstd closure are out.
-    ///
-    /// # `aterm-uds` is an OVER-APPROXIMATION, not browser code
-    ///
-    /// `aterm-uds` is in this pin because `aterm-shell-integration` reaches it
-    /// from a `[target.'cfg(any(unix, windows))'.dependencies]` section, and
-    /// [`classify_section`](super::scan_set) counts cfg-target deps IN on
-    /// every platform. That rule is deliberately fail-closed: the derivation
-    /// does not evaluate cfg predicates, so it cannot prove an edge absent,
-    /// and scanning source a target does not link is safe while missing source
-    /// it does link is not.
-    ///
-    /// It is NOT a claim about the browser bundle. `wasm32-unknown-unknown` is
-    /// neither `unix` nor `windows`, so cargo never resolves that edge for the
-    /// web build: no Unix-domain socket, no `/dev/urandom` fallback and no
-    /// blocking `std::fs` reaches the bundle. The wasm nonce mint takes the
-    /// `cfg(all(target_arch = "wasm32", target_os = "unknown"))` arm, which
-    /// calls `crypto.getRandomValues` through `getrandom` and never mentions
-    /// `aterm-uds`. If the census is ever taught to evaluate cfg predicates,
-    /// this entry is the first one that should disappear.
-    ///
-    /// # `aterm-objc` is the SAME over-approximation, added 2026-09-11
-    ///
-    /// `aterm-gpu` reaches `aterm-objc` from a
-    /// `[target.'cfg(target_os = "macos")'.dependencies]` section — the
-    /// first-party Metal backend's demand-driven drawable acquisition. The same
-    /// fail-closed rule counts it IN here, and for the same reason: the
-    /// derivation cannot prove the edge absent, and over-scanning is the safe
-    /// direction.
-    ///
-    /// It is NOT a claim that Objective-C reaches the browser.
-    /// `wasm32-unknown-unknown` is not `macos`, so cargo never resolves that
-    /// edge for the web build. Its one visible consequence is that OB-12 now
-    /// lexically scans `crates/aterm-gpu/src/metal/`, which is why the
-    /// `AcquireWorker`'s `thread::Builder` carries an explicit
-    /// `#[cfg(not(target_arch = "wasm32"))]` that is redundant to the compiler
-    /// and load-bearing to this gate. Both this entry and that marker go away
-    /// together if the census learns to evaluate cfg predicates.
-    ///
-    /// # `aterm-containment` LEFT the closure, 2026-09-24
-    ///
-    /// 6e79521a0 deleted `aterm-core`'s unused edges (`unused_crate_dependencies`
-    /// and a grep agreed nothing used them), `aterm-core -> aterm-containment`
-    /// among them, and nothing else a web module reaches depends on it, so the
-    /// derived closure shrank and this pin did not — main's gate was red here.
-    /// `aterm-alloc` and `aterm-bits` lost the same edge from `aterm-core` but
-    /// stay: other crates in the closure still reach them.
-    ///
-    /// # `aterm-tempfile` LEFT the closure, 2026-09-25
-    ///
-    /// `aterm-tempfile` left with aterm-grid's unused normal edge (it served
-    /// only a never-constructed disk-spill budget).
-    ///
-    /// # `aterm-messages` ENTERED the closure, 2026-09-28 (38 -> 39)
-    ///
-    /// Real browser code, not an over-approximation: the web CPU module now
-    /// draws the message band (`aterm-wasm/src/messages_api.rs`), and
-    /// aterm-render composes the band's rows for both hosts (`src/band.rs`).
-    /// The provenance sits on the entry.
-    #[test]
-    fn derived_wasm_closure_matches_the_pinned_canary() {
-        const PINNED: &[&str] = &[
-            "crates/aterm-alloc/src",
-            "crates/aterm-bits/src",
-            "crates/aterm-codec/src",
-            "crates/aterm-core/src",
-            // aterm-shell-integration names its per-build script folder by a
-            // SHA-256 of the script set. Dependency-, lock- and thread-free.
-            "crates/aterm-digest/src",
-            "crates/aterm-effects/src",
-            "crates/aterm-gpu-web/src",
-            "crates/aterm-gpu/src",
-            "crates/aterm-grapheme/src",
-            "crates/aterm-grid/src",
-            "crates/aterm-hash/src",
-            "crates/aterm-lexicon/src",
-            "crates/aterm-log/src",
-            "crates/aterm-lz4/src",
-            // aterm-render composes the message band and aterm-wasm exports
-            // `notice`/`messages`: clockless, no thread vocabulary, no
-            // `COST: UNBOUNDED` markers, and exports bounded by the engine's
-            // caps.
-            "crates/aterm-messages/src",
-            "crates/aterm-objc/src",
-            "crates/aterm-parser/src",
-            // aterm-render decodes inline images through it; pure Rust over
-            // `aterm-codec`'s inflate, no C build and no libc.
-            "crates/aterm-png/src",
-            "crates/aterm-policy/src",
-            "crates/aterm-predict/src",
-            "crates/aterm-provenance/src",
-            // aterm-selection and aterm-search compile patterns through it.
-            // Dependency- and lock-free.
-            "crates/aterm-regex/src",
-            "crates/aterm-render/src",
-            "crates/aterm-rle/src",
-            "crates/aterm-scene/src",
-            "crates/aterm-scrollback/src",
-            "crates/aterm-search/src",
-            "crates/aterm-selection/src",
-            "crates/aterm-shell-integration/src",
-            "crates/aterm-sixel/src",
-            // The clock for aterm-core, -types, -effects, -gpu and -predict;
-            // on wasm it keeps `Instant::now()` off the panicking std path.
-            "crates/aterm-time/src",
-            "crates/aterm-toml/src",
-            "crates/aterm-types/src",
-            // Not browser code: see the over-approximation note on this test.
-            "crates/aterm-uds/src",
-            "crates/aterm-vi/src",
-            "crates/aterm-wasm/src",
-        ];
-        let set = scan_set::derive_process_scan_set(&repo_root(), WASM_ROOT_CRATES)
-            .expect("derivation must succeed on HEAD");
-        let mut pinned: Vec<String> = PINNED.iter().map(|s| s.to_string()).collect();
-        pinned.sort();
-        assert_eq!(
-            set.scan_dirs, pinned,
-            "\nthe DERIVED wasm-process closure changed.\n\
-             If you just added/removed a dependency of the web modules' graphs, update \
-             the pin (the review diff is the audit trail). Otherwise investigate: the \
-             derivation or the workspace drifted unexpectedly.\n"
         );
     }
 }

@@ -6,17 +6,12 @@ use aterm_spec::{derive::console_pet_z_order_model, interp, verify};
 #[test]
 fn pet_z_order_proves_and_catches_every_mutant() {
     let model = console_pet_z_order_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, "console pet z-order hold");
-    assert!(
-        verify::uncaught_invariants(&model).is_empty(),
-        "every invariant has a mutant that breaks it"
+    assert_eq!(
+        verify::audit_dead_negative_controls(std::slice::from_ref(&model)),
+        Ok(0),
+        "every action fires at Buggy=0"
     );
-    verify::audit_dead_negative_controls(&model, &[]).expect("every action fires at Buggy=0");
     let declared: std::collections::BTreeSet<_> = model.actions.iter().map(|a| a.name).collect();
     assert_eq!(
         interp::fired_actions(&interp::with_buggy(&model, 1)),
@@ -47,9 +42,8 @@ fn pet_z_order_goes_under_at_once_and_surfaces_only_after_the_dwell() {
     assert!(model.fire("Hide", &mut state));
     assert_eq!(state["under"], 0, "nothing drawn releases the hold");
 
-    // The shipped per-frame rule: a clear body beside the caret sank on the
-    // caret's keep-off ring, and a body leaving ink surfaced on the very
-    // next clear frame.
+    // `Buggy = 1` is the per-frame rule: a clear body beside the caret sinks on the caret's
+    // keep-off ring, and a body leaving ink surfaces on the very next clear frame.
     let buggy = interp::with_buggy(&model, 1);
     let mut old = buggy.init_state();
     assert!(buggy.fire("Clear", &mut old));

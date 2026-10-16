@@ -1,32 +1,20 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unit-test scratch directories, removed when the test ends HOWEVER it ends.
+//! Unit-test scratch directories, removed when the test ends however it ends.
 //!
-//! A test module's scratch helper (`layout`, `scratch`, `tmp`, …) returns one of these
-//! guards rather than a bare path it made under `temp_dir()`. The directory is an
-//! [`aterm_tempfile::TempDir`], so a failing assertion unwinds through its drop: the
-//! suite leaves the shared `$TMPDIR` as it found it, where a trailing
-//! `remove_dir_all` line ran only when every assertion before it passed — and a test
-//! that forgot the line leaked on every run. The name keeps the helper's label
-//! (`atpkg-doctor-<label>-<pid>_<rand>_<n>`) and is unique per call, so two tests, or
-//! two concurrent runs of the suite, never share or wipe each other's tree. It is
-//! created mode `0700` (TempDir's own contract), the private shape the store's
-//! ownership checks require.
+//! Each is an [`aterm_tempfile::TempDir`] (mode `0700`, the shape the store's ownership
+//! checks require), so a failing assertion unwinds through its drop. The name keeps the
+//! helper's label and is unique per call, so concurrent tests and suite runs never share
+//! a tree. Bound first, a guard drops last, after any runner or host claim whose own drop
+//! still writes into the prefix. A removal that fails (a test took a write bit away and
+//! failed before restoring it) gives the tree's directories their owner bits back and
+//! tries once more.
 //!
-//! Bound first, a guard also drops LAST: after a runner or a host claim the test made
-//! later, whose own drop can still write into the prefix (measured 2026-09-30: the vendor
-//! head watch's tests recreated their removed prefix that way). A test that takes a
-//! directory's write bit away (the permission tests here do, to make a write fail) and
-//! then fails before giving it back leaves a tree `remove_dir_all` cannot empty, so a
-//! removal that fails gives the tree's directories their owner bits back and tries once
-//! more.
-//!
-//! Only a BORROW of a guard is a path (`&dir` to an `AsRef<Path>` parameter, `&*dir`,
-//! `dir.join(…)` through `Deref`). Moving one into a path-taking call would drop —
-//! and delete — the directory at that call, so it does not compile. What the compiler
-//! cannot catch is an unbound guard: `scratch("x").canonicalize()` deletes the directory
-//! at the end of that statement, so bind the guard and borrow from the binding.
+//! Only a borrow of a guard is a path (`&dir`, `&*dir`, `dir.join(…)`): moving one into a
+//! path-taking call would delete the directory there, so it does not compile. An unbound
+//! guard is not caught: `scratch("x").canonicalize()` deletes the directory at the end of
+//! that statement.
 
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -123,9 +111,8 @@ pub(crate) fn layout(prefix: &str) -> ScratchLayout {
     }
 }
 
-/// A store prefix that does not exist yet — `<scratch>/prefix`, for the tests about
-/// what creates it — inside a fresh scratch directory that is removed on drop, with
-/// anything a test lays beside the prefix.
+/// A store prefix that does not exist yet (`<scratch>/prefix`), inside a fresh scratch
+/// directory removed on drop.
 pub(crate) fn absent_layout(prefix: &str) -> ScratchLayout {
     let dir = dir(prefix);
     ScratchLayout {

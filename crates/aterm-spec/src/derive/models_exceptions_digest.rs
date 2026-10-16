@@ -6,20 +6,15 @@
 
 use super::Model;
 
-/// `open` exceptions stand in the digest (`MessageCenter::digest`); `glass` is
-/// what the band WANTS (`MessageCenter::wanted_rows`); `now_rows` is the ghost
-/// of what a Working, Notice or Now message legitimately earns. The incident
-/// that started this work was a band row that appeared and folded 0.7 ms apart
-/// and re-gridded every tab of the window, so the first invariant is the one
-/// with a death behind it: `LaterNeverWantsARow` (`glass == now_rows`).
-/// `PostLater` files nothing on the band; `PostLaterAtCap` files the oldest
-/// entry with its log line (`filed`, saturating: the check needs a finite space); `Cap` is `DIGEST_CAP`, so the cap loses nothing; `FileAll` is
-/// "Dismiss all", which quiets the facts it filed until `Resurface` (their
-/// span passing); `Suppress` is a dismissed fact raised again inside its span.
-/// `Buggy=1` adds four mutants, one per invariant: a `Later` seated on the
-/// band (the incident), a re-post that goes through a dismissal, a cap that
-/// drops an entry without its line, and an over-cap post.
-/// Tier-1 drives the shipping `MessageCenter` in lock step.
+/// `open` exceptions stand in the digest (`MessageCenter::digest`); `glass` is the band rows the
+/// center wants (`MessageCenter::wanted_rows`); `now_rows` is the ghost of what Working, Notice
+/// and Now messages earn, so `LaterNeverWantsARow` says a `Later` never wants a band row.
+/// `PostLaterAtCap` files the oldest entry with its log line (`filed` saturates to keep the space
+/// finite); `Cap` is `DIGEST_CAP`. `FileAll` is "Dismiss all", which quiets the facts it filed
+/// until `Resurface` (their span passing); `Suppress` is a dismissed fact raised inside its span.
+/// `Buggy=1` adds one mutant per invariant: a seated `Later`, a re-post through a dismissal, a cap
+/// that drops an entry without its line, and an over-cap post.
+/// Tier-1: `aterm-messages/tests/conformance_digest.rs`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn exceptions_digest_model() -> Model {

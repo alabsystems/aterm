@@ -21,6 +21,10 @@
 //! it).
 
 #![cfg(unix)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: a stand-in child may inherit descriptors"
+)]
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;

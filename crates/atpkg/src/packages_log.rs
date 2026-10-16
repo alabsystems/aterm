@@ -11,7 +11,7 @@
 //! window's pass children, the terminal session's detached pass (whose stdio is
 //! `/dev/null`), a verb typed in a shell, the `claude update`/`codex update` intercept's
 //! child and the head watch's door all run through [`crate::cli::main_entry`], and every
-//! program row any of them changes goes through [`crate::status::write`]. Four kinds of
+//! program row any of them changes goes through [`crate::status::write`]. Five kinds of
 //! event, one whole line each:
 //!
 //! * a PASS — `pass-start` once the verb holds the store lock, `pass-end` when it returns
@@ -27,7 +27,13 @@
 //!   person had linked there (`crate::seam::Attached::ReplacedStale`, 2026-09-26): what it
 //!   named, what it names now, why, and the command that puts it back. The one change a
 //!   pass makes outside the store that nobody laid there for it, so it is said where the
-//!   silent passes are reviewed.
+//!   silent passes are reviewed;
+//! * an INDEX RESOLVED — a pass's index discovery: the HEADs, the rounds they went out in,
+//!   the asset GETs, and the newest index found. Settings' Activity leaves it out.
+//!
+//! Every line written INSIDE a pass carries `t_ms`, its offset from the pass's start in
+//! milliseconds ([`start_pass_clock`]), so one pass reads as a timeline finer than its
+//! seconds-wide stamps.
 //!
 //! THE LINE: `<RFC 3339 UTC>\t<kind>\tpid=<pid>\t<key>=<value>…\n`. A tab can never occur
 //! inside a value — every control character is replaced — so the separator cannot be
@@ -87,6 +93,8 @@ pub mod kind {
     pub const WARM: &str = "warm";
     /// A rustup seam's entry replaced a stale foreign link.
     pub const SEAM: &str = "seam";
+    /// A pass's index discovery ran: what it asked and what it found.
+    pub const INDEX_RESOLVED: &str = "index-resolved";
 }
 
 /// Where the log lives: `<logs dir>/packages.log`, or `None` when no log directory
@@ -210,6 +218,19 @@ pub enum Event<'a> {
         /// How long it ran, in milliseconds.
         ms: u64,
     },
+    /// A pass's index discovery ran ([`crate::net::GithubFetcher`]): what it cost — the
+    /// HEADs, the rounds they went out in, the asset GETs — and the newest index it found.
+    /// The pass's own timeline, for whoever measures it; Settings' Activity leaves it out.
+    IndexResolved {
+        /// HEADs asked.
+        heads: u32,
+        /// The rounds they went out in, each at once.
+        rounds: u32,
+        /// Asset GETs asked.
+        gets: u32,
+        /// The newest index found (`atpkg-index-<n>`), or why none was.
+        found: &'a str,
+    },
     /// A rustup seam's entry REPLACED a stale foreign link
     /// (`crate::seam::Attached::ReplacedStale`).
     Seam {
@@ -236,8 +257,82 @@ pub fn append(layout: &Layout, event: &Event<'_>) {
     let Some(dir) = log_dir() else {
         return;
     };
-    let line = render(crate::flow::now_unix(), std::process::id(), event);
+    let line = render_at(
+        crate::flow::now_unix(),
+        std::process::id(),
+        pass_ms(),
+        event,
+    );
     let _ = append_line(&dir, &line, crate::lock::held_by_this_process(layout));
+}
+
+/// Append `event` from code that holds no layout — the fetcher — when, and only when, this
+/// process is inside a pass over the recorded store ([`start_pass_clock`]). Never rotates:
+/// a line written without knowing the lock only appends.
+pub(crate) fn append_in_pass(event: &Event<'_>) {
+    let Some(ms) = pass_ms() else {
+        return;
+    };
+    let Some(dir) = log_dir() else {
+        return;
+    };
+    let line = render_at(crate::flow::now_unix(), std::process::id(), Some(ms), event);
+    let _ = append_line(&dir, &line, false);
+}
+
+/// Start this process's PASS CLOCK — a pass over `layout` took the store lock — when that
+/// store is the one this log records: every line written until [`stop_pass_clock`] carries
+/// `t_ms`, its offset from here in milliseconds, so one pass's lines read as a timeline
+/// finer than the seconds of their stamps.
+pub(crate) fn start_pass_clock(layout: &Layout) {
+    if records(layout) {
+        pass_clock::set(Some(std::time::Instant::now()));
+    }
+}
+
+/// The pass ended: lines after it carry no `t_ms`.
+pub(crate) fn stop_pass_clock() {
+    pass_clock::set(None);
+}
+
+/// Milliseconds since this process's pass began, when it is inside one.
+fn pass_ms() -> Option<u64> {
+    pass_clock::get().map(|start| u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX))
+}
+
+/// One pass per process: the clock is the process's.
+#[cfg(not(test))]
+mod pass_clock {
+    static START: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+    pub(super) fn set(at: Option<std::time::Instant>) {
+        if let Ok(mut start) = START.lock() {
+            *start = at;
+        }
+    }
+
+    pub(super) fn get() -> Option<std::time::Instant> {
+        START.lock().ok().and_then(|start| *start)
+    }
+}
+
+/// Under test a pass runs on the thread that called it, beside other tests' passes: the
+/// clock is the thread's, as [`test_bind`]'s log directory is.
+#[cfg(test)]
+mod pass_clock {
+    use std::cell::Cell;
+
+    thread_local! {
+        static START: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn set(at: Option<std::time::Instant>) {
+        START.with(|start| start.set(at));
+    }
+
+    pub(super) fn get() -> Option<std::time::Instant> {
+        START.with(Cell::get)
+    }
 }
 
 /// Log every program transition between the record as it stood (`before`) and as it is
@@ -317,7 +412,12 @@ fn transition(
 /// `event` as its one line, `\n` included.
 #[must_use]
 pub fn render(unix: i64, pid: u32, event: &Event<'_>) -> String {
-    let (exit, secs, build, ms);
+    render_at(unix, pid, None, event)
+}
+
+/// [`render`], with the line's offset into its pass (`t_ms`) when it was written inside one.
+fn render_at(unix: i64, pid: u32, t_ms: Option<u64>, event: &Event<'_>) -> String {
+    let (exit, secs, build, ms, counts);
     let (kind, fields): (&str, Vec<(&str, &str)>) = match *event {
         Event::PassStart { lane, verb } => (kind::PASS_START, vec![("lane", lane), ("verb", verb)]),
         Event::PassEnd {
@@ -370,6 +470,23 @@ pub fn render(unix: i64, pid: u32, event: &Event<'_>) -> String {
                 ],
             )
         }
+        Event::IndexResolved {
+            heads,
+            rounds,
+            gets,
+            found,
+        } => {
+            counts = [heads.to_string(), rounds.to_string(), gets.to_string()];
+            (
+                kind::INDEX_RESOLVED,
+                vec![
+                    ("heads", counts[0].as_str()),
+                    ("rounds", counts[1].as_str()),
+                    ("gets", counts[2].as_str()),
+                    ("found", found),
+                ],
+            )
+        }
         Event::Seam {
             seam,
             from,
@@ -387,6 +504,13 @@ pub fn render(unix: i64, pid: u32, event: &Event<'_>) -> String {
             ],
         ),
     };
+    let stamp = t_ms.map(|t| t.to_string());
+    let fields: Vec<(&str, &str)> = stamp
+        .as_deref()
+        .map(|t| ("t_ms", t))
+        .into_iter()
+        .chain(fields)
+        .collect();
     render_record(unix, kind, pid, &fields, MAX_VALUE_CHARS)
 }
 
@@ -804,6 +928,7 @@ pub fn parse_line(line: &str) -> Option<Entry> {
             kind::PROGRAM,
             kind::WARM,
             kind::SEAM,
+            kind::INDEX_RESOLVED,
         ]
         .contains(&entry.kind.as_str())
     })
@@ -1453,6 +1578,67 @@ mod tests {
         // Written again unchanged: nothing more.
         crate::status::write(&layout, &st).unwrap();
         assert_eq!(read_tail(&dir, 10).len(), 1);
+        for d in [&dir, &store, &other] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// THE PASS CLOCK: a pass over THE store stamps every line written inside it with `t_ms`,
+    /// its offset from the pass's start — the fetcher's layout-free `index-resolved` line too,
+    /// which reads back as the log's own kind — and nothing outside a pass, or inside a pass
+    /// over another store, is stamped or written that way.
+    #[test]
+    fn lines_inside_a_pass_carry_their_offset_into_it() {
+        let dir = scratch("clock");
+        let store = scratch("clock-store");
+        let other = scratch("clock-other");
+        let _bound = test_bind::bind(dir.clone(), store.clone());
+        let layout = Layout {
+            prefix: store.clone(),
+        };
+        let start = Event::PassStart {
+            lane: "typed",
+            verb: "update",
+        };
+        let index = Event::IndexResolved {
+            heads: 3,
+            rounds: 2,
+            gets: 8,
+            found: "atpkg-index-45",
+        };
+        // Outside a pass: no stamp, and the layout-free line writes nothing.
+        append(&layout, &start);
+        append_in_pass(&index);
+        // A pass over another store starts no clock.
+        start_pass_clock(&Layout {
+            prefix: other.clone(),
+        });
+        append_in_pass(&index);
+        start_pass_clock(&layout);
+        append(&layout, &start);
+        append_in_pass(&index);
+        stop_pass_clock();
+        append_in_pass(&index);
+        let lines = read_tail(&dir, 10);
+        let kinds: Vec<(&str, Option<&str>)> = lines
+            .iter()
+            .rev()
+            .map(|e| (e.kind.as_str(), e.get("t_ms")))
+            .collect();
+        assert_eq!(kinds.len(), 3, "{lines:?}");
+        assert_eq!(kinds[0], (kind::PASS_START, None), "before the pass");
+        assert_eq!(kinds[1].0, kind::PASS_START);
+        assert_eq!(kinds[2].0, kind::INDEX_RESOLVED);
+        let t: Vec<u64> = kinds[1..]
+            .iter()
+            .map(|(_, t)| t.expect("stamped inside the pass").parse().unwrap())
+            .collect();
+        assert!(t[0] <= t[1], "{t:?}");
+        let resolved = &lines[0];
+        assert_eq!(resolved.get("heads"), Some("3"));
+        assert_eq!(resolved.get("rounds"), Some("2"));
+        assert_eq!(resolved.get("gets"), Some("8"));
+        assert_eq!(resolved.get("found"), Some("atpkg-index-45"));
         for d in [&dir, &store, &other] {
             let _ = std::fs::remove_dir_all(d);
         }

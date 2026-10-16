@@ -8,15 +8,6 @@
 // `(c*f+127)/255`, the GPU multiplies in f32 in `fs_sprite_over`, and the
 // tests assert non-trivial tints so the check is never vacuous.
 //
-// Covered:
-//   * base frames without rain are byte-exact, so the delta is effect-only;
-//   * a rain frame's sprite delta is within the bar, with multi-level tints;
-//   * `rain_add` head halos over the background are byte-exact
-//     (premultiplied One/One == CPU `add_sat`);
-//   * sprites + halos combined stay within the sprite bar;
-//   * empty rain channels (atlas with no quads, or after `clear_overlays`)
-//     are byte-identical on the GPU.
-//
 // No GPU or no font: no-op. Byte-exact additive checks also skip on downlevel
 // (sRGB-offscreen) adapters via `additive_is_byte_exact`.
 
@@ -38,9 +29,7 @@ use crate::common::{backends, max_channel_delta};
 #[test]
 fn rain_effect_only_parity_pinned_over_bg_and_text() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (10usize, 40usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -58,12 +47,12 @@ fn rain_effect_only_parity_pinned_over_bg_and_text() {
         "procedural-block base must be byte-exact so the rain delta is effect-only"
     );
 
-    // Drive a REAL engine to a genuine emission (deterministic seed).
+    // Drive a real engine to a genuine emission (deterministic seed).
     let mut scene = RainScene::new(rows, cols, cpu.cell_size(), &base_input);
     scene.drive_until_raining();
 
-    // The anti-vacuity pins: the ramp must make tint load-bearing. All-white
-    // tints would silently reduce this test to cat parity (design §9).
+    // Anti-vacuity: the ramp must make tint load-bearing; all-white tints would
+    // silently reduce this test to cat parity.
     assert!(
         scene.quads.iter().any(|q| q.tint != 0x00FF_FFFF),
         "rain emission carries only trivial (white) tints — the tint path is unexercised"
@@ -142,20 +131,15 @@ fn rain_effect_only_parity_pinned_over_bg_and_text() {
 
 /// The GPU rain row filter on the scissored path: with steady rain and a
 /// one-row text change, `present_input_readback` (`RepaintScope::Dirty`)
-/// uploads only `row_active` rain instances. This is pixel-exact because
+/// uploads only `row_active` rain instances. Pixel-exact because
 /// `compute_dirty_rows` marks every band row a rain quad overlaps, so an
-/// admitted quad is on a fully rebuilt row and a dropped one is clipped.
-///
-/// Non-vacuity: the changed row carries rain quads, rows past the band carry
-/// quads too (so the drop branch runs), and `scissor_taken()` must tick. The
-/// scissored frame must equal a fresh full render by an independent renderer;
-/// CPU-vs-GPU stays within the sprite bar.
+/// admitted quad is on a fully rebuilt row and a dropped one is clipped. The
+/// scissored frame equals an independent fresh render; CPU-vs-GPU stays within
+/// the sprite bar.
 #[test]
 fn scissored_path_rain_row_filter_matches_full_render() {
     let theme = Theme::default();
-    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
-        return;
-    };
+    let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win_cpu = WindowCpu::new();
     let mut win_gpu = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (10usize, 40usize);
@@ -188,8 +172,8 @@ fn scissored_path_rain_row_filter_matches_full_render() {
     let _ = cpu.render_input_cached(&mut win_cpu, &in_a);
     let _ = gpu.present_input_readback(&mut win_gpu, &in_a);
 
-    // Frame B: ONE row of text changes; the rain is UNCHANGED (settled) —
-    // exactly the sparse-damage shape the row filter optimizes.
+    // Frame B: one row of text changes and the rain is unchanged (settled), the
+    // sparse-damage shape the row filter optimizes.
     term.process(format!("\x1b[{};1H▒▒▒▒▒▒", hit_row + 1).as_bytes());
     let mut in_b = term.cell_frame(rows, cols);
     scene.apply(&mut in_b);
@@ -206,8 +190,8 @@ fn scissored_path_rain_row_filter_matches_full_render() {
          bypass the row filter and pass vacuously)"
     );
 
-    // Ground truth: a fresh full render of frame B by an INDEPENDENT renderer
-    // (the nova_parity idiom — no shared caches, no shared prev state).
+    // Ground truth: a fresh full render of frame B by an independent renderer
+    // (no shared caches, no shared prev state).
     let mut gpu2 = common::independent_gpu(18.0, theme);
     let mut win_fresh = aterm_gpu::WindowGpu::new();
     let gpu_fresh = gpu2.render_input(&mut win_fresh, &in_b, None);

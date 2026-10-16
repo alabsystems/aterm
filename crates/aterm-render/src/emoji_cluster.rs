@@ -2,18 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Emoji grapheme clusters the colour face shapes to MORE THAN ONE glyph.
+//! Emoji grapheme clusters the colour face shapes to more than one glyph.
 //!
-//! A cluster (a ZWJ sequence, a flag, a skin tone, a keycap) that the colour face
-//! ligates to one glyph is drawn as that glyph ([`GlyphClass::RgbaGid`]). One it
-//! shapes to several colour glyphs — every member of a ZWJ sequence it does not
-//! carry, or a flag's two regional-indicator letters where it has no flag glyph
-//! but draws letters in colour (Apple Color Emoji does not) — used to fall back
-//! to the cluster's first code point and draw that alone. Here the run is
+//! A cluster (ZWJ sequence, flag, skin tone, keycap) the colour face ligates is drawn as
+//! that glyph ([`GlyphClass::RgbaGid`]). One it shapes to several colour glyphs (ZWJ
+//! members it does not carry, or a flag's regional-indicator letters drawn in colour) is
 //! composited into one image fitted to the cluster's two cells, keyed
-//! [`GlyphClass::RgbaCluster`]: the CPU and GPU backends both pull it from the
-//! shared glyph cache, so they draw the same pixels, and each image costs the
-//! atlas no more than one emoji.
+//! [`GlyphClass::RgbaCluster`]: both backends pull it from the shared glyph cache, and it
+//! costs the atlas one emoji.
 //!
 //! [`GlyphClass::RgbaGid`]: crate::GlyphClass::RgbaGid
 //! [`GlyphClass::RgbaCluster`]: crate::GlyphClass::RgbaCluster
@@ -167,7 +163,7 @@ fn over(dst: (&mut [u8], usize, usize), src: (&[u8], usize, usize), x0: i32, y0:
 
 /// The shaping memo for emoji clusters, and the runs it names.
 ///
-/// Run ids are NEVER reused: a key naming one outlives it in the CPU glyph cache
+/// Run ids are never reused: a key naming one outlives it in the CPU glyph cache
 /// and the GPU atlas, so a reused id could serve another cluster's image. At id
 /// exhaustion a new run is refused and the cluster keeps its base-codepoint
 /// fallback. `runs` holds exactly the ids the memo names, so rotating or
@@ -270,8 +266,7 @@ mod tests {
 
     #[test]
     fn a_run_is_refused_unless_it_is_all_colour_and_two_to_eight_glyphs() {
-        // One colour glyph (the subdivision flag without its ligature): the
-        // bare base's own fallback draws it.
+        // One colour glyph: the bare base's own fallback draws it.
         assert!(layout_run(joined(1), colour).is_none());
         assert!(layout_run(joined(MAX_RUN_GLYPHS as u32), colour).is_some());
         assert!(layout_run(joined(MAX_RUN_GLYPHS as u32 + 1), colour).is_none());

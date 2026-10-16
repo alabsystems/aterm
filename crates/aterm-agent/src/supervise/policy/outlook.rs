@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The OUTLOOK of a wall ([`outlook`]): the one table the policy and whatever
+//! The outlook of a wall ([`outlook`]): the one table the policy and whatever
 //! shows a wall (the tab chip, `status`) both read, so the two cannot
 //! disagree about whether a person is needed. Pure, total over [`WallKind`].
 //!
-//! [`ExceptionKind`] names the points only a person can answer (owner,
-//! 2026-09-28: *"there needs to be some clear reason why the user must be
-//! engaged and what the user should do"*); [`super::exception`] raises them
-//! with their why and their one action.
+//! [`ExceptionKind`] names the points only a person can answer;
+//! [`super::exception`] raises them with their why and their one action.
 
 use aterm_phase::wall::WallKind;
 
@@ -30,21 +28,17 @@ pub enum ExceptionKind {
     GoalCleared,
     /// A wall with a reset that keeps answering the continuation after it.
     Futile,
-    /// A full context that `/compact` cannot lower: the vendor's own word, after
-    /// the third `/compact`, that the conversation cannot be reduced. What is
-    /// left is a person's, done in the tab (back a few messages), so the host
-    /// files it per tab.
+    /// A full context `/compact` cannot lower, by Claude Code's own word after
+    /// the third `/compact`. Going back is a person's, done in the tab, so the
+    /// host files it per tab.
     Context,
-    /// A screen no reader names: it has read busy on background work alone
-    /// for hours while Claude's own terminal title rests on its idle glyph
-    /// (the stall canary's third rung, [`super::exception::Exception::stalled`]).
+    /// A screen no reader names, busy on background work alone for hours while
+    /// Claude's title says idle ([`super::exception::Exception::stalled`]).
     Stalled,
-    /// A dialog no reader names: no composer, box or busy row has stood on the
-    /// screen for an hour, its words unchanged, while Claude's own title rests
-    /// on its idle glyph (the dialog flavour of the stall canary's third rung,
-    /// [`super::exception::Exception::dialog`]). Its own kind, not a `Stalled`
-    /// with other words: a person's dismissal of one must not silence the
-    /// other in the same tab, and the action differs.
+    /// A dialog no reader names, unchanged for an hour while Claude's title
+    /// says idle ([`super::exception::Exception::dialog`]). Its own kind, not
+    /// a `Stalled`: dismissing one must not silence the other in the same tab,
+    /// and the action differs.
     Dialog,
 }
 
@@ -65,9 +59,7 @@ impl ExceptionKind {
     }
 }
 
-/// What becomes of a wall — the ONE table the policy acts on and whatever
-/// SHOWS a wall reads (the tab chip's mark and words, `status`), so the two
-/// cannot disagree about whether a person is needed.
+/// What becomes of a wall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outlook {
     /// The supervisor continues it by itself, at the wall's reset when it
@@ -127,11 +119,9 @@ pub fn outlook(
     }
 }
 
-/// What a SURFACE that shows a wall (the presence row, the tab chip) needs of
-/// its [`Outlook`]: who answers it. The owner's rule (2026-09-28) — *"Don't
-/// continue to persist alerts to the user that are not actionable"* — is this
-/// table: a wall the supervisor resumes is a record, and only a wall a person
-/// must (or can) act on says so.
+/// What a surface that shows a wall (the presence row, the tab chip) needs of
+/// its [`Outlook`]: who answers it. A wall the supervisor resumes is a record;
+/// only a wall a person must (or can) act on says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answer {
     /// Nobody: a person is needed, or nothing supervises the wall here.
@@ -140,13 +130,13 @@ pub enum Answer {
     /// resumes it by itself.
     Resumes,
     /// The supervisor resumes it, slowly, and a person can lift it faster:
-    /// the ONE thing to do, as a short static phrase for the row.
+    /// the one thing to do, as a short static phrase for the row.
     ResumesAsks(&'static str),
 }
 
 /// The [`Answer`] to a wall of `kind` whose notice names a reset (`has_reset`)
 /// or not, under `cfg`, `supervised` by this process's own harness. A
-/// critical-memory banner is nobody's: it is drawn under a RUNNING spinner, the
+/// critical-memory banner is nobody's: it is drawn under a running spinner, the
 /// one place the supervisor never decides (`status_item::outlives_supervision`),
 /// so the stop stays for a person to see whatever `relaunch` says.
 #[must_use]

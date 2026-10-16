@@ -7,38 +7,30 @@
 //!
 //! Two trust-bearing decisions live here, both fail-closed:
 //!
-//! * **Prefix validation is a *chain* check, not just the leaf.**
-//!   `dir_safe_for_private_write` only checks one dir's owner+mode; it does not walk the
-//!   parent chain. Because `prefix` is config-controlled (§11), a prefix under a
-//!   shared/attacker-writable *parent* would reintroduce a CWE-379 symlink-swap window.
-//!   So [`resolve`] admits exactly TWO chain shapes, and never a mixture; anything else
-//!   falls back to the trusted default prefix (mirroring the
-//!   slug-fail-closed-to-default pattern). Neither shape may contain `..`.
+//! * Prefix validation checks the whole chain, not just the leaf: `prefix` is
+//!   config-controlled (§11), and a prefix under an attacker-writable parent reopens a
+//!   CWE-379 symlink-swap window. [`resolve`] admits exactly two chain shapes, never a
+//!   mixture and never with `..`; anything else falls back to the default prefix.
 //!
-//!   1. **HOME prefix** — strictly under `$HOME`, with **every existing directory from
-//!      `$HOME` down** owned-by-uid, not group/other-writable, and not a symlink.
-//!   2. **SYSTEM prefix** — anywhere outside `$HOME`, with **every existing directory
-//!      from `/` down** owned by ROOT, not group/other-writable, and not a symlink.
+//!   1. A `$HOME` prefix: strictly under `$HOME`, every existing directory from `$HOME`
+//!      down owned by the uid, not group/other-writable, and not a symlink.
+//!   2. A system prefix: outside `$HOME`, every existing directory from `/` down owned by
+//!      root, not group/other-writable, and not a symlink.
 //!
-//!   The system shape exists for a genuine multi-user install (one store several
-//!   accounts share, which no `$HOME` prefix can be), and for anyone opting in to
-//!   `TRUST_REQUIRE_SEALED_LAUNCHER=1`. A root-owned chain answers the same
-//!   "no attacker-writable ancestor" question at least as strongly, and writing there
-//!   requires root, which is checked rather than assumed. Both shapes are AND-checks
-//!   over the FULL chain: one world-writable ancestor (`/private/tmp`, say)
-//!   disqualifies the whole prefix.
-//!
-//!   The system shape is NOT required for the verified lane: Trust's default mode is
-//!   `CallerOwned` — a component owned by root **or by the invoking identity**, not
-//!   group/world-writable, is authoritative — so the DEFAULT `$HOME` prefix proves fine,
-//!   and running targo as root is REFUSED outright (`docs/GOLDEN-INSTALL-PATH.md` §2).
-//! * **Shim names that collide with sensitive commands are refused** ([`shim_allowed`]).
-//!   `bin/` is appended to the child `PATH` (never prepended, so a managed tool can't
-//!   shadow a system one), but a tool honestly or maliciously named `sudo`/`ssh`/`git`/…
-//!   must never get a shim at all.
+//!   The system shape is for a store several accounts share, or for
+//!   `TRUST_REQUIRE_SEALED_LAUNCHER=1`; writing there requires root, which is checked. One
+//!   world-writable ancestor (`/private/tmp`, say) disqualifies either shape. The verified
+//!   lane does not need it: Trust's default `CallerOwned` mode accepts a component owned by
+//!   root or the invoking identity, so the default `$HOME` prefix proves fine, and targo
+//!   refuses to run as root (`docs/GOLDEN-INSTALL-PATH.md` §2).
+//! * Shim names that collide with sensitive commands (`sudo`, `ssh`, `git`, …) never get a
+//!   shim ([`shim_allowed`]), even though `bin/` is appended to the child `PATH`, never
+//!   prepended.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
+
+use crate::manifest::DigestAlg;
 
 /// The resolved, validated install layout. All paths are absolute and under a prefix
 /// that passed the [`resolve`] chain check.
@@ -49,74 +41,47 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// Whether this is a SYSTEM prefix: the root-owned shape, as opposed to the
-    /// per-user `$HOME` shape.
-    ///
-    /// Decided by the ACTUAL on-disk chain ([`system_chain_trusted`]), not by location.
-    /// Location alone is not sound here: a `Layout` can be built directly (tests do,
-    /// at 28 sites) without passing through [`vet_prefix`], and "outside `$HOME`" would
-    /// then wrongly classify an ordinary user-owned temp dir as a system prefix and
-    /// publish it `0755`. Asking the filesystem instead means the mode always follows
-    /// the trust shape that is really there, and a prefix that is not root-owned can
-    /// never be widened.
+    /// Whether this is a system prefix (the root-owned shape) rather than a `$HOME` one,
+    /// decided by the on-disk chain ([`system_chain_trusted`]), not by location: a `Layout`
+    /// built directly (tests do) skips [`vet_prefix`], and "outside `$HOME`" would then
+    /// publish a user-owned temp dir `0755`.
     #[must_use]
     pub fn is_system_prefix(&self) -> bool {
         system_chain_trusted(&self.prefix)
     }
 
-    /// Create and harden a directory belonging to this layout, with the mode the
-    /// PREFIX SHAPE calls for.
-    ///
-    /// A `$HOME` prefix is private state: `0700`, owned by us, nobody else's business.
-    /// A SYSTEM prefix is the opposite — root writes it and every user must be able to
-    /// traverse and execute out of it, so it is `0755`. Hardening a system prefix to
-    /// `0700` installs a toolchain that only root can run, which passes every ownership
-    /// check (`0700 & 0o022 == 0` satisfies even Trust's launcher predicate) and then
-    /// fails at the only moment that matters — the first non-root invocation, with a
-    /// bare `Permission denied`.
-    ///
-    /// The write itself is still guarded by the prefix chain check: this only decides
-    /// who may READ and TRAVERSE, never who may write.
+    /// Create and harden a directory of this layout with the mode the prefix shape calls
+    /// for: `0700` in a `$HOME` prefix (private state), `0755` in a system prefix, which
+    /// every user must traverse and execute from (a `0700` system prefix passes every
+    /// ownership check, then fails the first non-root run with `Permission denied`). This
+    /// decides who may read and traverse, never who may write: the prefix chain check
+    /// guards the write.
     pub fn ensure_dir(&self, dir: &Path) -> std::io::Result<()> {
         let created = if self.is_system_prefix() {
             crate::platform::ensure_shared_dir(dir)
         } else {
             crate::platform::ensure_private_dir(dir)
         };
-        // KEEP THE TOOLCHAIN OUT OF BACKUPS. The store holds multiple GB of
-        // extracted compiler and prover binaries that are, by construction,
-        // re-downloadable and signature-verifiable from the signed index — Apple's
-        // own guidance is that exactly this content should be excluded. It lives
-        // under Application Support rather than Caches (it must survive a purge, and
-        // the verified lane needs a stable path), so nothing excludes it by default:
-        // without this, every Time Machine / Backblaze / Arq run copies ~3.2 GB of
-        // re-creatable bytes, and churns them again on every update pass.
-        //
-        // Applied to the PREFIX only, once, and best-effort: this is a storage
-        // courtesy, never a correctness property, so a filesystem that will not take
-        // the attribute changes nothing about the install.
+        // Keep the toolchain out of backups: the store holds GBs of re-downloadable,
+        // signature-verifiable binaries under Application Support (not Caches: it must
+        // survive a purge, and the verified lane needs a stable path), so nothing excludes
+        // it by default. Prefix only, best-effort: a storage courtesy, never correctness.
         if dir == self.prefix {
             crate::platform::exclude_from_backup(dir);
         }
         created
     }
 
-    /// `agents/` ([`Self::agents_dir`]) ENSURED as a REAL directory — the rule the `aterm`
-    /// front door applies before it hands the directory to a TTY session
-    /// ([`crate::reroute::AGENTS_DIR_ENV`]). What a launch needs synchronously
-    /// is only that the directory EXIST, so the twins atpkg lays into it later
-    /// ([`crate::activate::reconcile_agents`]) are found on the next invocation: one
-    /// `mkdir` through [`Self::ensure_dir`] — `0700` in a `$HOME` prefix, `0755` in a
-    /// system one — never a wait, and an existing directory is left as it is. A symlink or
-    /// a regular file at `agents/` is REFUSED and left alone (a pre-created link must never
-    /// capture the twins) — judged by `lstat` BEFORE the `mkdir`, so the refusal is this
-    /// function's one-path sentence and never the `update directory …` wording
-    /// `ensure_private_dir` would give the same fact. The window
-    /// (`aterm-gui::spawn::managed_agents_dir`) and the front door both come here, so a
-    /// symlinked `agents/` is handed by neither. `Ok` is the absolute directory, real and
-    /// traversable; `Err` is the sentence for the caller's one stderr line
-    /// ([`agents_dir_refusal_line`]), always starting with the path — the launch then
-    /// omits the directory rather than putting a nonexistent entry first on PATH.
+    /// `agents/` ([`Self::agents_dir`]) ensured as a real directory, before the `aterm` front
+    /// door hands it to a TTY session ([`crate::reroute::AGENTS_DIR_ENV`]) and the window
+    /// (`aterm-gui::spawn::managed_agents_dir`) puts it on a session's PATH, so the twins
+    /// atpkg lays later ([`crate::activate::reconcile_agents`]) are found. One `mkdir`
+    /// through [`Self::ensure_dir`], never a wait; an existing directory is left as it is. A
+    /// symlink or regular file at `agents/` is refused and left alone (a pre-created link
+    /// must never capture the twins), judged by `lstat` before the `mkdir`. `Ok` is the
+    /// absolute directory; `Err` is the sentence for the caller's stderr line
+    /// ([`agents_dir_refusal_line`]), always starting with the path, and the launch then
+    /// leaves the directory off PATH.
     pub fn ensure_agents_dir(&self) -> Result<PathBuf, String> {
         let dir = self.agents_dir();
         match std::fs::symlink_metadata(&dir) {
@@ -128,9 +93,9 @@ impl Layout {
             }
             _ => {}
         }
-        // The bare io error names no path (`Permission denied (os error 13)`); the
-        // caller's stderr line must. `ensure_private_dir`'s own refusals already start
-        // with it — a link swapped in after the lstat above — and are not prefixed twice.
+        // The bare io error names no path; the caller's stderr line must.
+        // `ensure_private_dir`'s own refusals (a link swapped in after the lstat) already
+        // start with it and are not prefixed twice.
         self.ensure_dir(&dir).map_err(|error| {
             let text = error.to_string();
             if text.starts_with(&dir.display().to_string()) {
@@ -162,27 +127,22 @@ impl Layout {
         self.prefix.join("bin")
     }
 
-    /// `reroute/` — the SESSION-SCOPED directory of upstream-name stubs
-    /// ([`crate::reroute`]), prepended FIRST only to the PATH aterm hands its own
-    /// children — and moved first by the rc hook's GATED arm, inside an
-    /// aterm session only ([`crate::hooks`]; outside one the hook takes it out); never
-    /// `bin/`, so [`shim_allowed`]'s deny-list keeps meaning exactly what it means for the
-    /// managed `bin/`.
+    /// `reroute/`: the session-scoped directory of upstream-name stubs ([`crate::reroute`]),
+    /// put first only on the PATH aterm hands its own children, and by the rc hook inside an
+    /// aterm session ([`crate::hooks`]). Never `bin/`, so [`shim_allowed`]'s deny-list keeps
+    /// its meaning for the managed `bin/`.
     #[must_use]
     pub fn reroute_dir(&self) -> PathBuf {
         crate::reroute::dir(self)
     }
 
-    /// `agents/` — the ONE managed directory that goes FIRST on `PATH` (the shell hook
+    /// `agents/`: the one managed directory that goes first on `PATH` (the shell hook
     /// prepends it, [`crate::hooks`]; the GUI's spawn seam front-inserts it beside
-    /// `reroute/`). It holds ONLY the shims of the agent programs
-    /// ([`crate::stub::AGENT_PROGRAMS`]), each forwarding exactly where its `bin/` twin
-    /// does with the same exported environment ([`crate::activate::reconcile_agents`];
-    /// the twin also carries the self-update block, [`crate::selfupdate`]),
-    /// so `claude`/`codex` run the managed copy ahead of a vendor's native install or a brew
-    /// cask — the rule-1 exception (aterm is the version manager for the coding agents;
-    /// docs/DESIGN-which-copy-runs-2026-08-27.md). Every other managed tool stays in `bin/`,
-    /// appended LAST, so [`shim_allowed`]'s deny-list keeps its meaning.
+    /// `reroute/`). It holds only the agent programs' shims
+    /// ([`crate::stub::AGENT_PROGRAMS`]), each forwarding exactly where its `bin/` twin does
+    /// ([`crate::activate::reconcile_agents`]), so `claude`/`codex` run the managed copy
+    /// ahead of a vendor's native install or a brew cask. Every other managed tool stays in
+    /// `bin/`, appended last, so [`shim_allowed`]'s deny-list keeps its meaning.
     #[must_use]
     pub fn agents_dir(&self) -> PathBuf {
         self.prefix.join("agents")
@@ -195,43 +155,27 @@ impl Layout {
         self.agents_dir().join(tool.shim_file())
     }
 
-    /// `landing/` — where passes from 2026-09-16 to 2026-09-22 wrote LANDING MARKERS,
-    /// which a twin those clients laid still tests for ([`crate::landing`]). No pass
-    /// writes one now; every pass removes the directory ([`crate::landing::sweep`]).
+    /// `landing/`: where older passes wrote landing markers, which twins those clients laid
+    /// still test for ([`crate::landing`]). No pass writes one now; every pass removes the
+    /// directory ([`crate::landing::sweep`]).
     #[must_use]
     pub fn landing_dir(&self) -> PathBuf {
         self.prefix.join("landing")
     }
 
-    /// `landing/<tool>` — the path an older twin tests for ([`Self::landing_dir`]).
-    #[must_use]
-    pub fn landing_marker(&self, tool: &ToolName) -> PathBuf {
-        self.landing_dir().join(tool.as_str())
-    }
-
-    /// `bin/<tool>` — a single shim. The concrete file name is [`ToolName::shim_file`]
-    /// (`bin/ay` on Unix, `bin/ay.cmd` on Windows).
-    ///
-    /// Taking a [`ToolName`] rather than a `&str` is what makes the [`shim_allowed`] gate
-    /// unskippable: there is no way to *name* a file in `bin/` without having gone through
-    /// [`ToolName::new`], so a sensitive name cannot reach the filesystem because one call
-    /// site among several forgot the deny-list.
+    /// `bin/<tool>`: a single shim, named by [`ToolName::shim_file`] (`bin/ay` on Unix,
+    /// `bin/ay.cmd` on Windows). Taking a [`ToolName`] makes the [`shim_allowed`] gate
+    /// unskippable: no file in `bin/` can be named without [`ToolName::new`].
     #[must_use]
     pub fn shim(&self, tool: &ToolName) -> PathBuf {
         self.bin_dir().join(tool.shim_file())
     }
 
-    /// `store/<program>/current` — the PER-PROGRAM active-build symlink, pointing at
-    /// `store/<program>/<build>/`.
-    ///
-    /// This is the ONE activation link, and the authority [`crate::gc::live_builds`]
-    /// resolves. ([`crate::gc::sweep_retired_channel_links`] removes the retired
-    /// per-channel `channels/<name>/current` an older prefix still has.)
-    ///
-    /// It lives INSIDE `store/<program>/` on purpose: there is exactly one per program by
-    /// construction, `uninstall`'s `remove_dir_all` of the program
-    /// tree takes it away with the builds it names, and it can never collide with a build dir
-    /// (`current` does not parse as a `u64`, so [`crate::ops::list_installed`] skips it).
+    /// `store/<program>/current`: the per-program active-build symlink to
+    /// `store/<program>/<build>/`, the one activation link ([`crate::gc::live_builds`]
+    /// resolves it). Inside `store/<program>/`, so there is one per program, `uninstall`'s
+    /// `remove_dir_all` of the program tree takes it with its builds, and it never collides
+    /// with a build dir (`current` is not a `u64`; [`crate::ops::list_installed`] skips it).
     #[must_use]
     pub fn program_current(&self, program: &str) -> PathBuf {
         self.prefix.join("store").join(program).join("current")
@@ -246,52 +190,39 @@ impl Layout {
     /// `floor` — the `0600` durable high-water `index_build` file (§8).
     ///
     /// Read together with [`Self::floor_generation`]; the pair is one value
-    /// ([`crate::sig::BuildFloor`]), because `index_build` is a number a MACHINE chooses and
+    /// ([`crate::sig::BuildFloor`]), because `index_build` is a number a machine chooses and
     /// a floor set by a machine must not outlive the roster generation that revoked it.
     #[must_use]
     pub fn floor(&self) -> PathBuf {
         self.prefix.join("floor")
     }
 
-    /// `floor.gen` — the `0600` roster generation that recorded the current [`Self::floor`].
+    /// `floor.gen`: the `0600` roster generation that recorded the current [`Self::floor`].
     ///
-    /// Its own file rather than a second field inside `floor` so the format of `floor` stays
-    /// what it has always been (a bare integer) and a store written by an older build reads
-    /// as "floor from generation 0", which the strictly-newer rule then re-bases on first
-    /// contact — the right answer, since no index that floor ever admitted can verify under
-    /// the single-root chain at all.
-    ///
-    /// Missing or unreadable reads as `0`, which makes the floor bind at a generation no
-    /// real roster carries. That is the fail-closed direction: it never waives a floor for
-    /// the generation that set it.
+    /// Its own file, so `floor` stays a bare integer and an older store reads as "floor from
+    /// generation 0", which the strictly-newer rule re-bases on first contact. Missing or
+    /// unreadable reads as `0`, a generation no real roster carries: the fail-closed
+    /// direction, which never waives a floor for the generation that set it.
     #[must_use]
     pub fn floor_generation(&self) -> PathBuf {
         self.prefix.join("floor.gen")
     }
 
-    /// `roster.floor` — the `0600` durable high-water `roster_seq` file: the replay
-    /// ratchet for the master-signed machine roster that authorizes this store's index.
+    /// `roster.floor`: the `0600` durable high-water `roster_seq`, the replay ratchet for the
+    /// master-signed machine roster that authorizes this store's index.
     ///
-    /// A SEPARATE file from [`Self::floor`] on purpose. The two counters move
-    /// independently — minting or revoking a machine bumps `roster_seq` without re-cutting
-    /// the index, and re-publishing the index bumps `index_build` without touching the
-    /// roster — so folding them into one high-water would make each one's advance silently
-    /// ratchet the other past documents that are still perfectly current.
-    ///
-    /// It is also deliberately atpkg's OWN file rather than shared with `aterm-update`'s
-    /// ratchet, even though both track the same document: the two live under different
-    /// prefixes with different ownership and lifetimes (uninstalling the toolchain store
-    /// must not reset the app updater's replay defence, or vice versa). A client that has
-    /// updated the app more recently than the toolchain simply carries a higher floor
-    /// there, which costs nothing — each ratchet only ever refuses what IT has already
-    /// seen superseded.
+    /// Separate from [`Self::floor`] because the counters move independently (minting or
+    /// revoking a machine bumps `roster_seq` without re-cutting the index, and vice versa).
+    /// atpkg's own rather than shared with `aterm-update`'s ratchet: the prefixes have
+    /// different ownership and lifetimes, and uninstalling the store must not reset the app
+    /// updater's replay defence. Each ratchet refuses only what it has itself seen superseded.
     #[must_use]
     pub fn roster_floor(&self) -> PathBuf {
         self.prefix.join("roster.floor")
     }
 
     /// `store.lock` — the `0600` store-wide single-writer advisory lock file
-    /// ([`crate::lock`]). TRY-acquired at the CLI edge by every verb that mutates the
+    /// ([`crate::lock`]). Try-acquired at the CLI edge by every verb that mutates the
     /// store, so exactly one process at a time stages/activates/discards builds here.
     #[must_use]
     pub fn store_lock(&self) -> PathBuf {
@@ -321,7 +252,7 @@ impl Layout {
         self.prefix.join("session-pass.stamp")
     }
 
-    /// `progress.json` — the LIVE install-progress snapshot ([`crate::progress`]), the
+    /// `progress.json` — the live install-progress snapshot ([`crate::progress`]), the
     /// in-flight complement to [`Self::status`]'s durable per-pass record. Written only
     /// by the process holding the store flock (via `--progress-file`); read by the GUI
     /// card, the pending-program stubs (`atpkg __pending`), and anyone tailing it —
@@ -334,75 +265,58 @@ impl Layout {
     /// `bump` — the priority-queue channel ([`crate::progress`]): one program name per
     /// line, appended by pending-program stubs, consumed by the installer between
     /// items. Reorder-only by construction — the installer intersects it with the work
-    /// the signed index already planned, so this file can never ADD work.
+    /// the signed index already planned, so this file can never add work.
     #[must_use]
     pub fn bump_file(&self) -> PathBuf {
         self.prefix.join("bump")
     }
 
-    /// `adopted` — the durable marker that this machine RUNS THE ALAB TOOLSET, as a set
-    /// rather than as a handful of individually-chosen programs (§11).
+    /// `pass-owed.json` — the promise that a default-set pass is coming and has not
+    /// planned yet ([`crate::progress::pass_owed`]): written under the store flock by the
+    /// window's first-run seed and by a whole update, read by the pending-program stubs,
+    /// so a stub run before `progress.json` exists waits for the pass instead of exiting.
+    #[must_use]
+    pub fn pass_owed_file(&self) -> PathBuf {
+        self.prefix.join("pass-owed.json")
+    }
+
+    /// `adopted`: the durable marker that this machine runs the ALab toolset as a set, not
+    /// as a handful of individually chosen programs (§11). Written when the whole default set
+    /// is laid down deliberately (the first-run seed bootstrap, or `install --default-set`),
+    /// never by `install <program>`.
     ///
-    /// Written when the whole default set is laid down deliberately: the batteries-included
-    /// first-run seed bootstrap, or an explicit `install --default-set` (the Settings
-    /// "Install ALab toolset" button). NOT written by `install <program>` — asking for one
-    /// tool is not adopting the suite.
-    ///
-    /// It exists because one config bit was once doing two unrelated jobs: a default-OFF
-    /// `[packages].auto_install` answered "may atpkg pull a multi-GB toolchain onto a
-    /// machine that has never had one?", and the update pass ALSO read it to answer "should
-    /// a machine that already runs this toolset keep that set complete?" — so a program
-    /// published to the index AFTER a user installed simply never arrived. Adoption
-    /// separates the two: consent is given once, and alignment thereafter is not a new
-    /// consent event. The consent is ONE default-on key
-    /// (`auto_install`, which folded in `seed_install`), and the update pass completes the
-    /// set of an ADOPTED machine while it holds (`cli::should_complete_set`).
-    ///
-    /// CLEARED by `uninstall` (see `crate::ops::uninstall`'s caller): removing a managed
-    /// program is an explicit act, and set-completion must never fight it by reinstalling on
-    /// the next pass. The durable way to drop ONE program while staying adopted is
-    /// `[packages].exclude`, which the default-set planner already honours.
-    ///
-    /// Existence-only, and silent on who adopted: that is a separate record,
-    /// [`Self::adopted_by_seed`].
+    /// Consent to pull a multi-GB toolchain (`[packages].auto_install`) is given once; while
+    /// adopted, the update pass keeps the set complete, so a program published after install
+    /// arrives (`cli::should_complete_set`). Cleared by `uninstall`, so set-completion never
+    /// reinstalls what was removed; `[packages].exclude` drops one program while staying
+    /// adopted. Existence-only; who adopted is [`Self::adopted_by_seed`].
     #[must_use]
     pub fn adopted(&self) -> PathBuf {
         self.prefix.join("adopted")
     }
 
-    /// `adopted-by-seed` — who adopted: present only when `atpkg seed`, the first launch's
-    /// bootstrap, created the [`Self::adopted`] marker itself. Existence only. It gates one
-    /// sentence: only beside this record may an update pass say "installing aterm is the
-    /// consent" and name `[packages].auto_install = false` as the switch that would have
-    /// stopped it. Cleared with `adopted`; `install --default-set` never writes one, so a
-    /// marker without a record claims no consent beyond the uninstall.
+    /// `adopted-by-seed`: present only when `atpkg seed`, the first launch's bootstrap,
+    /// created the [`Self::adopted`] marker itself. Existence only. Only beside it may an
+    /// update pass say "installing aterm is the consent" and name `[packages].auto_install =
+    /// false` as the switch that would have stopped it. Cleared with `adopted`;
+    /// `install --default-set` never writes one.
     #[must_use]
     pub fn adopted_by_seed(&self) -> PathBuf {
         self.prefix.join("adopted-by-seed")
     }
 
-    /// `removed` — programs the user uninstalled INDIVIDUALLY, one name per line.
-    ///
-    /// The whole-set `declined` marker cannot express this, and without it the
-    /// resumable seed lane silently undoes a targeted removal: the lane installs
-    /// whatever the store LACKS (that is what lets an interrupted first run finish),
-    /// so `atpkg uninstall ny` came back on the next launch. A package manager that
-    /// reinstalls what you just removed is worse than one that never had the package.
-    ///
-    /// An explicit `install <program>` or `install --default-set` clears the relevant
-    /// entries — asking for it back is unambiguous.
+    /// `removed`: programs the user uninstalled individually, one name per line. Without it
+    /// the resumable seed lane, which installs whatever the store lacks, would reinstall a
+    /// targeted removal on the next launch. An explicit `install <program>` or
+    /// `install --default-set` clears the relevant entries.
     #[must_use]
     pub fn removed(&self) -> PathBuf {
         self.prefix.join("removed")
     }
 
-    /// The programs this machine removed ON PURPOSE.
-    ///
-    /// Lives here rather than in the CLI because the UNATTENDED lanes need it too:
-    /// a coherence group is processed whenever any member is installed, and a
-    /// missing sibling is pulled back in to keep the tuple locked — which would silently
-    /// re-download programs the user had just uninstalled (`aterm pkg uninstall trust`
-    /// frees ~3.2 GB).
+    /// The programs this machine removed on purpose. Here rather than in the CLI because the
+    /// unattended lanes need it too: a coherence group pulls a missing sibling back in to
+    /// keep the tuple locked, which would re-download a program the user just uninstalled.
     #[must_use]
     pub fn removed_programs(&self) -> std::collections::BTreeSet<String> {
         std::fs::read_to_string(self.removed())
@@ -416,48 +330,36 @@ impl Layout {
             .unwrap_or_default()
     }
 
-    /// `declined` — the durable "this machine does not want the bundled toolset"
-    /// marker, written by `uninstall --all`.
-    ///
-    /// Without it the removal does not stick. The seed lane fires on every launch and
-    /// installs whatever channel-pinned members the store LACKS (that resumability is
-    /// what lets an interrupted first run finish), so a user who removed the toolset
-    /// would find the whole 3.2 GB back after the next launch — the manager undoing a
-    /// deliberate act, which is the single most infuriating thing a package manager
-    /// can do. `adopted` cannot carry this: its absence means "never adopted", which
-    /// is exactly the state a first run must install from.
-    ///
-    /// Cleared by any explicit install (`install --default-set`, `install <program>`):
-    /// asking for the toolset is unambiguous, and it must not be necessary to find and
-    /// delete a marker file to undo a decline.
+    /// `declined`: the durable "this machine does not want the bundled toolset" marker,
+    /// written by `uninstall --all`. Without it the seed lane, which installs whatever
+    /// channel-pinned members the store lacks on every launch, would bring the toolset back;
+    /// `adopted` cannot carry it, since its absence means "never adopted", the state a first
+    /// run installs from. Cleared by any explicit install (`install --default-set`,
+    /// `install <program>`).
     #[must_use]
     pub fn declined(&self) -> PathBuf {
         self.prefix.join("declined")
     }
 
-    /// `retired/` — the per-program RETIREMENT markers directory. One `0600` regular file
-    /// per program whose managed copy atpkg retired in favour of a system install
-    /// (`cli::satisfy_by_system`); its first line is the day it happened (`YYYY-MM-DD`),
-    /// which the canonical `system: <path> — not managed by aterm (managed copy retired
-    /// <date>)` state and `atpkg which` read back. Cleared when the program is
-    /// uninstalled on purpose; a later managed reinstall simply overwrites the next
-    /// retirement's date.
+    /// `retired/`: per-program retirement markers. One `0600` regular file per program whose
+    /// managed copy atpkg retired for a system install (`cli::satisfy_by_system`); its first
+    /// line is the day (`YYYY-MM-DD`), which the `system: <path> — not managed by aterm
+    /// (managed copy retired <date>)` state and `atpkg which` read back. Cleared when the
+    /// program is uninstalled on purpose.
     #[must_use]
     pub fn retired_dir(&self) -> PathBuf {
         self.prefix.join("retired")
     }
 
-    /// `retired/<program>` — one retirement marker, name-gated by [`ToolName`].
+    /// `retired/<program>`: one retirement marker; its callers gate the name by [`ToolName`].
     #[must_use]
     pub fn retired_marker(&self, program: &str) -> PathBuf {
         self.retired_dir().join(program)
     }
 
-    /// The `YYYY-MM-DD` day a managed copy of `program` was retired for a system
-    /// install, if this machine recorded one: the first line of a REGULAR, non-symlink
-    /// marker (a planted link is not a record), trimmed, and only when it reads as a
-    /// date shape (ten bytes, digits and two dashes) — a scribbled-over marker answers
-    /// `None` rather than a mangled date.
+    /// The `YYYY-MM-DD` day a managed copy of `program` was retired for a system install,
+    /// if recorded: the trimmed first line of a regular, non-symlink marker (a planted link
+    /// is not a record), only when it has a date's shape; a scribbled-over marker is `None`.
     #[must_use]
     pub fn retired_date(&self, program: &str) -> Option<String> {
         ToolName::new(program)?;
@@ -530,7 +432,7 @@ impl Layout {
         }
     }
 
-    /// Forget EVERY retirement record (`uninstall --all`).
+    /// Forget every retirement record (`uninstall --all`).
     pub fn clear_all_retired(&self) {
         let Ok(entries) = std::fs::read_dir(self.retired_dir()) else {
             return;
@@ -543,7 +445,7 @@ impl Layout {
     }
 
     /// `links/` — the per-program dev-link markers directory (§13). One `0600` marker per
-    /// dev-linked program; its presence makes `update`/`apply` HARD-SKIP that program.
+    /// dev-linked program; its presence makes `update`/`apply` skip that program outright.
     #[must_use]
     pub fn links_dir(&self) -> PathBuf {
         self.prefix.join("links")
@@ -558,15 +460,11 @@ impl Layout {
 }
 
 /// The one stderr line for a refused `agents/` ([`Layout::ensure_agents_dir`]), shared by
-/// the front door and the window so the two never disagree. `reach` is who goes without
-/// the managed agents ("this session", "this window's sessions"). The remedy is the one
-/// that is TRUE for what is there: a symlink or a regular file at `agents/` must be
-/// removed first — `aterm pkg repair` reaches the directory through the same
-/// `ensure_dir` and refuses the same entry rather than replacing it
-/// (`activate::reconcile_agents`), so naming repair alone would send the person in a
-/// loop; anything else (the `mkdir` refused) is what `repair` re-lays — as root when
-/// `system` says the prefix is root-owned ([`Layout::is_system_prefix`]). `error`
-/// already starts with the path.
+/// the front door and the window. `reach` is who goes without the managed agents ("this
+/// session", "this window's sessions"); `error` already starts with the path. A symlink or
+/// regular file at `agents/` must be removed first, since `aterm pkg repair` refuses the
+/// same entry (`activate::reconcile_agents`) and naming repair alone would loop; anything
+/// else is what `repair` re-lays, as root when `system` says the prefix is root-owned.
 #[must_use]
 pub fn agents_dir_refusal_line(dir: &Path, error: &str, system: bool, reach: &str) -> String {
     let remedy = match std::fs::symlink_metadata(dir) {
@@ -580,51 +478,39 @@ pub fn agents_dir_refusal_line(dir: &Path, error: &str, system: bool, reach: &st
     )
 }
 
-/// The per-build completeness marker: a SIBLING file `store/<program>/<build>.ready`
-/// next to the `<build>/` dir. It sits OUTSIDE the build tree deliberately, so it can
-/// never perturb the build's `tree_root` hash (the apply-time TOCTOU re-verify). It is
-/// written LAST by `verify_and_stage`, once the extracted tree has passed sha256 +
-/// tree_root re-verify; its presence is the sole "this build is fully installed"
-/// signal, so a build dir left partial by a crash mid-extract (which has no marker)
-/// reads as absent and is re-installed rather than mistaken for up-to-date.
-///
-/// `None` if `build_dir` has no final path component (never, for a real build dir).
+/// The per-build completeness marker: a sibling `store/<program>/<build>.ready`, outside
+/// the build tree so it never perturbs the build's `tree_root`. Written last by
+/// `verify_and_stage`, once the extracted tree passed sha256 and `tree_root` re-verify; it
+/// is the sole "fully installed" signal, so a build a crash left partial reads as absent
+/// and is re-installed. `None` if `build_dir` has no final component.
 fn ready_marker_path(build_dir: &Path) -> Option<PathBuf> {
     let name = build_dir.file_name()?.to_str()?;
     Some(build_dir.with_file_name(format!("{name}.ready")))
 }
 
-/// The key under which the readiness marker records WHICH SLICE installed the build.
+/// The key under which the readiness marker records which slice installed the build.
 /// Its spelling is a compatibility surface, not a detail — see [`ready_text_accepts`].
 const READY_PLATFORM_KEY: &str = "platform=";
 
-/// The key under which the readiness marker records WHAT THE BUILD CONTAINED when it was
-/// marked — the direct entries of its `bin/`, the files every shim and every exec root
-/// forward to. Its spelling is a compatibility surface for the same reason
-/// [`READY_PLATFORM_KEY`]'s is: a re-spelling silently demotes every marker this version
-/// wrote back to "no record", which is accepted (see [`ready_text_accepts`]) and therefore
-/// unchecked.
+/// The key under which the readiness marker records what the build contained when marked:
+/// the direct entries of its `bin/`, which every shim and exec root forward to. Its
+/// spelling is a compatibility surface: a re-spelling demotes every marker this version
+/// wrote to "no record", which is accepted unchecked ([`ready_text_accepts`]).
 ///
-/// **WHY READINESS IS A CLAIM ABOUT CONTENTS.** A marker beside a gutted tree (no `bin/`,
-/// marker still `ok`) is a corpse [`crate::ops::list_installed`] counts as installed,
-/// [`crate::gc`] refuses to sweep (it sweeps only marker-LESS trees), and
-/// [`crate::flow::rollback`] would select, re-pointing every shim at a build with no compiler
-/// in it. Corpses are not MADE ([`discard_build`], [`crate::ops::uninstall`]: the marker comes
-/// down BEFORE the tree goes). This key is the other half: a marker that records what it
-/// vouched for can be REFUTED by the disk, however a tree loses its contents — an
-/// interrupted `rm -rf`, a volume that dropped a directory, an older manager.
+/// A marker beside a gutted tree would be counted as installed
+/// ([`crate::ops::list_installed`]), spared by [`crate::gc`] (it sweeps only marker-less
+/// trees) and selected by [`crate::flow::rollback`]. [`discard_build`] and
+/// [`crate::ops::uninstall`] take the marker down before the tree; this key lets the disk
+/// refute a marker however a tree lost its contents (an interrupted `rm -rf`, a volume
+/// that dropped a directory, an older manager).
 ///
-/// Two values, so "recorded nothing" and "recorded that there was nothing" stay apart:
+/// * `contents=none`: the build had no `bin/` entries when marked; nothing to check.
+/// * `contents=bin:<name>,<name>,…`: the sorted names of `bin/`'s direct entries, each of
+///   which must still be there ([`contents_still_stand`]).
 ///
-/// * `contents=none` — the build had no `bin/` entries when it was marked. Nothing to check.
-/// * `contents=bin:<name>,<name>,…` — the sorted names of `bin/`'s direct entries. Each must
-///   still be there ([`contents_still_stand`]).
-///
-/// The key is OMITTED — leaving the marker exactly as lenient as every marker written before
-/// this version — when the inventory cannot be encoded: a `bin/` that cannot be read for a
-/// reason that is not `NotFound` (a bound on what this process may know is never written
-/// down as a fact about the build), or a name carrying a `,` or a newline. The writer says
-/// only what it can encode, and the reader checks only what was written.
+/// The key is omitted (the marker as lenient as an older one) when the inventory cannot be
+/// encoded: a `bin/` unreadable for a reason other than `NotFound`, or a name carrying a
+/// `,` or a newline.
 const READY_CONTENTS_KEY: &str = "contents=";
 
 /// [`READY_CONTENTS_KEY`]'s value for a build whose `bin/` held nothing (or is absent).
@@ -634,55 +520,34 @@ const READY_CONTENTS_NONE: &str = "none";
 /// [`READY_CONTENTS_KEY`]'s prefix for a recorded `bin/` inventory: `bin:<name>,<name>,…`.
 const READY_CONTENTS_BIN: &str = "bin:";
 
-/// Line 1 of every readiness marker every version of atpkg has ever written — and now the
-/// WELL-FORMEDNESS gate a marker must pass before [`ready_text_accepts`] reads anything
-/// else out of it. Bytes that do not carry this line were not written by this writer, so
-/// they are a crash artefact rather than a legacy marker. One spelling, shared by the
-/// writer ([`mark_build_ready`]) and the reader, so the two cannot drift.
+/// Line 1 of every readiness marker atpkg has written, and the well-formedness gate a
+/// marker must pass before [`ready_text_accepts`] reads anything else: bytes without it are
+/// a crash artefact, not a legacy marker. Shared by the writer ([`mark_build_ready`]) and
+/// the reader.
 const READY_OK_LINE: &str = "ok";
 
-/// `<arch>-<os>` for the atpkg slice that is RUNNING: `aarch64-macos`, `x86_64-macos`,
+/// `<arch>-<os>` for the running atpkg slice: `aarch64-macos`, `x86_64-macos`,
 /// `x86_64-linux`, …
 ///
-/// **THE HAZARD THIS EXISTS FOR, concretely.** The store path carries no architecture: a
-/// build lives at `store/<program>/<build>/` and is vouched for by the sibling
-/// `<build>.ready`, while `cli::current_triple()` — which decides WHICH artifact row to
-/// download — is a compile-time `cfg(target_arch)`. The shipped atpkg is a UNIVERSAL
-/// binary, so both of its slices can run on the same Apple Silicon Mac: `arch -x86_64`,
-/// an x86_64 parent shell, or Finder ▸ Get Info ▸ "Open using Rosetta" each start the
-/// x86_64 slice, which selects `x86_64-apple-darwin` rows. Without a record of who wrote
-/// it, that slice installs INTEL compilers and provers into the very same
-/// `store/<program>/<build>/` and writes the very same `<build>.ready` — and every later
-/// NATIVE arm64 run reads that marker as "build <n> is installed", skips it, and leaves
-/// the machine on Rosetta-translated solvers forever, silently, with `atpkg status`
-/// reporting a correct and up-to-date toolchain.
+/// The store path carries no architecture, and the shipped atpkg is a universal binary:
+/// its x86_64 slice (via `arch -x86_64`, an x86_64 parent shell, or "Open using Rosetta")
+/// selects `x86_64-apple-darwin` rows (`cli::current_triple()` is compile-time). Without a
+/// record of who wrote it, an Intel build in `store/<program>/<build>/` would satisfy every
+/// later native run. So the marker records this value and [`build_is_complete`] refuses a
+/// mismatch: the build reads as not installed and is re-staged natively (a re-download,
+/// never an error). The apply decision reads the marker too: `flow::installed_for_decide`
+/// drops a live build this predicate refuses before [`crate::gate::decide`] sees it.
 ///
-/// So the marker records this value and [`build_is_complete`] refuses one that does not
-/// match: a store populated by the other slice reads as NOT installed and is re-staged
-/// natively. That is a re-download, never an error — the direction that repairs itself.
-///
-/// WHO RE-STAGES IT, precisely — because "reads as not installed" is a claim about READERS,
-/// and for a LIVE build only some of them read this marker. [`crate::ops::list_installed`],
-/// `doctor` and `gc` always did. The APPLY DECISION did not: [`crate::gate::decide`] is fed
-/// [`crate::ops::active_builds`], the `bin/` shim view, which resolves a shim and stats its
-/// target without ever opening `<build>.ready`. `flow::installed_for_decide` closes that:
-/// every apply path drops a live build this predicate refuses BEFORE deciding, so the
-/// re-stage actually happens.
-///
-/// Deliberately `std::env::consts` and NOT the artifact triple (`aarch64-apple-darwin`):
-/// std exposes no target triple, so spelling one here means duplicating
-/// `cli::current_triple`'s `cfg` ladder in a file that cannot see it, and any later drift
-/// between the two copies would read as a mismatch on EVERY machine — re-downloading a
-/// ~3.2 GB toolchain because of a cosmetic edit. Both consts are per-slice at compile
-/// time (a universal binary is two separately compiled binaries stitched together, so
-/// each slice reports its own), which is the only property the comparison needs.
+/// `std::env::consts`, not the artifact triple: std exposes no triple, and a duplicated
+/// copy of `cli::current_triple`'s `cfg` ladder that drifted would read as a mismatch on
+/// every machine. Both consts are per-slice at compile time, which is all the comparison
+/// needs.
 fn running_platform() -> String {
     format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
 }
 
-/// The platform a marker's text records, or `None` when it records none — which covers
-/// BOTH "written before this field existed" (a bare `ok\n`) and any key this version does
-/// not recognise. An empty value is no record either.
+/// The platform a marker's text records, or `None` when it records none (a bare `ok\n`
+/// from before the field, or an empty value).
 fn recorded_platform(text: &str) -> Option<&str> {
     text.lines()
         .filter_map(|line| line.trim().strip_prefix(READY_PLATFORM_KEY))
@@ -690,9 +555,8 @@ fn recorded_platform(text: &str) -> Option<&str> {
         .find(|p| !p.is_empty())
 }
 
-/// The `contents=` record a marker's text carries, or `None` when it carries none — which
-/// covers BOTH "written before this field existed" and a value this version does not
-/// recognise. An empty value is no record either, exactly as for the platform key.
+/// The `contents=` record a marker's text carries, or `None` when it carries none (an
+/// older marker, or an empty value).
 fn recorded_contents(text: &str) -> Option<&str> {
     text.lines()
         .filter_map(|line| line.trim().strip_prefix(READY_CONTENTS_KEY))
@@ -700,27 +564,20 @@ fn recorded_contents(text: &str) -> Option<&str> {
         .find(|v| !v.is_empty())
 }
 
-/// The inventory [`mark_build_ready`] is about to record for `build_dir`, or `None` when it
-/// cannot be encoded (see [`READY_CONTENTS_KEY`]).
-///
-/// The names are the direct entries of `bin/` — read with [`std::fs::read_dir`], which does
-/// not follow the entries themselves, so a `bin/clippy -> ../lib/…` link is recorded by its
-/// own name and checked by its own name. Sorted, so the record is a function of the tree and
-/// not of `readdir` order: two markers for the same tree are byte-identical, which is what
-/// lets a test compare them and a human diff them.
+/// The inventory [`mark_build_ready`] records for `build_dir`, or `None` when it cannot be
+/// encoded ([`READY_CONTENTS_KEY`]). Names are `bin/`'s direct entries by their own names
+/// (a `bin/clippy -> ../lib/…` link is recorded as `clippy`), sorted so the record is a
+/// function of the tree, not of `readdir` order.
 fn bin_inventory(build_dir: &Path) -> Option<String> {
     let bin = build_dir.join("bin");
     let entries = match std::fs::read_dir(&bin) {
         Ok(entries) => entries,
-        // A `bin/` that is not there is a FACT about the build, and one worth recording:
-        // a build marked with no bin entries is never later refuted for having none.
+        // A missing `bin/` is a fact about the build, recorded as `none`.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Some(String::from(READY_CONTENTS_NONE));
         }
-        // Anything else is a bound on what this process may know — EACCES on the directory,
-        // EIO, macOS privacy consent. Recording `none` there would write that bound down as
-        // a fact about the build and unprotect it forever; omitting the key leaves the
-        // marker exactly as lenient as it was before this field existed.
+        // Anything else (EACCES, EIO, macOS privacy consent) bounds what this process may
+        // know; recording `none` would unprotect the build, so the key is omitted.
         Err(_) => return None,
     };
     let mut names: Vec<String> = Vec::new();
@@ -744,19 +601,12 @@ fn bin_inventory(build_dir: &Path) -> Option<String> {
     Some(format!("{READY_CONTENTS_BIN}{}", names.join(",")))
 }
 
-/// Whether the tree at `build_dir` still holds what its marker's `contents=` record
-/// vouches for.
-///
-/// **Only a PROVEN absence refutes.** Each recorded name is `symlink_metadata`'d — not
-/// `exists()`, which would read an EACCES on a shared prefix, or macOS privacy consent, as
-/// "the tool is gone" and re-stage a multi-GB toolchain over a permissions answer. The
-/// three-answer rule [`presence`] exists for, applied to the one question that can
-/// un-install a build. `symlink_metadata`, not `metadata`: a `bin/` entry that is a symlink
-/// into the build's own `lib/` is present as itself even when what it names is not, and the
-/// dangling-link case is [`crate::doctor`]'s to report, not this predicate's to re-stage on.
-///
-/// An unrecognised value is not a refutation either: a marker written by a LATER atpkg that
-/// records something this version cannot parse must read as "no record", never as "refuted".
+/// Whether the tree at `build_dir` still holds what its marker's `contents=` record vouches
+/// for. Only a proven absence refutes: each name is `symlink_metadata`'d, not `exists()`'d,
+/// so an EACCES or privacy-consent answer never re-stages a multi-GB toolchain, and a
+/// `bin/` symlink into the build's own `lib/` is present as itself (a dangling link is
+/// [`crate::doctor`]'s to report). An unrecognised value (a later atpkg's) reads as no
+/// record, never as refuted.
 fn contents_still_stand(build_dir: &Path, recorded: &str) -> bool {
     if recorded == READY_CONTENTS_NONE {
         return true;
@@ -771,7 +621,7 @@ fn contents_still_stand(build_dir: &Path, recorded: &str) -> bool {
         .any(|name| is_provably_absent(&bin.join(name)))
 }
 
-/// Whether `path` is PROVABLY not there, by its own link (never by its target).
+/// Whether `path` is provably not there, by its own link (never by its target).
 /// The `symlink_metadata` twin of [`Presence::is_absent`].
 fn is_provably_absent(path: &Path) -> bool {
     matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
@@ -779,34 +629,17 @@ fn is_provably_absent(path: &Path) -> bool {
 
 /// Whether a readiness marker with this text vouches for its build to a `running` slice.
 ///
-/// **BACKWARD COMPATIBILITY, decided here and only here: an absent platform record means
-/// ACCEPT.** Every marker written before this field existed is a bare `ok\n`, and reading
-/// those as a mismatch would make the first run of this version re-download every
-/// installed program on every existing machine — a multi-GB reinstall storm, to close a
-/// hazard none of those stores can be in (nothing published an `x86_64-apple-darwin` row
-/// before index build 12, so no marker already on disk can be the Intel-under-Rosetta
-/// case). The record is acquired LAZILY instead: the next ordinary install or update of a
-/// program stamps it, and that build is protected from then on. An absent record is
-/// therefore "unknown, and old enough to be safe" — never "corrupt", and never a reason
-/// to reinstall.
+/// An absent platform record means accept: older markers are a bare `ok\n`, and reading
+/// them as a mismatch would re-download every installed program on every machine. The
+/// record is acquired lazily, by the next install or update of a program. So
+/// [`READY_PLATFORM_KEY`]'s spelling is a compatibility surface: a re-spelling must keep
+/// reading the old key, or it unprotects every marker written with it.
 ///
-/// The same rule is what makes [`READY_PLATFORM_KEY`]'s spelling a compatibility surface:
-/// re-spelling it silently demotes every marker this version wrote back to "no record"
-/// (harmless — they are accepted) but also unprotects them, so a re-spelling has to keep
-/// reading the old key rather than simply replacing it.
-///
-/// **AN ABSENT RECORD IS NOT AN ABSENT MARKER.** The lenience above is about a marker
-/// that is WELL FORMED and merely predates the platform field — a bare `ok\n`, which is
-/// what every earlier version wrote. A ZERO-LENGTH file is a different thing entirely:
-/// `<build>.ready` is published by a rename, and a
-/// rename commits a NAME while the bytes behind it are still page cache, so a marker with
-/// no contents is precisely what a power loss leaves behind. Reading that as "installed,
-/// no record" would vouch for a build whose tree may equally have lost its data — the state
-/// nothing downstream ever repairs ([`crate::gate::decide`] answers `UpToDate` and the
-/// superseded tree is already reclaimed). So [`READY_OK_LINE`] is REQUIRED: a marker with
-/// no readable `ok` first line — empty, NUL-filled, a torn prefix — is refused and the
-/// build re-stages, which is the direction that repairs itself. Only a well-formed marker
-/// gets the legacy lenience.
+/// An absent record is not an absent marker: [`READY_OK_LINE`] is required.
+/// `<build>.ready` is published by a rename, which commits the name while the bytes may
+/// still be page cache, so a power loss can leave an empty or torn marker; vouching for it
+/// would leave a build nothing downstream repairs ([`crate::gate::decide`] answers
+/// `UpToDate`). Such a marker is refused and the build re-stages.
 fn ready_text_accepts(text: &str, running: &str) -> bool {
     if !first_line_is_ok(text) {
         return false;
@@ -817,7 +650,7 @@ fn ready_text_accepts(text: &str, running: &str) -> bool {
     }
 }
 
-/// Whether a well-formed marker's CONTENTS record (if any) is still true of `build_dir`.
+/// Whether a well-formed marker's contents record (if any) is still true of `build_dir`.
 /// Split out of [`ready_text_accepts`] because it is the one clause that reads the disk;
 /// the rest of that predicate is a function of the text alone and its tests say so.
 fn ready_contents_accept(text: &str, build_dir: &Path) -> bool {
@@ -827,33 +660,21 @@ fn ready_contents_accept(text: &str, build_dir: &Path) -> bool {
     }
 }
 
-/// Whether a marker's FIRST line is the historical [`READY_OK_LINE`] — the
-/// well-formedness gate [`ready_text_accepts`] applies before the lenient platform rule.
-/// Surrounding whitespace (a `\r` from a Windows-y tool, the same tolerance
-/// [`recorded_platform`] already had) is not a different line; a missing trailing newline
-/// is not a torn marker either, since `ok` alone is the whole of line 1.
+/// Whether a marker's first line is [`READY_OK_LINE`], ignoring surrounding whitespace (a
+/// `\r`) and a missing trailing newline.
 fn first_line_is_ok(text: &str) -> bool {
     matches!(text.lines().next(), Some(first) if first.trim() == READY_OK_LINE)
 }
 
-/// What this process could learn about whether `path` is there — THREE answers,
-/// because there are three.
+/// What this process could learn about whether `path` is there: three answers.
 ///
-/// [`Path::exists`] has only two, and it spends them badly: it is
-/// `fs::metadata(..).is_ok()`, so every reason a stat can fail — EACCES on a parent
-/// directory, EPERM from macOS privacy consent, EIO, ELOOP, ENAMETOOLONG — is spent
-/// on `false`, the same answer it gives for a path that genuinely is not there. That
-/// collapses a bound on what THIS PROCESS MAY KNOW into a fact about THE WORLD, and
-/// atpkg's consumers read it as a fact: a live program dropped out of
-/// [`crate::ops::active_builds`], doctor printed `FAIL — broken bin shim` over a shim
-/// that runs, and [`caller_can_use_prefix`] abandoned the shared store it exists to
-/// keep. Each of those implies the same remedy — reinstall — and each repairs nothing,
-/// which is the most expensive kind of wrong a package manager can be about its own
-/// store.
-///
-/// [`Presence::Unknown`] carries the error so a diagnostic can SAY why it cannot tell,
-/// rather than picking a verdict and calling it a measurement. `Absent` is reserved
-/// for the one answer a stat actually proves.
+/// [`Path::exists`] is `fs::metadata(..).is_ok()`, so every reason a stat can fail (EACCES
+/// on a parent, EPERM from macOS privacy consent, EIO, ELOOP, ENAMETOOLONG) reads as "not
+/// there", turning a bound on what this process may know into a fact about the world: a
+/// live program would drop out of [`crate::ops::active_builds`], doctor would call a
+/// working shim broken, and [`caller_can_use_prefix`] would abandon a shared store, each
+/// implying a reinstall that repairs nothing. [`Presence::Unknown`] carries the error so a
+/// diagnostic can say why it cannot tell; `Absent` is only what a stat proves.
 #[derive(Debug)]
 pub enum Presence {
     /// Stat succeeded: something is there.
@@ -865,7 +686,7 @@ pub enum Presence {
 }
 
 impl Presence {
-    /// True ONLY when the path is provably not there. An `Unknown` answers `false`
+    /// True only when the path is provably not there. An `Unknown` answers `false`
     /// here on purpose: a caller asking "may I act as though this is gone?" must be
     /// told no when nobody looked.
     #[must_use]
@@ -874,11 +695,8 @@ impl Presence {
     }
 }
 
-/// Ask the filesystem about `path`, keeping the three answers apart.
-///
-/// Follows symlinks, exactly as [`Path::exists`] does, so a dangling link is `Absent`
-/// (its target is what was asked about) and every existing caller keeps the behaviour
-/// it was written for on the two paths a stat can actually decide.
+/// Ask the filesystem about `path`, keeping the three answers apart. Follows symlinks, as
+/// [`Path::exists`] does, so a dangling link is `Absent`.
 #[must_use]
 pub fn presence(path: &Path) -> Presence {
     match std::fs::metadata(path) {
@@ -888,24 +706,19 @@ pub fn presence(path: &Path) -> Presence {
     }
 }
 
-/// Whether `build_dir` holds a COMPLETE install **for the running slice**: its sibling
-/// completeness marker exists, and the platform that marker records (if any) is ours.
-///
-/// A marker naming the OTHER slice of the universal binary reads as not-complete rather
-/// than as an error, so the build is re-staged from the row `cli::current_triple()`
-/// selects — see [`running_platform`] for the Rosetta hazard that motivates it.
+/// Whether `build_dir` holds a complete install for the running slice: the tree is not
+/// provably absent, its sibling marker is well formed, and the platform and `bin/` contents
+/// it records, if any, still hold. A marker naming the other slice reads as not complete,
+/// so the build is re-staged from the row `cli::current_triple()` selects
+/// ([`running_platform`]).
 #[must_use]
 pub fn build_is_complete(build_dir: &Path) -> bool {
     let Some(marker) = ready_marker_path(build_dir) else {
         return false;
     };
-    // THE TREE ITSELF, before its marker is even opened. [`mark_build_ready`] has no
-    // existence precondition — it writes a temp file beside the build and renames it onto
-    // `<build>.ready` without ever looking at `<build>` — and `install::restore_outgoing`'s
-    // doc has named the consequence since it was written: a marker for a tree that is not
-    // there is "a durable lie one refactor away from being believed". This is the refactor,
-    // so the lie is refused at the door. Only a PROVEN absence refuses (the whole point of
-    // [`presence`]): an EACCES on a shared prefix must never un-install a build.
+    // The tree itself first: [`mark_build_ready`] never looks at `<build>`, so a marker can
+    // exist for a tree that does not. Only a proven absence refuses ([`presence`]): an
+    // EACCES on a shared prefix must never un-install a build.
     if is_provably_absent(build_dir) {
         return false;
     }
@@ -915,30 +728,20 @@ pub fn build_is_complete(build_dir: &Path) -> bool {
                 && ready_contents_accept(&text, build_dir)
         }
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => false,
-        // Present and READ, but not text at all. Every marker this writer produces is
-        // ASCII (`ok\n` plus an ASCII platform record), so bytes that are not UTF-8 were
-        // never written here — they are the same crash artefact the `ok`-line rule
-        // refuses, arriving as a read error instead of as a string. That is evidence
-        // about CONTENT, so it decides the content question; the arm below is for the
-        // errors that say nothing about content.
-        // Present, but not readable AS TEXT: a directory planted at the marker path, a
-        // permissions oddity, a filesystem handing back non-UTF-8. `exists()` — the whole
-        // of this predicate before the platform record — answered `true` for all of those,
-        // so keep that answer. This check must not start reporting long-installed builds
-        // as missing because of a byte it never used to read.
+        // `InvalidData` (not UTF-8): never written here, since every marker is ASCII, so
+        // it is the crash artefact the `ok`-line rule refuses. Any other error but
+        // `NotFound` (a directory planted at the marker path, a permissions oddity) says
+        // nothing about content, so it reads as complete, as a plain existence check would.
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => true,
         Err(_) => false,
     }
 }
 
-/// Whether `build_dir` carries a well-formed completeness marker recording the *other*
-/// slice of the universal binary — a finished install, complete for that slice, not for us.
-///
-/// [`build_is_complete`] answers `false` here too, and a caller reading that as "no install
-/// ever finished" is [`crate::gc`]'s interrupted-install sweep, whose verdict is a
-/// `remove_dir_all`. As strict as the acceptance rule: an `ok` first line
-/// ([`first_line_is_ok`]), a platform record present ([`recorded_platform`] — an absent one
-/// is the legacy `ok\n` this slice accepts anyway), and that record not ours.
+/// Whether `build_dir` carries a well-formed marker recording the other slice of the
+/// universal binary: a finished install, complete for that slice. [`build_is_complete`]
+/// answers `false` here too, and [`crate::gc`]'s interrupted-install sweep must not read
+/// that as "never finished" and remove it. As strict as the acceptance rule: an `ok` first
+/// line, a platform record present, and not ours.
 pub(crate) fn build_marks_another_slice(build_dir: &Path) -> bool {
     let Some(marker) = ready_marker_path(build_dir) else {
         return false;
@@ -950,22 +753,14 @@ pub(crate) fn build_marks_another_slice(build_dir: &Path) -> bool {
         && recorded_platform(&text).is_some_and(|p| p != running_platform().as_str())
 }
 
-/// Atomically AND DURABLY mark `build_dir` complete (temp + fsync + rename, so a crash
-/// during the write leaves NO marker rather than a half-written one). Call as the LAST
-/// staging step.
+/// Atomically and durably mark `build_dir` complete (temp + fsync + rename, so a crash
+/// leaves no marker rather than a half-written one). Call as the last staging step.
 ///
-/// The fsync is not ceremony. A rename publishes a NAME — metadata — and the bytes behind
-/// that name stay in the page cache until something flushes them, so on any filesystem
-/// that can commit metadata ahead of data a power loss could expose `<build>.ready` as a
-/// correctly-named ZERO-LENGTH file. This is the commit record of an entire multi-GB
-/// stage: it has to be on disk before its name is. (A refusal from a volume that cannot
-/// flush is not a failure — see [`sync_contents_or_accept_refusal`].)
-///
-/// The text also records WHICH SLICE of the universal binary installed the build
-/// ([`running_platform`]), so the other slice cannot silently inherit the verdict. Line 1
-/// stays the historical `ok`, so a marker written here still reads — to a human, to
-/// `cat`, and to anything that only asks whether the file is there — exactly like the
-/// ones every earlier version wrote.
+/// The fsync matters: a rename publishes the name while the bytes may sit in page cache,
+/// so a filesystem that commits metadata first could expose a zero-length `<build>.ready`
+/// after a power loss. (A volume that cannot flush is accepted:
+/// [`sync_contents_or_accept_refusal`].) The text records which slice installed the build
+/// ([`running_platform`]) and its `bin/` inventory; line 1 stays `ok`.
 pub fn mark_build_ready(build_dir: &Path) -> std::io::Result<()> {
     let dest = ready_marker_path(build_dir).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
@@ -976,11 +771,8 @@ pub fn mark_build_ready(build_dir: &Path) -> std::io::Result<()> {
         "{READY_OK_LINE}\n{READY_PLATFORM_KEY}{}\n",
         running_platform()
     );
-    // AND WHAT THIS MARKER IS VOUCHING FOR ([`READY_CONTENTS_KEY`]): the `bin/` inventory
-    // as it stands right now, so a later reader can REFUTE the marker against the tree
-    // instead of believing it. Derived here, from the tree, rather than passed in by the
-    // stager: readiness is then a claim this function makes about what it can see, and no
-    // caller can assert a completeness it did not measure.
+    // What this marker vouches for ([`READY_CONTENTS_KEY`]), derived from the tree here,
+    // not passed in, so no caller can assert a completeness it did not measure.
     if let Some(contents) = bin_inventory(build_dir) {
         body.push_str(READY_CONTENTS_KEY);
         body.push_str(&contents);
@@ -988,25 +780,20 @@ pub fn mark_build_ready(build_dir: &Path) -> std::io::Result<()> {
     }
     {
         use std::io::Write as _;
-        // `0644` explicitly rather than `fs::write`'s umask-dependent `0666 & ~umask`:
-        // under a SYSTEM prefix this file is root-owned and every unprivileged reader
-        // must still be able to read the verdict it carries — the same argument the
-        // durable floor settled (`sig.rs`).
+        // `0644` explicitly, not umask-dependent: under a system prefix this file is
+        // root-owned and every unprivileged reader must read it.
         let mut f = crate::platform::open_create_write(&tmp, 0o644)?;
         f.write_all(body.as_bytes())?;
-        // Inside the braces: on stable storage BEFORE the handle drops, and before the
+        // Inside the braces: on stable storage before the handle drops, and before the
         // rename below publishes the name.
         sync_contents_or_accept_refusal(&f)?;
     }
     std::fs::rename(&tmp, &dest)
 }
 
-/// Remove the completeness marker, making `build_dir` read as NOT installed.
-///
-/// Called FIRST when a stage is about to replace a live tree: for the window in which the
-/// old tree is being swapped out and the new one in, the build genuinely is not complete,
-/// and a crash inside that window must leave it re-installable. Best-effort on a missing
-/// marker (that is already the state we want).
+/// Remove the completeness marker, making `build_dir` read as not installed. Called first
+/// when a stage replaces a live tree, so a crash mid-swap leaves it re-installable. A
+/// missing marker is already the wanted state.
 pub(crate) fn clear_build_ready(build_dir: &Path) -> std::io::Result<()> {
     let Some(marker) = ready_marker_path(build_dir) else {
         return Ok(());
@@ -1017,24 +804,16 @@ pub(crate) fn clear_build_ready(build_dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Take down the completeness marker of EVERY build under `prog_store`
+/// Take down the completeness marker of every build under `prog_store`
 /// (`<prefix>/store/<program>`), durably, before a caller removes the tree.
 ///
-/// The whole-program twin of the unmark that opens [`discard_build`], and it exists for the
-/// same reason: [`crate::ops::uninstall`]'s `remove_dir_all` of a program's whole store is
-/// the longest-running delete in this manager — for `trust`, several gigabytes across tens
-/// of thousands of files — and `readdir` order decides what it removes first. An interrupt
-/// inside that walk leaves whichever build dirs it had not reached, each still vouched for
-/// by a `<n>.ready` it also had not reached. Unmarking first means an interrupted uninstall
-/// leaves trees that read as INCOMPLETE — reclaimable debris that `gc`'s partial arm sweeps
-/// and that `list_installed`, `decide` and `rollback` all ignore — rather than installed
-/// builds that are not there.
-///
-/// Best-effort, and deliberately so: it is a narrowing of a window, not a precondition of
-/// the removal, and a marker that cannot be unlinked must not stop the uninstall the user
-/// asked for. One `sync_dir` at the end, not one per build: the ordering the flush
-/// establishes is "every marker gone before any tree goes", which is a claim about the
-/// directory, not about any one entry in it.
+/// The whole-program twin of the unmark that opens [`discard_build`]:
+/// [`crate::ops::uninstall`]'s `remove_dir_all` of a program's store is long (several GB
+/// for `trust`) and `readdir` order decides what goes first, so an interrupt would leave
+/// build dirs still vouched for by their `<n>.ready`. Unmarked, they read as incomplete
+/// debris that `gc` sweeps and `list_installed`, `decide` and `rollback` ignore.
+/// Best-effort (a marker that cannot be unlinked must not stop the uninstall), with one
+/// `sync_dir` at the end: the ordering is "every marker gone before any tree goes".
 pub(crate) fn unmark_program_builds(prog_store: &Path) {
     let Ok(entries) = std::fs::read_dir(prog_store) else {
         return;
@@ -1060,24 +839,21 @@ pub(crate) fn unmark_program_builds(prog_store: &Path) {
     }
 }
 
-/// The suffix of the DECLARED-MODE record beside a build dir: `store/<program>/<build>.modes`.
+/// The suffix of the declared-mode record beside a build dir: `store/<program>/<build>.modes`.
 ///
-/// A SIBLING, like `<build>.ready` and `<build>.shim-env`, so it never perturbs the
-/// build's `tree_root`. It lists the permission bits the stage DECLARED for every regular
-/// file it laid — the mode slot of each signed `tree_root` line — for the one platform
-/// whose filesystem stores none and reads every mode back as `0`: Windows. Without it a
-/// later on-disk walk there (`atpkg verify`) folds `0` for every file and can agree with
-/// no root any producer signed (measured 2026-09-22, `crate::tree`'s module docs). On
-/// Unix the inode stores the bits and the walk reads them back, so nothing is written or
-/// read: [`write_declared_modes`] is a no-op and [`declared_modes`] answers empty.
+/// A sibling like `<build>.ready`, so it never perturbs the build's `tree_root`. It lists
+/// the permission bits the stage declared for every regular file (the mode slot of each
+/// signed `tree_root` line), for Windows, whose filesystem reads every mode back as `0`:
+/// without it an on-disk walk there (`atpkg verify`) could agree with no signed root. On
+/// Unix the inode stores the bits, so [`write_declared_modes`] is a no-op and
+/// [`declared_modes`] answers empty.
 pub const DECLARED_MODES_SUFFIX: &str = ".modes";
 
 /// The record's first line, the schema gate a reader refuses anything else on.
 const DECLARED_MODES_HEADER: &str = "declared-modes v1";
 
-/// Upper bound on a declared-mode record: one line per regular file — the shipped
-/// `trust` sysroot lays 4114 — so 16 MiB is orders of magnitude above any real tree
-/// while keeping the read strictly finite.
+/// Upper bound on a declared-mode record (one line per regular file; the `trust` sysroot
+/// lays about 4100): far above any real tree, and the read stays strictly finite.
 const MAX_DECLARED_MODES_BYTES: usize = 16 * 1024 * 1024;
 
 /// `store/<program>/<build>.modes` for `build_dir`, or `None` for a path with no name.
@@ -1090,15 +866,11 @@ pub fn declared_modes_path(build_dir: &Path) -> Option<PathBuf> {
     Some(build_dir.with_file_name(sidecar))
 }
 
-/// Write the declared-mode record beside `build_dir` DURABLY, as the stage's other
-/// sidecars are ([`write_sidecar_durably`]: temp + flush + rename): one `<relpath bytes>
-/// 0x00 <octal mode> 0x0A` line per regular file, the same framing as the `tree_root`
-/// line minus its digest, so a reader splits on the same bytes the fold does. A no-op
-/// where the filesystem stores permission bits ([`crate::platform::HAS_POSIX_MODES`]):
-/// the walk there reads the inode and would never consult the record. Called by the
-/// stage BEFORE the build is marked complete, so a record that could not be written
-/// leaves an unmarked (re-stageable) build rather than a marked one `verify` can never
-/// attest — and `.ready` implies the record's bytes, not just its name, reached the disk.
+/// Write the declared-mode record beside `build_dir` durably ([`write_sidecar_durably`]):
+/// one `<relpath bytes> 0x00 <octal mode> 0x0A` line per regular file, the `tree_root`
+/// line's framing minus its digest. A no-op where the filesystem stores permission bits
+/// ([`crate::platform::HAS_POSIX_MODES`]). Called before the build is marked complete, so a
+/// record that could not be written leaves an unmarked, re-stageable build.
 ///
 /// # Errors
 /// The record could not be written.
@@ -1128,16 +900,14 @@ pub fn write_declared_modes(
 
 /// The declared-mode record beside `build_dir`, for [`crate::tree::tree_root_declared`].
 ///
-/// Where the filesystem stores permission bits ([`crate::platform::HAS_POSIX_MODES`])
-/// this answers EMPTY without touching the disk: the walk reads the inode and ignores the
-/// map, so a record is neither written nor wanted there. Where it stores none, the record
-/// is REQUIRED — a missing, oversized, symlinked or malformed one is an error, never an
-/// empty map: an empty map would fold `0` for every file and report a healthy build as
-/// drifted, and a walk that cannot say what it folded must not pretend to attest.
+/// Where the filesystem stores permission bits ([`crate::platform::HAS_POSIX_MODES`]) this
+/// answers empty without touching the disk. Elsewhere the record is required: a missing,
+/// oversized, symlinked or malformed one is an error, never an empty map, which would fold
+/// `0` for every file and report a healthy build as drifted.
 ///
 /// # Errors
-/// The record is absent (a build staged by an atpkg before 0.90.1 on this platform —
-/// `aterm pkg install <program>` re-stages it and writes one), unreadable, or malformed.
+/// The record is absent (a build staged before this platform kept one; `aterm pkg install
+/// <program>` re-stages it), unreadable, or malformed.
 pub fn declared_modes(build_dir: &Path) -> std::io::Result<crate::tree::DeclaredModes> {
     if crate::platform::HAS_POSIX_MODES {
         return Ok(crate::tree::DeclaredModes::new());
@@ -1205,17 +975,16 @@ pub const STAGE_REFUSAL_SUFFIX: &str = ".refused";
 /// read at all, so a future shape can never be half-understood by this reader.
 const STAGE_REFUSAL_HEADER: &str = "stage-refusal v1";
 
-/// Bound on a memo read: it holds eight short lines at most (`signer=`/`hold=` and
-/// `client=` joined the original six).
+/// Bound on a memo read; it holds eight short lines at most.
 const MAX_REFUSAL_BYTES: usize = 4 * 1024;
 
-/// How long the SECOND consecutive refusal of a build's signed digests holds the next
-/// attempt off the wire — 12 h, two of the GUI's six-hourly ticks — doubling per further
-/// refusal up to [`REFUSAL_COOLDOWN_CAP_SECS`]. The FIRST refusal holds nothing at all:
-/// see [`StageRefusal::cooldown_secs`].
+/// How long the second consecutive refusal of a build's signed digests holds the next
+/// attempt off the wire (12 h, two of the GUI's six-hourly ticks), doubling per further
+/// refusal up to [`REFUSAL_COOLDOWN_CAP_SECS`]. The first refusal holds nothing
+/// ([`StageRefusal::cooldown_secs`]).
 const REFUSAL_COOLDOWN_BASE_SECS: i64 = 12 * 60 * 60;
 
-/// The ceiling on that doubling: one week. A pin whose SIGNED digests do not match the
+/// The ceiling on that doubling: one week. A pin whose signed digests do not match the
 /// published asset is a publishing fact that only a new index can fix, and every attempt
 /// to re-prove it costs the whole asset.
 const REFUSAL_COOLDOWN_CAP_SECS: i64 = 7 * 24 * 60 * 60;
@@ -1224,37 +993,29 @@ const REFUSAL_COOLDOWN_CAP_SECS: i64 = 7 * 24 * 60 * 60;
 /// memo cannot grow past a line or two.
 const MAX_REFUSAL_WHY_CHARS: usize = 300;
 
-/// What a DETERMINISTIC stage failure recorded beside `store/<program>/<build>`: the
-/// SIGNED digests the published bytes did not match, the stage's own sentence, when it
-/// was recorded, and how many consecutive attempts have now proved the same thing.
+/// What a deterministic stage failure recorded beside `store/<program>/<build>`: the
+/// signed digests the published bytes did not match, the stage's own sentence, when, and
+/// how many consecutive attempts proved the same thing. The payload digest is the row's
+/// ([`crate::manifest::Artifact::digest`]), on a line named for its algorithm (`sha256=`
+/// or `sha512=`).
 ///
-/// # Why a memo exists at all
+/// While the pin and its digest hold still, a signed-digest mismatch keeps its answer, and
+/// the failed archive (and any `.part`) is deleted, so without a memo every tick would
+/// re-download the whole asset (~3.4 GB for `trust`) to the same verdict. The memo can
+/// only skip a transfer: it is consulted after the signed manifest is verified, and never
+/// admits bytes, relaxes a digest or keeps a build alive.
 ///
-/// A signed-`sha256` mismatch says the published bytes are not the bytes the manifest
-/// names, and while the pin and its digest hold still, so does that answer. The archive
-/// is (rightly) deleted on that failure, and any `.part` with it — the bytes are wrong,
-/// and a poisoned prefix must never seed the next attempt — so the NEXT attempt starts
-/// from byte 0: every six-hourly tick re-downloaded the whole asset (~3.4 GB for
-/// `trust`) to reach the identical verdict, on every machine in the fleet, until the
-/// publisher cut a new index. This is the record that stops that, and the ONLY thing it
-/// can do is skip a transfer — it is consulted after the signed manifest has been
-/// fetched and verified, and it can never admit bytes, relax a digest, or keep a build
-/// alive.
-///
-/// # Why it lapses
-///
-/// A publisher can repair the asset UNDER the same pin (re-upload the bytes the signed
-/// digest always named), and a transfer can simply have been truncated on the wire — a
-/// permanent memo would hide both. So the record holds a COOLDOWN, not a verdict, and
-/// the first one is ZERO: the next pass downloads again exactly as it always did. From
-/// the second identical verdict it bounds the retry to one attempt per 12 h, then 24,
-/// 48, 96, up to one a week, instead of four a day — and any change to the pinned
-/// build's signed `sha256`/`tree_root` makes it stop binding at once.
+/// It holds a cooldown, not a verdict, because a publisher can repair the asset under the
+/// same pin and a transfer can be truncated on the wire: the first is zero, then one
+/// attempt per 12 h, 24, 48, … up to one a week, and any change to the pin's signed digest
+/// or `tree_root` stops it binding at once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageRefusal {
-    /// The SIGNED `sha256` of the artifact this refusal is about.
-    pub sha256: String,
-    /// The SIGNED `tree_root` of that artifact (empty when the manifest carries none).
+    /// The algorithm of [`Self::digest`].
+    pub alg: DigestAlg,
+    /// The signed payload digest of the artifact this refusal is about.
+    pub digest: String,
+    /// The signed `tree_root` of that artifact (empty when the manifest carries none).
     pub tree_root: String,
     /// The stage's own sentence ([`crate::install::StageError`]'s `Display`).
     pub why: String,
@@ -1262,42 +1023,31 @@ pub struct StageRefusal {
     pub at: i64,
     /// How many consecutive attempts have failed on these digests (>= 1).
     pub attempts: u32,
-    /// The platform signer check refused bytes that MATCHED these digests
+    /// The platform signer check refused bytes that matched these digests
     /// ([`crate::install::StageError::SignerRefused`]): a re-download can only fetch the
     /// same bytes, so the memo binds until the digests change, with no cooldown to lapse.
     pub signer: bool,
-    /// Whether the row is HELD rather than cooled down: a `tree_root` mismatch. The
-    /// archive passed the signed `sha256` gate, so the bytes are exactly the ones the
-    /// row names, the extraction is deterministic, and no retry over the same archive
-    /// and the same row can reach a different verdict — there is no wire to blame and
-    /// nothing to wait out. A held memo binds until the pin's signed digests move or a
-    /// person asks (`aterm pkg install <p>`, `aterm pkg update --retry`); the archive
-    /// is kept beside it so that retry costs no download.
+    /// Whether the row is held rather than cooled down: a `tree_root` mismatch. The archive
+    /// passed the signed digest gate and extraction is deterministic, so no retry over the
+    /// same archive and row can differ. A held memo binds until the pin's signed digests
+    /// move or a person asks (`aterm pkg install <p>`, `aterm pkg update --retry`); the
+    /// archive is kept beside it so that retry costs no download.
     pub held: bool,
-    /// The atpkg version that reached the verdict (the running build's,
-    /// [`aterm_types::version::app_version`]). A memo binds only the client that
-    /// wrote it: a verdict about "these bytes, this row" is also a
-    /// verdict by THIS extractor and THIS fold, and the one fix a held row can ever get
-    /// on the client side ships as a new atpkg — which must then be allowed one attempt.
-    /// Empty from a memo written before the field existed, which therefore binds
-    /// nothing once, and is re-recorded with the version on its next verdict.
+    /// The atpkg version that reached the verdict ([`aterm_types::version::app_version`]).
+    /// A memo binds only the client that wrote it: the verdict is also one by this
+    /// extractor and fold, and a client-side fix ships as a new atpkg, which gets one
+    /// attempt. Empty in an older memo, which binds nothing.
     pub client: String,
 }
 
 impl StageRefusal {
-    /// The cooldown this record's attempt count buys — ZERO for a first refusal, then
-    /// [`REFUSAL_COOLDOWN_BASE_SECS`] doubled once per further consecutive refusal,
-    /// capped at [`REFUSAL_COOLDOWN_CAP_SECS`].
-    ///
-    /// THE FIRST RETRY IS ALWAYS FREE, and that is the load-bearing half. A digest
-    /// mismatch is not proof of a publishing slip: a truncated transfer, a bad mirror or
-    /// a meddling proxy produces exactly the same verdict, and those heal on the very
-    /// next attempt. So one failure buys nothing — the next pass downloads again, as it
-    /// always did, and a publisher who repaired the asset under the same pin is found
-    /// there (`flow`'s `a_member_stage_failure_aborts_the_group_and_a_retry_heals_it`
-    /// pins that healing). Only a SECOND failure over the identical signed digests — two
-    /// independent downloads, two identical verdicts — is evidence about the publication
-    /// rather than about the wire, and that is where holding off starts to pay.
+    /// The cooldown this record's attempt count buys: zero for a first refusal, then
+    /// [`REFUSAL_COOLDOWN_BASE_SECS`] doubled per further consecutive refusal, capped at
+    /// [`REFUSAL_COOLDOWN_CAP_SECS`]. The first retry is always free: a truncated transfer,
+    /// a bad mirror or a meddling proxy gives the same verdict as a publishing slip and
+    /// heals on the next attempt (`flow`'s
+    /// `a_member_stage_failure_aborts_the_group_and_a_retry_heals_it`). Only a second
+    /// identical verdict is evidence about the publication.
     #[must_use]
     pub fn cooldown_secs(&self) -> i64 {
         let Some(steps) = self.attempts.checked_sub(2) else {
@@ -1315,28 +1065,30 @@ impl StageRefusal {
     }
 
     /// Whether this record still stands in the way of re-staging an artifact with these
-    /// SIGNED digests at `now_unix`. Fail-OPEN by construction: a memo with no `sha256`,
-    /// one whose digests differ from the pin's (the publisher moved them — the repair
-    /// this memo must not hide), one another atpkg version wrote ([`Self::client`]), or
-    /// a cooled-down one whose cooldown has lapsed binds nothing, and a clock that
-    /// cannot be read (`i64::MAX`) makes every cooled-down memo look lapsed. A
-    /// [`Self::signer`] memo and a HELD memo ([`Self::held`]) have no cooldown to lapse:
-    /// they bind while the digests and the client hold. The only thing a memo can do is
-    /// skip a transfer or a stage that would fail again.
+    /// signed digests at `now_unix`. Fail-open: a memo with no digest, with digests that
+    /// differ from the pin's (the publisher's repair), from another atpkg version
+    /// ([`Self::client`]), or whose cooldown lapsed binds nothing, and an unreadable clock
+    /// (`i64::MAX`) lapses every cooldown. [`Self::signer`] and [`Self::held`] memos have
+    /// no cooldown: they bind while the digests and the client hold.
     #[must_use]
-    pub fn binds(&self, sha256: &str, tree_root: &str, now_unix: i64) -> bool {
-        !self.sha256.is_empty()
-            && self.sha256.eq_ignore_ascii_case(sha256)
-            && self.tree_root.eq_ignore_ascii_case(tree_root)
+    pub fn binds(&self, digest: (DigestAlg, &str), tree_root: &str, now_unix: i64) -> bool {
+        self.same_digests(digest, tree_root)
             && self.client == aterm_types::version::app_version()
             && (self.signer || self.held || now_unix < self.retry_after())
     }
+
+    /// Whether this record is about an artifact with these signed digests.
+    fn same_digests(&self, (alg, digest): (DigestAlg, &str), tree_root: &str) -> bool {
+        !self.digest.is_empty()
+            && self.alg == alg
+            && self.digest.eq_ignore_ascii_case(digest)
+            && self.tree_root.eq_ignore_ascii_case(tree_root)
+    }
 }
 
-/// `store/<program>/<build>.refused` for `build_dir` — a SIBLING, like `<build>.ready`
-/// and `<build>.shim-env`, so it never perturbs the build's `tree_root` and can outlive a
-/// build directory that never came to exist (which is the point: the stage it records
-/// FAILED).
+/// `store/<program>/<build>.refused` for `build_dir`: a sibling like `<build>.ready`, so it
+/// never perturbs the build's `tree_root` and can outlive a build directory that never
+/// came to exist (the stage it records failed).
 fn stage_refusal_path(build_dir: &Path) -> Option<PathBuf> {
     let name = build_dir.file_name()?;
     let name = name.to_str()?;
@@ -1345,28 +1097,25 @@ fn stage_refusal_path(build_dir: &Path) -> Option<PathBuf> {
     Some(build_dir.with_file_name(marker))
 }
 
-/// Record that staging `build_dir` failed on the SIGNED digests (temp + rename, so a
-/// crash leaves no half-written memo). A record already naming these digests has its
-/// attempt count ADVANCED — that is what lengthens the cooldown; a record naming other
-/// digests is replaced, starting the count again.
-///
-/// At most ONE memo survives per program: writing one reclaims every other `*.refused`
-/// beside it — the same bound `staging/` keeps for partials — so a program whose pin
-/// moves repeatedly leaves one small file, never one per build it refused.
+/// Record that staging `build_dir` failed on the signed digests (temp + rename, so a crash
+/// leaves no half-written memo). A record already naming these digests has its attempt
+/// count advanced, lengthening the cooldown; one naming other digests is replaced. Writing
+/// one reclaims every other `*.refused` beside it, so at most one memo survives per
+/// program.
 ///
 /// # Errors
-/// The memo could not be written (its parent — `store/<program>/` — cannot be created,
-/// or the volume refuses).
+/// The memo could not be written (`store/<program>/` cannot be created, or the volume
+/// refuses).
 pub fn record_stage_refusal(
     build_dir: &Path,
-    sha256: &str,
+    digest: (DigestAlg, &str),
     tree_root: &str,
     why: &str,
     now_unix: i64,
 ) -> std::io::Result<()> {
     write_stage_refusal(
         build_dir,
-        sha256,
+        digest,
         tree_root,
         why,
         now_unix,
@@ -1380,14 +1129,14 @@ pub fn record_stage_refusal(
 /// As [`record_stage_refusal`].
 pub(crate) fn record_signer_refusal(
     build_dir: &Path,
-    sha256: &str,
+    digest: (DigestAlg, &str),
     tree_root: &str,
     why: &str,
     now_unix: i64,
 ) -> std::io::Result<()> {
     write_stage_refusal(
         build_dir,
-        sha256,
+        digest,
         tree_root,
         why,
         now_unix,
@@ -1395,7 +1144,7 @@ pub(crate) fn record_signer_refusal(
     )
 }
 
-/// [`record_stage_refusal`] for a `tree_root` mismatch: a HELD memo
+/// [`record_stage_refusal`] for a `tree_root` mismatch: a held memo
 /// ([`StageRefusal::held`]) that binds from its first verdict until the pin's signed
 /// digests or the client move, or a person asks (`aterm pkg install <p>`,
 /// `aterm pkg update --retry`).
@@ -1404,14 +1153,14 @@ pub(crate) fn record_signer_refusal(
 /// As [`record_stage_refusal`].
 pub(crate) fn record_held_refusal(
     build_dir: &Path,
-    sha256: &str,
+    digest: (DigestAlg, &str),
     tree_root: &str,
     why: &str,
     now_unix: i64,
 ) -> std::io::Result<()> {
     write_stage_refusal(
         build_dir,
-        sha256,
+        digest,
         tree_root,
         why,
         now_unix,
@@ -1422,7 +1171,7 @@ pub(crate) fn record_held_refusal(
 /// Which of the three memos [`write_stage_refusal`] writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RefusalKind {
-    /// A signed-`sha256` mismatch: it cools down ([`StageRefusal::cooldown_secs`]).
+    /// A signed-digest mismatch: it cools down ([`StageRefusal::cooldown_secs`]).
     Cooldown,
     /// A platform signer refusal: `signer=1` ([`StageRefusal::signer`]).
     Signer,
@@ -1432,7 +1181,7 @@ enum RefusalKind {
 
 fn write_stage_refusal(
     build_dir: &Path,
-    sha256: &str,
+    digest: (DigestAlg, &str),
     tree_root: &str,
     why: &str,
     now_unix: i64,
@@ -1442,17 +1191,16 @@ fn write_stage_refusal(
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
     })?;
     let attempts = stage_refusal(build_dir)
-        .filter(|prior| {
-            prior.sha256.eq_ignore_ascii_case(sha256)
-                && prior.tree_root.eq_ignore_ascii_case(tree_root)
-        })
+        .filter(|prior| prior.same_digests(digest, tree_root))
         .map_or(1, |prior| prior.attempts.saturating_add(1));
     let parent = dest.parent().unwrap_or(build_dir);
     make_build_parent(build_dir)?;
     let tmp = parent.join(format!(".refused.tmp-{}", std::process::id()));
     let mut body = String::from(STAGE_REFUSAL_HEADER);
-    body.push_str("\nsha256=");
-    body.push_str(sha256);
+    body.push('\n');
+    body.push_str(digest.0.key());
+    body.push('=');
+    body.push_str(digest.1);
     body.push_str("\ntree_root=");
     body.push_str(tree_root);
     body.push_str("\nattempts=");
@@ -1524,12 +1272,14 @@ fn parse_stage_refusal(text: &str) -> Option<StageRefusal> {
     if lines.next()?.trim() != STAGE_REFUSAL_HEADER {
         return None;
     }
-    let (mut sha256, mut tree_root, mut why) = (None, None, None);
+    let (mut sha256, mut sha512, mut tree_root, mut why) = (None, None, None, None);
     let (mut at, mut attempts, mut signer) = (None, None, false);
     let (mut held, mut client) = (false, String::new());
     for line in lines {
         if let Some(v) = line.strip_prefix("sha256=") {
-            sha256 = Some(v.to_string());
+            sha256 = Some(v);
+        } else if let Some(v) = line.strip_prefix("sha512=") {
+            sha512 = Some(v);
         } else if let Some(v) = line.strip_prefix("tree_root=") {
             tree_root = Some(v.to_string());
         } else if let Some(v) = line.strip_prefix("why=") {
@@ -1546,8 +1296,15 @@ fn parse_stage_refusal(text: &str) -> Option<StageRefusal> {
             client = v.trim().to_string();
         }
     }
+    // Exactly one payload digest, on the line named for its algorithm.
+    let (alg, digest) = match (sha256, sha512) {
+        (Some(v), None) => (DigestAlg::Sha256, v),
+        (None, Some(v)) => (DigestAlg::Sha512, v),
+        _ => return None,
+    };
     Some(StageRefusal {
-        sha256: sha256?,
+        alg,
+        digest: digest.to_string(),
         tree_root: tree_root?,
         why: why.unwrap_or_default(),
         at: at?,
@@ -1558,7 +1315,7 @@ fn parse_stage_refusal(text: &str) -> Option<StageRefusal> {
     })
 }
 
-/// Remove the refusal beside `build_dir`, if any — a stage of this build that SUCCEEDED,
+/// Remove the refusal beside `build_dir`, if any — a stage of this build that succeeded,
 /// every discard, and the explicit install door, so the memo never outlives its cause.
 pub fn clear_stage_refusal(build_dir: &Path) {
     if let Some(marker) = stage_refusal_path(build_dir) {
@@ -1628,14 +1385,11 @@ pub(crate) fn clear_vendor_sidecar(build_dir: &Path) {
     }
 }
 
-/// Forget every refusal recorded for `program` — what the EXPLICIT door
-/// (`aterm pkg install <program>`) does before it installs, so a person who has just
-/// fixed the publish (or the proxy that corrupted the transfer) never waits out a
-/// cooldown meant for an unattended six-hourly loop.
-///
-/// A `program` that is not ONE directory name ([`crate::ops::uninstall_name_shape`])
-/// forgets nothing: the name arrives from argv, and `store/..\..\x` is a directory
-/// outside the store whose `*.refused` files are not this store's to delete.
+/// Forget every refusal recorded for `program`: what the explicit door (`aterm pkg install
+/// <program>`) does before it installs, so a person who fixed the publish never waits out
+/// an unattended loop's cooldown. A `program` that is not one directory name
+/// ([`crate::ops::uninstall_name_shape`]) forgets nothing: it arrives from argv, and
+/// `store/..\..\x` is outside the store.
 pub fn clear_stage_refusals(layout: &Layout, program: &str) -> usize {
     if crate::ops::uninstall_name_shape(program).is_err() {
         return 0;
@@ -1661,7 +1415,7 @@ pub fn clear_stage_refusals(layout: &Layout, program: &str) -> usize {
     forgotten
 }
 
-/// [`clear_stage_refusals`] for EVERY program the store has a directory for — what
+/// [`clear_stage_refusals`] for every program the store has a directory for — what
 /// `aterm pkg update --retry` does before its pass, so a held `tree_root` verdict
 /// ([`StageRefusal::held`]), which never lapses on its own, can be asked again by the
 /// person who believes the publish is fixed. Returns how many memos were forgotten.
@@ -1681,22 +1435,17 @@ pub fn clear_all_stage_refusals(layout: &Layout) -> usize {
     forgotten
 }
 
-/// The sibling scratch directory a stage extracts INTO before it swaps: `<build>.incoming-<pid>`.
-///
-/// Staging never writes into the live `<build>/` tree. The old flow deleted the live tree
-/// and extracted over it, so from the first byte of extraction until the final marker
-/// write the installed toolchain simply did not exist — a Ctrl-C, a crash, or a
-/// disk-full there left the user with no compiler AND (because the marker is a SIBLING
-/// that the delete did not touch) a store that still claimed the build was installed.
+/// The sibling scratch directory a stage extracts into before it swaps:
+/// `<build>.incoming-<pid>`. Staging never writes into the live `<build>/` tree, so a
+/// Ctrl-C, crash or full disk mid-extract never leaves the user without a compiler.
 pub(crate) fn incoming_dir(build_dir: &Path) -> Option<PathBuf> {
     scratch_sibling(build_dir, ".incoming-")
 }
 
-/// Write the temp of a small record that is renamed into place beside a build (the
-/// shim-environment sidecar, the stage-refusal memo): created `0644`, which the umask can
-/// only narrow, never `0666 & ~umask` as `std::fs::write` creates it. A record its group
-/// or every user could rewrite would let them steer what a later verb believes about the
-/// build (AT3, 2026-10-10).
+/// Write the temp of a small record renamed into place beside a build (the
+/// shim-environment sidecar, the stage-refusal memo), created `0644`, which the umask can
+/// only narrow: a record its group or every user could rewrite would steer what a later
+/// verb believes about the build.
 pub(crate) fn write_record_temp(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     let _ = std::fs::remove_file(tmp);
@@ -1704,13 +1453,10 @@ pub(crate) fn write_record_temp(tmp: &Path, bytes: &[u8]) -> std::io::Result<()>
 }
 
 /// Make the directory a build lives in (`store/<program>/`, and `store/` above it) when
-/// it is missing, each at the stage's one directory mode
-/// ([`crate::extract::safe_mode`], `0755`) whatever the umask
-/// ([`crate::platform::make_dirs_born`]). Every writer that can be first to need it
-/// (the stage, the shim-environment sidecar, the refusal record) makes it here: from
-/// `create_dir_all` it was born `0777 & ~umask`, and a `store/<program>/` its group or
-/// every user could write lets them rename a build away and put their own in its place
-/// (AT3, 2026-10-10). One that exists is left exactly as it is.
+/// missing, at the stage's one directory mode ([`crate::extract::safe_mode`], `0755`)
+/// whatever the umask ([`crate::platform::make_dirs_born`]). Every writer that can be
+/// first to need it comes here: a `store/<program>/` its group or every user could write
+/// would let them swap a build for their own. One that exists is left as it is.
 pub(crate) fn make_build_parent(build_dir: &Path) -> std::io::Result<()> {
     match build_dir.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => {
@@ -1720,7 +1466,7 @@ pub(crate) fn make_build_parent(build_dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// The sibling the OUTGOING tree is moved to during a swap: `<build>.superseded-<pid>`.
+/// The sibling the outgoing tree is moved to during a swap: `<build>.superseded-<pid>`.
 /// It exists only between the two renames, and is deleted immediately after.
 pub(crate) fn superseded_dir(build_dir: &Path) -> Option<PathBuf> {
     scratch_sibling(build_dir, ".superseded-")
@@ -1739,7 +1485,7 @@ fn scratch_sibling(build_dir: &Path, suffix: &str) -> Option<PathBuf> {
 pub(crate) enum Scratch {
     /// `<build>.incoming-<pid>` — the tree being extracted, before it has been verified.
     Incoming,
-    /// `<build>.superseded-<pid>` — the OUTGOING tree, parked between the two swap renames.
+    /// `<build>.superseded-<pid>` — the outgoing tree, parked between the two swap renames.
     Superseded,
 }
 
@@ -1758,14 +1504,12 @@ pub(crate) fn parse_build_name(name: &str) -> Option<u64> {
     name.parse::<u64>().ok()
 }
 
-/// Recognise stage scratch by the PRODUCER's exact shape: `<build>.incoming-<pid>` or
+/// Recognise stage scratch by the producer's exact shape: `<build>.incoming-<pid>` or
 /// `<build>.superseded-<pid>`, where `<build>` is a real build number and `<pid>` a
-/// non-empty run of ASCII digits. Returns the build number and the shape.
-///
-/// This is the SINGLE recogniser both sweepers use ([`sweep_stage_scratch`] here and
-/// [`crate::gc`]'s pass), because they authorize the same unguarded `remove_dir_all` inside
-/// a directory the user can also put things in, and a policy that only one half enforces is
-/// not a policy: `18.incoming-drafts/` is not ours to delete, whichever code path meets it.
+/// non-empty run of ASCII digits. Returns the build number and the shape. The single
+/// recogniser both sweepers use ([`sweep_stage_scratch`] and [`crate::gc`]), since they
+/// authorize `remove_dir_all` in a directory the user can also write:
+/// `18.incoming-drafts/` is not ours to delete.
 pub(crate) fn stage_scratch_of(name: &str) -> Option<(u64, Scratch)> {
     let (build, rest) = name.split_once('.')?;
     let build = parse_build_name(build)?;
@@ -1799,39 +1543,31 @@ fn scratch_siblings(build_dir: &Path) -> Vec<(Scratch, PathBuf)> {
         .filter_map(|entry| {
             let entry_name = entry.file_name();
             let (found, kind) = stage_scratch_of(entry_name.to_str()?)?;
-            // Siblings of a DIFFERENT build are that build's business, not ours.
+            // Siblings of a different build are that build's business, not ours.
             (found == build).then(|| (kind, entry.path()))
         })
         .collect()
 }
 
-/// Recover the one crash window a swap cannot make atomic. `true` when a tree was moved back.
+/// Recover the one crash window a swap cannot make atomic; `true` when a tree was moved
+/// back.
 ///
 /// [`crate::install::verify_and_stage`]'s swap moves the outgoing tree to
-/// `<build>.superseded-<pid>` and then moves the verified incoming tree onto `<build>`.
-/// Between those two renames the ONLY copy of the old tree lives under the scratch name. A
-/// SIGKILL, a `^C`, or a power loss there leaves `<build>` absent with exactly one
-/// superseded sibling — and sweeping that sibling as housekeeping would turn a recoverable
-/// crash into a permanently deleted toolchain. This is the only place
-/// a plain crash, with no I/O error anywhere, could leave neither the old build nor the new.
+/// `<build>.superseded-<pid>`, then the verified incoming tree onto `<build>`. Between the
+/// renames the only copy of the old tree is under the scratch name, so a kill or power
+/// loss leaves `<build>` absent with one superseded sibling, which a sweep would destroy.
 ///
-/// The recovery is deliberately NARROW, because a wrong move here is as destructive as the
-/// delete it replaces. It fires only when `<build>` is absent AND exactly one superseded
-/// sibling is present: that is the swap window and nothing else. With `<build>` present the
-/// sibling is genuine leftover (the swap got past its second rename, or its rollback put the
-/// tree back) and must still be swept; with two siblings there is no way to tell which is
-/// the real outgoing tree, and guessing is exactly how live trees get deleted.
+/// Narrow on purpose: it fires only when `<build>` is absent and exactly one superseded
+/// sibling is a real directory. With `<build>` present the sibling is leftover; with two
+/// there is no telling which is the outgoing tree.
 ///
-/// It does NOT re-mark the recovered tree. The swap clears the marker before the first
-/// rename, so whether that tree was complete is unrecoverable from disk — leaving it
-/// unmarked means it reads as not-installed and is re-staged, which is honest, whereas
-/// re-marking would promote a tree nothing can vouch for. The re-stage is the next apply
-/// pass's, shims or no shims: `flow::installed_for_decide` drops an unmarked live build
-/// before [`crate::gate::decide`] sees it, so a recovered tree the shims still resolve into
-/// is repaired rather than read as up to date.
+/// It does not re-mark the recovered tree (the swap cleared the marker, so its
+/// completeness is unknowable): it reads as not installed and the next apply pass
+/// re-stages it, since `flow::installed_for_decide` drops an unmarked live build before
+/// [`crate::gate::decide`] sees it.
 pub(crate) fn recover_interrupted_swap(build_dir: &Path) -> bool {
-    // `symlink_metadata`, not `exists()`: a DANGLING symlink at the build path is still
-    // something being there, and "the window" means nothing at all is. Narrower is safer.
+    // `symlink_metadata`, not `exists()`: a dangling symlink at the build path is still
+    // something there, and the window means nothing is.
     if std::fs::symlink_metadata(build_dir).is_ok() {
         return false;
     }
@@ -1849,38 +1585,31 @@ pub(crate) fn recover_interrupted_swap(build_dir: &Path) -> bool {
     std::fs::rename(&old, build_dir).is_ok()
 }
 
-/// Delete every stage-scratch sibling of `build_dir` left behind by an earlier run, after
-/// recovering the swap window ([`recover_interrupted_swap`]) so a crash there does not get
-/// swept as debris. The caller holds the store lock, which every stager takes.
-///
-/// Nothing else reclaims this scratch — GC only sees numeric, marker-bearing dirs — and a
-/// non-directory at a scratch path is reclaimed by neither sweeper while blocking every
-/// later swap of that build. A superseded *directory* is spared while `<build>` is absent
-/// and the recovery above declined to move it: it is the only copy of the build on disk.
+/// Delete every stage-scratch sibling of `build_dir` an earlier run left, after recovering
+/// the swap window ([`recover_interrupted_swap`]). The caller holds the store lock, which
+/// every stager takes. Nothing else reclaims this scratch (GC sees only numeric,
+/// marker-bearing dirs). A superseded directory is spared while `<build>` is absent: it is
+/// the only copy of the build on disk.
 pub(crate) fn sweep_stage_scratch(build_dir: &Path) {
     let recovered = recover_interrupted_swap(build_dir);
-    // Not debris: while nothing stands at `<build>`, a superseded sibling is the only copy
-    // of that build on disk — a swap window [`recover_interrupted_swap`] could not close.
-    // Still swept: a sibling of a live `<build>`, `.incoming-<pid>` half-extracts, and the
-    // sibling itself once `<build>` is whole again. `crate::gc` holds this same guard and
-    // reports an ambiguous pair as `doctor`'s `diverged` line rather than reclaiming one.
+    // While nothing stands at `<build>`, a superseded sibling is the only copy of that
+    // build: a swap window [`recover_interrupted_swap`] could not close. `crate::gc` holds
+    // the same guard and reports an ambiguous pair as `doctor`'s `diverged` line.
     let parked_only_copy = !recovered && std::fs::symlink_metadata(build_dir).is_err();
     for (kind, path) in scratch_siblings(build_dir) {
-        // A directory, the predicate [`recover_interrupted_swap`] filters on: a swap parks a
-        // tree. A file or symlink at that name is nobody's only copy, and the one entry
-        // neither sweeper can otherwise reclaim — so it must still be swept.
+        // Spare only a directory (what a swap parks); a file or symlink at that name is
+        // nobody's only copy, and nothing else reclaims it.
         if parked_only_copy
             && kind == Scratch::Superseded
             && std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir())
         {
             continue;
         }
-        // `symlink_metadata`, not `is_dir()`: `remove_dir_all` refuses a SYMLINK to a
-        // directory (it does not follow it — proven by the sweep tests), so dispatching on
-        // the followed type would leave exactly that entry behind forever.
+        // `symlink_metadata`, not `is_dir()`: `remove_dir_all` refuses a symlink to a
+        // directory, so dispatching on the followed type would leave that entry forever.
         match std::fs::symlink_metadata(&path) {
             Ok(m) if m.is_dir() => {
-                let _ = std::fs::remove_dir_all(&path);
+                let _ = remove_tree(&path);
             }
             Ok(_) => {
                 let _ = std::fs::remove_file(&path);
@@ -1893,7 +1622,7 @@ pub(crate) fn sweep_stage_scratch(build_dir: &Path) {
 /// Flush a directory's metadata so the renames that make up a swap are durable in the
 /// order they were issued. Best-effort: a platform that refuses to open a directory (or an
 /// exotic filesystem) is not a reason to fail an otherwise-good install, and the swap is
-/// crash-CORRECT either way — this only narrows the window in which a power loss can
+/// crash-correct either way — this only narrows the window in which a power loss can
 /// reorder the marker ahead of the tree.
 pub(crate) fn sync_dir(dir: &Path) {
     if let Ok(handle) = std::fs::File::open(dir) {
@@ -1901,14 +1630,10 @@ pub(crate) fn sync_dir(dir: &Path) {
     }
 }
 
-/// [`crate::platform::sync_file_contents`], with a REFUSAL degraded to success.
-///
-/// The rule the updater's boot sentinel already settled: some volumes a store can live on
-/// (a network home, some FUSE mounts) answer a flush `ENOTSUP`/`EINVAL`, and failing an
-/// install there would trade a durability guarantee the volume cannot give for a
-/// toolchain the user cannot have. A REAL error (`EIO`, `ENOSPC`) still propagates —
-/// those are the answers that say the bytes are not on disk, which is the whole question
-/// being asked.
+/// [`crate::platform::sync_file_contents`], with a refusal degraded to success: some
+/// volumes (a network home, some FUSE mounts) answer a flush `ENOTSUP`/`EINVAL`, and
+/// failing the install there buys nothing. A real error (`EIO`, `ENOSPC`) still
+/// propagates.
 pub(crate) fn sync_contents_or_accept_refusal(f: &std::fs::File) -> std::io::Result<()> {
     match crate::platform::sync_file_contents(f) {
         Ok(()) => Ok(()),
@@ -1925,7 +1650,7 @@ pub(crate) fn sync_contents_or_accept_refusal(f: &std::fs::File) -> std::io::Res
 }
 
 /// What [`sync_tree`] flushed. The counts exist so a test can prove the walk reached
-/// EVERY file and directory of a staged tree rather than some arbitrary subset of it —
+/// every file and directory of a staged tree rather than some arbitrary subset of it —
 /// there is no other observable the flush leaves behind.
 #[derive(Debug, Default)]
 pub(crate) struct Synced {
@@ -1935,34 +1660,21 @@ pub(crate) struct Synced {
     pub dirs: u64,
 }
 
-/// Flush a STAGED TREE — every regular file's contents, then every directory's entries —
-/// so that nothing which PUBLISHES the tree can become durable ahead of the bytes it
-/// publishes. Call between the last verification and the swap.
+/// Flush a staged tree (every regular file's contents, then every directory's entries) so
+/// nothing that publishes the tree can become durable ahead of the bytes it publishes.
+/// Call between the last verification and the swap.
 ///
-/// **The hazard, concretely.** Staging writes gigabytes through a plain write loop and
-/// then publishes them with renames. A rename is metadata; the data behind it is page
-/// cache until something flushes it. Under ext4's default delayed allocation — whose
-/// `auto_da_alloc` heuristic covers a rename OVER AN EXISTING FILE, which neither the
-/// swap nor the marker is — the journal can commit `store/<program>/<build>/` and its
-/// sibling `<build>.ready` while the payload is still unwritten. After a power loss the
-/// store then says "build N is complete" over files that are zero-length or truncated,
-/// and NOTHING repairs that state: [`crate::gate::decide`] answers `UpToDate`, the apply
-/// path never re-fetches, and the superseded tree was already reclaimed by the swap that
-/// installed this one. Only a hand-run `atpkg verify` would ever walk the tree again.
-/// [`sync_dir`] orders the RENAMES against each other; it never made the data durable.
+/// A rename is metadata; the data behind it is page cache until flushed. Under ext4's
+/// delayed allocation (`auto_da_alloc` covers only a rename over an existing file, which
+/// neither the swap nor the marker is) the journal can commit `<build>/` and
+/// `<build>.ready` before the payload, and after a power loss nothing repairs a store
+/// that says "complete" over truncated files ([`crate::gate::decide`] answers
+/// `UpToDate`). [`sync_dir`] orders the renames; it does not make the data durable.
 ///
-/// **The cost, deliberately bounded.** One `fsync(2)` per file, never
-/// `fcntl(F_FULLFSYNC)` — see [`crate::platform::sync_file_contents`]. The work is
-/// dominated by writeback the install already owes the filesystem; what this gives up is
-/// batching it, and what it buys is that no crash can mark a build installed over data
-/// that never landed.
-///
-/// Symlinks are never followed and never opened: a link has no contents of its own, and
-/// the directory entry naming it is flushed with its directory. A file this process
-/// cannot OPEN is one it cannot flush, and failing a whole install over one would be
-/// strictly worse than the gap this closes. No lane lays one any more: every staged
-/// file is `0644` or `0755` (`extract::safe_mode`), the `dmg` lane's copied bundle
-/// included since 2026-10-10 (AT3).
+/// One `fsync(2)` per file, never `fcntl(F_FULLFSYNC)`
+/// ([`crate::platform::sync_file_contents`]). Symlinks are never followed or opened. A
+/// file this process cannot open is skipped rather than failing the install; no lane lays
+/// one (every staged file is `0644` or `0755`, `extract::safe_mode`).
 pub(crate) fn sync_tree(root: &Path) -> std::io::Result<Synced> {
     let mut counts = Synced::default();
     let mut stack = vec![root.to_path_buf()];
@@ -1989,7 +1701,7 @@ pub(crate) fn sync_tree(root: &Path) -> std::io::Result<Synced> {
                 }
             }
         }
-        // The directory's own entries, AFTER the contents they name. Best-effort on the
+        // The directory's own entries, after the contents they name. Best-effort on the
         // open alone: Windows cannot open a directory as a file at all (NTFS journals
         // directory metadata itself), so that arm is skipped there.
         if let Ok(handle) = std::fs::File::open(&dir) {
@@ -2000,83 +1712,94 @@ pub(crate) fn sync_tree(root: &Path) -> std::io::Result<Synced> {
     Ok(counts)
 }
 
-/// Discard a build entirely: remove its tree AND its sibling completeness marker (the
-/// inverse of a stage + [`mark_build_ready`]), its sidecars, and the exec root
-/// [`crate::compat`] laid for it. Used to clean up a build that a transaction
-/// STAGED but then ABORTED without activating — leaving it complete-but-inactive would make
-/// `list_installed`/`decide` mis-read it as the active build on the next run. Best-effort.
+/// The mode of a single-binary build's `bin/` once its file is laid ([`seal_bin`]): read
+/// and search for everyone, write for nobody, its owner included.
+pub(crate) const SEALED_BIN_MODE: u32 = 0o555;
+
+/// Seal a staged single-binary tree's `bin/` at [`SEALED_BIN_MODE`]
+/// ([`crate::install::verify_and_stage`], once every member has its final mode).
 ///
-/// **`pub(crate)` deliberately.** This is an unconditional `remove_dir_all` with no notion of
-/// which build is live: handed to a caller that got its build number from a `read_dir` fold,
-/// it will happily delete the running toolchain — which is precisely how GC came to brick a
-/// prefix. Reclaim therefore goes through [`crate::gc::discard_superseded`], which demands a
-/// [`crate::gc::LiveBuild`] witness and refuses to delete it; making the raw form
-/// crate-private is what stops that call from being *writable* elsewhere. The remaining
-/// in-crate caller ([`crate::flow`]) is the staged-but-ABORTED path, where the build was
-/// never activated and so no witness can name it.
+/// A vendor's own updater rewrites its executable in place (agy's `update`, its background
+/// updater and its `install` all write beside `os.Executable()`, the store build, leaving
+/// a 183 MB `agy.<nanos>.old`), and each refuses a directory it cannot write. The shim's
+/// intercept is bypassed by an older atpkg answering it, an older `repair` laying a shim
+/// without it, or the shim's atpkg being gone; a write bit nobody holds stops all three.
+/// Directory modes are not folded into a `tree_root` ([`crate::tree`]), so the seal
+/// changes no verified root. Every removal of a store tree unseals it first
+/// ([`remove_tree`]).
+pub(crate) fn seal_bin(tree: &Path) -> std::io::Result<()> {
+    crate::platform::set_mode(&tree.join("bin"), SEALED_BIN_MODE)
+}
+
+/// Give a sealed `<tree>/bin` ([`seal_bin`]) its owner's write bit back so the tree's
+/// removal can unlink what it holds. Only the seal is undone: a `bin/` at any other mode
+/// or a link, or a `tree` that is not a real directory, is left as it is.
+pub(crate) fn unseal_bin(tree: &Path) {
+    let real_dir = |p: &Path| std::fs::symlink_metadata(p).ok().filter(|m| m.is_dir());
+    let bin = tree.join("bin");
+    if real_dir(tree).is_some()
+        && real_dir(&bin)
+            .is_some_and(|m| crate::platform::permission_mode(&m) & 0o7777 == SEALED_BIN_MODE)
+    {
+        let _ = crate::platform::set_mode(&bin, crate::extract::safe_mode(0, true));
+    }
+}
+
+/// Remove the store tree at `dir` (a build, or a stage's `.incoming`/`.superseded`
+/// scratch), unsealing its `bin/` first ([`unseal_bin`]). std's `remove_dir_all` never
+/// follows a link.
+pub(crate) fn remove_tree(dir: &Path) -> std::io::Result<()> {
+    unseal_bin(dir);
+    std::fs::remove_dir_all(dir)
+}
+
+/// Discard a build entirely: its tree, its sibling completeness marker, its sidecars, and
+/// the exec root [`crate::compat`] laid for it. For a build a transaction staged but
+/// aborted without activating, which `list_installed`/`decide` would otherwise mis-read as
+/// active. Best-effort.
 ///
-/// ONE caller IS a `read_dir` fold, and it is the exception that states the rule:
-/// [`crate::gc::run`]'s interrupted-install sweep. A witness is impossible there — an
-/// interrupted FRESH install has no live build for one to be about — so it is guarded on
-/// the CLAIM UNION instead: every authoritative `current` link plus every `bin/` shim
-/// target. That is strictly stronger evidence of not-live than supersession, because it
-/// deletes only trees that NOTHING on disk points into, which is what earns it the right
-/// to name a build number it read out of a directory listing.
+/// `pub(crate)` because it is an unconditional `remove_dir_all` with no notion of which
+/// build is live: reclaim goes through [`crate::gc::discard_superseded`], which demands a
+/// [`crate::gc::LiveBuild`] witness and refuses to delete it. The one `read_dir`-fold
+/// caller, [`crate::gc::run`]'s interrupted-install sweep, has no live build to witness and
+/// is guarded instead on the claim union (every `current` link plus every `bin/` shim
+/// target), deleting only trees nothing on disk points into.
 pub(crate) fn discard_build(build_dir: &Path) {
-    // THE MARKER COMES DOWN FIRST, AND DURABLY — before the exec root, before the tree.
-    //
-    // FIRST, before `remove_dir_all`: that walk takes tens of seconds over a toolchain, and
-    // anything ending the process inside it — ^C, a SIGTERM at logout, an EACCES partway —
-    // would otherwise leave a gutted tree with a marker still saying `ok`, a corpse
-    // `list_installed` counts, `gc` will not sweep, and `flow::rollback` could select,
-    // removing every shim on the machine ([`READY_CONTENTS_KEY`]).
-    //
-    // Unmarking first makes the whole window safe instead of merely narrower: from the
-    // instant the marker is gone the tree reads as incomplete to every reader
-    // ([`build_is_complete`]), which is the truth for the rest of this function and the
-    // truth for any interrupt inside it — and `gc`'s partial arm reclaims exactly such a
-    // tree on the next pass, under its claim guard. The `sync_dir` is what makes the
-    // ordering survive a power loss and not merely a kill: an unlink is metadata, and
-    // without a directory flush the marker's removal may reach the platter AFTER the
-    // tree's, which is the ordering this fix exists to forbid.
+    // The marker comes down first, and durably, before the exec root and the tree: the
+    // `remove_dir_all` walk takes tens of seconds, and an interrupt inside it would leave
+    // a gutted tree with an `ok` marker ([`READY_CONTENTS_KEY`]). Unmarked, the tree reads
+    // as incomplete to every reader ([`build_is_complete`]) and `gc`'s partial arm
+    // reclaims it. The `sync_dir` makes the order survive a power loss, not just a kill.
     let _ = clear_build_ready(build_dir);
     if let Some(parent) = build_dir.parent() {
         sync_dir(parent);
     }
-    // The build's EXEC ROOT (`<prefix>/compat/<program>/<n>`, `crate::compat`) next: it is
-    // a copy-on-write clone of this build's files, so left behind it would keep every
-    // reclaimed block allocated and could still run the tools of a build the store no
-    // longer has. Derived from this path's own `store/<program>/<n>` chain only.
+    // The build's exec root (`<prefix>/compat/<program>/<n>`, `crate::compat`): a
+    // copy-on-write clone that would keep reclaimed blocks allocated and could still run
+    // a discarded build's tools.
     crate::compat::discard_root_of(build_dir);
-    let _ = std::fs::remove_dir_all(build_dir);
-    // And the marker again, for the one case the unmark above could not settle: it is
-    // best-effort, so a failure there (a read-only parent that a later act made writable,
-    // an EIO) must not leave the sibling behind once the tree really is gone.
+    let _ = remove_tree(build_dir);
+    // The marker again: the unmark above is best-effort, and the sibling must not outlive
+    // the tree.
     if let Some(marker) = ready_marker_path(build_dir) {
         let _ = std::fs::remove_file(marker);
     }
-    // Also remove the source-build provenance sidecar (a sibling `<build>.provenance`), so a
-    // later SIGNED reinstall reusing this build number can never be mis-verified as
-    // source-built by a stale sidecar. Mirrors the `.ready` sibling naming.
+    // The source-build provenance sidecar (`<build>.provenance`), so a later signed
+    // reinstall under this build number is never mis-verified as source-built.
     if let Some(name) = build_dir.file_name().and_then(|n| n.to_str()) {
         let mut prov = String::from(name);
         prov.push_str(".provenance");
         let _ = std::fs::remove_file(build_dir.with_file_name(prov));
     }
-    // And the shim-environment sidecar (`<build>.shim-env`, design S7): a later
-    // reinstall under this build number writes its own from its own signed manifest,
-    // and must never re-lay shims with an environment a discarded build declared.
+    // The shim-environment sidecar (`<build>.shim-env`): a later reinstall writes its own
+    // from its signed manifest.
     crate::shim_env::remove_sidecar(build_dir);
-    // And the digest-refusal memo (`<build>.refused`): it is a statement about the bytes
-    // a pin named, and a later reinstall under this build number must start from the
-    // signed manifest, never from a verdict about a tree that is gone.
+    // The digest-refusal memo (`<build>.refused`): a verdict about bytes a pin named.
     clear_stage_refusal(build_dir);
-    // And the vendor record (`<build>.vendor`): it vouches for a verified tree, and the
-    // tree is gone.
+    // The vendor record (`<build>.vendor`) vouches for a tree that is gone.
     clear_vendor_sidecar(build_dir);
-    // And the declared-mode record (`<build>.modes`): it describes the modes of a tree
-    // that is gone, and a later stage under this build number writes its own before it
-    // is marked complete — a stale one must never be what `verify` folds.
+    // The declared-mode record (`<build>.modes`): a stale one must never be what `verify`
+    // folds.
     clear_declared_modes(build_dir);
 }
 
@@ -2090,21 +1813,17 @@ pub fn default_prefix(home: &Path) -> PathBuf {
 }
 
 /// Resolve the install layout. `configured` is the optional `[packages].prefix` override
-/// (`None` ⇒ the default). The chosen prefix is **chain-validated** against the home dir
-/// ([`vet_prefix`]); any violation falls back to the default. Returns `None` only when the
-/// home directory can't be resolved (`$HOME` / `/etc/passwd` on Unix, `%USERPROFILE%` on
-/// Windows) — the same fail-closed posture the updater takes. Uses the platform-aware
-/// [`aterm_types::dirs::home_dir`], NOT a raw `$HOME` read: a native-Windows shell does not
-/// set `HOME`, so a raw read left every prefix-dependent verb dead with "HOME is unset".
+/// (`None`: the default). The prefix is chain-validated against the home dir
+/// ([`vet_prefix`]); any violation falls back to the default. `None` only when the home
+/// directory cannot be resolved ([`aterm_types::dirs::home_dir`], not a raw `$HOME`, which
+/// a native-Windows shell does not set).
 #[must_use]
 pub fn resolve(configured: Option<&Path>) -> Option<Layout> {
     let home = aterm_types::dirs::home_dir()?;
     let prefix = vet_prefix(configured, &home);
-    // A REJECTED prefix falls back to the default — correct in production (a typo in
-    // `[packages].prefix` must not brick the store) and catastrophic under test, where
-    // the default prefix is the developer's OWN live store: a test aimed at a prefix
-    // `vet_prefix` refuses would write into the real machine's ledger. Asserted HERE so
-    // no test has to remember. Costs nothing in a release build.
+    // A rejected prefix falls back to the default: right in production (a typo must not
+    // brick the store), catastrophic under test, where the default is the developer's own
+    // live store. Asserted here so no test has to remember.
     #[cfg(test)]
     if let Some(asked) = configured {
         assert_eq!(
@@ -2119,21 +1838,18 @@ pub fn resolve(configured: Option<&Path>) -> Option<Layout> {
     Some(Layout { prefix })
 }
 
-/// Resolve the layout THE USER CONFIGURED — `[packages].prefix` when set, the
-/// default otherwise.
-///
-/// The one edge every caller outside `atpkg`'s own CLI should use: a reader on
-/// `resolve(None)` looks at the default prefix on a machine with a relocated or shared
-/// store, and reports an installed toolset as absent.
+/// Resolve the layout the user configured: `[packages].prefix` when set, the default
+/// otherwise. Every caller outside `atpkg`'s own CLI should use it: `resolve(None)` looks
+/// at the default prefix and misses a relocated or shared store.
 #[must_use]
 pub fn resolve_configured() -> Option<Layout> {
     resolve_from(&crate::config::load())
 }
 
 /// [`resolve_configured`] over a `[packages]` table already read. The terminal session
-/// reads `aterm.toml` ONCE ([`crate::config::cached`]) and resolves from that: re-reading
-/// it per consumer repeated every complaint about the file once per read. The window keeps
-/// [`resolve_configured`]: it lives for days, and re-reads so an edited prefix is seen.
+/// reads `aterm.toml` once ([`crate::config::cached`]) so complaints about the file are not
+/// repeated per consumer; the window, which lives for days, keeps [`resolve_configured`]
+/// so an edited prefix is seen.
 #[must_use]
 pub fn resolve_from(cfg: &crate::config::PackagesConfig) -> Option<Layout> {
     resolve(
@@ -2155,31 +1871,16 @@ pub fn vet_prefix(configured: Option<&Path>, home: &Path) -> PathBuf {
     if !p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir)) {
         return default;
     }
-    // SYSTEM PREFIX — the second trusted shape. A prefix OUTSIDE $HOME is admissible
-    // only when every existing component from `/` down is root-owned and not
-    // group/other-writable. That answers the same question the $HOME chain answers
-    // (no attacker-writable ancestor can swap a component) at least as strongly.
-    // Installing here needs root; that is the point, and it is checked rather than
-    // assumed. It is for a genuinely shared multi-user store, NOT a precondition of
-    // the verified lane — Trust's default `CallerOwned` mode admits a component owned
-    // by the invoking identity, so the $HOME shape proves fine (see the module docs).
+    // System prefix: outside $HOME, admissible only when every existing component from `/`
+    // down is root-owned and not group/other-writable (see the module docs).
     if !under_home(p, home) {
         if !system_chain_trusted(p) {
             return default;
         }
-        // TRUSTED IS NOT THE SAME AS USABLE. The chain check above proves no
-        // attacker-writable ancestor can swap a component; it says nothing about
-        // whether the CALLER can write here. A non-root user with a root-owned
-        // prefix configured would pass this check and then fail on `store.lock`
-        // for every verb, forever (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
-        //
-        // Falling back is the posture this function already takes for every other
-        // violation, and it is the safe direction: the default prefix is
-        // `$HOME`-owned and needs no privilege, so a config that would otherwise
-        // brick the install degrades to a working one. Say so out loud — silence
-        // is what made the original failure survive — as an unasked notice: a typed
-        // verb's stderr, a host's log ([`crate::notice`]) — once per process, since every
-        // layout resolution vets the prefix again.
+        // Trusted is not usable: a non-root user with a root-owned prefix would fail on
+        // `store.lock` for every verb (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
+        // Fall back to the `$HOME`-owned default, which needs no privilege, and say so
+        // once per process as an unasked notice ([`crate::notice`]).
         if !caller_can_use_prefix(p) {
             crate::notice::say_once(&format!(
                 "configured prefix {} is not writable by this user — using the default {} \
@@ -2192,23 +1893,18 @@ pub fn vet_prefix(configured: Option<&Path>, home: &Path) -> PathBuf {
         }
         return p.to_path_buf();
     }
-    // HOME PREFIX — must be strictly under $HOME. Containment is compared with
-    // `under_home` (case-insensitively on Windows, whose filesystem is
-    // case-insensitive — else a validly-configured prefix that differs only in case
-    // from %USERPROFILE% is wrongly rejected and silently ignored).
+    // Home prefix: strictly under $HOME, compared by `under_home` (case-insensitive on
+    // Windows).
     if p == home {
         return default;
     }
-    // Walk every EXISTING directory from `home` down to the leaf (the not-yet-created
-    // tail that atpkg will make `0700` is fine). Each must be a real dir (NOT a symlink OR a
-    // Windows junction), owned by us, and not group/other-writable — else fall back
-    // fail-closed. (On Windows `dir_meta_is_private` is a best-effort `true`; privacy rests
-    // on the per-user ACL.)
+    // Walk every existing directory from `home` down to the leaf; each must be a real dir
+    // (not a symlink or Windows junction), owned by us, and not group/other-writable. (On
+    // Windows `dir_meta_is_private` is a best-effort `true`; privacy rests on the per-user
+    // ACL.)
     for anc in p.ancestors().filter(|a| under_home(a, home)) {
-        // A non-existent ancestor is the not-yet-created tail atpkg makes 0700 — skip it.
-        // `is_reparse` disqualifies a symlink OR a directory junction: a junction (needs no
-        // admin) reports is_symlink()==false, so without the reparse-bit check an attacker-
-        // pre-created junction ancestor would reintroduce the CWE-379 reparse-swap window.
+        // A missing ancestor is the tail atpkg makes `0700`. `is_reparse` also catches a
+        // junction, which needs no admin and reports `is_symlink() == false`.
         if let Ok(m) = std::fs::symlink_metadata(anc)
             && (crate::platform::is_reparse(&m) || !crate::platform::dir_meta_is_private(&m))
         {
@@ -2218,57 +1914,37 @@ pub fn vet_prefix(configured: Option<&Path>, home: &Path) -> PathBuf {
     p.to_path_buf()
 }
 
-/// Whether EVERY existing directory from `/` down to `p` is root-owned and not
-/// group/other-writable — the system-prefix chain check.
-///
-/// Same fail-closed shape as the `$HOME` walk in [`vet_prefix`]: a non-existent tail is
-/// the part atpkg will create (as root, since it must already be root to write here);
-/// any existing component that is a symlink/reparse point, or is not root-owned, or is
-/// group/other-writable, disqualifies the whole prefix. One writable component anywhere
-/// in the chain is enough to reintroduce the CWE-379 swap window this exists to close,
-/// so this is an AND over the full chain, not a leaf check.
 #[must_use]
-/// Can the caller actually install into `p`?
-///
-/// The tail of a configured prefix need not exist yet — atpkg creates it — so the
-/// question is asked of the deepest component that *does* exist, which is the
-/// directory the first `create_dir` would land in. A prefix whose every component is
-/// missing answers `false` only if even `/` is unwritable, which is the correct
-/// answer for a non-root caller.
+/// Whether the caller can use `p`: it can write the deepest existing component (where the
+/// first `create_dir` lands; atpkg creates the tail), or the prefix already serves working
+/// tools through its `bin/` shims.
 fn caller_can_use_prefix(p: &Path) -> bool {
-    // WRITABLE — we can install here. The tail of a configured prefix need not exist
-    // yet (atpkg creates it), so the question is asked of the deepest component that
-    // does, which is where the first `create_dir` lands.
+    // Writable: we can install here.
     if p.ancestors()
         .find(|a| a.exists())
         .is_some_and(crate::platform::dir_writable_by_caller)
     {
         return true;
     }
-    // NOT writable — but a prefix that already SERVES WORKING TOOLS is still usable. A
-    // shared multi-user prefix is installed once by an admin and then read by users who
-    // cannot write it; degrading those users to a private default would cut them off
-    // from the very store they are meant to share.
-    //
-    // The test is whether a shim RESOLVES, not whether a `store/` directory exists.
-    // Those differ exactly where it matters: the machine this fix comes from had a
-    // fully populated `store/` and 22 shims in `bin/` every one of which dangled into
-    // a `/Library/aterm` that had been removed. A directory count called that healthy;
-    // a resolve call calls it what it is.
+    // Not writable, but a prefix that already serves working tools is still usable: a
+    // shared multi-user prefix is installed once by an admin and read by users who cannot
+    // write it. The test is whether a shim resolves, not whether `store/` exists: a
+    // populated `store/` whose shims all dangle is not a working prefix.
     let Ok(entries) = std::fs::read_dir(p.join("bin")) else {
         return false;
     };
-    //
-    // "Not PROVABLY gone", not "stat succeeded". The machine this branch serves is the
-    // one whose store it may traverse and exec but not read, and `t.exists()` answered
-    // `false` for exactly those tools — abandoning the shared prefix, printing "not
-    // writable by this user", and installing the whole toolchain a second time into a
-    // private default. Only a `NotFound` is evidence that a tool is not there.
+    // Not provably gone, rather than stat succeeded: a user who may traverse and exec this
+    // store but not read it gets `false` from `exists()`, which would abandon the shared
+    // prefix for a private reinstall. Only a `NotFound` shows a tool is not there.
     entries.flatten().any(|e| {
         crate::platform::resolve_shim(&e.path()).is_some_and(|t| !presence(&t).is_absent())
     })
 }
 
+/// Whether every existing directory from `/` down to `p` is root-owned, not
+/// group/other-writable, and not a symlink or reparse point: the system-prefix chain
+/// check, an AND over the full chain, since one writable component reopens the CWE-379
+/// swap window. A non-existent tail is what atpkg will create (as root).
 fn system_chain_trusted(p: &Path) -> bool {
     p.ancestors().all(|anc| {
         // A component that does not exist yet is the tail we will create; skip it. An
@@ -2280,7 +1956,7 @@ fn system_chain_trusted(p: &Path) -> bool {
 }
 
 /// Containment check `p` is at/under `home`. Case-sensitive on Unix (`starts_with`);
-/// case-INSENSITIVE per-component on Windows, where the filesystem is case-insensitive so
+/// case-insensitive per-component on Windows, where the filesystem is case-insensitive so
 /// `c:\users\me\pkg` is genuinely under `C:\Users\Me` and must not be rejected.
 #[must_use]
 fn under_home(p: &Path, home: &Path) -> bool {
@@ -2304,10 +1980,9 @@ fn under_home(p: &Path, home: &Path) -> bool {
     }
 }
 
-/// Commands a managed shim must NEVER be allowed to name, even though `bin/` is only
-/// *appended* to `PATH`. A tool honestly or maliciously named one of these is refused a
-/// shim outright (and the refusal is surfaced in `status.toml`), so a key-compromise (or
-/// an honest mistake) can't quietly intercept core/security commands. Lower-cased.
+/// Commands a managed shim may never name, even though `bin/` is only appended to `PATH`:
+/// a tool named one of these is refused a shim (surfaced in `status.toml`), so a key
+/// compromise or an honest mistake cannot intercept core or security commands. Lower-cased.
 const SENSITIVE_SHIMS: &[&str] = &[
     "sudo",
     "ssh",
@@ -2350,31 +2025,25 @@ const SENSITIVE_SHIMS: &[&str] = &[
     "cat",
 ];
 
-/// The prefix of an ALIAS shim: `alab-<tool>` is laid beside every `<tool>` shim of one
-/// of ALab's own programs and forwards to the same store executable
-/// ([`crate::activate::Aliases`]). The alias exists because ALab's bare tool names collide
-/// with other software (verified 2026-08-27: Homebrew's p11-kit installs a certificate
-/// tool at `/opt/homebrew/bin/trust`; Homebrew core owns the formula names `ty` and
-/// `clean`) and the managed `bin/` is deliberately APPENDED to `PATH` — so `trust` may run
-/// someone else's copy, while `alab-trust` always names ALab's. The prefix is RESERVED:
-/// `alab-<x>` is admissible exactly when `<x>` is (the sensitive-name refusal applies to
-/// the base name, so `alab-sudo` is refused like `sudo`), and an alias of an alias
-/// (`alab-alab-x`) never exists — a tool that already carries the prefix is its own alias.
+/// The prefix of an alias shim: `alab-<tool>` is laid beside every `<tool>` shim of one of
+/// ALab's own programs and forwards to the same store executable
+/// ([`crate::activate::Aliases`]). ALab's bare tool names collide with other software
+/// (Homebrew's p11-kit installs `/opt/homebrew/bin/trust`; Homebrew core owns `ty` and
+/// `clean`) and the managed `bin/` is appended to `PATH`, so `alab-trust` always names
+/// ALab's. The prefix is reserved: `alab-<x>` is admissible exactly when `<x>` is
+/// (`alab-sudo` is refused like `sudo`), and a tool already carrying the prefix is its own
+/// alias.
 pub const ALIAS_PREFIX: &str = "alab-";
 
-/// Whether `name` may be installed as a `bin/` shim: a non-empty, path-separator-free
-/// name that is not on the `SENSITIVE_SHIMS` deny-list (case-insensitive). Fail-closed:
-/// an empty name, a name containing `/`, `\` or `\0`, or `.`/`..` is also refused.
-/// BOTH separators are rejected: on Windows `Layout::shim` does `bin_dir().join(name)`, and
-/// a `\` in an (untrusted, manifest-supplied) name makes `Path::join` traverse OUT of `bin/`
-/// (e.g. `..\..\evil` → a `.cmd` written outside the managed tree) and also lets a name like
-/// `..\git` dodge the sensitive-name deny-list. This matches `linkmode::safe_component`,
-/// `ops::uninstall`, and the other name gates, which all reject `\` too.
+/// Whether `name` may be installed as a `bin/` shim: non-empty, not `.`/`..`, free of `/`,
+/// `\` and NUL, and not on the `SENSITIVE_SHIMS` deny-list (case-insensitive). Both
+/// separators are refused: on Windows a `\` in a manifest-supplied name makes `Path::join`
+/// traverse out of `bin/` (`..\..\evil`) and lets `..\git` dodge the deny-list;
+/// `linkmode::safe_component`, `ops::uninstall` and the other name gates refuse `\` too.
 ///
-/// An [`ALIAS_PREFIX`]ed name is admitted only when its BASE is: `alab-sudo` is refused
-/// exactly like `sudo` (the deny-list is checked on both spellings, case-insensitively),
-/// a bare `alab-` has no base and is refused, and a nested `alab-alab-x` is refused — the
-/// prefix is reserved for one level of aliasing.
+/// An [`ALIAS_PREFIX`]ed name is admitted only when its base is: `alab-sudo` is refused
+/// like `sudo`, a bare `alab-` has no base, and `alab-alab-x` is refused (one level of
+/// aliasing).
 #[must_use]
 pub fn shim_allowed(name: &str) -> bool {
     if name.is_empty()
@@ -2397,53 +2066,36 @@ pub fn shim_allowed(name: &str) -> bool {
     }
 }
 
-/// A **logical** tool name — one entry of a manifest's `exposes` list. Never a file name.
+/// A logical tool name: one entry of a manifest's `exposes` list, never a file name.
 ///
-/// Three things share a name: the logical name, the `bin/` shim file
-/// (`<name><SHIM_SUFFIX>`), and the executable inside a build's `bin/`
-/// (`<name><EXE_SUFFIX>`). On Unix both suffixes are `""`, so all three coincide and every
-/// confusion between them is invisible; on Windows they are `.cmd` and `.exe` and the three
-/// are three distinct files.
-///
-/// So this type deliberately has **no `Deref<Target = str>` and no `Display`**:
-/// `Path::join(tool)` and `format!("{tool}")` do not compile, and the author must say which
-/// rendering they mean — [`shim_file`](Self::shim_file) or [`exe_file`](Self::exe_file).
-/// Choosing between those two is exactly the decision that was silently wrong at all three
-/// sites; making it unavoidable is the whole point of the type.
+/// The logical name, the `bin/` shim file (`<name><SHIM_SUFFIX>`) and the executable
+/// inside a build's `bin/` (`<name><EXE_SUFFIX>`) coincide on Unix (both suffixes `""`)
+/// but are three files on Windows (`.cmd`, `.exe`). So the type has no
+/// `Deref<Target = str>` and no `Display`: `Path::join(tool)` and `format!("{tool}")` do
+/// not compile, and the author must pick [`shim_file`](Self::shim_file) or
+/// [`exe_file`](Self::exe_file).
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ToolName(String);
 
-/// `<name><suffix>` — the single rule behind both of [`ToolName`]'s renderings.
-///
-/// Split out from the two methods, and taking the suffix as a PARAMETER, purely so the rule
-/// is testable: `SHIM_SUFFIX` and `EXE_SUFFIX` are both `""` on Unix, so every assertion
-/// written against the methods degenerates to the identity on the hosts this repo is
-/// developed on and would hold for a wrong implementation too. The tests drive this with
-/// literal `.cmd`/`.exe`.
+/// `<name><suffix>`, the single rule behind both of [`ToolName`]'s renderings. The suffix
+/// is a parameter so tests can drive it with `.cmd`/`.exe`: on Unix both suffixes are `""`
+/// and a test against the methods would pass a wrong implementation.
 fn with_suffix(name: &str, suffix: &str) -> String {
     format!("{name}{suffix}")
 }
 
-/// The inverse of [`with_suffix`], and total: a name that does NOT carry the suffix is
-/// returned unchanged rather than rejected.
-///
-/// Totality is the load-bearing part. `strip_suffix("")` is `Some`, so on Unix this is the
-/// identity for every input; on Windows a `bin/` entry may legitimately be either `ay.cmd`
-/// (a shim this manager wrote) or `ay` (a hand-made file), and both must read back as the
-/// logical `ay` so that re-shimming REPLACES rather than writing `ay.cmd.cmd` beside it.
+/// The inverse of [`with_suffix`], and total: a name without the suffix is returned
+/// unchanged. On Windows a `bin/` entry may be `ay.cmd` (a shim this manager wrote) or `ay`
+/// (a hand-made file), and both must read back as `ay` so re-shimming replaces rather than
+/// writing `ay.cmd.cmd` beside it.
 fn without_suffix<'a>(name: &'a str, suffix: &str) -> &'a str {
     name.strip_suffix(suffix).unwrap_or(name)
 }
 
 impl ToolName {
-    /// Admit `raw` as a tool name, or `None` when it fails [`shim_allowed`] — a sensitive
-    /// command (`sudo`/`ssh`/`git`/…) or a malformed name (empty, `.`/`..`, a path separator
-    /// or NUL).
-    ///
-    /// Running the deny-list HERE rather than at each call site is the second half of the
-    /// type's job: `install_shims`, the tombstone writer, the transaction rollback, the seed
-    /// "still installing" shims and the dev-link lane would otherwise each repeat the check,
-    /// and any one of them forgetting it would put a shadowing shim on the user's `PATH`.
+    /// Admit `raw` as a tool name, or `None` when it fails [`shim_allowed`] (a sensitive
+    /// command or a malformed name). Checking here rather than at each call site means no
+    /// shim writer can forget the deny-list.
     #[must_use]
     pub fn new(raw: &str) -> Option<Self> {
         shim_allowed(raw).then(|| Self(raw.to_string()))
@@ -2457,31 +2109,25 @@ impl ToolName {
     }
 
     /// The **executable** file name inside a build's `bin/`: `<tool><EXE_SUFFIX>` — `ay` on
-    /// Unix, `ay.exe` on Windows. This is what a shim FORWARDS to; it is never the shim's own
+    /// Unix, `ay.exe` on Windows. This is what a shim forwards to; it is never the shim's own
     /// name, and on Windows conflating the two yields `bin/ay.cmd` pointing at `bin\ay.cmd`.
     #[must_use]
     pub fn exe_file(&self) -> String {
         with_suffix(&self.0, crate::platform::EXE_SUFFIX)
     }
 
-    /// Recover the logical name from a `bin/` directory entry, stripping the platform
-    /// [`crate::platform::SHIM_SUFFIX`] (so `ay.cmd` reads back as `ay` on Windows; on Unix
-    /// the suffix is `""` and `strip_suffix("")` is the identity, so the name is unchanged).
-    ///
-    /// Callers feed the result back through [`Layout::shim`] / `install_shims` /
-    /// `install_tombstone_shim`, which append the suffix again — returning the raw file name
-    /// would double it (`bin/ay.cmd.cmd`), writing tombstones and rollback shims BESIDE the
-    /// live shim instead of replacing it.
-    ///
-    /// `None` for a `bin/` entry that this manager could never have written (a name
-    /// [`shim_allowed`] refuses), which is the fail-closed direction for the one caller that
-    /// DELETES what it recognizes.
+    /// Recover the logical name from a `bin/` entry, stripping the platform
+    /// [`crate::platform::SHIM_SUFFIX`] (`ay.cmd` reads back as `ay` on Windows). Callers
+    /// feed it back through [`Layout::shim`] / `install_shims` / `install_tombstone_shim`,
+    /// which append the suffix again. `None` for an entry this manager could never have
+    /// written ([`shim_allowed`] refuses it), the fail-closed direction for the caller that
+    /// deletes what it recognizes.
     #[must_use]
     pub fn from_shim_file(name: &str) -> Option<Self> {
         Self::new(without_suffix(name, crate::platform::SHIM_SUFFIX))
     }
 
-    /// The logical name, for reporting (`status.toml`, refusal lists, log lines). NOT for
+    /// The logical name, for reporting (`status.toml`, refusal lists, log lines). not for
     /// building a path — use [`shim_file`](Self::shim_file) / [`exe_file`](Self::exe_file).
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -2515,10 +2161,9 @@ impl ToolName {
     }
 }
 
-/// Split a manifest's raw `exposes` list into the names that may be shimmed and the ones
-/// refused. This is the ONE place a `Vec<String>` off the wire becomes [`ToolName`]s, so the
-/// refusal list stays honest (it reports the raw name the manifest actually asked for) while
-/// everything downstream of it holds the validated type. Order is preserved in both halves.
+/// Split a manifest's raw `exposes` list into the names that may be shimmed and the raw
+/// names refused: the one place a `Vec<String>` off the wire becomes [`ToolName`]s. Order
+/// is preserved in both halves.
 #[must_use]
 pub fn split_exposed(exposes: &[String]) -> (Vec<ToolName>, Vec<String>) {
     let mut tools = Vec::new();
@@ -2533,16 +2178,14 @@ pub fn split_exposed(exposes: &[String]) -> (Vec<ToolName>, Vec<String>) {
 }
 
 /// Compose the child `PATH` for running a managed tool: the inherited `PATH` with the
-/// managed `bin_dir` **appended** — never prepended, so a pinned tool's siblings are
-/// reachable by bare name while system commands (`sudo`/`ssh`/…) on the inherited `PATH`
-/// are never shadowed (§10). A same-named tool earlier on the inherited `PATH` wins, and
-/// `atpkg doctor` warns about that shadow. Idempotent: if `bin_dir` is already present
-/// the inherited value is returned unchanged. With no inherited `PATH`, returns just
-/// `bin_dir`. This is the single source of truth for the `atpkg run` / `aterm <tool>`
-/// child environment; keeping it pure makes the append-not-prepend policy unit-testable.
+/// managed `bin_dir` appended, never prepended, so a pinned tool's siblings resolve by bare
+/// name while system commands on the inherited `PATH` are never shadowed (§10); `atpkg
+/// doctor` warns when a same-named tool earlier on `PATH` wins. Idempotent; with no
+/// inherited `PATH`, just `bin_dir`. The one source of the `atpkg run` / `aterm <tool>`
+/// child `PATH`.
 #[must_use]
 pub fn append_bin_to_path(inherited: Option<&OsStr>, bin_dir: &Path) -> OsString {
-    // An absent OR empty inherited `PATH` means "no directories" — start empty so we never
+    // An absent or empty inherited `PATH` means "no directories" — start empty so we never
     // emit a leading empty component (which Unix reads as the current directory).
     let mut dirs: Vec<PathBuf> = match inherited {
         Some(p) if !p.is_empty() => std::env::split_paths(p).collect(),
@@ -2567,11 +2210,9 @@ mod tests {
         crate::testdir::dir(&format!("atpkg-store-{label}-"))
     }
 
-    /// `Layout::ensure_agents_dir` — the rule the front door and the window share:
-    /// a fresh prefix gets `agents/` created (private, `0700`, the `$HOME` shape) and
-    /// the absolute directory back; a second call is a no-op with the same answer; a
-    /// symlink at `agents/` — even one that resolves to a real directory — is REFUSED
-    /// and left alone; a regular file there is refused and left alone.
+    /// A fresh prefix gets a private `agents/` and its absolute path, a second call is a
+    /// no-op, and a symlink (even to a real directory) or a regular file there is refused
+    /// and left alone.
     #[test]
     fn ensure_agents_dir_creates_a_real_directory_once_and_refuses_a_link_or_a_file() {
         let h = temp_home("ensure-agents");
@@ -2640,11 +2281,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&h);
     }
 
-    /// The declared-mode record: written beside the build (a sibling, outside the
-    /// tree) on the platform whose inode stores no permission bits, read back as the
-    /// map the walk folds, and taken by `discard_build`. Where the inode stores the bits
-    /// (Unix) nothing is written and the read answers empty without touching the disk —
-    /// asserted on both sides so neither platform's contract drifts.
+    /// The declared-mode record is written beside the build where the inode stores no
+    /// permission bits, read back as the folded map, and taken by `discard_build`; on Unix
+    /// nothing is written and the read answers empty.
     #[test]
     fn the_declared_mode_record_round_trips_and_goes_with_the_build() {
         let h = temp_home("declared-modes");
@@ -2686,9 +2325,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&h);
     }
 
-    /// The record's parser fails CLOSED on every malformed shape — a wrong header, a
-    /// line with no `\0`, an empty path, a non-octal or oversized digit run — and reads
-    /// the octal spelling the tree line uses (`0` for a zero mode).
+    /// The parser fails closed on every malformed shape and reads the tree line's octal
+    /// spelling (`0` for a zero mode).
     #[test]
     fn the_declared_mode_record_parser_fails_closed() {
         let ok =
@@ -2715,16 +2353,87 @@ mod tests {
         assert_eq!(crate::tree::oct_mode(0o755), "755");
     }
 
-    /// The refusal's PURE half: what it binds, and for how long. A memo binds only the
-    /// digests it was recorded for, only from the SECOND identical verdict, and only
-    /// until its cooldown lapses — the three escapes that keep a bandwidth cooldown from
-    /// ever becoming a verdict (a truncated transfer heals on the next attempt, a
-    /// publisher may repair the asset under the same pin, and a re-cut pin moves the
-    /// digests).
+    /// A sha256 payload digest, as a refusal names it.
+    fn sha256(hex: &str) -> (DigestAlg, &str) {
+        (DigestAlg::Sha256, hex)
+    }
+
+    /// A memo names its payload digest on its algorithm's line: a sha256 memo's bytes are
+    /// unchanged, a sha512 one binds nothing under the other algorithm, and a memo naming
+    /// both digests or neither is no memo.
+    #[test]
+    fn a_refusal_memo_names_its_digest_by_algorithm() {
+        let h = temp_home("refusal-alg");
+        let l = Layout { prefix: h.clone() };
+        let build = l.build_dir("agy", 1_000_001_000_003_000_006);
+        let marker = build.with_file_name("1000001000003000006.refused");
+        let client = aterm_types::version::app_version();
+        // The shape an earlier client wrote.
+        let earlier = format!(
+            "stage-refusal v1\nsha256=aa\ntree_root=bb\nattempts=2\nat=1000\nclient={client}\n\
+             why=asset sha256 mismatch: expected aa, got cc\n"
+        );
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, &earlier).unwrap();
+        let m = stage_refusal(&build).unwrap();
+        assert_eq!(
+            (m.alg, m.digest.as_str(), m.attempts),
+            (DigestAlg::Sha256, "aa", 2)
+        );
+        assert!(m.binds(sha256("aa"), "bb", 1_001));
+        record_stage_refusal(
+            &build,
+            sha256("aa"),
+            "bb",
+            "asset sha256 mismatch: expected aa, got cc",
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            earlier.replace("attempts=2", "attempts=3"),
+            "a sha256 memo is written as it always was"
+        );
+
+        let sha512 = "5".repeat(128);
+        record_signer_refusal(
+            &build,
+            (DigestAlg::Sha512, &sha512),
+            "bb",
+            "signer refused: x",
+            2_000,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&marker).unwrap();
+        assert!(text.contains(&format!("\nsha512={sha512}\n")), "{text}");
+        assert!(!text.contains("sha256="), "{text}");
+        let m = stage_refusal(&build).unwrap();
+        assert_eq!(
+            (m.alg, m.digest.as_str(), m.attempts),
+            (DigestAlg::Sha512, sha512.as_str(), 1)
+        );
+        assert!(m.binds((DigestAlg::Sha512, &sha512), "bb", i64::MAX));
+        assert!(
+            !m.binds(sha256(&sha512), "bb", i64::MAX),
+            "the same hex under another algorithm is another question"
+        );
+        for bad in [
+            text.replace("sha512=", "sha256=x\nsha512="),
+            text.replace(&format!("sha512={sha512}\n"), ""),
+        ] {
+            std::fs::write(&marker, &bad).unwrap();
+            assert_eq!(stage_refusal(&build), None, "{bad}");
+        }
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    /// A memo binds only the digests it was recorded for, only from the second identical
+    /// verdict, and only until its cooldown lapses.
     #[test]
     fn a_stage_refusal_binds_only_while_its_digests_and_cooldown_hold() {
         let memo = |attempts| StageRefusal {
-            sha256: "AA".into(),
+            alg: DigestAlg::Sha256,
+            digest: "AA".into(),
             tree_root: "bb".into(),
             why: "asset sha256 mismatch: expected aa, got cc".into(),
             at: 1_000,
@@ -2733,9 +2442,8 @@ mod tests {
             held: false,
             client: aterm_types::version::app_version().into(),
         };
-        // THE FIRST RETRY IS FREE: one mismatch can be a truncated transfer, and the next
-        // pass must still be able to find the publisher's repair. From the second
-        // identical verdict: 12 h, doubling, capped at a week.
+        // The first retry is free; from the second identical verdict: 12 h, doubling,
+        // capped at a week.
         assert_eq!(memo(1).cooldown_secs(), 0, "one failure holds nothing");
         assert_eq!(memo(2).cooldown_secs(), 12 * 3600);
         assert_eq!(memo(3).cooldown_secs(), 24 * 3600);
@@ -2747,51 +2455,50 @@ mod tests {
         );
         assert_eq!(memo(1_000).cooldown_secs(), 7 * 24 * 3600, "no overflow");
         assert!(
-            !memo(1).binds("aa", "bb", 1_000),
+            !memo(1).binds(sha256("aa"), "bb", 1_000),
             "a single failure never holds the next attempt off the wire"
         );
 
         let m = memo(2);
         assert_eq!(m.retry_after(), 1_000 + 12 * 3600);
         assert!(
-            m.binds("aa", "BB", 1_000),
+            m.binds(sha256("aa"), "BB", 1_000),
             "case-insensitive on both digests"
         );
         assert!(
-            !m.binds("aa", "BB", m.retry_after()),
+            !m.binds(sha256("aa"), "BB", m.retry_after()),
             "the cooldown lapses — the next attempt is due"
         );
         assert!(
-            !m.binds("dd", "bb", 1_000),
+            !m.binds(sha256("dd"), "bb", 1_000),
             "a re-cut pin's new sha256 binds nothing"
         );
         assert!(
-            !m.binds("aa", "dd", 1_000),
+            !m.binds(sha256("aa"), "dd", 1_000),
             "a re-cut pin's new tree_root binds nothing"
         );
         assert!(
-            !m.binds("aa", "bb", i64::MAX),
+            !m.binds(sha256("aa"), "bb", i64::MAX),
             "an unreadable clock (now_unix's fail-closed i64::MAX) reads as lapsed, \
              so it can only cost a download — never block an install"
         );
         assert!(
             !StageRefusal {
-                sha256: String::new(),
+                digest: String::new(),
                 ..memo(2)
             }
-            .binds("", "bb", 1_000),
+            .binds(sha256(""), "bb", 1_000),
             "a memo with no digest binds nothing"
         );
-        // ANOTHER CLIENT'S VERDICT BINDS NOTHING: the fix a held row can get on the
-        // client side ships as a new atpkg, which must be allowed its one attempt — and
-        // a memo written before the field existed (empty client) is that case too.
+        // Another client's verdict binds nothing (a client-side fix ships as a new
+        // atpkg), and neither does an older memo's empty client.
         let another = format!("{}+another", aterm_types::version::app_version());
         assert!(
             !StageRefusal {
                 client: another.clone(),
                 ..memo(2)
             }
-            .binds("aa", "bb", 1_000),
+            .binds(sha256("aa"), "bb", 1_000),
             "a memo another atpkg wrote binds nothing"
         );
         assert!(
@@ -2799,36 +2506,45 @@ mod tests {
                 client: String::new(),
                 ..memo(2)
             }
-            .binds("aa", "bb", 1_000),
+            .binds(sha256("aa"), "bb", 1_000),
             "a pre-field memo binds nothing"
         );
-        // A HELD memo (a tree_root mismatch: same bytes, same row, same verdict every
-        // time) has no cooldown to lapse — it binds from the FIRST verdict, at any
-        // clock, until the digests or the client move.
+        // A held memo (a tree_root mismatch) has no cooldown: it binds from the first
+        // verdict, at any clock, until the digests or the client move.
         let held = StageRefusal {
             held: true,
             ..memo(1)
         };
-        assert!(held.binds("aa", "bb", 1_000), "held from the first verdict");
-        assert!(held.binds("aa", "bb", i64::MAX), "no cooldown to lapse");
-        assert!(!held.binds("dd", "bb", 1_000), "a re-cut pin releases it");
+        assert!(
+            held.binds(sha256("aa"), "bb", 1_000),
+            "held from the first verdict"
+        );
+        assert!(
+            held.binds(sha256("aa"), "bb", i64::MAX),
+            "no cooldown to lapse"
+        );
+        assert!(
+            !held.binds(sha256("dd"), "bb", 1_000),
+            "a re-cut pin releases it"
+        );
         assert!(
             !StageRefusal {
                 client: another,
                 ..held.clone()
             }
-            .binds("aa", "bb", 1_000),
+            .binds(sha256("aa"), "bb", 1_000),
             "a new client gets its attempt"
         );
     }
 
-    /// A SIGNER refusal judged bytes that matched their digests, so a re-download can only
-    /// fetch the same verdict: its memo binds from the first attempt and never lapses —
-    /// but only while the digests hold, and never with no digest at all.
+    /// A signer refusal judged bytes that matched their digests, so its memo binds from
+    /// the first attempt and never lapses, but only while the digests hold, and never
+    /// with no digest.
     #[test]
     fn a_signer_refusal_binds_until_the_digests_move() {
         let m = StageRefusal {
-            sha256: "AA".into(),
+            alg: DigestAlg::Sha256,
+            digest: "AA".into(),
             tree_root: "bb".into(),
             why: "signer refused: bin/claude is not signed by Developer ID team X".into(),
             at: 1_000,
@@ -2838,24 +2554,27 @@ mod tests {
             client: aterm_types::version::app_version().into(),
         };
         assert!(
-            m.binds("aa", "BB", 1_000),
+            m.binds(sha256("aa"), "BB", 1_000),
             "the first refusal already binds"
         );
-        assert!(m.binds("aa", "bb", i64::MAX), "no cooldown to lapse");
         assert!(
-            !m.binds("dd", "bb", 1_000),
+            m.binds(sha256("aa"), "bb", i64::MAX),
+            "no cooldown to lapse"
+        );
+        assert!(
+            !m.binds(sha256("dd"), "bb", 1_000),
             "a new sha256 is a new question"
         );
         assert!(
-            !m.binds("aa", "dd", 1_000),
+            !m.binds(sha256("aa"), "dd", 1_000),
             "a new tree_root is a new question"
         );
         assert!(
             !StageRefusal {
-                sha256: String::new(),
+                digest: String::new(),
                 ..m
             }
-            .binds("", "bb", 1_000)
+            .binds(sha256(""), "bb", 1_000)
         );
     }
 
@@ -2866,25 +2585,24 @@ mod tests {
         let h = temp_home("signer-refusal");
         let l = Layout { prefix: h.clone() };
         let build = l.build_dir("claude", 1_000_002_000_001_000_280);
-        record_signer_refusal(&build, "aa", "bb", "signer refused: x", 1_000).unwrap();
+        record_signer_refusal(&build, sha256("aa"), "bb", "signer refused: x", 1_000).unwrap();
         let m = stage_refusal(&build).unwrap();
         assert!(m.signer);
         assert!(!m.held, "a signer memo is its own kind, not a hold");
         assert_eq!(m.client, aterm_types::version::app_version());
         assert_eq!((m.attempts, m.why.as_str()), (1, "signer refused: x"));
-        assert!(m.binds("aa", "bb", i64::MAX));
-        record_stage_refusal(&build, "aa", "bb", "asset sha256 mismatch", 2_000).unwrap();
+        assert!(m.binds(sha256("aa"), "bb", i64::MAX));
+        record_stage_refusal(&build, sha256("aa"), "bb", "asset sha256 mismatch", 2_000).unwrap();
         assert!(!stage_refusal(&build).unwrap().signer);
-        record_signer_refusal(&build, "aa", "bb", "signer refused: x", 3_000).unwrap();
+        record_signer_refusal(&build, sha256("aa"), "bb", "signer refused: x", 3_000).unwrap();
         clear_stage_refusals(&l, "claude");
         assert_eq!(stage_refusal(&build), None);
         let _ = std::fs::remove_dir_all(&h);
     }
 
-    /// The refusal memo on disk: written beside the build like `.ready`/`.shim-env`, read
-    /// back whole, its attempt count ADVANCED while the digests hold and reset when they
-    /// move, one memo per program at most, and taken away by the success/discard/explicit
-    /// -door clears. A malformed or foreign file reads as no memo at all.
+    /// The refusal memo on disk: written beside the build, read back whole, its attempt
+    /// count advanced while the digests hold and reset when they move, one per program,
+    /// and taken by the clears. A malformed or foreign file reads as no memo.
     #[test]
     fn the_refusal_memo_round_trips_advances_and_is_one_per_program() {
         let h = temp_home("stage-refusal");
@@ -2894,7 +2612,7 @@ mod tests {
 
         record_stage_refusal(
             &build,
-            "AA",
+            sha256("AA"),
             "bb",
             "asset sha256 mismatch:\nexpected aa",
             1_000,
@@ -2904,7 +2622,7 @@ mod tests {
         assert!(marker.is_file(), "a sibling, outside the tree");
         assert!(!build.exists(), "the build it refused never came to exist");
         let m = stage_refusal(&build).unwrap();
-        assert_eq!((m.sha256.as_str(), m.tree_root.as_str()), ("AA", "bb"));
+        assert_eq!((m.digest.as_str(), m.tree_root.as_str()), ("AA", "bb"));
         assert_eq!(m.at, 1_000);
         assert_eq!(m.attempts, 1);
         assert!(!m.held, "a sha256 mismatch cools down; it is not held");
@@ -2923,21 +2641,23 @@ mod tests {
             "one line: the newline is folded"
         );
 
-        // The same digests again: the attempt count advances, which is what lengthens the
-        // cooldown (12 h, then 24, …) instead of retrying every six-hourly tick.
-        record_stage_refusal(&build, "aa", "BB", "again", 50_000).unwrap();
+        // The same digests again: the attempt count advances, lengthening the cooldown.
+        record_stage_refusal(&build, sha256("aa"), "BB", "again", 50_000).unwrap();
         let m = stage_refusal(&build).unwrap();
         assert_eq!((m.attempts, m.at), (2, 50_000));
-        // Digests that MOVED are a different question: the count starts again.
-        record_stage_refusal(&build, "cc", "bb", "new pin, new verdict", 60_000).unwrap();
+        // Digests that moved are a different question: the count starts again.
+        record_stage_refusal(&build, sha256("cc"), "bb", "new pin, new verdict", 60_000).unwrap();
         assert_eq!(stage_refusal(&build).unwrap().attempts, 1);
-        // A HELD verdict (tree_root mismatch) round-trips its hold line and binds at
+        // A held verdict (tree_root mismatch) round-trips its hold line and binds at
         // once, whatever the clock.
-        record_held_refusal(&build, "cc", "bb", "tree_root mismatch", 70_000).unwrap();
+        record_held_refusal(&build, sha256("cc"), "bb", "tree_root mismatch", 70_000).unwrap();
         let m = stage_refusal(&build).unwrap();
         assert!(m.held, "the hold line reads back");
         assert_eq!(m.attempts, 2, "the same digests: the count still advances");
-        assert!(m.binds("cc", "bb", i64::MAX), "held: no cooldown to lapse");
+        assert!(
+            m.binds(sha256("cc"), "bb", i64::MAX),
+            "held: no cooldown to lapse"
+        );
         assert!(
             std::fs::read_to_string(&marker)
                 .unwrap()
@@ -2947,14 +2667,14 @@ mod tests {
 
         // One memo per program: recording the next build's reclaims the last build's.
         let next = l.build_dir("trust", 4901);
-        record_stage_refusal(&next, "dd", "ee", "and again", 70_000).unwrap();
+        record_stage_refusal(&next, sha256("dd"), "ee", "and again", 70_000).unwrap();
         assert!(
             !marker.exists(),
             "the superseded build's memo is reclaimed, not left to accumulate"
         );
         assert!(stage_refusal(&next).is_some());
 
-        // Malformed/foreign content reads as NO memo — the fail-open direction.
+        // Malformed/foreign content reads as no memo — the fail-open direction.
         std::fs::write(next.with_file_name("4901.refused"), b"nonsense\nat=1\n").unwrap();
         assert_eq!(
             stage_refusal(&next),
@@ -2963,14 +2683,14 @@ mod tests {
         );
 
         // The three clears.
-        record_stage_refusal(&next, "dd", "ee", "once more", 80_000).unwrap();
+        record_stage_refusal(&next, sha256("dd"), "ee", "once more", 80_000).unwrap();
         clear_stage_refusal(&next);
         assert_eq!(stage_refusal(&next), None);
         clear_stage_refusal(&next); // idempotent
-        record_stage_refusal(&next, "dd", "ee", "once more", 90_000).unwrap();
+        record_stage_refusal(&next, sha256("dd"), "ee", "once more", 90_000).unwrap();
         clear_stage_refusals(&l, "trust");
         assert_eq!(stage_refusal(&next), None, "the explicit door forgets it");
-        record_stage_refusal(&next, "dd", "ee", "once more", 95_000).unwrap();
+        record_stage_refusal(&next, sha256("dd"), "ee", "once more", 95_000).unwrap();
         std::fs::create_dir_all(next.join("bin")).unwrap();
         discard_build(&next);
         assert_eq!(stage_refusal(&next), None, "the discard takes it too");
@@ -3021,11 +2741,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// The SYSTEM prefix shape: outside `$HOME` is admissible when every existing
-    /// ancestor is root-owned and not group/other-writable. This is what makes the
-    /// verified Trust lane reachable at all — its launcher refuses a user-owned path
-    /// component, so an atpkg that can only install under `$HOME` can never provide a
-    /// toolchain with pathname execution authority.
+    /// The system prefix shape: outside `$HOME` is admissible when every existing ancestor
+    /// is root-owned and not group/other-writable.
     #[cfg(unix)]
     #[test]
     fn root_owned_prefix_outside_home_is_accepted() {
@@ -3043,18 +2760,13 @@ mod tests {
         }
         // A non-existent leaf is the tail the installer creates (as root).
         let prefix = Path::new("/usr/lib/aterm-pkg-system-prefix-test");
-        // The TRUST property this test is named for holds for every caller.
+        // The trust property this test is named for holds for every caller.
         assert!(
             system_chain_trusted(prefix),
             "a fully root-owned chain outside $HOME is a trusted system prefix"
         );
-        // What `vet_prefix` RETURNS now also depends on whether this caller could
-        // ever use it — trusted is not the same as usable. As root (the installer
-        // this test's comment describes) the tail is creatable and the prefix is
-        // returned; as an ordinary user it is not, and returning it would hand back
-        // a prefix that fails on `store.lock` for every verb, forever. That was a
-        // real three-week outage, so the fallback is deliberate
-        // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
+        // What `vet_prefix` returns also depends on whether this caller can use it: as root
+        // the prefix comes back; as an ordinary user it falls back to the default.
         let expected = if caller_can_use_prefix(prefix) {
             prefix.to_path_buf()
         } else {
@@ -3064,10 +2776,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// The system shape is an AND over the WHOLE chain, not a leaf check: one
-    /// world-writable ancestor reintroduces the CWE-379 swap window, so the prefix must
-    /// fail closed to the default even though the leaf itself would be created by root.
-    /// `/private/tmp` is mode 0777 and root-owned — exactly that trap.
+    /// The system shape is an AND over the whole chain: one world-writable ancestor
+    /// (`/private/tmp`, root-owned and `0777`) fails the prefix closed to the default even
+    /// though root would create the leaf.
     #[cfg(unix)]
     #[test]
     fn world_writable_system_ancestor_is_refused() {
@@ -3095,7 +2806,7 @@ mod tests {
     fn group_writable_intermediate_parent_is_rejected() {
         let home = temp_home("gwparent");
         // A safe (0700) intermediate, then a group/other-writable one beneath it, then
-        // the would-be prefix leaf — the design's exact "intermediate parent rejected" case.
+        // the would-be prefix leaf.
         let mid = home.join("Library");
         std::fs::create_dir_all(&mid).unwrap();
         std::fs::set_permissions(&mid, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -3124,17 +2835,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// A SYSTEM prefix that is trusted but that this user cannot write must fall back
-    /// to the default, not be handed back to be failed on later.
-    ///
-    /// This is the defect that left a machine with no toolchain for three weeks: the
-    /// chain check proved `/usr/local/aterm/pkg` was root-owned and therefore
-    /// *trusted*, `vet_prefix` returned it, and every verb then died on `store.lock`
-    /// with `Operation not permitted` — while the GUI logged the failure and showed
-    /// nothing (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
-    ///
-    /// Runs only as a non-root user: as root every path is writable and there is
-    /// nothing to assert.
+    /// A trusted system prefix this user cannot write falls back to the default rather
+    /// than failing every verb on `store.lock`
+    /// (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md). Runs only as a non-root user.
     #[cfg(unix)]
     #[test]
     fn trusted_system_prefix_that_we_cannot_write_falls_back_to_default() {
@@ -3142,9 +2845,8 @@ mod tests {
             return; // root can write anywhere; the case does not exist.
         }
         let home = temp_home("unwritable-system");
-        // `/usr` is the real thing this guards: outside $HOME, root-owned, not
-        // group/other-writable — so `system_chain_trusted` accepts it — and not
-        // writable by an ordinary user.
+        // `/usr` is outside $HOME, root-owned and not group/other-writable (trusted), and
+        // not writable by an ordinary user.
         let prefix = PathBuf::from("/usr/local/aterm-nux-probe/pkg");
         if !system_chain_trusted(&prefix) {
             return; // a machine with a non-standard /usr chain proves nothing here.
@@ -3161,20 +2863,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// THE SHARED-PREFIX USER THIS CHECK EXISTS FOR, CUT OFF BY THE CHECK ITSELF.
-    ///
-    /// A prefix the caller cannot write is still usable when its shims SERVE — that is
-    /// the whole second half of `caller_can_use_prefix`, and it is the admin-installed
-    /// multi-user store the comment above it describes. But the serving test was
-    /// `t.exists()`, which is `fs::metadata(..).is_ok()`: on the very machine shape it
-    /// protects — a store an admin laid down and a user may execute but not stat — it
-    /// answers `false` for tools that run perfectly. `vet_prefix` then prints "not
-    /// writable by this user", silently redirects the whole store to a private default,
-    /// and installs the entire toolchain a second time. Losing the shared store is the
-    /// exact outcome this branch was written to prevent.
-    ///
-    /// Only the permission to LOOK is withdrawn here; the shim and its target are
-    /// untouched and would still exec.
+    /// A prefix the caller cannot write is still usable when its shims serve, even where
+    /// the user may exec but not stat the store (`exists()` would answer `false` there).
+    /// Only the permission to look is withdrawn; the shim and its target would still exec.
     #[cfg(unix)]
     #[test]
     fn an_unwritable_prefix_whose_shims_cannot_be_stat_ed_is_still_usable() {
@@ -3244,9 +2935,8 @@ mod tests {
         }
     }
 
-    /// The `alab-` alias prefix: admitted exactly when the BASE is — the sensitive-name
-    /// refusal applies to the base (`alab-sudo` is `sudo` wearing a hat), the bare prefix
-    /// has no base, and the prefix nests once, never twice.
+    /// `alab-<x>` is admitted exactly when `<x>` is: the deny-list applies to the base,
+    /// the bare prefix has no base, and the prefix nests once, never twice.
     #[test]
     fn alias_names_admit_on_their_base_and_refuse_sensitive_bases() {
         for ok in ["alab-ay", "alab-trust", "alab-trust-cg"] {
@@ -3272,8 +2962,7 @@ mod tests {
         assert_eq!(alias.alias_base(), Some(trust.clone()));
         assert_eq!(trust.alias_base(), None, "a plain name has no base");
         assert_eq!(alias.alias(), None, "an alias never gets an alias");
-        // Hyphenated tools alias like any other — and the shim/exe renderings carry the
-        // whole alias, never the base.
+        // Hyphenated tools alias like any other; the renderings carry the whole alias.
         let cg = ToolName::new("trust-cg").unwrap();
         let cg_alias = cg.alias().unwrap();
         assert_eq!(cg_alias.as_str(), "alab-trust-cg");
@@ -3288,16 +2977,15 @@ mod tests {
 
     #[test]
     fn tool_name_admits_through_the_deny_list_and_renders_both_file_names() {
-        // Construction IS the deny-list check — a refused name has no ToolName at all, so it
-        // cannot be handed to `Layout::shim`, `install_shim`, or anything else that writes.
+        // Construction is the deny-list check: a refused name has no `ToolName`, so it
+        // cannot reach `Layout::shim` or any other writer.
         assert!(ToolName::new("sudo").is_none());
         assert!(ToolName::new("../git").is_none());
         assert!(ToolName::new("").is_none());
         let ay = ToolName::new("ay").unwrap();
         assert_eq!(ay.as_str(), "ay");
-        // The two renderings are the shim's own name and the binary it forwards to. They are
-        // the same string on Unix and different files on Windows; the point of the type is
-        // that a caller must pick one, not that they differ on the host that runs this test.
+        // The shim's own name and the binary it forwards to: one string on Unix, two files
+        // on Windows.
         assert_eq!(
             ay.shim_file(),
             format!("ay{}", crate::platform::SHIM_SUFFIX)
@@ -3308,31 +2996,26 @@ mod tests {
     #[test]
     fn from_shim_file_round_trips_and_never_doubles_the_suffix() {
         let ay = ToolName::new("ay").unwrap();
-        // The exact inverse of `shim_file` — this is what makes `bin/ay.cmd` read back as the
-        // logical `ay`, so re-shimming it replaces the live shim instead of writing
-        // `bin/ay.cmd.cmd` beside it.
+        // The exact inverse of `shim_file`, so re-shimming replaces the live shim.
         assert_eq!(ToolName::from_shim_file(&ay.shim_file()), Some(ay.clone()));
         assert_eq!(ToolName::from_shim_file("ay"), Some(ay));
-        // A `bin/` entry this manager could never have written is not recognized, so the
-        // one caller that DELETES what it recognizes leaves it alone.
+        // An entry this manager could never have written is not recognized, so the caller
+        // that deletes what it recognizes leaves it alone.
         assert_eq!(ToolName::from_shim_file("sudo"), None);
     }
 
-    /// The two assertions above are, on Unix, `""`-suffixed identities: they hold for ANY
-    /// implementation, including the conflated `String` this type replaced. The defect the
-    /// type exists to close is a WINDOWS one (`.cmd` vs `.exe` vs the logical name), and no
-    /// macOS/Linux runner can reach it through `SHIM_SUFFIX`. So drive the rule directly.
+    /// The suffix rule with Windows' real suffixes, which no Unix runner reaches through
+    /// `SHIM_SUFFIX` (`""`).
     #[test]
     fn the_suffix_rule_round_trips_and_never_doubles_on_a_suffixed_platform() {
-        // Windows' real pair: a shim and the executable it forwards to are DIFFERENT files.
+        // Windows' real pair: a shim and the executable it forwards to are different files.
         assert_eq!(with_suffix("ay", ".cmd"), "ay.cmd");
         assert_eq!(with_suffix("ay", ".exe"), "ay.exe");
         assert_ne!(with_suffix("ay", ".cmd"), with_suffix("ay", ".exe"));
 
         // The round trip a `bin/` scan performs: file name -> logical -> file name.
         assert_eq!(without_suffix(&with_suffix("ay", ".cmd"), ".cmd"), "ay");
-        // THE trap: strip first, or re-appending writes `bin/ay.cmd.cmd` BESIDE the live
-        // shim instead of replacing it — silently disabling nothing and tombstoning nothing.
+        // Strip first, or re-appending writes `bin/ay.cmd.cmd` beside the live shim.
         assert_eq!(
             with_suffix(&with_suffix("ay", ".cmd"), ".cmd"),
             "ay.cmd.cmd"
@@ -3340,12 +3023,10 @@ mod tests {
 
         // Total, not fallible: an unsuffixed entry reads back unchanged …
         assert_eq!(without_suffix("ay", ".cmd"), "ay");
-        // … and the shim suffix is NOT the exe suffix, so a `.exe` in `bin/` keeps its name
-        // rather than being mistaken for a shim of `ay`.
+        // … and the shim suffix is not the exe suffix: a `.exe` in `bin/` keeps its name.
         assert_eq!(without_suffix("ay.exe", ".cmd"), "ay.exe");
 
-        // The empty suffix (Unix) is the identity in both directions — which is exactly why
-        // every assertion phrased in terms of `SHIM_SUFFIX` is vacuous here.
+        // The empty suffix (Unix) is the identity in both directions.
         assert_eq!(with_suffix("ay", ""), "ay");
         assert_eq!(without_suffix("ay", ""), "ay");
     }
@@ -3362,9 +3043,8 @@ mod tests {
         assert_eq!(refused, vec!["sudo".to_string()]);
     }
 
-    /// The Rosetta hazard, end to end: a readiness marker written by the OTHER slice of
-    /// the universal binary must not vouch for the build to this one, and an ordinary
-    /// native re-install must make it vouch again (the store repairs, it does not wedge).
+    /// A marker written by the other slice of the universal binary does not vouch for the
+    /// build to this one, and a native re-install makes it vouch again.
     #[test]
     fn a_marker_from_the_other_slice_reads_as_not_installed() {
         let home = temp_home("readyslice");
@@ -3400,14 +3080,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// THE m3 CORPSE, exactly as it was found (2026-09-17): `store/trust/8595/` with no
-    /// `bin/` at all, 417 MB of orphaned `lib/`, and `8595.ready` beside it still saying
-    /// `ok`. `ops::list_installed` counted it as an installed build, `gc` would not sweep it
-    /// (it sweeps only marker-LESS trees) and `flow::rollback` would have switched onto it,
-    /// removing every shim on the machine.
-    ///
-    /// A readiness marker is now a claim ABOUT CONTENTS: it records the `bin/` it was
-    /// written over, and the disk can refute it.
+    /// A marker beside a build whose `bin/` is gone (the rest of the tree intact) is
+    /// refuted by the `bin/` inventory it recorded.
     #[test]
     fn a_marker_is_refuted_when_the_bin_it_vouched_for_is_gone() {
         let home = temp_home("readygutted");
@@ -3420,8 +3094,7 @@ mod tests {
         mark_build_ready(&build).unwrap();
         assert!(build_is_complete(&build), "precondition: a whole build");
 
-        // The record is really there, and it really names the tools — otherwise the
-        // refutation below could be produced by a check that reads nothing.
+        // Non-vacuity: the record is there and names the tools.
         let text = std::fs::read_to_string(ready_marker_path(&build).unwrap()).unwrap();
         assert_eq!(
             recorded_contents(&text),
@@ -3429,8 +3102,8 @@ mod tests {
             "sorted, comma-joined, so the record is a function of the tree: {text:?}"
         );
 
-        // Now gut it the way an interrupted `remove_dir_all` does: `bin` goes, `lib` stays,
-        // the marker is untouched.
+        // Gut it as an interrupted `remove_dir_all` does: `bin` goes, `lib` stays, the
+        // marker is untouched.
         std::fs::remove_dir_all(build.join("bin")).unwrap();
         assert!(
             ready_marker_path(&build).unwrap().is_file(),
@@ -3447,8 +3120,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// The other half of the same corpse: ONE tool removed out of a `bin/` that is
-    /// otherwise intact. A predicate that only asked "is there a `bin/`?" would miss it.
+    /// One tool removed from an otherwise intact `bin/` refutes the marker too.
     #[test]
     fn a_marker_is_refuted_when_one_recorded_tool_is_gone() {
         let home = temp_home("readyonetool");
@@ -3464,10 +3136,8 @@ mod tests {
         );
     }
 
-    /// A `bin/` ENTRY that is a symlink is recorded and checked BY ITS OWN NAME: the link
-    /// standing is what the record claims, and a dangling link is doctor's to report, not
-    /// this predicate's to re-stage on. Otherwise every build whose `bin/clippy` points at a
-    /// tool it ships would re-download on a machine where that target moved.
+    /// A `bin/` entry that is a symlink is recorded and checked by its own name: a dangling
+    /// link still stands (doctor reports it); the link itself going refutes.
     #[cfg(unix)]
     #[test]
     fn a_bin_symlink_is_recorded_and_checked_by_its_own_name() {
@@ -3479,7 +3149,7 @@ mod tests {
         mark_build_ready(&build).unwrap();
         let text = std::fs::read_to_string(ready_marker_path(&build).unwrap()).unwrap();
         assert_eq!(recorded_contents(&text), Some("bin:clippy,tippy"));
-        // The link's TARGET goes; the link itself stands. Still complete.
+        // The link's target goes; the link itself stands. Still complete.
         std::fs::remove_file(build.join("bin").join("tippy")).unwrap();
         assert!(
             !build_is_complete(&build),
@@ -3487,15 +3157,14 @@ mod tests {
         );
         std::fs::write(build.join("bin").join("tippy"), b"x").unwrap();
         assert!(build_is_complete(&build));
-        // …and the link itself going IS a refutation.
+        // …and the link itself going is a refutation.
         std::fs::remove_file(build.join("bin").join("clippy")).unwrap();
         assert!(!build_is_complete(&build));
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// A build with no `bin/` at all when it was marked records a RECORDED EMPTINESS, which
-    /// is not the same thing as no record: it is never refuted for having no `bin/`, and it
-    /// never silently inherits the legacy lenience either.
+    /// A build marked with no `bin/` records `contents=none`: never refuted for having no
+    /// `bin/`, and distinct from no record.
     #[test]
     fn a_build_with_no_bin_records_none_and_stays_complete() {
         let home = temp_home("readynone");
@@ -3508,10 +3177,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// A marker for a build dir that IS NOT THERE. `mark_build_ready` has no existence
-    /// precondition, so `install::restore_outgoing` can write one after a restore that
-    /// failed — a state that function's own doc called "a durable lie one refactor away
-    /// from being believed". The predicate refuses it at the door.
+    /// A marker for a build dir that is not there does not vouch: `mark_build_ready` has
+    /// no existence precondition, so the predicate refuses it.
     #[test]
     fn a_marker_over_an_absent_build_dir_is_not_complete() {
         let home = temp_home("readyghost");
@@ -3527,8 +3194,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// The contents rule, driven directly — the tests above all run on one machine with one
-    /// real `bin/`, so they would hold for an implementation that never compared anything.
+    /// The contents rule, driven directly, so it cannot pass without comparing anything.
     #[test]
     fn contents_still_stand_refutes_only_a_proven_absence() {
         let home = temp_home("readycontents");
@@ -3538,21 +3204,15 @@ mod tests {
         assert!(contents_still_stand(&build, READY_CONTENTS_NONE));
         assert!(contents_still_stand(&build, "bin:ay"));
         assert!(!contents_still_stand(&build, "bin:ay,ny"));
-        // A value a LATER atpkg might write is not a refutation: unknown is not refuted.
+        // A value a later atpkg might write is not a refutation: unknown is not refuted.
         assert!(contents_still_stand(&build, "tree-root:deadbeef"));
         // …and an unrecognised value does not accidentally match the `bin:` branch.
         assert!(contents_still_stand(&build, "bin"));
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// `discard_build` takes the MARKER DOWN FIRST. The corpse on m3 was made by the old
-    /// order — tree first, marker last — where anything ending the process inside a
-    /// multi-gigabyte `remove_dir_all` leaves a gutted tree still vouched for.
-    ///
-    /// The interrupt is simulated the only way a test can: the tree is made UNREMOVABLE
-    /// (its own permissions, so its writable parent can still lose the marker), which is one
-    /// of the real ways that walk aborts partway. Under the old order the marker would
-    /// survive untouched; under this one the build reads as incomplete the moment the
+    /// `discard_build` takes the marker down first: with the tree made unremovable (its
+    /// own permissions, its parent still writable), the build reads as incomplete when the
     /// function returns, whatever happened to the tree.
     #[cfg(unix)]
     #[test]
@@ -3563,8 +3223,8 @@ mod tests {
         std::fs::write(build.join("bin").join("trustc"), b"x").unwrap();
         mark_build_ready(&build).unwrap();
         assert!(build_is_complete(&build), "precondition");
-        // No write permission on `bin/`: its entries cannot be unlinked, so `remove_dir_all`
-        // aborts inside the tree — the interrupt, in a form a test can arrange.
+        // No write permission on `bin/`: `remove_dir_all` fails inside the tree, the
+        // interrupt in a form a test can arrange.
         std::fs::set_permissions(build.join("bin"), std::fs::Permissions::from_mode(0o500))
             .unwrap();
         discard_build(&build);
@@ -3586,9 +3246,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// The whole-program twin: `unmark_program_builds` takes down every build's marker and
-    /// touches nothing else, so `ops::uninstall` can run its `remove_dir_all` knowing an
-    /// interrupt inside it leaves incomplete trees rather than installed ones.
+    /// `unmark_program_builds` takes down every build's marker and touches nothing else.
     #[test]
     fn unmark_program_builds_unmarks_every_build_and_only_builds() {
         let home = temp_home("unmarkall");
@@ -3619,9 +3277,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// BACKWARD COMPATIBILITY: a store written before the platform record existed holds a
-    /// bare `ok\n`. It must keep reading as installed — treating it as a mismatch would
-    /// re-download the whole toolchain on every machine that already has one.
+    /// A bare `ok\n` marker, written before the platform record, still reads as installed.
     #[test]
     fn a_legacy_marker_without_a_platform_record_still_reads_as_installed() {
         let home = temp_home("readylegacy");
@@ -3635,15 +3291,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// The accept rule itself, driven directly: the two tests above can only ever see the
-    /// ONE platform this test binary was compiled for, so on any single runner they would
-    /// hold for an implementation that never compared anything.
+    /// The accept rule, driven directly: the tests above see only the platform this test
+    /// binary was compiled for.
     #[test]
     fn ready_text_accepts_only_an_absent_or_matching_record() {
         assert!(ready_text_accepts("ok\n", "aarch64-macos"));
-        // A marker with no `ok` line is a CRASH ARTEFACT, never a legacy marker: empty is
-        // what a rename-without-fsync exposes after a power loss, and a NUL run is how a
-        // committed-but-unwritten inode reads back.
+        // A marker with no `ok` line is a crash artefact, never a legacy marker: empty after
+        // a rename without fsync, a NUL run from a committed but unwritten inode.
         assert!(!ready_text_accepts("", "aarch64-macos"));
         assert!(!ready_text_accepts("\0\0\0\0", "aarch64-macos"));
         assert!(!ready_text_accepts("o", "aarch64-macos"));
@@ -3657,7 +3311,7 @@ mod tests {
             "ok\nplatform=aarch64-macos\n",
             "aarch64-macos"
         ));
-        // THE hazard case: the Intel slice's marker, read by the native arm64 slice.
+        // The hazard case: the Intel slice's marker, read by the native arm64 slice.
         assert!(!ready_text_accepts(
             "ok\nplatform=x86_64-macos\n",
             "aarch64-macos"
@@ -3673,8 +3327,7 @@ mod tests {
             "ok\r\nplatform=aarch64-macos\r\n",
             "aarch64-macos"
         ));
-        // An empty value carries no information, and an unrecognised key is not a record:
-        // both are "absent", which is accept — never a reinstall.
+        // An empty value or an unrecognised key is no record, which is accept.
         assert!(ready_text_accepts("ok\nplatform=\n", "aarch64-macos"));
         assert!(ready_text_accepts(
             "ok\narch=x86_64-macos\n",
@@ -3682,13 +3335,8 @@ mod tests {
         ));
     }
 
-    /// THE CRASH MARKER, through the real predicate. `<build>.ready` is published by a
-    /// rename — a directory entry — while the bytes behind it are page cache, so a power
-    /// loss in that window leaves the NAME with no contents. Until the `ok` line was
-    /// required, such a marker took the "no platform record" branch and vouched for the
-    /// build: the store reported it installed, `decide` answered `UpToDate`, and nothing
-    /// short of a hand-run `atpkg verify` ever looked at the tree again — while the tree's
-    /// own data, flushed by nothing either, may have been just as lost.
+    /// A marker a crash left without a readable `ok` line (empty, NUL-filled, non-UTF-8,
+    /// torn) does not vouch for its build, through the real predicate.
     #[test]
     fn a_marker_left_empty_or_torn_by_a_crash_reads_as_incomplete() {
         let home = temp_home("readytorn");
@@ -3715,8 +3363,7 @@ mod tests {
         std::fs::write(&marker, b"o").unwrap();
         assert!(!build_is_complete(&build), "a torn marker is not `ok`");
 
-        // NON-VACUITY, both directions: the real writer's marker vouches, and so does the
-        // legacy bare `ok` a pre-platform-record version left behind.
+        // Non-vacuity: the real writer's marker vouches, and so does a legacy bare `ok`.
         mark_build_ready(&build).unwrap();
         assert!(build_is_complete(&build));
         std::fs::write(&marker, b"ok\n").unwrap();
@@ -3724,10 +3371,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// THE STAGED TREE IS FLUSHED BEFORE IT IS PUBLISHED. The walk has to reach every
-    /// regular file and every directory — a subset would leave exactly the files the
-    /// swap's renames then vouch for unflushed — and must never follow a symlink out of
-    /// the tree it was handed.
+    /// The flush reaches every regular file and every directory of the staged tree and
+    /// never follows a symlink out of it.
     #[test]
     fn sync_tree_flushes_every_file_and_directory_it_walks() {
         let home = temp_home("synctree");
@@ -3745,18 +3390,15 @@ mod tests {
             synced.files, 3,
             "every regular file, and the symlink is not one"
         );
-        // Windows cannot open a directory as a file (`File::open` answers `Access is
-        // denied`), so the directory arm is best-effort there and flushes none — NTFS
-        // journals directory metadata itself, and PostgreSQL skips directory fsync on
-        // Windows for the same reason. The FILE count above is the half that matters.
+        // Windows cannot open a directory as a file, so the directory arm flushes none
+        // there (NTFS journals directory metadata itself).
         let dirs_expected = if cfg!(windows) { 0 } else { 4 };
         assert_eq!(
             synced.dirs, dirs_expected,
             "the root, bin, lib and lib/nested — where a directory can be opened"
         );
 
-        // A tree that is not there is an ERROR, not a quiet success: this runs on the path
-        // an install is about to publish, so "nothing to flush" must never read as
+        // A tree that is not there is an error: "nothing to flush" must never read as
         // "flushed".
         assert!(sync_tree(&home.join("absent")).is_err());
         let _ = std::fs::remove_dir_all(&home);
@@ -3768,7 +3410,7 @@ mod tests {
         // Inputs/expectations built with join_paths so the platform separator (':' Unix,
         // ';' Windows) is exercised, not hard-coded.
         let inherited = std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
-        // bin_dir lands at the END (so it can't shadow system commands earlier on PATH).
+        // bin_dir lands at the end (so it can't shadow system commands earlier on PATH).
         let out = append_bin_to_path(Some(&inherited), bin);
         assert_eq!(
             out,

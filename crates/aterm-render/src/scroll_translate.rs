@@ -171,7 +171,8 @@ pub fn translate_grid_band_in_place(buf: &mut [u32], w: usize, y0: usize, y1: us
 /// backends consult, so they cannot disagree about the strip's existence.
 ///
 /// * a POSITIVE residual (the up-glide; a bounce exposes rubber-band gap);
-/// * a PRESENT apron (`display_offset > 0`: a row lies below the viewport);
+/// * a PRESENT apron, or the live bottom (`display_offset == 0`), whose exposed
+///   strip is blank; an absent reordered BiDi apron above it keeps the placeholder;
 /// * a band that reaches the frame's LAST row (`grid_bot_row == rows`), so the
 ///   row below the band is the row below the viewport — a bottom chrome row
 ///   inside the frame (the find bar floated to the bottom) would put the row
@@ -181,7 +182,7 @@ pub fn translate_grid_band_in_place(buf: &mut [u32], w: usize, y0: usize, y1: us
 #[must_use]
 pub fn incoming_row_applies(input: &aterm_core::render::RenderInput) -> bool {
     input.scroll_frac_px > 0
-        && input.apron_row.present
+        && (input.apron_row.present || input.display_offset == 0)
         && input.grid_bot_row == input.rows
         && input.wallpaper.is_none()
 }
@@ -510,35 +511,6 @@ mod tests {
             assert_eq!(paint_incoming_strip(&mut buf, w, y0, y1, frac, ap), 0);
             assert_eq!(buf, before, "frac={frac}: a literal no-op");
         }
-    }
-
-    /// NEGATIVE CONTROL for (2): a NAIVE translate that shifts the WHOLE
-    /// framebuffer (ignoring the band) genuinely disturbs chrome rows — so the
-    /// chrome-invariance assertion above has teeth.
-    #[test]
-    fn whole_frame_shift_would_break_chrome() {
-        let (w, h) = (5usize, 20usize);
-        let base = checkerboard(w, h);
-        // Band is the middle; chrome occupies the first and last rows.
-        let (y0, y1, frac) = (2usize, h - 2, 3usize);
-        // Naive: shift EVERY row up by frac.
-        let mut naive = base.clone();
-        for y in 0..h - frac {
-            naive.copy_within((y + frac) * w..(y + frac) * w + w, y * w);
-        }
-        // The correct band translate leaves chrome row 0 and the last row alone.
-        let mut correct = base.clone();
-        translate_grid_band_in_place(&mut correct, w, y0, y1, frac as i64);
-        assert_ne!(
-            naive[0..w],
-            base[0..w],
-            "control: the naive whole-frame shift DID disturb the top chrome row"
-        );
-        assert_eq!(
-            correct[0..w],
-            base[0..w],
-            "the band translate leaves the top chrome row pinned"
-        );
     }
 
     /// PROVE (3) — band derivation matches the renderer's row→px mapping

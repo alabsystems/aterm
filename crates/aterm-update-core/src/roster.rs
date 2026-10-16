@@ -1,33 +1,21 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The **machine roster** — one paper master, many machine keys.
+//! The machine roster: one paper master, many machine keys.
 //!
-//! The owner's decision, in one sentence: there is ONE master key, written on paper and
-//! present on no computer, and it mints a SEPARATE signing key for every machine that
-//! publishes. A machine key never leaves the machine that minted it. Adding a laptop, or
-//! reformatting one, mints another. See `docs/RELEASE-KEYS.md` for the decision and
-//! why it reverses the one-key record it replaces.
+//! One master key, on paper and on no computer, mints a separate signing key for every
+//! machine that publishes; a machine key never leaves the machine that minted it. See
+//! `docs/RELEASE-KEYS.md`.
 //!
-//! # This tier authorizes atpkg too
+//! The same roster authorizes atpkg: `atpkg::sig::admit_roster` runs steps 1–7 below and
+//! `TrustedRoster::authorize_bytes` delegates steps 8–9 to [`Roster::authorize_appcast`] (a
+//! signature check over opaque bytes, named for its first artifact). atpkg publishes
+//! [`ROSTER_ASSET`]/[`ROSTER_SIG_ASSET`] beside its index, so one revocation stops a machine
+//! publishing either product.
 //!
-//! The roster is not the update channel's private tier. `atpkg` — the toolchain package
-//! manager — folds under the same master: `atpkg::sig::admit_roster` runs steps 1–7 below
-//! verbatim, and `atpkg::sig::TrustedRoster::authorize_bytes` delegates step 8–9 to
-//! [`Roster::authorize_appcast`], which is a signature check over opaque bytes under the
-//! authorized set and is named for the first artifact it verified rather than the only
-//! one. atpkg's `index.toml` and every `pkg-*.toml` are authorized by exactly this
-//! machinery, so a machine revoked here stops publishing BOTH products at once — the
-//! property two independent roots could not express. atpkg publishes
-//! [`ROSTER_ASSET`]/[`ROSTER_SIG_ASSET`] beside its index on the same release, so the
-//! grant and the deny reach a toolchain client the same way they reach an app client.
-//!
-//! # The document
-//!
-//! The roster (`aterm-machines.toml`) is a small TOML file published as a release asset
-//! beside the appcast, with a detached Ed25519 signature by the MASTER
-//! (`aterm-machines.toml.sig`). It names every machine authorized to sign, and every
-//! machine whose authority has been withdrawn:
+//! The roster (`aterm-machines.toml`) is a release asset beside the appcast with a detached
+//! Ed25519 master signature (`aterm-machines.toml.sig`), naming every machine authorized to
+//! sign and every machine whose authority was withdrawn:
 //!
 //! ```toml
 //! schema      = 1
@@ -41,62 +29,41 @@
 //! added_at = "2026-08-04T00:00:00Z"
 //! ```
 //!
-//! Every top-level key comes before the first `[[machine]]`: TOML gives a bare key written
-//! after an array of tables to the LAST table, so `revoked` placed at the end would be a
-//! key of the last machine. The schema's key set is closed (see [`Roster`]), so that
-//! layout is refused as [`RosterReject::Malformed`] rather than read as "nothing
-//! revoked".
+//! Every top-level key comes before the first `[[machine]]`: TOML gives a bare key after an
+//! array of tables to the last table, and the closed key set ([`Roster`]) refuses that layout
+//! as [`RosterReject::Malformed`] rather than read it as "nothing revoked".
 //!
-//! # ONE roster, not per-machine delegation files
+//! The grant and the deny live in one signed document, never per-machine delegation files: a
+//! thief holding a revoked machine's key would also hold its still-valid delegation, and a
+//! client would have no reason to fetch the document that revokes it. So the deny-list must
+//! never become a separate asset.
 //!
-//! This is the single most important structural choice here, and it is not an
-//! implementation detail. If each machine carried its OWN master-signed delegation file,
-//! a thief holding a revoked machine's key would also hold that machine's still-valid,
-//! still-master-signed delegation — and a client would have no reason to ever fetch the
-//! document that revokes it. Putting the grant and the deny in the SAME signed document
-//! means a client cannot learn that a machine is authorized without simultaneously
-//! learning who is revoked. It is why the deny-list must never become a separate asset —
-//! and, since atpkg folded under this master, why ONE revocation stops both products.
+//! Every gate refuses rather than accepts, cheapest first:
 //!
-//! # Cheapest-first, fail-closed, and parse-only-after-verify
+//! 1. master anchor empty ⇒ [`RosterReject::Disabled`]; the tier grants nothing.
+//! 2. both signatures are exactly 64 bytes.
+//! 3. verify the roster under the master keyset (crypto #1).
+//! 4. parse the roster, only from a [`VerifiedRoster`], which only [`verify_roster`] constructs.
+//! 5. `schema > SUPPORTED_SCHEMA` ⇒ refused rather than misread.
+//! 6. `roster_seq` below the durable floor ⇒ [`RosterReject::Rollback`], the replay defence.
+//! 7. `valid_until` lapsed ⇒ [`RosterReject::Stale`]. Rosters are minted with 9999-12-31
+//!    (`atpkg-keys`' `roster_ops`), so a fresh install with no floor has no replay defence at
+//!    first contact; revocation is the answer.
+//! 8. revoked and expired machines leave the candidate set before any artifact crypto.
+//! 9. verify the appcast under the surviving machines (crypto #2).
+//! 10. bind the manifest's `machine_id` / `roster_seq` to what verified
+//!     ([`Attribution::bind`]).
 //!
-//! Every gate below refuses rather than accepts, and the expensive crypto runs last:
-//!
-//! 1. master anchor empty ⇒ [`RosterReject::Disabled`]. Free. The tier grants NOTHING —
-//!    it never means "accept anything".
-//! 2. signature length (both signatures are exactly 64 bytes). Cheap, local.
-//! 3. verify the roster under the master keyset. **CRYPTO #1.**
-//! 4. parse the roster — only from [`VerifiedRoster`], which has a private field and no
-//!    public constructor, so parsing unverified roster bytes does not type-check.
-//! 5. `schema > SUPPORTED_SCHEMA` ⇒ refuse rather than misread. Cheap.
-//! 6. `roster_seq` below the durable floor ⇒ [`RosterReject::Rollback`]. Cheap. THE
-//!    replay defence for a client that has already seen a newer roster.
-//! 7. `valid_until` lapsed ⇒ [`RosterReject::Stale`]. Cheap, pure. Still enforced, but
-//!    every roster is minted with 9999-12-31 by owner decision
-//!    (`crates/atpkg-keys/src/roster_ops.rs`), so a brand-new install, which has no
-//!    floor yet, has no replay defence at first contact; revocation is the answer.
-//! 8. the revoked and expired machines are removed from the candidate set BEFORE any
-//!    artifact crypto — a revoked machine's perfectly valid signature is never checked.
-//! 9. verify the appcast under the surviving machines. **CRYPTO #2.**
-//! 10. post-verify, bind the manifest's self-declared `machine_id` / `roster_seq` to what
-//!     actually verified ([`Attribution::bind`]).
-//!
-//! # The id↔key bind is two-way, and free
-//!
-//! `machine_id` sits INSIDE the signed appcast bytes, so a genuine m3 signature cannot be
-//! relabelled as m11 — the bytes, and therefore the signature, would change. Conversely a
-//! thief holding m11's key cannot claim `machine_id = "m3"`, because the roster maps m3 to
-//! m3's public key and step 9 verifies against m11's. No extra mechanism is needed for
-//! either direction; step 10 is a string compare over already-authenticated data.
+//! The id↔key bind is two-way and free: `machine_id` is inside the signed appcast, so m3's
+//! signature cannot be relabelled as m11, and m11's key cannot claim `machine_id = "m3"`
+//! because the roster maps m3 to m3's key.
 
 use serde::{Deserialize, Serialize};
 
 use ring::signature::{ED25519, UnparsedPublicKey};
 
-/// The highest roster `schema` this build understands. A roster declaring a higher schema
-/// is from a newer format we cannot safely interpret, so it is REFUSED rather than
-/// misread — the same reject-newer discipline as `manifest::SUPPORTED_SCHEMA` and
-/// `atpkg::manifest::SUPPORTED_SCHEMA`.
+/// The highest roster `schema` this build understands; a higher one is refused rather than
+/// misread.
 pub const SUPPORTED_SCHEMA: u32 = 1;
 
 /// The roster's published asset name, beside `aterm-appcast.toml` on the same release.
@@ -105,68 +72,57 @@ pub const ROSTER_ASSET: &str = "aterm-machines.toml";
 /// The roster's detached master signature, beside [`ROSTER_ASSET`].
 pub const ROSTER_SIG_ASSET: &str = "aterm-machines.toml.sig";
 
-/// A roster larger than this is refused as malformed.
-///
-/// The bound is not about attacker-supplied input — the roster is master-signed, so its
-/// size is the owner's own choice. It is about the OWNER: the roster is not a convenience
-/// list of the machines you own, it is the set of machines that can publish to every user,
-/// and any one of them can sign any release. A hard ceiling makes "the roster grew and
-/// nobody noticed" impossible, and 16 is far above the handful of machines the decision
-/// record contemplates. A machine that only BUILDS never needs to be here; only a machine
-/// that PUBLISHES does.
+/// A roster larger than this is refused as malformed. Not an input bound (the roster is
+/// master-signed) but one on the owner: every listed machine can sign any release for every
+/// user, so a hard ceiling keeps the roster from growing unnoticed. Only a machine that
+/// publishes belongs here, not one that only builds.
 pub const MAX_MACHINES: usize = 16;
 
-/// Why the chain refused. Deliberately coarse on the crypto steps (every `ring` failure
-/// collapses to [`RosterReject::Verify`], whose error is opaque by design), and specific
-/// on the structural steps, which are all decidable from already-authenticated bytes and
-/// so cannot act as an oracle.
+/// Why the chain refused: coarse on the crypto steps (every `ring` failure is
+/// [`RosterReject::Verify`]), specific on the structural steps, which are decided from
+/// authenticated bytes and so cannot act as an oracle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RosterReject {
-    /// No master anchor is pinned — the tier is inert. Returned BEFORE any crypto, and it
-    /// never means "accept anything": an inert tier authorizes no machine at all.
+    /// No master anchor is pinned: the tier is inert and authorizes no machine. Returned
+    /// before any crypto.
     Disabled,
-    /// A master public key did not base64-decode, or was not exactly 32 bytes — and no
-    /// usable master key remained. A keyset of nothing but garbage must not read as "the
-    /// signature was bad".
+    /// No master key was usable (each failed base64 or was not 32 bytes): a garbage keyset
+    /// must not read as a bad signature.
     BadKey,
     /// A detached signature was not exactly 64 bytes.
     BadSig,
     /// Ed25519 verification failed: the roster is not signed by the pinned master, or the
     /// appcast is not signed by any live machine on it.
     Verify,
-    /// Verified bytes that are not UTF-8, not TOML, or structurally invalid (a duplicate
-    /// machine id, an empty id, an over-long roster). Post-verify, so not an oracle.
+    /// Verified bytes that are not UTF-8, not TOML, or structurally invalid (an undeclared
+    /// key, a duplicate id or key, an empty id, an over-long roster). Post-verify, so not an
+    /// oracle.
     Malformed,
     /// The roster declares a schema newer than this build understands.
     Schema,
-    /// `roster_seq` is below the durable high-water floor — an attempted replay of an
-    /// older, once-legitimate, still-validly-signed roster.
+    /// `roster_seq` is below the durable high-water floor: a replay of an older, still
+    /// validly signed roster.
     Rollback,
     /// `now >= valid_until`: the roster's freshness window has lapsed.
     Stale,
-    /// The appcast's `roster_seq` is NEWER than the roster it verified under, or absent —
-    /// an attempt to pair an old roster with a new release. (A NEWER roster paired with
-    /// an older release is admitted: see [`Attribution::bind`].)
+    /// The appcast's `roster_seq` is newer than the roster it verified under, or absent: an
+    /// old roster paired with a new release ([`Attribution::bind`]).
     SeqMismatch,
-    /// The appcast carries no `machine_id`, so the release cannot be attributed. Under an
-    /// armed master anchor an unattributed release is refused: attribution is a
-    /// requirement, not a nicety.
+    /// The appcast carries no `machine_id`; under an armed master anchor an unattributed
+    /// release is refused.
     Unattributed,
-    /// The appcast's `machine_id` names a machine the roster does not list, or names a
-    /// DIFFERENT machine than the key that actually verified (a relabelling attempt).
+    /// The appcast's `machine_id` names a machine the roster does not list, or a different
+    /// machine than the key that verified (a relabelling attempt).
     UnknownMachine,
     /// The named machine is on the roster's deny-list. Checked before any artifact crypto.
     Revoked,
-    /// The named machine's own `not_after` has lapsed — defence in depth, so a machine key
-    /// ages out and is re-minted from paper even if nothing went wrong.
+    /// The named machine's own `not_after` has lapsed.
     Expired,
 }
 
-/// Roster bytes that have PASSED master verification. The inner `Vec<u8>` is private and
-/// there is no public constructor, so the only way to obtain one is [`verify_roster`] —
-/// which makes "parse only after verify" a compile-time guarantee rather than a
-/// convention. Mirrors `atpkg::sig::VerifiedBytes`, deliberately: the property is the
-/// same, and two spellings of it would be two things to keep right.
+/// Roster bytes that passed master verification. The fields are private and only
+/// [`verify_roster`] constructs one, so "parse only after verify" is a compile-time
+/// guarantee (as `atpkg::sig::VerifiedBytes` is for atpkg).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedRoster {
     bytes: Vec<u8>,
@@ -174,25 +130,21 @@ pub struct VerifiedRoster {
 }
 
 impl VerifiedRoster {
-    /// The verified raw bytes — the SAME bytes the signature was checked over, with no
-    /// normalization, re-serialization or lossy UTF-8 conversion applied.
+    /// The verified raw bytes, exactly as the signature covered them.
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
         &self.bytes
     }
 
-    /// Which master keyset member verified. Index 0 is the master this build considers
-    /// current; a hit anywhere else means a master rotation is in progress or stalled, and
-    /// is worth saying out loud — never a rejection.
+    /// Which master keyset member verified. Index 0 is the current master; any other index
+    /// means a rotation is in progress or stalled, worth reporting but never a rejection.
     #[must_use]
     pub fn master_index(&self) -> usize {
         self.master_index
     }
 }
 
-/// Verify a detached Ed25519 signature under ONE key, cheapest-first: empty key (free) →
-/// base64 decode + 32-byte length (cheap, local) → 64-byte signature length (cheap,
-/// local) → the crypto, last.
+/// Verify a detached Ed25519 signature under one key, cheapest check first.
 fn verify_under(pubkey_b64: &str, msg: &[u8], sig: &[u8]) -> Result<(), RosterReject> {
     if pubkey_b64.is_empty() {
         return Err(RosterReject::Disabled);
@@ -212,30 +164,24 @@ fn verify_under(pubkey_b64: &str, msg: &[u8], sig: &[u8]) -> Result<(), RosterRe
 
 /// **Step 1–3.** Verify the roster's exact bytes under the pinned master keyset.
 ///
-/// The master anchor is a LIST because a client that accepts exactly one key cannot be told about a replacement by a document it would
-/// refuse to verify. An EMPTY slice means the tier is unpinned, and unpinned means inert —
-/// this returns [`RosterReject::Disabled`] and authorizes nothing. That is the fail-closed
-/// default, not a bypass.
-///
-/// A malformed member can neither GRANT nor DENY: it is skipped, and the verdict comes
-/// from the usable members. If NO member was usable the answer is [`RosterReject::BadKey`],
-/// because a keyset of pure garbage must not be reported as a bad signature.
+/// An empty keyset is unpinned and inert: [`RosterReject::Disabled`]. A malformed member can
+/// neither grant nor deny; it is skipped, and if no member was usable the answer is
+/// [`RosterReject::BadKey`], not a bad signature.
 pub fn verify_roster(
     master_pubkeys: &[&str],
     raw: Vec<u8>,
     sig: &[u8],
 ) -> Result<VerifiedRoster, RosterReject> {
-    // STEP 1 — free. No anchor, no authority. Never "accept anything".
+    // Step 1: no anchor, no authority.
     if master_pubkeys.is_empty() {
         return Err(RosterReject::Disabled);
     }
-    // STEP 2 — cheap, local, and checked ONCE rather than per member: a wrong-length
-    // signature is BadSig no matter how many masters are listed.
+    // Step 2, once rather than per member.
     if sig.len() != 64 {
         return Err(RosterReject::BadSig);
     }
-    // STEP 3 — the crypto. `usable` distinguishes "every member is garbage" (BadKey) from
-    // "the members are fine and this signature is not theirs" (Verify).
+    // Step 3, the crypto. `usable` tells "every member is garbage" (BadKey) from "this
+    // signature is not theirs" (Verify).
     let mut usable = 0usize;
     for (master_index, key) in master_pubkeys.iter().enumerate() {
         match verify_under(key, &raw, sig) {
@@ -256,172 +202,115 @@ pub fn verify_roster(
     }
 }
 
-/// One authorized machine. `id` is the ATTRIBUTION handle — the thing a verifier reports
-/// and a human reads later — and it is what the deny-list names.
-///
-/// The key set of a `[[machine]]` table is closed: a key not declared here is refused as
-/// [`RosterReject::Malformed`]. This matters most for keys written after the tables, which
-/// TOML assigns to the last machine. See [`Roster`] for the ruling and why it is safe
-/// for forward compatibility.
+/// One authorized machine. `id` is the attribution handle and what the deny-list names. The
+/// key set is closed (see [`Roster`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Machine {
-    /// The machine identity, e.g. `"m3"`. Stable for the life of the key, and NEVER
-    /// reused: see [`Roster::machine`] for why re-minting under an old id creates two
-    /// live authorities under one name.
+    /// The machine identity, e.g. `"m3"`: stable for the life of the key and never reused
+    /// (see [`Roster::machine`]).
     pub id: String,
-    /// The machine's base64 Ed25519 public key (32 raw bytes). The secret half was minted
-    /// on that machine and never leaves it.
+    /// The machine's base64 Ed25519 public key (32 raw bytes); the secret half never leaves
+    /// that machine.
     pub pubkey: String,
-    /// RFC3339 mint time. Informational, and the human-readable half of attribution.
+    /// RFC3339 mint time; informational.
     #[serde(default)]
     pub added_at: String,
-    /// Optional RFC3339 expiry for this machine alone — defence in depth, so a key ages
-    /// out on its own schedule and is re-minted from paper even when nothing went wrong.
-    /// Absent ⇒ the machine lives until it is revoked or the whole roster lapses.
+    /// Optional RFC3339 expiry for this machine alone, so a key ages out and is re-minted
+    /// from paper. Absent ⇒ it lives until revoked or the roster lapses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_after: Option<String>,
 }
 
 /// The master-signed roster: who may sign, and who no longer may.
 ///
-/// Emission puts every plain key before the `[[machine]]` tables whatever the declaration
-/// order (`aterm_toml` writes values before sub-tables), so [`Roster::to_toml`] never
-/// produces a key that a table would swallow.
+/// Within the schema this build knows ([`SUPPORTED_SCHEMA`]) the key set is closed: a key
+/// neither this head nor [`Machine`] declares is refused as [`RosterReject::Malformed`]. The
+/// roster's job is to withdraw authority, and an ignored key is a dropped instruction: TOML
+/// gives a bare key written after the `[[machine]]` tables to the last machine, so a misplaced
+/// `revoked` or a misspelt `revoke` would otherwise parse as "nothing revoked".
 ///
-/// # The key set of a schema is closed (ruling 2026-10-10)
-///
-/// Within the one schema this build knows ([`SUPPORTED_SCHEMA`]), a key that neither this
-/// head nor [`Machine`] declares is refused as [`RosterReject::Malformed`]. Before this,
-/// both types ignored unknown keys. The roster's job is to WITHDRAW authority, and an
-/// ignored key is an instruction that was dropped. TOML assigns a bare key written after
-/// the `[[machine]]` tables to the last machine. So a `revoked = [..]` placed there (which
-/// is how this module's own example was laid out) or a misspelt `revoke = [..]` parsed as
-/// "nothing is revoked", and the machine the owner withdrew went on signing.
-///
-/// Forward compatibility, which is what makes this safe: a refused roster ends the update
-/// check (`aterm_update::github`'s head that cannot be authorized), so a client that
-/// refuses its channel's roster is stranded. A new field can reach the fleet in only two
-/// ways. It can come as a key that older builds ignore, which is fail-open for any field
-/// that narrows authority (a per-machine scope, a `not_before`). Or it can come under a
-/// new `schema` number. Every build since the roster began has refused a newer schema by
-/// version, so that path strands old builds exactly as it did before this ruling. A new
-/// key therefore arrives only with a new schema number. Adding a field to either type is
-/// a schema change: bump [`SUPPORTED_SCHEMA`], and have the producer (`atpkg-keys`'
-/// `roster_ops`) stamp the new number on any roster that carries the field.
-/// [`Roster::parse`] reads the schema BEFORE the strict parse, so a newer roster is refused
-/// as [`RosterReject::Schema`] for its version, never as `Malformed` for a key it is
-/// entitled to add.
-///
-/// No published roster is refused. Every master signature goes through
-/// [`Roster::to_toml`] of this type, and its field set has not changed since the type was
-/// introduced.
+/// A new field reaches the fleet only under a new `schema`, since a key older builds ignored
+/// would be fail-open for any field that narrows authority. Adding a field to either type is
+/// a schema change: bump [`SUPPORTED_SCHEMA`] and have `atpkg-keys`' `roster_ops` stamp it on
+/// any roster carrying the field. [`Roster::parse`] reads the schema before the strict parse,
+/// so a newer roster is refused as [`RosterReject::Schema`], never as `Malformed`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Roster {
     /// Format version; `> SUPPORTED_SCHEMA` is refused rather than misread.
     pub schema: u32,
-    /// Monotonic roster counter — THE replay counter. Every mint or revocation bumps it,
-    /// and a client that has durably seen `n` permanently refuses anything below `n`.
+    /// Monotonic roster counter, the replay counter: every mint or revocation bumps it, and a
+    /// client that has durably seen `n` refuses anything below `n`.
     pub roster_seq: u64,
-    /// RFC3339 freshness deadline. A lapsed roster is refused fail-closed.
-    ///
-    /// It was a DIAL: a short window bounds a stolen key's reach against FRESH installs
-    /// (which have no `roster_seq` floor and so get nothing from the ratchet), but sends
-    /// the owner back to the paper master that often. The owner turned it off — every
-    /// mint and revocation stamps 9999-12-31 (`crates/atpkg-keys/src/roster_ops.rs`,
-    /// decided, not defaulted) — so the gate still checks the date but never fires on a
-    /// live channel, and revocation is the only defence against a stolen key. See
+    /// RFC3339 freshness deadline; a lapsed roster is refused. Every mint and revocation
+    /// stamps 9999-12-31 (`atpkg-keys`' `roster_ops::VALID_UNTIL_FOREVER`), so the gate never
+    /// fires on a live channel and revocation is the defence against a stolen key. See
     /// `docs/RELEASE-KEYS.md`.
     pub valid_until: String,
     /// The authorized machines. `[[machine]]` on the wire.
     #[serde(default, rename = "machine")]
     pub machines: Vec<Machine>,
-    /// Withdrawn machine IDS — never public keys. A revoked id is refused before any
-    /// artifact crypto, and an id never returns from the dead.
-    ///
-    /// On the wire this key must come BEFORE the first `[[machine]]`. Written after the
-    /// tables it would belong to the last machine, which refuses it (the closed key set
-    /// above). It is declared after `machines` here, and that is harmless: the serializer
-    /// writes plain keys ahead of tables whatever the declaration order.
+    /// Withdrawn machine ids, never public keys; refused before any artifact crypto. On the
+    /// wire this key comes before the first `[[machine]]` (the serializer writes plain keys
+    /// ahead of tables whatever the declaration order).
     #[serde(default)]
     pub revoked: Vec<String>,
 }
 
-/// The attribution record: WHICH machine signed this release, proved by its key rather
-/// than claimed by a label. Produced only by [`Roster::authorize_appcast`], i.e. only
-/// after the signature verified, so every field here is authenticated.
+/// Which machine signed a release, proved by its key. Produced only by
+/// [`Roster::authorize_appcast`] after the signature verified, so every field is
+/// authenticated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attribution {
-    /// The signing machine's id — the answer to "which computer cut this?".
+    /// The signing machine's id.
     pub machine_id: String,
-    /// The signing machine's base64 public key. Public identity only; the secret never
-    /// leaves the machine, is never logged, and is never journaled.
+    /// The signing machine's base64 public key (public identity only).
     pub pubkey_b64: String,
-    /// The `roster_seq` of the roster that authorized it, so a recorded attribution can be
-    /// matched back to the exact roster generation that granted the authority.
+    /// The `roster_seq` of the roster that granted the authority.
     pub roster_seq: u64,
 }
 
 impl std::fmt::Display for Attribution {
-    /// The one-line human form recorded in status and the log: `m3 (roster seq 3)`.
+    /// The one-line form recorded in status and the log: `m3 (roster seq 3)`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} (roster seq {})", self.machine_id, self.roster_seq)
     }
 }
 
 impl Roster {
-    /// **Step 4–5.** Parse a roster from bytes that have already passed master
-    /// verification, then check the structural invariants a signature cannot check.
-    ///
-    /// Taking `&VerifiedRoster` is what makes the ordering unrepresentable rather than
-    /// merely tested: there is no way to call this on unverified bytes.
+    /// **Step 4–5.** Parse a roster from bytes that passed master verification, then check
+    /// the structural invariants a signature cannot. Taking `&VerifiedRoster` makes parsing
+    /// unverified bytes unrepresentable.
     pub fn parse(verified: &VerifiedRoster) -> Result<Self, RosterReject> {
-        /// The schema alone, read with every other key ignored. A newer schema may add keys,
-        /// and it is refused for its version before the closed key set below can call
-        /// those keys malformed.
+        /// The schema alone, every other key ignored, so a newer schema is refused for its
+        /// version before the closed key set can call its new keys malformed.
         #[derive(Deserialize)]
         struct Head {
             schema: u32,
         }
         let text = std::str::from_utf8(verified.as_slice()).map_err(|_| RosterReject::Malformed)?;
         let head: Head = aterm_toml::from_str(text).map_err(|_| RosterReject::Malformed)?;
-        // Reject-newer BEFORE any semantic use of the fields: a newer schema may mean
-        // something different by them, and may carry keys this build has never heard of.
+        // Reject newer first: it may mean something else by the fields, or add keys.
         if head.schema > SUPPORTED_SCHEMA {
             return Err(RosterReject::Schema);
         }
-        // The strict parse: within a known schema every key is one these types declare
-        // (`deny_unknown_fields` on both), so a misplaced or misspelt key is refused,
-        // never dropped.
+        // The strict parse: within a known schema a misplaced or misspelt key is refused,
+        // never dropped (`deny_unknown_fields` on both types).
         let roster: Roster = aterm_toml::from_str(text).map_err(|_| RosterReject::Malformed)?;
         roster.validate()?;
         Ok(roster)
     }
 
-    /// Structural invariants shared by parsing and by the minting tool's emission, so a
-    /// roster this build would refuse can never be PRODUCED either.
+    /// Structural invariants shared by parsing and the minting tool's emission, so a roster
+    /// this build would refuse can never be produced either.
     ///
-    /// # The id → key map must be a BIJECTION, and both directions are load-bearing
-    ///
-    /// Duplicate IDS are the obvious half. The roster maps id → key, so two entries under
-    /// one id would leave which key is authoritative up to iteration order, and the
-    /// id-keyed deny-list could not name one without naming the other.
-    ///
-    /// Duplicate PUBKEYS are the half that is easy to miss and worse when it happens,
-    /// because it defeats revocation — the single property this whole tier exists to
-    /// provide, and the only authorization defence the client has. Authority is decided by KEY
-    /// (`authorize_appcast` verifies against every live machine's key and reports the
-    /// first that matches) while denial is expressed by ID. So one key listed under two
-    /// ids means revoking either id withdraws nothing: `live()` drops the named entry,
-    /// keeps its twin, and the same key goes on signing under the surviving name. The
-    /// owner would have run `machine-revoke`, seen it succeed, and still be publishable
-    /// by the machine they cut off.
-    ///
-    /// Refusing it here — in the client's own parser, over bytes the master signed — is
-    /// what makes that unrepresentable rather than merely discouraged. `roster_ops::add`
-    /// refuses it too, with a message; this is the backstop for a roster assembled by
-    /// hand and re-signed from the paper master, which is the only way to produce one.
+    /// The id → key map must be a bijection. Duplicate ids would leave which key is
+    /// authoritative to iteration order. Duplicate pubkeys defeat revocation: authority is
+    /// decided by key (`authorize_appcast` tries every live machine's key) while denial names
+    /// an id, so with one key under two ids revoking either withdraws nothing; `live()` keeps
+    /// the twin and the key signs on. `roster_ops::add` refuses it too; this is the backstop
+    /// for a roster hand-edited and re-signed from the paper master.
     pub fn validate(&self) -> Result<(), RosterReject> {
         if self.machines.len() > MAX_MACHINES {
             return Err(RosterReject::Malformed);
@@ -430,8 +319,7 @@ impl Roster {
             if m.id.is_empty() || m.pubkey.is_empty() {
                 return Err(RosterReject::Malformed);
             }
-            // O(n²) over a list bounded by `MAX_MACHINES`, and deliberately so: a set
-            // would need an allocation on a path that runs before the roster is trusted.
+            // O(n²) over at most `MAX_MACHINES`: no allocation before the roster is trusted.
             if self.machines[..i]
                 .iter()
                 .any(|p| p.id == m.id || p.pubkey == m.pubkey)
@@ -445,19 +333,16 @@ impl Roster {
         Ok(())
     }
 
-    /// **Step 6–7.** Admit the roster itself: the durable replay floor, then freshness.
-    ///
-    /// Both are cheap and both run before any artifact crypto. `floor_seq` is the highest
-    /// `roster_seq` this client has ever durably recorded, and `now_unix` is injected so
-    /// the whole gate stays pure and deterministic — the real clock is the caller's.
+    /// **Step 6–7.** Admit the roster itself: the durable replay floor (`floor_seq`, the
+    /// highest `roster_seq` this client has recorded), then freshness. `now_unix` is injected,
+    /// so the gate is pure.
     pub fn admit(&self, floor_seq: u64, now_unix: i64) -> Result<(), RosterReject> {
-        // STEP 6 — the ratchet. Strong for a client that has already seen a newer roster,
-        // and worth exactly nothing to a brand-new install, which is why step 7 exists.
+        // Step 6, the ratchet: strong for a client that has seen a newer roster, nothing for
+        // a fresh install.
         if self.roster_seq < floor_seq {
             return Err(RosterReject::Rollback);
         }
-        // STEP 7 — freshness. A `valid_until` we cannot parse is treated as LAPSED, not as
-        // absent: an unreadable deadline must not become an unbounded one.
+        // Step 7, freshness: an unparseable `valid_until` is lapsed, not unbounded.
         let until = rfc3339_to_unix(&self.valid_until).ok_or(RosterReject::Stale)?;
         if now_unix >= until {
             return Err(RosterReject::Stale);
@@ -465,27 +350,19 @@ impl Roster {
         Ok(())
     }
 
-    /// Whether `id` is on the deny-list. A cheap string compare, and the whole reason the
-    /// grant and the deny live in one signed document.
+    /// Whether `id` is on the deny-list.
     #[must_use]
     pub fn is_revoked(&self, id: &str) -> bool {
         self.revoked.iter().any(|r| r == id)
     }
 
-    /// The named machine, iff it is listed, not revoked, and not itself expired.
+    /// The named machine, iff it is listed, not revoked, and not itself expired. Revocation is
+    /// checked first, so a machine both listed and revoked is refused.
     ///
-    /// Revocation is checked FIRST and beats listing, deliberately: a producer bug that
-    /// leaves a machine in both `[[machine]]` and `revoked` must resolve to REFUSED. The
-    /// deny always wins.
-    ///
-    /// # Never reuse an id
-    ///
-    /// Because this lookup is id-keyed, re-minting under an existing id silently REPLACES
-    /// that id's public key: a client still holding the old roster honours the old key
-    /// while a client on the new one honours the new key — two live authorities under one
-    /// name — and the deny-list, which names ids, cannot distinguish them. Reformatting a
-    /// machine therefore means a NEW id plus a revocation of the old, and the minting tool
-    /// refuses an id collision rather than leaving that to the docs.
+    /// Never reuse an id: this lookup is id-keyed, so re-minting under an existing id replaces
+    /// its key, leaving clients on the old and new rosters honouring different keys under one
+    /// name that the id-keyed deny-list cannot tell apart. A reformatted machine gets a new id
+    /// and the old one is revoked; the minting tool refuses an id collision.
     pub fn machine(&self, id: &str, now_unix: i64) -> Result<&Machine, RosterReject> {
         if self.is_revoked(id) {
             return Err(RosterReject::Revoked);
@@ -496,7 +373,7 @@ impl Roster {
             .find(|m| m.id == id)
             .ok_or(RosterReject::UnknownMachine)?;
         if let Some(not_after) = &m.not_after {
-            // Same fail-closed reading as the roster's own window: unparseable ⇒ lapsed.
+            // Unparseable ⇒ lapsed, as for the roster's own window.
             let until = rfc3339_to_unix(not_after).ok_or(RosterReject::Expired)?;
             if now_unix >= until {
                 return Err(RosterReject::Expired);
@@ -505,9 +382,8 @@ impl Roster {
         Ok(m)
     }
 
-    /// The machines eligible to have signed anything right now: listed, not revoked, not
-    /// expired. This is the set step 9 runs crypto against, and building it first is what
-    /// keeps a revoked machine's key from ever reaching the verifier.
+    /// The machines eligible to have signed anything now: listed, not revoked, not expired.
+    /// Step 9 runs crypto against only this set.
     #[must_use]
     pub fn live(&self, now_unix: i64) -> Vec<&Machine> {
         self.machines
@@ -516,36 +392,26 @@ impl Roster {
             .collect()
     }
 
-    /// **Step 8–9.** Verify the appcast's exact bytes under the roster's LIVE machines,
-    /// and report which one signed.
+    /// **Step 8–9.** Verify the appcast's exact bytes under the roster's live machines and
+    /// report which one signed.
     ///
-    /// # Why this tries the set instead of looking the machine up first
-    ///
-    /// The signing machine's id lives INSIDE the appcast, so it cannot be read before the
-    /// appcast is verified — and reading it first would be a parse of unverified bytes,
-    /// which is precisely the thing the whole design refuses to do. So the crypto runs
-    /// against the authorized set (bounded by [`MAX_MACHINES`]), and the label the
-    /// manifest carries is bound to the result afterwards by [`Attribution::bind`], over
-    /// bytes that are by then authenticated.
-    ///
-    /// Excluding revoked and expired machines happens BEFORE any of that, so a revoked
-    /// machine's otherwise-valid signature is never even checked — the ordering property
-    /// `atpkg::sig::verify_pkg` established, adapted from "did the index revoke the key it
-    /// also delegates" to "is the machine that signed this artifact on the deny-list".
+    /// The signer's id lives inside the appcast, and reading it first would parse unverified
+    /// bytes, so the crypto runs against the live set (bounded by [`MAX_MACHINES`]) and the
+    /// label is bound afterwards by [`Attribution::bind`]. Revoked and expired machines are
+    /// excluded first, so a revoked machine's valid signature is never checked.
     pub fn authorize_appcast(
         &self,
         appcast: &[u8],
         sig: &[u8],
         now_unix: i64,
     ) -> Result<Attribution, RosterReject> {
-        // Cheap, local, once: a wrong-length signature is BadSig regardless of the roster.
+        // Once, before the set: a wrong-length signature is BadSig regardless of the roster.
         if sig.len() != 64 {
             return Err(RosterReject::BadSig);
         }
         let live = self.live(now_unix);
         if live.is_empty() {
-            // Every machine is revoked or expired. Refuse — an empty authorized set
-            // authorizes nothing, and must never degrade to "unsigned is fine".
+            // Every machine is revoked or expired: an empty set authorizes nothing.
             return Err(RosterReject::UnknownMachine);
         }
         let mut usable = 0usize;
@@ -559,7 +425,7 @@ impl Roster {
                     });
                 }
                 Err(RosterReject::Verify) => usable += 1,
-                // A machine whose recorded pubkey is malformed can neither grant nor deny.
+                // A malformed recorded pubkey can neither grant nor deny.
                 Err(_) => {}
             }
         }
@@ -572,29 +438,18 @@ impl Roster {
 }
 
 impl Attribution {
-    /// **Step 10.** Bind the manifest's SELF-DECLARED identity to what actually verified.
+    /// **Step 10.** Bind the manifest's self-declared identity to what verified, by compares
+    /// over authenticated bytes:
     ///
-    /// Both cross-checks are string/integer compares over already-authenticated bytes:
-    ///
-    /// * `machine_id` must be present (an unattributed release is refused under an armed
-    ///   anchor — "I can track which computer does what" is a requirement) and must equal
-    ///   the machine whose key verified, which is what stops a genuine signature from one
-    ///   machine being relabelled as another;
-    /// * `roster_seq` must not EXCEED the roster's: the release was signed under
-    ///   generation `s`, and it may be verified under any generation `≥ s` (the roster it
-    ///   was cut with, or a NEWER master-signed one that still lists the machine as live).
-    ///   What is refused is the other direction — a release attributed under a newer
-    ///   generation than the roster presented, i.e. an OLD roster paired with a NEW
-    ///   release, which is the pairing that could resurrect a since-revoked machine.
-    ///
-    ///   Why "≤" and not "==": the roster is distributed as an asset on the channel's
-    ///   latest release, so when a machine joins (seq n+1) the new pair is attached to
-    ///   releases whose manifests were attributed under seq n. Under `==` every such
-    ///   release would be uninstallable for the whole fleet after a join, with no security won:
-    ///   verifying under a NEWER roster is strictly stronger (the newer deny-list applies,
-    ///   `Revoked` is checked first, and `Rollback` already forbids anything below the
-    ///   client's observed floor). A newer roster with an older release is the normal
-    ///   steady state of a multi-machine channel, not an attack.
+    /// * `machine_id` must be present (attribution is required under an armed anchor) and
+    ///   equal the machine whose key verified, so one machine's signature cannot be relabelled
+    ///   as another's;
+    /// * `roster_seq` must not exceed the roster's: a release signed under generation `s`
+    ///   verifies under any generation `≥ s`. The refused direction, an old roster with a new
+    ///   release, is the pairing that could resurrect a since-revoked machine. Not `==`: the
+    ///   roster rides the channel's latest release, so after a join (seq n+1) releases
+    ///   attributed under seq n must stay installable, and a newer roster is strictly stronger
+    ///   (its deny-list applies, and `Rollback` forbids anything below the floor).
     pub fn bind(
         &self,
         manifest_machine_id: Option<&str>,
@@ -606,49 +461,34 @@ impl Attribution {
         }
         match manifest_roster_seq {
             Some(seq) if seq <= self.roster_seq => Ok(()),
-            // Absent is a mismatch, not a pass: a release cut without a roster_seq cannot
-            // be paired with any particular roster generation, which is the whole point.
+            // Absent is a mismatch: such a release cannot be paired with a roster generation.
             _ => Err(RosterReject::SeqMismatch),
         }
     }
 }
 
-/// RFC3339 (`YYYY-MM-DDTHH:MM:SSZ`) → unix seconds, or `None` for anything this does not
-/// recognise — which every caller treats as LAPSED, never as absent. The workspace's one
-/// strict parser, `aterm_types::rfc3339::parse_utc`, shared with `atpkg::flow` so the two
-/// gates cannot disagree about the same string.
-///
-/// The `Z` suffix is REQUIRED and the length exact. A zone-offset stamp (`…+05:30`) names
-/// a DIFFERENT instant than the digits ahead of it do, and reading it as UTC would move a
-/// deadline the wrong way: `not_after = "2026-12-31T23:59:59+05:30"` expires at 18:29:59Z,
-/// so a parser that ignored the offset would keep that machine authorizing for another
-/// 5.5 h — up to 14 h at the extreme of the offset range. Fractional seconds and trailing
-/// bytes are refused on the same principle: the producers all emit exactly this shape
-/// (`roster_ops` stamps it), so anything else is a hand-edit this gate must not guess at.
+/// RFC3339 (`YYYY-MM-DDTHH:MM:SSZ`) → unix seconds, or `None` (lapsed at every caller) for
+/// anything else: the workspace's strict `aterm_types::rfc3339::parse_utc`, shared with
+/// `atpkg::flow`. The `Z` is required and the length exact: an offset stamp names a different
+/// instant (`not_after = "2026-12-31T23:59:59+05:30"` expires at 18:29:59Z), and read as UTC it
+/// would extend a deadline by up to 14 h. The producers (`roster_ops`) emit exactly this shape.
 use aterm_types::rfc3339::parse_utc as rfc3339_to_unix;
 
 impl Roster {
-    /// Serialize to the published TOML shape — the producer half, used by the minting tool
-    /// so the bytes the owner signs are produced by the same type the client parses.
-    ///
-    /// Validation runs FIRST: a roster this build would refuse must never be emitted,
-    /// signed, and published only to be rejected by every client in the field.
+    /// Serialize to the published TOML shape: the minting tool's half, so the bytes the owner
+    /// signs come from the type the client parses. Validates first, so a roster every client
+    /// would refuse is never emitted.
     pub fn to_toml(&self) -> Result<String, RosterReject> {
         self.validate()?;
         aterm_toml::to_string(self).map_err(|_| RosterReject::Malformed)
     }
 }
 
-/// Unix seconds now, as the `now_unix` the roster's gates take: its `valid_until`
-/// ([`Roster::admit`]) and each machine's `not_after` ([`Roster::machine`]).
+/// Unix seconds now, for the roster's gates ([`Roster::admit`], [`Roster::machine`]).
 ///
-/// # A clock we cannot read fails CLOSED — `i64::MAX`, never `0`
-///
-/// Zero reads as 1970, before every conceivable deadline, so a roster generation that
-/// lapsed years ago would be ADMITTED and an expired machine treated as live — and roster
-/// freshness is the only defence a fresh install has (it carries no floor). `i64::MAX`
-/// makes every window look already expired, which refuses everything. It is the opposite
-/// of a retry-deadline clock, where "passed" means "retry now" and zero is right.
+/// An unreadable clock fails closed with `i64::MAX`, never `0`: zero reads as 1970, before
+/// every deadline, so a long-lapsed roster or an expired machine would be admitted.
+/// `i64::MAX` makes every window already expired.
 // Skip: aterm_time clock accessors (third-party absent bodies).
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
@@ -656,8 +496,7 @@ pub fn now_unix() -> i64 {
     fail_closed(aterm_time::unix_secs())
 }
 
-/// [`now_unix`]'s decision, apart from the clock read so the fail-closed direction is
-/// tested rather than asserted in prose.
+/// [`now_unix`]'s decision, apart from the clock read so its direction is tested.
 fn fail_closed(unix_secs: Option<u64>) -> i64 {
     unix_secs.map_or(i64::MAX, |s| i64::try_from(s).unwrap_or(i64::MAX))
 }
@@ -667,8 +506,7 @@ mod tests {
     use super::*;
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
-    // Obviously synthetic seeds. These are constant byte-fills — they could not be
-    // mistaken for a real key, and none of them ever appears in `pins.rs`.
+    // Obviously synthetic constant seeds; none ever appears in `pins.rs`.
     const MASTER_SEED: [u8; 32] = [0xA1; 32];
     const OTHER_MASTER_SEED: [u8; 32] = [0xA2; 32];
     const M3_SEED: [u8; 32] = [0xB1; 32];
@@ -714,9 +552,8 @@ mod tests {
         }
     }
 
-    /// Emit + master-sign a roster, then take it back through the real client path:
-    /// `verify_roster` → `Roster::parse`. Returns the parsed roster, so every test below
-    /// exercises the bytes rather than the in-memory struct.
+    /// Emit and master-sign a roster, then take it back through `verify_roster` →
+    /// `Roster::parse`, so tests exercise the bytes.
     fn through_the_chain(r: &Roster, master: &Ed25519KeyPair, anchors: &[&str]) -> Roster {
         let raw = r.to_toml().unwrap().into_bytes();
         let sig = sign(master, &raw);
@@ -726,8 +563,7 @@ mod tests {
 
     const APPCAST: &[u8] = b"schema = 1\nversion = \"0.99\"\nmachine_id = \"m3\"\nroster_seq = 3\n";
 
-    /// THE HAPPY PATH, end to end over real bytes: a master-signed roster verifies under
-    /// the pinned master, admits, and an m3-signed appcast is attributed to m3.
+    /// A master-signed roster verifies, admits, and an m3-signed appcast is attributed to m3.
     #[test]
     fn a_valid_chain_verifies_and_attributes_the_signing_machine() {
         let master = kp(&MASTER_SEED);
@@ -741,12 +577,10 @@ mod tests {
         assert_eq!(a.pubkey_b64, pk(&kp(&M3_SEED)));
         assert_eq!(a.roster_seq, 3);
         a.bind(Some("m3"), Some(3)).expect("the manifest agrees");
-        // The human-readable form is what lands in status/log.
         assert_eq!(a.to_string(), "m3 (roster seq 3)");
     }
 
-    /// ATTRIBUTION IS NOT A LABEL. The very same appcast signed by m11 is attributed to
-    /// m11 — the report follows the KEY, not the file's contents.
+    /// The same appcast signed by m11 is attributed to m11: the key decides, not the label.
     #[test]
     fn attribution_follows_the_key_that_signed() {
         let master = kp(&MASTER_SEED);
@@ -759,16 +593,14 @@ mod tests {
             a.machine_id, "m11",
             "the key decides who signed, never the manifest's own claim"
         );
-        // ...and because the appcast's bytes say `machine_id = "m3"`, the bind REFUSES.
-        // This is the relabelling defence in both directions at once.
+        // ...and since the appcast's bytes say `machine_id = "m3"`, the bind refuses.
         assert_eq!(
             a.bind(Some("m3"), Some(3)),
             Err(RosterReject::UnknownMachine)
         );
     }
 
-    /// THE WRONG MASTER. A roster signed by a different master is refused under the pinned
-    /// anchor, and the chain never reaches a parse.
+    /// A roster signed by a different master is refused before any parse.
     #[test]
     fn a_roster_signed_by_the_wrong_master_is_refused() {
         let anchor = pk(&kp(&MASTER_SEED));
@@ -780,8 +612,7 @@ mod tests {
         );
     }
 
-    /// A ONE-BYTE EDIT to the roster is refused: adding a machine to a genuine roster
-    /// without the master cannot work.
+    /// Flipping the low bit of any byte of the roster is refused.
     #[test]
     fn a_tampered_roster_is_refused() {
         let master = kp(&MASTER_SEED);
@@ -799,8 +630,7 @@ mod tests {
         }
     }
 
-    /// THE WRONG MACHINE KEY. A thief's key is not on the roster, so an appcast it signed
-    /// verifies under nobody — even though the roster itself is perfectly genuine.
+    /// An appcast signed by a key outside a genuine roster verifies under nobody.
     #[test]
     fn an_appcast_signed_by_a_key_outside_the_roster_is_refused() {
         let master = kp(&MASTER_SEED);
@@ -812,8 +642,7 @@ mod tests {
         );
     }
 
-    /// EMPTY MEANS INERT. An unpinned master anchor authorizes NOTHING — not even a roster
-    /// signed by a real master. There is no "accept anything" path.
+    /// An unpinned master anchor authorizes nothing, not even a genuinely signed roster.
     #[test]
     fn an_empty_master_anchor_is_inert_and_never_accepts() {
         let master = kp(&MASTER_SEED);
@@ -826,17 +655,14 @@ mod tests {
         );
         // The single-key primitive agrees, before any crypto.
         assert_eq!(verify_under("", &raw, &sig), Err(RosterReject::Disabled));
-        // And an anchor list of nothing but empty/garbage members is BadKey — a broken
-        // keyset must not read as "this roster's signature was bad".
+        // A keyset of nothing but garbage is BadKey, not a bad signature.
         assert_eq!(
             verify_roster(&["", "!!not base64!!"], raw, &sig),
             Err(RosterReject::BadKey)
         );
     }
 
-    /// REVOCATION, the case the retired design called unfixable. m11's key is genuine, was
-    /// once legitimately authorized, and still signs perfectly — and is refused, before any
-    /// crypto touches it, because the roster that names it also revokes it.
+    /// A revoked machine's genuine signature is refused before any crypto touches it.
     #[test]
     fn a_revoked_machine_is_refused_though_its_signature_is_valid() {
         let master = kp(&MASTER_SEED);
@@ -855,16 +681,14 @@ mod tests {
             Err(RosterReject::Verify),
             "a revoked machine must not be in the candidate set at all"
         );
-        // Negative control: m3, on the same roster, still works — revocation is targeted,
-        // not a channel-wide brick.
+        // Negative control: m3 on the same roster still works.
         assert!(
             r.authorize_appcast(APPCAST, &sign(&kp(&M3_SEED), APPCAST), NOW)
                 .is_ok()
         );
     }
 
-    /// The deny-list is checked BEFORE the listing, so a producer bug that leaves a
-    /// machine in both `[[machine]]` and `revoked` resolves to REFUSED. The deny wins.
+    /// A machine both listed and revoked is refused.
     #[test]
     fn deny_beats_grant_when_a_roster_says_both() {
         let mut r = roster();
@@ -872,24 +696,20 @@ mod tests {
         assert_eq!(r.machine("m3", NOW), Err(RosterReject::Revoked));
     }
 
-    /// REPLAY: the old roster (seq 3, still listing m11) carries a master signature that is
-    /// valid FOREVER — signatures do not expire, documents do. A client that has durably
-    /// seen seq 4 refuses it permanently.
+    /// An older roster's master signature stays valid forever, so a client that has durably
+    /// seen seq 4 refuses seq 3.
     #[test]
     fn an_older_roster_is_refused_once_a_newer_one_has_been_seen() {
         let master = kp(&MASTER_SEED);
         let anchor = pk(&master);
         let old = through_the_chain(&roster(), &master, &[&anchor]); // seq 3
-        // Its master signature still verifies — that is exactly why the floor exists.
         assert_eq!(old.roster_seq, 3);
         assert_eq!(old.admit(4, NOW), Err(RosterReject::Rollback));
-        // Equal is allowed (the gate is seq >= floor), so a re-fetch of the current roster
-        // is not mistaken for an attack.
+        // Equal is allowed, so a re-fetch of the current roster is no attack.
         assert_eq!(old.admit(3, NOW), Ok(()));
     }
 
-    /// An unreadable clock yields `i64::MAX`, not `0`: every window then reads as EXPIRED,
-    /// so a lapsed roster is refused rather than admitted as if it were 1970.
+    /// An unreadable clock yields `i64::MAX`, so a lapsed roster is refused, not read as 1970.
     #[test]
     fn an_unreadable_clock_fails_closed_rather_than_reading_as_1970() {
         assert_eq!(fail_closed(None), i64::MAX);
@@ -897,21 +717,18 @@ mod tests {
         let r = roster();
         assert_eq!(r.admit(0, 0), Ok(()), "1970 is inside every window");
         assert_eq!(r.admit(0, fail_closed(None)), Err(RosterReject::Stale));
-        // NON-VACUITY: the readable path is unaffected and returns the real second.
+        // Non-vacuity: the readable path returns the real second.
         assert_eq!(fail_closed(Some(1_790_000_000)), 1_790_000_000);
         assert!(now_unix() > 1_700_000_000);
     }
 
-    /// The freshness gate still refuses a lapsed roster (minted rosters say 9999-12-31 by
-    /// owner decision, but the format and the check are kept), and an unparseable deadline
-    /// is treated as lapsed — never as absent, which would turn a typo into an unbounded
-    /// window.
+    /// A lapsed roster is refused, and an unparseable deadline reads as lapsed, never absent.
     #[test]
     fn a_lapsed_or_unreadable_valid_until_is_refused() {
         let mut r = roster();
         r.valid_until = "2026-01-01T00:00:00Z".into();
         assert_eq!(r.admit(0, NOW), Err(RosterReject::Stale));
-        // The boundary itself: now == valid_until is already lapsed.
+        // now == valid_until is already lapsed.
         let until = rfc3339_to_unix("2026-01-01T00:00:00Z").unwrap();
         assert_eq!(r.admit(0, until), Err(RosterReject::Stale));
         assert_eq!(r.admit(0, until - 1), Ok(()));
@@ -919,8 +736,7 @@ mod tests {
         assert_eq!(r.admit(0, NOW), Err(RosterReject::Stale));
     }
 
-    /// A machine's own `not_after` ages it out without a revocation, and the expired
-    /// machine leaves the candidate set entirely.
+    /// A machine's own `not_after` ages it out of the candidate set without a revocation.
     #[test]
     fn an_expired_machine_ages_out_of_the_candidate_set() {
         let mut r = roster();
@@ -930,16 +746,13 @@ mod tests {
             r.authorize_appcast(APPCAST, &sign(&kp(&M3_SEED), APPCAST), NOW),
             Err(RosterReject::Verify)
         );
-        // Before the deadline it is perfectly live — the gate is a date, not a brick.
+        // Before the deadline it is live.
         let before = rfc3339_to_unix("2025-12-31T23:59:59Z").unwrap();
         assert!(r.machine("m3", before).is_ok());
     }
 
-    /// STEP 9's cross-check: an old roster cannot be paired with a NEW release (the
-    /// manifest may not claim a generation newer than the roster it verified under), a
-    /// NEWER roster paired with an older release is admitted (the roster travels on the
-    /// channel head; a join re-dresses published releases with the new pair), and an
-    /// unattributed release is refused outright under an armed anchor.
+    /// An old roster cannot be paired with a newer release, a newer roster with an older
+    /// release is admitted, and an unattributed release is refused.
     #[test]
     fn the_manifest_must_name_its_machine_and_not_outrun_its_roster_generation() {
         let a = Attribution {
@@ -967,34 +780,24 @@ mod tests {
         );
     }
 
-    /// Reject-newer: a roster from a format this build does not understand is refused
-    /// rather than misread, and the refusal is post-verify (it is not an oracle).
+    /// A newer schema is refused rather than misread, post-verify.
     #[test]
     fn a_newer_roster_schema_is_refused_not_misread() {
         let master = kp(&MASTER_SEED);
         let anchor = pk(&master);
         let mut r = roster();
         r.schema = SUPPORTED_SCHEMA + 1;
-        // `to_toml` validates structure, not schema — the producer may legitimately emit a
-        // newer schema for newer clients — so this reaches the client's gate.
+        // `to_toml` validates structure, not schema, so this reaches the client's gate.
         let raw = r.to_toml().unwrap().into_bytes();
         let sig = sign(&master, &raw);
         let v = verify_roster(&[&anchor], raw, &sig).unwrap();
         assert_eq!(Roster::parse(&v), Err(RosterReject::Schema));
     }
 
-    /// A KEY THE SCHEMA DOES NOT DECLARE IS REFUSED, NEVER DROPPED (ruling 2026-10-10).
-    ///
-    /// The case that matters is the layout this module's own example used to show:
-    /// `revoked` written after the `[[machine]]` tables. TOML gives that key to the last
-    /// machine. When unknown keys were ignored, the master-signed roster parsed with
-    /// NOTHING revoked, and the machine the owner withdrew stayed authorized. The same
-    /// went for a misspelt head key and for a key a machine table does not declare.
-    ///
-    /// Negative controls: the same roster with `revoked` above the tables revokes, and
-    /// the emitter's own output round-trips. A NEWER schema that adds a key is refused
-    /// for its version (`Schema`), not as `Malformed`, because the closed key set is
-    /// per schema.
+    /// A key the schema does not declare is refused, never dropped: `revoked` written after
+    /// the tables, a misspelt head key, an undeclared machine key. Controls: `revoked` above
+    /// the tables revokes, the emitter round-trips, and a newer schema that adds a key is
+    /// refused as `Schema`, not `Malformed`.
     #[test]
     fn a_key_the_schema_does_not_declare_is_refused_not_dropped() {
         let master = kp(&MASTER_SEED);
@@ -1014,8 +817,7 @@ mod tests {
         let m11_appcast = b"schema = 1\nmachine_id = \"m11\"\nroster_seq = 3\n";
         let m11_sig = sign(&kp(&M11_SEED), m11_appcast);
 
-        // The control first: `revoked` ABOVE the tables withdraws m11, so its otherwise
-        // valid signature authorizes nothing.
+        // Control: `revoked` above the tables withdraws m11.
         let above = parse(&format!("{head}revoked     = [\"m11\"]\n{tables}"))
             .expect("the documented layout parses");
         assert!(above.is_revoked("m11"));
@@ -1025,8 +827,7 @@ mod tests {
             "a revoked machine's signature is never checked"
         );
 
-        // THE DEFECT: the same deny-list written after the tables. Before the ruling this
-        // parsed as `revoked == []`, and the m11-signed appcast was authorized.
+        // The same deny-list after the tables belongs to the last machine: refused.
         assert_eq!(
             parse(&format!("{head}{tables}\nrevoked = [\"m11\"]\n")),
             Err(RosterReject::Malformed),
@@ -1042,8 +843,7 @@ mod tests {
             Err(RosterReject::Malformed)
         );
 
-        // Forward compatibility: a newer schema may add keys, and it is refused for its
-        // version before the closed key set is applied.
+        // A newer schema may add keys: refused for its version first.
         let newer = format!(
             "schema = {}\nroster_seq = 3\nvalid_until = \"9999-12-31T00:00:00Z\"\nhorizon = 7\n{}",
             SUPPORTED_SCHEMA + 1,
@@ -1051,7 +851,7 @@ mod tests {
         );
         assert_eq!(parse(&newer), Err(RosterReject::Schema));
 
-        // The emitter's own layout carries every key it declares and round-trips.
+        // The emitter's layout round-trips every declared key.
         let mut emitted = roster();
         emitted.revoked = vec!["m2".into()];
         emitted.machines[0].not_after = Some("2027-01-01T00:00:00Z".into());
@@ -1059,9 +859,8 @@ mod tests {
         assert_eq!(parse(&text), Ok(emitted));
     }
 
-    /// Structural invariants a signature cannot check: duplicate ids (two live authorities
-    /// under one name), empty ids, and an over-long roster. Refused on BOTH sides, so a
-    /// roster the client would reject cannot be produced and published either.
+    /// Duplicate ids, empty ids and revocations, and an over-long roster are refused on both
+    /// parse and emission.
     #[test]
     fn malformed_rosters_are_refused_on_parse_and_on_emission() {
         let mut dup = roster();
@@ -1081,9 +880,7 @@ mod tests {
         huge.machines = (0..=MAX_MACHINES)
             .map(|i| Machine {
                 id: i.to_string(),
-                // DISTINCT keys, so this case tests the ceiling and only the ceiling. A
-                // repeated key here would now be refused by the bijection rule below and
-                // this assertion would pass for the wrong reason.
+                // Distinct keys, so only the ceiling is tested.
                 pubkey: format!("key-{i}"),
                 added_at: String::new(),
                 not_after: None,
@@ -1091,29 +888,13 @@ mod tests {
             .collect();
         assert_eq!(huge.validate(), Err(RosterReject::Malformed));
 
-        // The negative control that makes the four above non-vacuous.
+        // Negative control.
         assert_eq!(roster().validate(), Ok(()));
     }
 
-    /// ONE KEY UNDER TWO IDS DEFEATS REVOCATION, so no roster may contain one.
-    ///
-    /// Authority is decided by KEY — `authorize_appcast` verifies against every live
-    /// machine's key — while denial is expressed by ID. A key listed twice therefore
-    /// survives `machine-revoke` of either name: `live()` drops the revoked entry, keeps
-    /// its twin, and the same key signs on under the surviving id. The owner would have
-    /// revoked the machine, watched it succeed, and still be publishable by it.
-    ///
-    /// The roster's deny-list is the ONLY thing that can withdraw a machine's authority —
-    /// the client consults no other key (`fetch_authoritative_release`). A hole in it is a
-    /// hole in the whole tier.
-    ///
-    /// Refused in the client's own parser rather than only in the minting tool, because
-    /// the only way to produce such a document is to hand-edit one and re-sign it from
-    /// the paper master — which the tool cannot intercept and the master's signature
-    /// would otherwise make authoritative.
-    ///
-    /// Kills the mutation "check duplicate ids only" — under it, every assertion below
-    /// flips.
+    /// One key under two ids would survive `machine-revoke` of either name (see
+    /// [`Roster::validate`]), so it is refused on parse and on emission. Kills the mutation
+    /// "check duplicate ids only".
     #[test]
     fn one_public_key_may_not_appear_under_two_machine_ids() {
         let shared = pk(&kp(&M3_SEED));
@@ -1128,11 +909,9 @@ mod tests {
             "precondition: and they are NOT a duplicate id, which is the other rule"
         );
         assert_eq!(twinned.validate(), Err(RosterReject::Malformed));
-        // Refused on emission too, so the shape cannot be published in the first place.
         assert_eq!(twinned.to_toml(), Err(RosterReject::Malformed));
 
-        // AND THE REASON, demonstrated rather than asserted: revoking one name leaves the
-        // other live and holding the same key. This is what the parse refusal prevents.
+        // Why: revoking one name leaves the twin live with the same key.
         let mut revoked_one = twinned.clone();
         revoked_one.revoked = vec![revoked_one.machines[0].id.clone()];
         let survivors = revoked_one.live(NOW);
@@ -1142,13 +921,11 @@ mod tests {
             "and it holds the very key that was supposed to have been withdrawn"
         );
 
-        // The negative control: the same roster with the keys left distinct is fine, so
-        // the refusal above is about the collision and not about the fixture.
+        // Negative control: distinct keys are fine.
         assert_eq!(roster().validate(), Ok(()));
     }
 
-    /// The wire round-trip: emit → master-sign → verify → parse reproduces the value
-    /// exactly, so the bytes the owner signs are the bytes the client reads.
+    /// Emit → master-sign → verify → parse reproduces the value exactly.
     #[test]
     fn the_roster_round_trips_through_emission_and_the_client_parser() {
         let master = kp(&MASTER_SEED);
@@ -1159,9 +936,8 @@ mod tests {
         assert_eq!(through_the_chain(&original, &master, &[&anchor]), original);
     }
 
-    /// A malformed anchor member can neither GRANT nor DENY: a good master beside it still
-    /// verifies, and the reported index is the one that actually did the work — so a
-    /// stalled master rotation is visible rather than silent.
+    /// A malformed anchor member neither grants nor denies: a good master beside it verifies,
+    /// and the reported index is the one that did, so a stalled rotation is visible.
     #[test]
     fn a_malformed_anchor_member_neither_grants_nor_denies() {
         let master = kp(&MASTER_SEED);
@@ -1178,18 +954,11 @@ mod tests {
         );
     }
 
-    /// AN OFFSET STAMP IS NOT UTC, and must not be gated as though it were.
-    ///
-    /// `…T23:59:59+05:30` denotes an instant 5.5 hours EARLIER than the same digits read
-    /// as UTC, so reading the digits alone moves the deadline the wrong way: the machine
-    /// would keep authorizing past the expiry the operator wrote, by as much as the 14 h
-    /// the offset range allows. Such a stamp is refused outright instead — `None` ⇒
-    /// lapsed at every caller — which is the verdict `atpkg::flow`'s twin already gives
-    /// the same string, so the two gates agree.
+    /// An offset stamp is refused rather than read as UTC (which would move the deadline the
+    /// wrong way): `None`, lapsed at every caller, as `atpkg::flow` reads the same string.
     #[test]
     fn an_offset_stamp_is_refused_rather_than_silently_read_as_utc() {
-        // THE MACHINE GATE. True expiry is 2026-12-31T18:29:59Z; well past it, m3 must be
-        // gone from the candidate set rather than live until the 23:59:59Z the digits say.
+        // True expiry is 18:29:59Z; past it m3 must be gone, not live until 23:59:59Z.
         let mut r = roster();
         r.machines[0].not_after = Some("2026-12-31T23:59:59+05:30".into());
         let past_the_real_deadline = rfc3339_to_unix("2026-12-31T20:00:00Z").unwrap();
@@ -1202,15 +971,13 @@ mod tests {
             "an unreadable not_after must not leave the machine in the live set"
         );
 
-        // THE ROSTER'S OWN WINDOW, read the same way: a deadline that cannot be read as
-        // UTC is lapsed, never open.
+        // The roster's own window: an offset deadline is lapsed, never open.
         let mut r = roster();
         r.valid_until = "2027-02-01T00:00:00+05:30".into();
         assert_eq!(r.admit(0, NOW), Err(RosterReject::Stale));
     }
 
-    /// The date arithmetic the freshness gate rests on, pinned against hand-checked
-    /// values — a wrong epoch here would silently widen or brick every window.
+    /// The date arithmetic the freshness gate rests on, against hand-checked values.
     #[test]
     fn rfc3339_parses_the_shapes_the_roster_uses() {
         assert_eq!(rfc3339_to_unix("1970-01-01T00:00:00Z"), Some(0));
@@ -1223,9 +990,8 @@ mod tests {
             "2026-13-04T00:00:00Z",
             "2026-08-04T24:00:00Z",
             "20xx-08-04T00:00:00Z",
-            // THE ZONE IS PART OF THE SHAPE. Each of these reads as a plausible date to
-            // a human and must still be refused, because none of them is the UTC instant
-            // the digits ahead of the suffix would claim.
+            // The zone is part of the shape: none of these is the UTC instant its digits
+            // claim.
             "2026-08-04T00:00:00+05:30", // an offset denotes an EARLIER instant
             "2026-08-04T00:00:00-08:00", // ...and this one a later instant
             "2026-08-04T00:00:00",       // bare, no zone at all

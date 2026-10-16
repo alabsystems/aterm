@@ -6,9 +6,8 @@ use super::{
 };
 use aterm_render::{RenderInput, Theme};
 
-/// Every cell of a composed frame that is not the plain divider seam, as
-/// `(row, col, glyph)`. The mark is the only thing that puts a glyph in a
-/// divider gap, so this is the complete inventory of what it painted.
+/// Every cell of a composed frame that is not the plain divider seam, as `(row, col, glyph)`:
+/// everything the mark painted.
 fn stripes(dst: &RenderInput, theme: Theme) -> Vec<(usize, usize, char)> {
     let seam = divider_cell(theme);
     let mut out = Vec::new();
@@ -22,9 +21,8 @@ fn stripes(dst: &RenderInput, theme: Theme) -> Vec<(usize, usize, char)> {
     out
 }
 
-/// The mark hugs exactly the divider lines that touch the active pane, on the
-/// side facing it, and reaches nothing else — not the far divider, not one
-/// cell of any pane's rectangle.
+/// The mark inks exactly the divider lines touching the active pane, on the side facing it,
+/// and nothing else: not the far divider, not one cell of a pane's rectangle.
 #[test]
 fn the_mark_inks_the_divider_lines_that_touch_the_active_pane_and_no_others() {
     let theme = Theme::default();
@@ -65,10 +63,8 @@ fn the_mark_inks_the_divider_lines_that_touch_the_active_pane_and_no_others() {
     );
 }
 
-/// The other two sides of the same layout, so all four are reached: the
-/// Top-left pane (rows 0..2, cols 0..5) has a divider below it and one to its
-/// Right, and the ink lands on the near side of each — the top of the row
-/// below, the left of the column beside.
+/// The other two sides: a top-left pane (rows 0..2, cols 0..5) with a divider below and one
+/// to its right is inked on the side facing each.
 #[test]
 fn a_pane_with_a_divider_below_and_beside_it_is_inked_on_those_two_sides() {
     let theme = Theme::default();
@@ -103,8 +99,7 @@ fn a_pane_with_a_divider_below_and_beside_it_is_inked_on_those_two_sides() {
     );
 }
 
-/// A frame that marks no pane is byte-identical to the plain seam grid: the
-/// mark can only ever ADD ink to a divider gap.
+/// A frame that marks no pane is the plain seam grid.
 #[test]
 fn an_unmarked_composite_is_the_plain_seam_grid() {
     let theme = Theme::default();
@@ -117,10 +112,8 @@ fn an_unmarked_composite_is_the_plain_seam_grid() {
     );
 }
 
-/// A pane that owns the whole composite has no divider to mark, so a
-/// single-pane (or zoomed) frame is the plain seam grid even with the mark
-/// resolved and the window focused. This is the property that keeps a
-/// single-pane window completely unchanged.
+/// A pane that fills the composite has no divider to mark, so a single-pane (or zoomed)
+/// frame is the plain seam grid even with the mark resolved and the window focused.
 #[test]
 fn a_pane_that_fills_the_window_stamps_nothing() {
     let theme = Theme::default();
@@ -168,9 +161,8 @@ fn the_setting_and_the_windows_own_focus_each_withhold_the_mark() {
     );
 }
 
-/// Each side's stripe sits on the half of the divider cell that FACES the
-/// pane — the whole point of the mark, since a 1-cell divider is shared by
-/// two panes and only the side the ink is on says which of them is live.
+/// Each stripe sits on the half of the divider cell facing the pane: a 1-cell divider is
+/// shared by two panes, and only the side the ink is on says which is live.
 #[test]
 fn each_edge_inks_the_side_of_the_divider_cell_that_faces_the_pane() {
     let theme = Theme::default();
@@ -197,11 +189,8 @@ fn each_edge_inks_the_side_of_the_divider_cell_that_faces_the_pane() {
     }
 }
 
-/// The RepaintKey term: `0` while nothing is marked (the idle invariant), and
-/// a value that MOVES when the marked rectangle does — otherwise the present
-/// early-out swallows the frame that moves the ring to the pane the user just
-/// focused, and the mark would point at the previous pane until unrelated
-/// output arrived.
+/// The RepaintKey term is `0` with no mark (the idle invariant) and moves with the marked
+/// rectangle, so the present early-out never swallows the frame that moves the ring.
 #[test]
 fn the_repaint_key_term_is_zero_for_no_mark_and_moves_with_the_rectangle() {
     assert_eq!(ActivePaneMark::key_term(None), 0);

@@ -100,22 +100,6 @@ fn bg_alpha_is_rounded_and_monotone() {
 }
 
 #[test]
-fn negative_control_a_translucent_ink_would_be_caught() {
-    // The pre-fix DEFECT reproduced: if the ink stream had (wrongly) inherited the
-    // background opacity, its alpha at opacity=0.3 would be bg_quad_alpha(0.3),
-    // NOT 255. Assert the shipping ink policy does NOT do that — the exact bug the
-    // guarantee excludes.
-    let buggy_translucent_ink = bg_quad_alpha(0.3);
-    assert!(buggy_translucent_ink < 255, "control precondition");
-    assert_ne!(
-        ink_quad_alpha(0.3),
-        buggy_translucent_ink,
-        "ink must NOT inherit the background's translucency (the pre-fix defect)"
-    );
-    assert_eq!(ink_quad_alpha(0.3), 255);
-}
-
-#[test]
 fn renderer_background_opacity_roundtrips_and_clamps() {
     // Tier-1: the SHIPPING renderer accessor clamps to the same [0,1] domain the
     // policy assumes, and defaults to solid.

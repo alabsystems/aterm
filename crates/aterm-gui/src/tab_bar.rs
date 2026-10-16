@@ -1328,11 +1328,23 @@ pub(crate) const STRIP_CHIP_CARDS: bool = STRIP_IS_CHROME_BAND;
 /// live in the native toolbar ([`STRIP_IS_CHROME_BAND`]).
 pub(crate) const STRIP_DISTINCT_LABELS: bool = STRIP_IS_CHROME_BAND;
 
-/// The contrast floor every strip ink is held to against its surface. 3.0:1 rather
-/// than AA's 4.5 because muted schemes cannot reach 4.5 even at full strength
-/// (Solarized Light's fg is ~4.13:1). A no-op on bundled schemes; it keeps a user
-/// theme from putting illegible ink on the band.
-const STRIP_INK_FLOOR: f64 = 3.0;
+/// The legibility floor every strip ink is held to against its surface: 3.0:1,
+/// BELOW WCAG AA's 4.5:1 for text of this size, and on purpose. The strip draws
+/// the theme's own foreground unchanged wherever the theme's pair clears this
+/// floor, rather than darkening it to AA as the message band does: muted
+/// schemes such as Solarized Light sit between 3:1 and 4.5:1 against the
+/// strip (its fg ~4.4–5.0:1, its dim labels ~3.4–3.7:1, band and bare ground),
+/// so an AA floor would repaint their text. It does fire on a bundled scheme:
+/// on a blended band it lifts Solarized Dark's active-tab ink on the raised
+/// card (~2.85:1 unfloored). And it keeps a user theme from putting illegible
+/// ink on the band.
+const STRIP_LEGIBILITY_FLOOR: f64 = 3.0;
+
+/// The non-text floor of the strip's accent marks (the active underline, the
+/// update rule, the status marks) against the surfaces they are drawn on:
+/// WCAG 1.4.11's 3:1 for a graphical object, the floor the message band's
+/// accent takes too.
+const STRIP_ACCENT_FLOOR: f64 = 3.0;
 
 /// How far the bottom seam steps off the band toward the foreground: enough to read
 /// as the band's edge at 12 px type, not enough to compete with the active accent.
@@ -1462,13 +1474,13 @@ fn forced_strip_colors(hc: crate::chrome_band::ForcedChrome) -> StripColors {
 /// (default theme: grid `#111318`, band `#303135`, card `#525256`). On macOS
 /// `band_bg == theme.bg`, so the expression is the same.
 ///
-/// Each ink is floored to [`STRIP_INK_FLOOR`] against the surface it is drawn on
+/// Each ink is floored to [`STRIP_LEGIBILITY_FLOOR`] against the surface it is drawn on
 /// (band ink against `band_bg`, card ink against `raise_bg`).
 ///
 /// The raise follows `bg_is_light(theme.bg)`: 0.21 toward fg on dark themes, 0.14
 /// on light ones, where a deeper step reads as a slab. The inactive-label dim is a
 /// mild 0.15 on both, since the raised card carries the focus cue.
-/// `strip_contrast_meets_wcag_aa` guards active, inactive and `+` contrast.
+/// `strip_inks_clear_the_legibility_floor` guards the inks and the accent.
 ///
 /// Under an OS-forced chrome palette (Windows High Contrast) [`forced_strip_colors`]
 /// answers instead.
@@ -1514,7 +1526,9 @@ fn strip_colors(theme: Theme) -> StripColors {
     let raise_bg = crate::chrome_band::mix3(band_bg, fg, active_t);
     // Each ink is floored against the surface it lands on: band and raised card are
     // two surfaces, and the raise also moves the card toward its ink.
-    let ink = |c: [u8; 3], on: [u8; 3]| crate::chrome_band::ensure_contrast(c, on, STRIP_INK_FLOOR);
+    let ink = |c: [u8; 3], on: [u8; 3]| {
+        crate::chrome_band::ensure_contrast(c, on, STRIP_LEGIBILITY_FLOOR)
+    };
     let raise_fg = ink(fg, raise_bg);
     // Full-strength ink on the band. Also the CEILING for the dim below.
     let band_fg = ink(fg, band_bg);
@@ -1522,7 +1536,7 @@ fn strip_colors(theme: Theme) -> StripColors {
     // pushes ink away from its surface, so on a muted light scheme it can lift the
     // dim back toward full strength; past the band ink, unfocused labels would
     // outshine the focused one. Inert on bundled schemes
-    // (`strip_contrast_meets_wcag_aa`); it guards re-tunes and user themes.
+    // (`strip_inks_clear_the_legibility_floor`); it guards re-tunes and user themes.
     let dim = ink(crate::chrome_band::mix3(fg, band_bg, inactive_t), band_bg);
     let inactive_fg = if crate::chrome_band::contrast(dim, band_bg)
         > crate::chrome_band::contrast(band_fg, band_bg)
@@ -1542,6 +1556,16 @@ fn strip_colors(theme: Theme) -> StripColors {
     let chip_bg = crate::chrome_band::mix3(band_bg, fg, chip_t);
     let chip_fg = ink(inactive_fg, chip_bg);
     let chip_button_fg = ink(fg, chip_bg);
+    // The accent marks: the active underline sits on the raised card, the
+    // update rule on the `↻` card (the same raise), and the status marks on the
+    // band, so the cursor is floored against the card first and the band
+    // second. The card is a step from the band toward the ink, so the second
+    // floor is a no-op unless the first crossed the cursor to the band's side.
+    let accent = {
+        let on_card =
+            crate::chrome_band::ensure_contrast(rgb(theme.cursor), raise_bg, STRIP_ACCENT_FLOOR);
+        crate::chrome_band::ensure_contrast(on_card, band_bg, STRIP_ACCENT_FLOOR)
+    };
     StripColors {
         fg: band_fg,
         band_bg,
@@ -1556,12 +1580,12 @@ fn strip_colors(theme: Theme) -> StripColors {
         hover_bg,
         hover_fg,
         button_hover_fg,
-        accent: rgb(theme.cursor),
+        accent,
         // The selected pair plus the theme accent as its rule; only the
         // forced-palette branch differs.
         update_bg: raise_bg,
         update_fg: raise_fg,
-        update_rule: rgb(theme.cursor),
+        update_rule: accent,
         seam: STRIP_IS_CHROME_BAND.then(|| crate::chrome_band::mix3(band_bg, fg, STRIP_SEAM_T)),
     }
 }
@@ -2904,13 +2928,13 @@ fn truncate_title_tail(title: &str, max: usize) -> String {
 /// tab instead.
 ///
 /// Rules, in order:
-/// - Every label is first cut head-first ([`truncate_title`]). A cut title sheds
-///   its own state clause first ([`cut_core`]); a title that fits is shown whole.
+/// - Every label is first cut head-first ([`truncate_title`]); a title that fits
+///   is shown whole.
 /// - Cut tabs cluster when their common prefix is at least half the smaller label
 ///   window. A cluster sheds its common suffix (snapped to a word boundary,
-///   [`snap_shed`]) and each member's state clause, then cuts at the last word
-///   boundary inside the common head when the rest fits (`…~/aterm`), else a plain
-///   tail cut. Clusters flip together, so one strip speaks one dialect.
+///   [`snap_shed`]), then cuts at the last word boundary inside the common head
+///   when the rest fits (`…~/aterm`), else a plain tail cut. Clusters flip
+///   together, so one strip speaks one dialect.
 /// - Twins (cut tabs with an identical subject) cannot be told apart by text, so
 ///   each non-active twin is labelled with its 1-based tab-order position
 ///   ([`ordinal_chip_label`]): `2 · …~/aterm`, or bare `2`. The active twin keeps
@@ -2949,9 +2973,9 @@ fn distinct_chip_labels(
         });
     // (tab, its title width budget) for every label the first cut shortened.
     let mut cut: Vec<(usize, usize)> = Vec::new();
-    // Every tab's subject (title less its state clause), seated or not: what a
-    // path chip's cut is told apart from ([`path_chip_label`]).
-    let subjects: Vec<&str> = titles.iter().map(|title| cut_core(title, 0)).collect();
+    // Every tab's subject (its title), seated or not: what a path chip's cut is
+    // told apart from ([`path_chip_label`]).
+    let subjects: Vec<&str> = titles.iter().map(String::as_str).collect();
     // Cut tabs whose subject is a path. Their first cut is already final
     // ([`path_chip_label`]), so neither the cluster arm nor the flip re-cuts them
     // and their label does not depend on neighbours.
@@ -2968,17 +2992,11 @@ fn distinct_chip_labels(
         let avail = usize::from(layout.title_end.saturating_sub(layout.title_start));
         let raw = titles[i].as_str();
         let over = strip_display_cells(raw) > avail;
-        // Every cut tab sheds its own state clause here, including on a pressured
-        // strip with no cluster, which the cluster arm and the flip never reach.
-        // A title with no separator sheds nothing, and a title that fits is shown
-        // whole.
-        let source = if over { cut_core(raw, 0) } else { raw };
         // A path keeps its end: its head is ancestry every tab shares. The path's
         // own cut is the same whichever branch labels it, so its chip holds still.
-        path_cut[i] = over && is_path_subject(source);
-        let path = (path_cut[i] && strip_display_cells(source) > avail)
-            .then(|| path_chip_label(i, &subjects, avail));
-        labels[i] = Some(path.unwrap_or_else(|| truncate_title(source, avail)));
+        path_cut[i] = over && is_path_subject(raw);
+        let path = path_cut[i].then(|| path_chip_label(i, &subjects, avail));
+        labels[i] = Some(path.unwrap_or_else(|| truncate_title(raw, avail)));
         if over {
             cut.push((i, avail));
         }
@@ -3022,7 +3040,7 @@ fn distinct_chip_labels(
         relabelled[a] = true;
         let (i, avail) = cut[a];
         // Shed the cluster's common raw-title suffix. Byte-identical titles share
-        // the whole title, so this contributes nothing there and the state shed
+        // the whole title, so this contributes nothing there and the twin rule
         // below answers.
         let mut suffix = usize::MAX;
         for window in members.windows(2) {
@@ -3031,9 +3049,6 @@ fn distinct_chip_labels(
         // Snapped to a word boundary, so the shed takes whole words
         // ([`snap_shed`]).
         let suffix = snap_shed(&titles[i], suffix);
-        // Each member also sheds its own state clause ([`state_clause_bytes`]),
-        // which the pairwise shed cannot find when members are twins or differ
-        // only in state. Whichever shed reaches further wins.
         let core = cut_core(&titles[i], suffix);
         // Prefer the cut at the last word boundary inside the shared head
         // (`…~/aterm`) over a raw tail that keeps a fragment of the shared prompt.
@@ -3056,9 +3071,8 @@ fn distinct_chip_labels(
             .map(|&m| titles[m].as_str())
             .collect();
         // Twins by subject: no cut tells this title from members with the same
-        // subject (the state shed removed their only difference), so a non-active
-        // twin is labelled by ordinal. Subject, not title, so the label does not
-        // flip as a tab goes mid-command. The active twin keeps its subject.
+        // subject (nothing but the shared suffix told them apart), so a non-active
+        // twin is labelled by ordinal. The active twin keeps its subject.
         let twins = members
             .iter()
             .filter(|&&m| cut_core(&titles[m], suffix) == core)
@@ -3125,8 +3139,8 @@ fn distinct_chip_labels(
             if relabelled[a] || path_cut[i] {
                 continue;
             }
-            // A loner can share its ending without sharing a head (a composed
-            // ` · Ready` on every idle chip). Shed the longest tail this loner
+            // A loner can share its ending without sharing a head (a program's
+            // ` - zsh` on every idle chip). Shed the longest tail this loner
             // shares with at least two other cut tabs (the second-largest pairwise
             // suffix; one match is coincidence). Shed only when that furniture
             // fills the whole visible keep; distinguishing characters outrank it.
@@ -3144,14 +3158,11 @@ fn distinct_chip_labels(
             {
                 suffix = 0;
             }
-            // Also shed its own state clause unconditionally ([`cut_core`]): a
-            // loner mid-work shares no ending, so the pairwise shed finds nothing,
-            // and the state clause distinguishes nothing.
             let core = cut_core(&titles[i], suffix);
             let mut cand = truncate_title_tail(core, avail);
             // Survivor check: a word-boundary snap can move the cut past the
             // distinguishing characters, leaving only shared furniture
-            // (`…· Ready`). Then shed the furniture and re-cut.
+            // (`…- zsh`). Then shed the furniture and re-cut.
             if suffix == 0 && furniture > 0 && furniture < titles[i].len() {
                 let painted = cand.trim_start_matches('…').trim_start();
                 let shed_tail = titles[i][titles[i].len() - furniture..].trim_start();
@@ -3184,14 +3195,13 @@ fn distinct_chip_labels(
 /// Re-cut a cluster label that kept only shared furniture against the tab's own
 /// text.
 ///
-/// The cluster sheds the suffix shared by every member, so one member in a
-/// different state collapses it and the cut can keep the furniture (`…· Ready`).
+/// The cluster sheds the suffix shared by every member, so one member with a
+/// different ending collapses it and the cut can keep the furniture (`…- zsh`).
 /// When the painted text is only the tail this title shares with a sibling, shed
 /// that suffix and cut again; an empty re-cut is declined.
 ///
 /// `siblings` are the cluster's other titles. Byte-identical twins are skipped
-/// (`n < title.len()`): they share everything and get an ordinal instead. Callers
-/// have already shed the state clause ([`state_clause_bytes`]).
+/// (`n < title.len()`): they share everything and get an ordinal instead.
 fn furniture_survivor_recut(
     title: &str,
     siblings: &[&str],
@@ -3256,8 +3266,8 @@ fn ordinal_chip_label(
             "…".to_string()
         };
     }
-    // ` · ` — the separator composed titles already use — costs 3 cells; a
-    // tail below 2 cells (one char and its mark) says nothing worth the space.
+    // ` · ` costs 3 cells; a tail below 2 cells (one char and its mark) says
+    // nothing worth the space.
     let room = avail.saturating_sub(digit_cells + 3);
     if room >= 2 {
         let tail = tail_cut(core, remainder, room);
@@ -3293,7 +3303,7 @@ fn family_tail(core: &str, remainder: &str, room: usize) -> String {
 /// 2. else the head of `core`, cut by [`truncate_title`] (`~\at…`).
 ///
 /// A directory's name is what identifies the place, so it is never shown as a
-/// fragment (`tabs_that_differ_only_in_state_are_told_apart_by_position`). Both
+/// fragment (`twins_keep_whole_components_or_the_head_at_every_width`). Both
 /// `/` and `\` separate components. Only paths get this: a subject with no
 /// separator keeps its family cut (`…toml`). The head is `core`'s, so a prompt
 /// head (`user@host: `) is never dropped without its mark.
@@ -3345,19 +3355,17 @@ fn is_head_cut(core: &str, text: &str) -> bool {
 }
 
 /// What one chip's tail cut is taken from: its title minus the shared ending
-/// computed for it or its own composed state clause, whichever reaches further
-/// ([`state_clause_bytes`], [`distinct_chip_labels`]).
+/// computed for it ([`distinct_chip_labels`]).
 ///
 /// Every tail cut goes through here (the cluster arm with the family's common
 /// suffix, the one-dialect flip with the loner's shared furniture), so a chip's
 /// label does not depend on which path reached it. A tail cut of the raw title
-/// would spend the window on the state clause.
+/// would spend the window on the ending every sibling shares.
 ///
 /// `shared` is the pairwise suffix in bytes. When it covers the whole title
-/// (byte-identical twins) it is ignored and the state clause answers alone.
+/// (byte-identical twins) it is ignored and the whole title is the core.
 fn cut_core(title: &str, shared: usize) -> &str {
-    let pairwise = if shared >= title.len() { 0 } else { shared };
-    let shed = pairwise.max(state_clause_bytes(title));
+    let shed = if shared >= title.len() { 0 } else { shared };
     &title[..title.len() - shed]
 }
 
@@ -3573,38 +3581,6 @@ fn path_fallback(tab: usize, subject: &str, room: usize, kin: &[&str]) -> String
     } else {
         "…".to_string()
     }
-}
-
-/// Byte length of a composed title's trailing state clause, separator included, or
-/// `0` when there is none a cut may shed.
-///
-/// `App::tab_titles` joins the session title and its activity summary with
-/// [`crate::title_summary::TAB_LABEL_SEPARATOR`], and `compose_parts` puts the half
-/// `tab_title_format` ranks second after it. Shedding the last clause keeps the
-/// half the user asked to lead with. The state repeats across idle tabs and is
-/// already shown by the status marks ([`TabStripMetadata::has_status`]), while
-/// the tail dialect would otherwise keep exactly it.
-///
-/// `0` for a title with no separator, an empty clause, or a clause that is the
-/// whole title (a shed must leave a subject).
-///
-/// `pub(crate)` for `title_summary`: its test splits a composed label back through
-/// this in both title formats, and `title_summary::whole_label` splits a strip
-/// label on this seam to cap each half.
-pub(crate) fn state_clause_bytes(title: &str) -> usize {
-    let Some(at) = title.rfind(crate::title_summary::TAB_LABEL_SEPARATOR) else {
-        return 0;
-    };
-    // `rfind` with a `&str` pattern lands on a char boundary, and both halves
-    // have to say something for the split to be a shed rather than a deletion.
-    if title[..at].trim().is_empty()
-        || title[at + crate::title_summary::TAB_LABEL_SEPARATOR.len()..]
-            .trim()
-            .is_empty()
-    {
-        return 0;
-    }
-    title.len() - at
 }
 
 /// Byte length of the longest common PREFIX of `a` and `b`, aligned to char
@@ -6159,7 +6135,7 @@ pub(crate) mod pixel_band {
         #[test]
         fn ten_identical_tabs_stay_addressable_through_the_pixel_fit() {
             let titles: Vec<String> = (0..10)
-                .map(|_| "user@m17-tower: ~/aterm · Typing a command".to_string())
+                .map(|_| "user@m17-tower: ~/aterm".to_string())
                 .collect();
             let metadata = plain(titles.len());
             for cols in [80u16, 130, 200] {
@@ -8241,7 +8217,7 @@ mod tests {
     }
 
     /// The SOLO band's subtitle comes from the composed session chrome, prefers
-    /// authored prose over generated status, and never echoes the title back.
+    /// authored prose over observed status, and never echoes the title back.
     #[test]
     fn solo_subtitle_prefers_authored_prose_and_never_echoes_the_title() {
         let full = "aterm\ndescription: the release cutter\nactivity: Building\ncwd: ~/aterm";
@@ -8265,8 +8241,8 @@ mod tests {
             "a lifecycle word is not a description; the bare title reads better"
         );
 
-        // A title that already carries the fact gets no echo (the composed label
-        // folds the activity in: "aterm · Ready").
+        // A title that already carries the fact gets no echo (a program may say
+        // it in its own title: "aterm · Ready").
         assert_eq!(
             solo_subtitle("aterm · Ready", Some("aterm · Ready\nactivity: Ready")),
             None
@@ -9194,7 +9170,7 @@ mod tests {
     }
 
     /// Deep sibling titles past the chrome cap stay distinguishable: the strip
-    /// composes with no cap (`ChromeSurface::TabStrip`), so the pass sees whole
+    /// presents with no cap (`ChromeSurface::TabStrip`), so the pass sees whole
     /// titles and each chip keeps the component that differs.
     ///
     /// One case per region a fixed cut discards: cwds differing in the leaf (a head
@@ -9204,8 +9180,7 @@ mod tests {
     /// collapsing cut is replayed as a negative control.
     #[test]
     fn deep_siblings_past_the_chrome_cap_stay_tellable_apart() {
-        use crate::app_config::{Config, TitleFormat};
-        use crate::title_summary::{ChromeSurface, Coordinator, whole_label};
+        use crate::chrome_label::{ChromeSurface, capped_label, present};
         use aterm_grapheme::GraphemeClusters as _;
         // (one, two, what names one, what names two, widths, [head, middle] collapse).
         type Case = (
@@ -9217,11 +9192,9 @@ mod tests {
             [bool; 2],
         );
 
-        let coordinator = Coordinator::new(None);
-        let config = Config::default();
         let head_cut: fn(&str) -> String =
             |t| format!("{}…", t.graphemes().take(96).collect::<String>());
-        let middle_cut: fn(&str) -> String = |t| whole_label(t).into_owned();
+        let middle_cut: fn(&str) -> String = |t| capped_label(t).into_owned();
         let deep = format!("user@m17-tower: ~/{}", "ab/".repeat(40));
         let cases: [Case; 4] = [
             (
@@ -9233,16 +9206,16 @@ mod tests {
                 [true, false],
             ),
             (
-                "~/src/github.com/alabsystems/aterm/.claude/worktrees/lane-bec3123b-89c-10/crates/aterm-gui/src/title_summary/fixtures/model".to_string(),
-                "~/src/github.com/alabsystems/aterm/.claude/worktrees/lane-bec3123b-89c-25/crates/aterm-gui/src/title_summary/fixtures/model".to_string(),
+                "~/src/github.com/alabsystems/aterm/.claude/worktrees/lane-bec3123b-89c-10/crates/aterm-gui/src/native_config/fixtures/model".to_string(),
+                "~/src/github.com/alabsystems/aterm/.claude/worktrees/lane-bec3123b-89c-25/crates/aterm-gui/src/native_config/fixtures/model".to_string(),
                 "10",
                 "25",
                 &[80],
                 [false, true],
             ),
             (
-                "user@m17-tower: ~/aterm/.claude/worktrees/lane-bec3123b-89c-10/crates/aterm-gui/src/title_summary/description.rs".to_string(),
-                "user@m17-tower: ~/aterm/.claude/worktrees/lane-bec3123b-89c-11/crates/aterm-gui/src/title_summary/description.rs".to_string(),
+                "user@m17-tower: ~/aterm/.claude/worktrees/lane-bec3123b-89c-10/crates/aterm-gui/src/native_config/description.rs".to_string(),
+                "user@m17-tower: ~/aterm/.claude/worktrees/lane-bec3123b-89c-11/crates/aterm-gui/src/native_config/description.rs".to_string(),
                 "89c-10",
                 "89c-11",
                 &[60, 120, 240],
@@ -9276,16 +9249,7 @@ mod tests {
                 .collect();
             let titles: Vec<String> = raw
                 .iter()
-                .map(|t| {
-                    coordinator.compose(
-                        None,
-                        t,
-                        None,
-                        TitleFormat::Title,
-                        &config,
-                        ChromeSurface::TabStrip,
-                    )
-                })
+                .map(|t| present(t, ChromeSurface::TabStrip))
                 .collect();
             assert_eq!(titles, raw, "the strip receives the whole titles");
             for &cols in widths {
@@ -9391,20 +9355,21 @@ mod tests {
              `~` included"
         );
 
-        // Composed labels share their ending (`title · <activity>`); the group's
-        // common suffix is shed first, so the kept tail ends at the cwd.
-        let composed = [
+        // Titles that share their ending (a prompt that prints its status into
+        // the title); the group's common suffix is shed first, so the kept tail
+        // ends at the cwd.
+        let suffixed = [
             "user@m17-tower: ~/aterm · Typing a command".to_string(),
             "user@m17-tower: $HOME/trust · Typing a command".to_string(),
             "user@m17-tower: ~ · Typing a command".to_string(),
             "user@m17-tower: ~/aterm/crates · Typing a command".to_string(),
         ];
-        let segments = layout_segments(80, composed.len(), 0, false);
-        let labels = distinct_chip_labels(&segments, &composed, None, 0, None);
+        let segments = layout_segments(80, suffixed.len(), 0, false);
+        let labels = distinct_chip_labels(&segments, &suffixed, None, 0, None);
         let resolved: Vec<String> = labels.into_iter().map(Option::unwrap).collect();
         assert!(
             resolved[0].ends_with("aterm"),
-            "the shared activity suffix is shed, the cwd tail survives: {:?}",
+            "the shared suffix is shed, the cwd tail survives: {:?}",
             resolved[0]
         );
         assert!(resolved[1].ends_with("trust"), "{:?}", resolved[1]);
@@ -9413,8 +9378,8 @@ mod tests {
 
         // One dialect per strip: on a wider band the head cuts stop colliding, but
         // the shared-head cluster still flips the whole family together.
-        let segments = layout_segments(130, composed.len(), 0, false);
-        let labels = distinct_chip_labels(&segments, &composed, None, 0, None);
+        let segments = layout_segments(130, suffixed.len(), 0, false);
+        let labels = distinct_chip_labels(&segments, &suffixed, None, 0, None);
         let resolved: Vec<String> = labels.into_iter().map(Option::unwrap).collect();
         assert_eq!(
             resolved,
@@ -9485,282 +9450,6 @@ mod tests {
         );
     }
 
-    /// Eight shells in one directory, and tabs sharing no head at all: every chip
-    /// sheds its composed state clause ([`state_clause_bytes`]) before the cut, so
-    /// no label is `…in aterm` or `…a command`. The selected shell is named the
-    /// same whether idle or mid-command. Asserts only what a label must not say,
-    /// so the chip-card pad cannot move it.
-    #[test]
-    fn a_loner_sheds_its_state_clause_with_no_cluster_to_carry_it() {
-        let titles: Vec<String> = [
-            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
-        ]
-        .iter()
-        .enumerate()
-        .map(|(i, subject)| {
-            if i % 2 == 0 {
-                format!("{subject} · Ready in aterm")
-            } else {
-                format!("{subject} · Typing a command")
-            }
-        })
-        .collect();
-        // No two of these share a head, so every tab is its own cluster.
-        let segments = layout_segments(80, titles.len(), 0, false);
-        let resolved = seated_labels(&segments, &titles, 0);
-        assert!(!resolved.is_empty(), "the strip seats something");
-        for label in &resolved {
-            assert!(
-                !label.contains("Ready")
-                    && !label.contains("Typing")
-                    && !label.contains("command")
-                    && !label.contains("aterm"),
-                "a chip with no cluster still names its tab, not the moment it \
-                 is having: {resolved:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn eight_shells_in_one_cwd_name_their_subject_not_their_state() {
-        let idle: Vec<String> = (0..8)
-            .map(|_| "claude · Ready in aterm".to_string())
-            .collect();
-        // The second capture: the selected tab is mid-command, so its state
-        // clause — and nothing else — differs from the other seven.
-        let mut typing = idle.clone();
-        typing[7] = "claude · Typing a command".to_string();
-        for (capture, titles) in [("idle", idle), ("typing", typing)] {
-            // 160 cols: eight equal 20-cell chips, a 14-cell title window each
-            // — room for a name, never for the whole composed title.
-            let segments = layout_segments(160, titles.len(), 7, false);
-            let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 7, None)
-                .into_iter()
-                .map(Option::unwrap)
-                .collect();
-            assert_eq!(
-                resolved[7], "claude",
-                "{capture}: the selected chip names its tab, where it painted \
-                 the activity phrase: {resolved:?}"
-            );
-            for (i, label) in resolved.iter().enumerate().take(7) {
-                assert_eq!(
-                    label,
-                    &format!("{} · claude", i + 1),
-                    "{capture}: a quiet chip carries its position AND what it \
-                     is, where it painted a bare number: {resolved:?}"
-                );
-            }
-
-            // At 80 cols eight chips would keep four title cells each; the strip
-            // seats the selection's page instead ([`STRIP_SEATS_FLOOR`]): four
-            // 19-column chips, a `‹` mark, and every chip carries its position and
-            // whole subject.
-            let segments = layout_segments(80, titles.len(), 7, false);
-            let seats = seated(&segments, &titles, 7);
-            assert_eq!(
-                seats.iter().map(|(tab, _)| *tab).collect::<Vec<_>>(),
-                [4, 5, 6, 7],
-                "{capture}: the window is the selection's PAGE"
-            );
-            assert_eq!(
-                strip_overflow(&segments, titles.len()),
-                StripOverflow {
-                    left: Some(0),
-                    right: None
-                },
-                "{capture}: and says so at the edge it clips"
-            );
-            for (tab, label) in &seats {
-                if *tab == 7 {
-                    assert_eq!(label, "claude", "{capture}: {seats:?}");
-                    continue;
-                }
-                assert_eq!(
-                    label,
-                    &format!("{} · claude", tab + 1),
-                    "{capture}: a quiet chip carries its position AND what it \
-                     is, where it painted a bare number: {seats:?}"
-                );
-                assert_ne!(
-                    label,
-                    &(tab + 1).to_string(),
-                    "{capture}: the bare ordinal is the defect: {seats:?}"
-                );
-            }
-
-            // At no width does a chip spend its window on the state alone.
-            for cols in [80u16, 98, 120, 160] {
-                let segments = layout_segments(cols, titles.len(), 7, false);
-                let resolved = seated_labels(&segments, &titles, 7);
-                for (i, label) in resolved.iter().enumerate() {
-                    assert!(
-                        !label.contains("Ready")
-                            && !label.contains("Typing")
-                            && !label.contains("command"),
-                        "{capture} at {cols} cols: chip {i} spends its window on \
-                         the state: {resolved:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Subject before state holds at every width, not only where cluster admission
-    /// (shared head covering half the window) happens to catch a chip. A chip may
-    /// show its state only after naming its subject; the assertion is positional.
-    #[test]
-    fn a_cut_chip_names_its_subject_before_its_state_at_every_width() {
-        let idle: Vec<String> = (0..8)
-            .map(|_| "claude · Ready in aterm".to_string())
-            .collect();
-        let mut typing = idle.clone();
-        typing[7] = "claude · Typing a command".to_string();
-        let mut chips = 0usize;
-        for (capture, titles) in [("idle", idle), ("typing", typing)] {
-            for cols in 40..=240u16 {
-                let segments = layout_segments(cols, titles.len(), 7, false);
-                for (tab, label) in seated(&segments, &titles, 7) {
-                    chips += 1;
-                    assert!(
-                        !label.is_empty() && label != "…",
-                        "{capture} at {cols} cols: chip {tab} says nothing ({label:?})"
-                    );
-                    assert!(
-                        !label.chars().all(|c| c.is_ascii_digit()),
-                        "{capture} at {cols} cols: chip {tab} is the bare ordinal {label:?}"
-                    );
-                    let Some(state) = ["Ready", "Typing", "command", "in aterm"]
-                        .iter()
-                        .filter_map(|word| label.find(word))
-                        .min()
-                    else {
-                        continue;
-                    };
-                    let subject = label.find("claude").unwrap_or_else(|| {
-                        panic!(
-                            "{capture} at {cols} cols: chip {tab} spends its window on the \
-                             state and never names its subject: {label:?}"
-                        )
-                    });
-                    assert!(
-                        subject < state,
-                        "{capture} at {cols} cols: chip {tab} leads with the moment it is \
-                         having: {label:?}"
-                    );
-                }
-            }
-        }
-        assert!(chips > 1000, "vacuous: only {chips} chips were labelled");
-    }
-
-    /// The state shed also reaches the loner arm: a family that clusters plus an
-    /// unrelated shell mid-build that shares neither head nor ending. Under one
-    /// dialect it tail-cuts with the family, and its own state clause is shed first
-    /// ([`cut_core`]), so the tail lands on `build`.
-    #[test]
-    fn the_one_dialect_flip_cuts_the_subject_not_the_state() {
-        let titles = [
-            "Settings.toml · Ready".to_string(),
-            "Settings.toml · Ready".to_string(),
-            "cargo build · Building the project".to_string(),
-            "README.md · Ready".to_string(),
-            "Setup.sh · Ready".to_string(),
-        ];
-        // 48 columns seats three 14-column chips: two clustered twins and a loner
-        // on one page, the geometry where the flip is observable.
-        let segments = layout_segments(48, titles.len(), 0, false);
-        let seats = seated(&segments, &titles, 0);
-        assert_eq!(
-            seats.iter().map(|(tab, _)| *tab).collect::<Vec<_>>(),
-            [0, 1, 2],
-            "the fixture's geometry: family, family, loner on one page"
-        );
-        assert_eq!(
-            seats[2].1, "…build",
-            "the loner is named by what it is RUNNING, where it painted the \
-             phrase for what it is doing: {seats:?}"
-        );
-        for (tab, label) in &seats {
-            for moment in ["Ready", "Building", "project"] {
-                assert!(
-                    !label.contains(moment),
-                    "chip {tab} spends its window on the state: {seats:?}"
-                );
-            }
-        }
-        assert!(
-            seats[0].1.contains("toml") && seats[1].1.contains("toml"),
-            "the family still names the file it shares: {seats:?}"
-        );
-        assert!(
-            seats[1].1.starts_with("2 · "),
-            "and the non-active twin is still addressable: {seats:?}"
-        );
-    }
-
-    /// Two shells in one directory differing only in state are twins by subject: the
-    /// non-active one takes its position, never `…s passed` / `…e project`.
-    #[test]
-    fn tabs_that_differ_only_in_state_are_told_apart_by_position() {
-        let titles = [
-            "~/work/api · Tests passed".to_string(),
-            "~/work/api · Building the project".to_string(),
-        ];
-        let segments = layout_segments(40, titles.len(), 0, false);
-        let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 0, None)
-            .into_iter()
-            .map(Option::unwrap)
-            .collect();
-        assert_ne!(
-            resolved[0], resolved[1],
-            "still tellable apart: {resolved:?}"
-        );
-        for (i, label) in resolved.iter().enumerate() {
-            assert!(
-                label.contains("api"),
-                "tab {i} names the directory both tabs are in: {resolved:?}"
-            );
-            assert!(
-                !label.contains("passed") && !label.contains("Building"),
-                "tab {i} is named after a moment: {resolved:?}"
-            );
-        }
-        assert!(
-            resolved[1].starts_with("2 · "),
-            "the one text cannot name takes its position: {resolved:?}"
-        );
-    }
-
-    /// A state clause is shed only when a subject survives, and only the last one
-    /// (the half `compose_parts` appends; `title_summary`'s
-    /// `a_composed_tab_label_splits_back_where_the_strip_looks_for_it` pins the
-    /// composition side).
-    #[test]
-    fn a_state_clause_is_shed_only_when_a_subject_survives_it() {
-        let subject = |title: &str| -> String {
-            title[..title.len() - state_clause_bytes(title)].to_string()
-        };
-        assert_eq!(state_clause_bytes("claude"), 0, "no separator, no clause");
-        assert_eq!(
-            state_clause_bytes(" · Ready in aterm"),
-            0,
-            "a shed that would leave no subject is not a shed"
-        );
-        assert_eq!(state_clause_bytes("claude · "), 0, "an empty clause");
-        assert_eq!(subject("claude · Ready in aterm"), "claude");
-        assert_eq!(
-            subject("user@m17-tower: ~/aterm · Typing a command"),
-            "user@m17-tower: ~/aterm"
-        );
-        assert_eq!(
-            subject("mux · pane 2 · Ready"),
-            "mux · pane 2",
-            "only the LAST clause goes: a title that carries the separator \
-             itself keeps everything the composition did not append"
-        );
-    }
-
     /// Ten shells in one cwd under pressure: each non-active twin is labelled by its
     /// 1-based position with a tail of the subject, and the active twin keeps as
     /// much subject as fits (`…~/aterm`). At an ordinary width the ordinal is never
@@ -9774,7 +9463,7 @@ mod tests {
     #[test]
     fn byte_identical_tabs_under_pressure_are_addressable_by_ordinal() {
         let titles: Vec<String> = (0..10)
-            .map(|_| "user@m17-tower: ~/aterm · Typing a command".to_string())
+            .map(|_| "user@m17-tower: ~/aterm".to_string())
             .collect();
         // 80 cols, 10 tabs → the band seats six chips at the floor, which pages
         // ten tabs into two fives; the five it cannot reach are marked.
@@ -9790,9 +9479,8 @@ mod tests {
                 (4, on_band("5 · …aterm", "5 · …/aterm").to_string()),
             ],
             "the active twin keeps as much SUBJECT as its width fits — the cwd \
-             its prompt names, not the `…command` its state clause used to \
-             leave there — and every other seated twin carries its number AND a \
-             piece of that same cwd"
+             its prompt names — and every other seated twin carries its number \
+             AND a piece of that same cwd"
         );
         assert_eq!(
             strip_overflow(&segments, titles.len()).right,
@@ -9917,7 +9605,7 @@ mod tests {
         ];
         for (tabs, widths) in sweep {
             let titles: Vec<String> = (0..tabs)
-                .map(|_| "user@m17-tower: ~/aterm · Typing a command".to_string())
+                .map(|_| "user@m17-tower: ~/aterm".to_string())
                 .collect();
             for cols in widths {
                 for active in [0usize, tabs / 2] {
@@ -10060,12 +9748,12 @@ mod tests {
     /// a chip can get: a family of twins paints context beside its ordinals
     /// ([`twin_tail`]): the subject whole, its whole trailing components behind the
     /// mark, or its head; never the cut-off end of a directory name (`…term`).
-    /// Pinned by value per window, then end to end for a composed title and the
-    /// idle title `~\aterm`.
+    /// Pinned by value per window, then end to end for the idle title `~\aterm`
+    /// and a deeper one.
     #[test]
     fn twins_keep_whole_components_or_the_head_at_every_width() {
-        let title = "~\\aterm · Ready in aterm";
         let subject = "~\\aterm";
+        let title = subject;
         let siblings = [title, title];
         // (window, the non-active twin's label, the active twin's text).
         let expected: [(usize, &str, &str); 12] = [
@@ -10148,38 +9836,37 @@ mod tests {
 
         // End to end at the layout's own windows, every width and selection.
         let mut cut = 0usize;
-        for composed in [title, subject] {
-            let titles: Vec<String> = (0..3).map(|_| composed.to_string()).collect();
-            for cols in 12..=120u16 {
-                for active in 0..3 {
-                    let segments = layout_segments(cols, 3, active, false);
-                    let labels = distinct_chip_labels(&segments, &titles, None, active, None);
-                    for seg in &segments {
-                        let TabHit::Select(i) = seg.kind else {
-                            continue;
-                        };
-                        let Some(label) = labels[i].as_deref() else {
-                            continue;
-                        };
-                        if label == composed {
-                            continue; // wide enough: painted whole
-                        }
-                        cut += 1;
-                        let digits = (i + 1).to_string();
-                        let painted = label.strip_prefix(&format!("{digits} · ")).unwrap_or(label);
-                        assert!(
-                            painted.is_empty()
-                                || painted == "…"
-                                || painted == digits
-                                || is_twin_context(subject, painted),
-                            "{cols} cols, active {active}, tab {i}: {label:?} is not context \
-                             for {subject:?}, a number, or the mark"
-                        );
+        let titles: Vec<String> = (0..3).map(|_| subject.to_string()).collect();
+        for cols in 12..=120u16 {
+            for active in 0..3 {
+                let segments = layout_segments(cols, 3, active, false);
+                let labels = distinct_chip_labels(&segments, &titles, None, active, None);
+                for seg in &segments {
+                    let TabHit::Select(i) = seg.kind else {
+                        continue;
+                    };
+                    let Some(label) = labels[i].as_deref() else {
+                        continue;
+                    };
+                    if label == subject {
+                        continue; // wide enough: painted whole
                     }
+                    cut += 1;
+                    let digits = (i + 1).to_string();
+                    let painted = label.strip_prefix(&format!("{digits} · ")).unwrap_or(label);
+                    assert!(
+                        painted.is_empty()
+                            || painted == "…"
+                            || painted == digits
+                            || is_twin_context(subject, painted),
+                        "{cols} cols, active {active}, tab {i}: {label:?} is not context \
+                         for {subject:?}, a number, or the mark"
+                    );
                 }
             }
         }
-        assert!(cut > 100, "vacuous: only {cut} chips were cut");
+        // The idle title is seven cells, so only the narrow widths cut it.
+        assert!(cut > 50, "vacuous: only {cut} chips were cut");
     }
 
     /// [`twin_tail`]'s reach on a pressure strip. A family of twins that kept its
@@ -10191,11 +9878,11 @@ mod tests {
     fn twin_context_stops_at_a_mixed_family_and_a_head_flips_no_loner() {
         let strip = |dir: &str| -> Vec<String> {
             vec![
-                format!("{dir} · Ready"),
-                format!("{dir} · Ready"),
-                "cargo build --release · Building the project".to_string(),
-                "README.md · Ready".to_string(),
-                "Setup.sh · Ready".to_string(),
+                dir.to_string(),
+                dir.to_string(),
+                "cargo build --release".to_string(),
+                "README.md".to_string(),
+                "Setup.sh".to_string(),
             ]
         };
         // The deep directory: `workspace` does not fit behind a quiet chip's
@@ -10218,7 +9905,7 @@ mod tests {
         );
         // The shallow directory: `api` fits whole behind the mark — the tail
         // dialect — and the loner flips with the family.
-        let titles = strip("~/wave/api");
+        let titles = strip("~/wave/services/api");
         let segments = layout_segments(48, titles.len(), 0, false);
         let seats = seated(&segments, &titles, 0);
         assert!(
@@ -10235,9 +9922,9 @@ mod tests {
         // so the tail cut can land inside a component, where a family of twins
         // would take its head and a mixed one must not.
         let titles = [
-            "user@m17-tower: ~/src/aterm-gui · Ready".to_string(),
-            "user@m17-tower: ~/src/aterm-gui · Ready".to_string(),
-            "user@m17-tower: ~/src/aterm-cli · Ready".to_string(),
+            "user@m17-tower: ~/src/aterm-gui".to_string(),
+            "user@m17-tower: ~/src/aterm-gui".to_string(),
+            "user@m17-tower: ~/src/aterm-cli".to_string(),
         ];
         let mut mixed = 0usize;
         for cols in 40..=160u16 {
@@ -10265,7 +9952,7 @@ mod tests {
     #[test]
     fn an_out_of_range_selection_resolves_like_the_clamped_one() {
         let titles: Vec<String> = (0..4)
-            .map(|_| "user@m17-tower: ~/aterm · Typing a command".to_string())
+            .map(|_| "user@m17-tower: ~/aterm".to_string())
             .collect();
         for cols in [40u16, 80, 130] {
             let segments = layout_segments(cols, titles.len(), 99, false);
@@ -10333,15 +10020,16 @@ mod tests {
             "one strip, one dialect — and the twins are addressable"
         );
 
-        // With ` · <activity>` composed onto every chip, unrelated loners share an
-        // ending; the flip sheds that furniture (shared with two or more chips)
-        // first, but not a one-chip coincidence like the trailing `d`.
-        let composed: Vec<String> = one_dialect_titles()
+        // With the same ` · Ready` ending on every chip (a program's own status
+        // suffix), unrelated loners share an ending; the flip sheds that furniture
+        // (shared with two or more chips) first, but not a one-chip coincidence
+        // like the trailing `d`.
+        let suffixed: Vec<String> = one_dialect_titles()
             .iter()
             .map(|t| format!("{t} · Ready"))
             .collect();
-        let segments = layout_segments(70, composed.len(), 9, false);
-        let resolved = seated_labels(&segments, &composed, 9);
+        let segments = layout_segments(70, suffixed.len(), 9, false);
+        let resolved = seated_labels(&segments, &suffixed, 9);
         assert_eq!(
             resolved,
             [
@@ -10351,7 +10039,7 @@ mod tests {
                 on_band("9 · …oml", "9 · …toml"),
                 "….bak"
             ],
-            "the composed activity is shed strip-wide, the loners stay tellable"
+            "the shared ending is shed strip-wide, the loners stay tellable"
         );
 
         // Two visible cells per chip: `README.md` and `cargo build` both tail-cut
@@ -10783,7 +10471,7 @@ mod tests {
     /// three.
     fn realistic_strips() -> [(&'static str, Vec<String>); 3] {
         let same: Vec<String> = (0..8)
-            .map(|_| "claude · Ready in aterm".to_string())
+            .map(|_| "claude --resume release-notes".to_string())
             .collect();
         let distinct: Vec<String> = [
             "vim src/main.rs",
@@ -10796,20 +10484,22 @@ mod tests {
             "claude",
         ]
         .iter()
-        .map(|subject| format!("{subject} · Ready in aterm"))
+        .map(|title| (*title).to_string())
         .collect();
+        // Duplicates long enough to be cut: two tabs whose whole titles FIT
+        // paint them whole, so they are only told apart by what they say.
         let mixed: Vec<String> = [
-            "claude",
-            "claude",
+            "claude --resume release-notes",
+            "claude --resume release-notes",
             "vim TODO",
-            "~/aterm",
-            "~/aterm",
+            "~/src/aterm/crates/aterm-gui",
+            "~/src/aterm/crates/aterm-gui",
             "cargo test",
             "git log",
-            "claude",
+            "claude --resume release-notes",
         ]
         .iter()
-        .map(|subject| format!("{subject} · Ready in aterm"))
+        .map(|title| (*title).to_string())
         .collect();
         [("same", same), ("distinct", distinct), ("mixed", mixed)]
     }
@@ -10825,15 +10515,11 @@ mod tests {
             .trim_matches('…')
     }
 
-    /// Whether this chip says something of its own tab: a cut of the title's
-    /// subject (the tail dialect and the ordinal's tail) or a head cut of the whole
-    /// composed title, rather than the repeated state clause.
+    /// Whether this chip says something of its own tab: a cut of its title (the
+    /// tail dialect, the ordinal's tail, or a head cut).
     fn says_its_own(label: &str, title: &str) -> bool {
         let painted = painted_text(label);
-        let subject = title
-            .rsplit_once(" \u{00b7} ")
-            .map_or(title, |(subject, _)| subject);
-        !painted.is_empty() && (subject.contains(painted) || title.starts_with(painted))
+        !painted.is_empty() && title.contains(painted)
     }
 
     /// Sweep of 1 to 20 tabs, 40 to 300 columns, the selection at each end and in the
@@ -10938,7 +10624,7 @@ mod tests {
     }
 
     /// The selected chip names its tab at every width: never empty, never a bare
-    /// elision mark, never the state clause.
+    /// elision mark, always text of its own title.
     #[test]
     fn the_selected_chip_names_its_tab_at_every_width() {
         for (set, titles) in realistic_strips() {
@@ -10959,19 +10645,8 @@ mod tests {
                     assert_ne!(label, "…", "{where_}: the selection names nothing");
                     assert!(
                         says_its_own(label, &titles[active]),
-                        "{where_}: the selection spends its chip on the state \
-                         every chip repeats: {label:?}"
+                        "{where_}: the selection keeps nothing of its own title: {label:?}"
                     );
-                    // The subject is the title's first word; wherever the chip has
-                    // room for the word and its elision mark, it shows that word.
-                    let subject = titles[active].split(' ').next().unwrap();
-                    let mark = usize::from(label != titles[active].as_str());
-                    if strip_display_cells(label) >= strip_display_cells(subject) + mark {
-                        assert!(
-                            label.contains(subject),
-                            "{where_}: room for {subject:?} and it painted {label:?}"
-                        );
-                    }
                 }
             }
         }
@@ -11005,7 +10680,7 @@ mod tests {
                     "{set}: chip {tab} is a bare ordinal — the defect: {chips:?}"
                 );
                 // Some of this chip's own title survives: the ordinal may lead but
-                // never stands alone, and never before the state clause.
+                // never stands alone.
                 assert!(
                     says_its_own(label, &titles[*tab]),
                     "{set}: chip {tab} keeps nothing of {:?}: {label:?}",
@@ -11221,18 +10896,12 @@ mod tests {
     fn the_band_is_distinct_from_the_grid_and_the_card_is_distinct_from_the_band() {
         for name in aterm_types::scheme::builtin_names() {
             let s = aterm_types::scheme::builtin(name).expect("builtin exists");
-            let tp = s.to_theme_parts();
-            let theme = Theme {
-                fg: tp.fg,
-                bg: tp.bg,
-                cursor: tp.cursor,
-                selection: tp.selection,
-            };
+            let theme = Theme::from(&s);
             let c = strip_colors(theme);
             let grid = [
-                ((tp.bg >> 16) & 0xff) as u8,
-                ((tp.bg >> 8) & 0xff) as u8,
-                (tp.bg & 0xff) as u8,
+                ((theme.bg >> 16) & 0xff) as u8,
+                ((theme.bg >> 8) & 0xff) as u8,
+                (theme.bg & 0xff) as u8,
             ];
             assert_ne!(
                 c.band_bg, grid,
@@ -11409,12 +11078,14 @@ mod tests {
         );
     }
 
-    /// Every built-in theme keeps the strip's text above the 3.0:1 UI-text floor:
-    /// active-tab text on the raised card, the `+`, and inactive labels on the band,
-    /// on dark and light themes alike. The default theme's inactive labels are
-    /// pinned higher.
+    /// Every built-in theme keeps the strip's text above its 3.0:1 legibility
+    /// floor ([`STRIP_LEGIBILITY_FLOOR`], deliberately below AA): active-tab text on
+    /// the raised card, the `+`, and inactive labels on the band, on dark and light
+    /// themes alike; and its accent marks (the active underline, the update rule,
+    /// the status marks) clear the 3:1 non-text floor on the card and the band. The
+    /// default theme's inactive labels are pinned higher.
     #[test]
-    fn strip_contrast_meets_wcag_aa() {
+    fn strip_inks_clear_the_legibility_floor() {
         use aterm_types::Rgb;
         let rgb = |c: [u8; 3]| Rgb::new(c[0], c[1], c[2]);
         // Assertions (i)-(iii) below compare against the raw theme fg, which is the
@@ -11428,13 +11099,7 @@ mod tests {
         );
         for name in aterm_types::scheme::builtin_names() {
             let s = aterm_types::scheme::builtin(name).expect("builtin exists");
-            let tp = s.to_theme_parts();
-            let theme = Theme {
-                fg: tp.fg,
-                bg: tp.bg,
-                cursor: tp.cursor,
-                selection: tp.selection,
-            };
+            let theme = Theme::from(&s);
             let c = strip_colors(theme);
             // Each pair is the ink and the surface `strip_cell` actually puts
             // together for that role.
@@ -11447,9 +11112,9 @@ mod tests {
                 (c.fg, c.band_bg)
             };
             let new_tab = rgb(new_tab_fg).contrast(rgb(new_tab_bg));
-            // Inactive labels on the band, held to the 3:1 floor (muted schemes
-            // cannot reach AA 4.5: Solarized Light's full-strength text is ~4.13:1
-            // and its dim ~3.20:1). The default theme is pinned higher below.
+            // Inactive labels on the band, held to the 3:1 floor (the strip keeps
+            // the theme's own fg where it clears that floor, so a muted scheme's
+            // dim labels sit under AA). The default theme is pinned higher below.
             let inactive = rgb(c.inactive_fg).contrast(rgb(c.band_bg));
             assert!(
                 active >= 3.0,
@@ -11463,6 +11128,16 @@ mod tests {
                 inactive >= 3.0,
                 "{name}: inactive-tab label contrast {inactive:.2} < 3.0:1"
             );
+            // The accent marks: the underline and the update rule on the raised
+            // card, the status marks on the band.
+            for (what, mark, on) in [
+                ("accent on the card", c.accent, c.raise_bg),
+                ("accent on the band", c.accent, c.band_bg),
+                ("update rule on its card", c.update_rule, c.update_bg),
+            ] {
+                let ratio = rgb(mark).contrast(rgb(on));
+                assert!(ratio >= 3.0, "{name}: {what} {ratio:.2} < 3.0:1");
+            }
             // The hover wash (chrome band only) is a step toward the ink, so it is
             // the pair likeliest to slip under the floor on a muted scheme.
             if STRIP_IS_CHROME_BAND {
@@ -11553,7 +11228,36 @@ mod tests {
         );
     }
 
-    /// The forced-chrome twin of [`strip_contrast_meets_wcag_aa`]: with Linux
+    /// Catppuccin Latte's cursor (rosewater) sits close to its background, so the
+    /// strip's focus cue, the accent under the active tab and on the update rule,
+    /// is floored rather than drawn raw. Negative control: the raw cursor misses
+    /// 3:1 against the raised card, so the floor is what carries it.
+    #[test]
+    fn latte_strip_accent_is_floored_against_the_card() {
+        let s = aterm_types::scheme::builtin("Catppuccin Latte").expect("builtin exists");
+        let tp = s.to_theme_parts();
+        let theme = Theme {
+            fg: tp.fg,
+            bg: tp.bg,
+            cursor: tp.cursor,
+            selection: tp.selection,
+        };
+        let c = strip_colors(theme);
+        let raw = [
+            ((tp.cursor >> 16) & 0xff) as u8,
+            ((tp.cursor >> 8) & 0xff) as u8,
+            (tp.cursor & 0xff) as u8,
+        ];
+        let contrast = crate::chrome_band::contrast;
+        assert!(
+            contrast(raw, c.raise_bg) < 3.0,
+            "negative control: Latte's raw cursor already clears 3:1 on the card"
+        );
+        assert!(contrast(c.accent, c.raise_bg) >= 3.0);
+        assert!(contrast(c.update_rule, c.update_bg) >= 3.0);
+    }
+
+    /// The forced-chrome twin of [`strip_inks_clear_the_legibility_floor`]: with Linux
     /// `window_theme = light|dark` against the terminal theme's darkness, the strip
     /// uses [`crate::native_appearance::forced_chrome_theme`] (authored surfaces with
     /// every bundled scheme's accent), and the same ink/surface floors hold for
@@ -11570,13 +11274,7 @@ mod tests {
         );
         for name in aterm_types::scheme::builtin_names() {
             let s = aterm_types::scheme::builtin(name).expect("builtin exists");
-            let tp = s.to_theme_parts();
-            let terminal = Theme {
-                fg: tp.fg,
-                bg: tp.bg,
-                cursor: tp.cursor,
-                selection: tp.selection,
-            };
+            let terminal = Theme::from(&s);
             for dark in [false, true] {
                 let forced = crate::native_appearance::forced_chrome_theme(terminal, dark);
                 assert_eq!(
@@ -11629,7 +11327,7 @@ mod tests {
         }
     }
 
-    /// The High-Contrast twin of [`strip_contrast_meets_wcag_aa`]: under every stock
+    /// The High-Contrast twin of [`strip_inks_clear_the_legibility_floor`]: under every stock
     /// HC palette the strip's four ink/surface pairs stay above the UI-text floor and
     /// the selected chip is a distinct surface, with a hostile theme underneath to
     /// prove no theme byte leaks through. Contrast assertions only: the sibling's
@@ -11731,13 +11429,7 @@ mod tests {
         };
         let parts = |name: &str| {
             let s = aterm_types::scheme::builtin(name).expect("builtin exists");
-            let tp = s.to_theme_parts();
-            strip_colors(Theme {
-                fg: tp.fg,
-                bg: tp.bg,
-                cursor: tp.cursor,
-                selection: tp.selection,
-            })
+            strip_colors(Theme::from(&s))
         };
         // Dark builtin: the active card is brighter than the body (a raised step).
         let dark = parts("Dracula");

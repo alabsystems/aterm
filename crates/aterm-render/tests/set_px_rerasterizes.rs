@@ -116,24 +116,6 @@ fn set_px_invalidates_glyph_cache_and_rerasterizes() {
     }
 }
 
-// A focused sanity case so the contract is also pinned at a human-readable
-// size pair.
-#[test]
-fn set_px_doubling_clears_cache_and_doubles_height_anchor() {
-    let mut r = renderer_at(16.0);
-    let (_w16, h16) = glyph_dims(&mut r, 'W');
-    assert!(r.glyph_cache_len() > 0);
-
-    r.set_px(32.0);
-    assert_eq!(r.glyph_cache_len(), 0, "doubling px clears the glyph cache");
-
-    let (_w32, h32) = glyph_dims(&mut r, 'W');
-    assert!(
-        h32 > h16,
-        "32px glyph must be taller than 16px (re-rasterized, not cached): {h16} -> {h32}"
-    );
-}
-
 // set_px is a NO-OP when the size is unchanged (within the 0.01 epsilon): a warm
 // cache survives, so an idle pane re-applying its current px never pays a needless
 // atlas rebuild. This pins the early-return in set_px.

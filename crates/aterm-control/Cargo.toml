@@ -15,7 +15,7 @@ workspace = true
 
 [features]
 # Compile the reference `MemoryHost` + verb-matrix suite into a NON-test build so
-# a downstream host (aterm-gui, orca-daemon) can run it as a dev-dependency. It
+# a downstream host (aterm-gui) can run it as a dev-dependency. It
 # is always built under `cfg(test)` here, so it cannot rot when the feature is off.
 conformance = []
 

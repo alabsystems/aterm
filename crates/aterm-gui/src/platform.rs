@@ -1,30 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The application-runtime (`apprt`) seam: the ONE place that names every native
-//! OS-integration operation aterm performs (window chrome colour/appearance, the
-//! menu bar, the per-window toolbar tab strip, and the desktop-notification
-//! delivery thread). It exists so `main.rs` / `app_window.rs` / `app_tabs.rs`
-//! stay platform-NEUTRAL: they call through an [`AppRt`] instance and never name
-//! AppKit directly (through `aterm-objc`, the first-party runtime layer).
+//! Platform adapter for window chrome, menus, toolbar state, notifications and
+//! appearance preferences. Shared application code calls [`AppRt`]; its target
+//! implementation owns these native operations.
 //!
-//! Two impls back the one trait:
+//! Platform implementations back the one trait:
 //!
-//! * [`AppRtMacOS`] WRAPS the existing AppKit calls EXACTLY — the NSWindow
-//!   colour-space + NSAppearance/titlebar logic moved here verbatim from
-//!   `app_window.rs`, and the menu/toolbar/notify methods forward straight to the
-//!   already-`cfg(macos)`-guarded [`crate::menu`] / [`crate::toolbar`] /
-//!   [`crate::notify`] modules. So the macOS binary is behaviorally identical: the
-//!   same AppKit operations run, just reached through the trait.
-//! * [`AppRtLinux`] is the no-op fallback for every non-macOS target: chrome
-//!   colour/appearance do nothing, the menu/toolbar install nothing (`None`), the
-//!   tab-strip sync + chrome read are no-ops, and notification delivery spins the
-//!   same channel-draining stub `notify::spawn_delivery` already provides. The
-//!   terminal renders + input works; native chrome is gracefully absent.
+//! * [`AppRtMacOS`] uses AppKit for window appearance and forwards menu, toolbar
+//!   and notification work to [`crate::menu`], [`crate::toolbar`] and
+//!   [`crate::notify`].
+//! * `AppRtWindows` provides Windows-native chrome, notifications and preferences.
+//! * [`AppRtLinux`] applies winit's window theme and maintains the in-memory
+//!   toolbar model on Linux/BSD. Unsupported native chrome operations are inert;
+//!   notification delivery uses the channel-draining stub.
 //!
-//! [`PlatformAppRt`] is the cfg-selected concrete type the `App` stores: the macOS
-//! impl on macOS, the Linux impl everywhere else. Both are zero-sized, so the
-//! field costs nothing.
+//! [`PlatformAppRt`] is the target-selected concrete type the `App` stores. Its
+//! preference-probe flag keeps test Apps on an inert arm of the same runtime seam.
 
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
@@ -66,9 +58,8 @@ pub(crate) enum RenameEditorEdit {
     SelectAll,
 }
 
-/// The native application-runtime seam. Every method is a platform OS-integration
-/// operation aterm performs; the macOS impl runs the real AppKit calls, the Linux
-/// impl is a graceful no-op. Implementors are zero-sized.
+/// The native application-runtime seam for each platform's OS integrations.
+/// Preference reads have a per-instance inert test arm.
 pub(crate) trait AppRt {
     /// Paint the OS window background the terminal's theme background colour
     /// (`bg`, as `0x00RRGGBB`) so the transparent titlebar / bare compact bar reads
@@ -576,22 +567,15 @@ impl From<crate::app_config::WindowColorspace> for SurfaceColorspace {
     }
 }
 
-/// This window's live AppKit `NSView`, or nil when the window has no AppKit
-/// backend (headless, or another platform's handle).
+/// This window's live AppKit content `NSView`, or nil off the main thread.
 ///
-/// The winit → `raw-window-handle` → `NSView` walk that every macOS chrome
-/// method below opened by hand, written once. It is NOT a message send: the
-/// pointer comes straight out of the handle, so nothing here can raise.
+/// The winit → `NSView` read every macOS chrome method below starts from,
+/// written once: the window's first-party [`aterm_objc::HasNsView`], winit's
+/// own `-contentView` read, which cannot raise. The view is borrowed (+0) and
+/// lives as long as `window`.
 #[cfg(target_os = "macos")]
 pub(crate) fn ns_view_of(window: &Window) -> aterm_objc::Id {
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    let Ok(handle) = window.window_handle() else {
-        return aterm_objc::Id::NIL;
-    };
-    let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-        return aterm_objc::Id::NIL;
-    };
-    aterm_objc::Id::from_ptr(h.ns_view.as_ptr().cast())
+    aterm_objc::HasNsView::ns_view(window)
 }
 
 /// This window's AppKit `NSWindow`, or nil.
@@ -599,7 +583,7 @@ pub(crate) fn ns_view_of(window: &Window) -> aterm_objc::Id {
 /// `-window` is nil for a view that is not in a window yet, which every caller
 /// here treats as "no chrome to configure" — the best-effort contract.
 #[cfg(target_os = "macos")]
-fn ns_window_of(window: &Window) -> aterm_objc::Id {
+pub(crate) fn ns_window_of(window: &Window) -> aterm_objc::Id {
     let view = ns_view_of(window);
     if view.is_null() {
         return aterm_objc::Id::NIL;
@@ -614,9 +598,11 @@ fn ns_window_of(window: &Window) -> aterm_objc::Id {
 /// macOS application-runtime: WRAPS the existing AppKit integration exactly. The
 /// chrome methods carry the verbatim NSWindow colour-space + NSAppearance logic
 /// relocated from `app_window.rs`; the rest forward to the `cfg(macos)`-guarded
-/// menu/toolbar/notify modules. Zero-sized.
+/// menu/toolbar/notify modules.
 #[cfg(target_os = "macos")]
-pub(crate) struct AppRtMacOS;
+pub(crate) struct AppRtMacOS {
+    pub(crate) probe_preferences: bool,
+}
 
 #[cfg(target_os = "macos")]
 impl AppRt for AppRtMacOS {
@@ -1078,10 +1064,13 @@ impl AppRt for AppRtMacOS {
     }
 
     fn reduce_motion(&self) -> bool {
-        reduce_motion::query()
+        self.probe_preferences && reduce_motion::query()
     }
 
     fn native_appearance_preferences(&self) -> crate::native_appearance::AppearancePreferences {
+        if !self.probe_preferences {
+            return crate::native_appearance::AppearancePreferences::default();
+        }
         crate::native_appearance::AppearancePreferences {
             high_contrast: reduce_motion::increase_contrast(),
             reduced_transparency: reduce_motion::reduce_transparency(),
@@ -1090,7 +1079,11 @@ impl AppRt for AppRtMacOS {
     }
 
     fn observe_reduce_motion(&self, proxy: &EventLoopProxy<Wake>) -> Option<ReduceMotionObserver> {
-        reduce_motion::observe(proxy)
+        if self.probe_preferences {
+            reduce_motion::observe(proxy)
+        } else {
+            None
+        }
     }
 
     fn hold_off_app_nap(&self) -> Option<AppNapActivity> {
@@ -1100,9 +1093,12 @@ impl AppRt for AppRtMacOS {
 
 /// Map aterm's config [`WindowTheme`] onto the winit window-theme override
 /// [`winit::window::Theme`] applied via [`Window::set_theme`]:
-/// * `Auto`  → `None` — reset to the system default so the chrome tracks the OS
-///   light/dark preference (on Wayland winit reads it over D-Bus; on X11 winit
-///   defaults the `_GTK_THEME_VARIANT` hint to dark).
+/// * `Auto`  → `None` — clear the override. On Wayland the sctk-adwaita frame
+///   picks its own variant (`FrameConfig::auto`); on X11 winit defaults the
+///   `_GTK_THEME_VARIANT` hint to dark. Neither backend reports the desktop
+///   preference back (`Window::theme()` is the override or `None`, and no
+///   `ThemeChanged` arrives), which is why `App::chrome_theme_for_apprt` resolves
+///   Linux `Auto` from the terminal theme instead.
 /// * `Light` → `Some(Theme::Light)` — force the light client-side-decoration variant.
 /// * `Dark`  → `Some(Theme::Dark)` — force the dark variant.
 ///
@@ -1136,8 +1132,8 @@ pub(crate) fn window_theme_to_winit(theme: WindowTheme) -> Option<winit::window:
 /// `flagsChanged:`-shaped row (see `App::note_objc_containments`): the cache
 /// is current while the app's copy may be one event behind. NOT a hardware
 /// probe: the class-level flags query on `NSEvent` is WindowServer-backed and
-/// banned tree-wide (tools/grep_guard.sh B9a) — the first cut of this hook
-/// reached for it and the guard caught it.
+/// banned tree-wide (the aterm-census guard `input-probe`) — the first cut of
+/// this hook reached for it and the guard caught it.
 #[cfg(target_os = "macos")]
 pub(crate) fn cached_modifiers(window: &winit::window::Window) -> winit::keyboard::ModifiersState {
     use winit::platform::macos::WindowExtMacOS as _;
@@ -1244,7 +1240,7 @@ pub(crate) fn appkit_window_number(_window: &Window) -> i64 {
 /// Fails CLOSED: if the HID system cannot be read, input is reported as recent
 /// (the machine is treated as busy), the same posture as an invalid sample.
 #[cfg(target_os = "macos")]
-pub(crate) fn recent_user_input_event(within: std::time::Duration) -> bool {
+fn recent_user_input_event(within: std::time::Duration) -> bool {
     match hid_idle::seconds_since_last_input() {
         Some(age_seconds) => user_input_age_is_recent(age_seconds, within.as_secs_f64()),
         None => true,
@@ -1257,8 +1253,20 @@ pub(crate) fn recent_user_input_event(within: std::time::Duration) -> bool {
 // If a non-macOS automatic apply lane ever lands, this must become
 // fail-closed (`true`) or read a real input clock.
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn recent_user_input_event(_within: std::time::Duration) -> bool {
+fn recent_user_input_event(_within: std::time::Duration) -> bool {
     false
+}
+
+/// The input-activity source an `App` holds: the platform read
+/// ([`recent_user_input_event`]) windowed, [`no_recent_user_input_event`]
+/// headless. The platform read is private to this module, so a
+/// headless-constructible path can reach it only through this choice.
+pub(crate) fn user_input_source(headless: bool) -> fn(std::time::Duration) -> bool {
+    if headless {
+        no_recent_user_input_event
+    } else {
+        recent_user_input_event
+    }
 }
 
 /// The input-activity source for HEADLESS instances and unit tests: never
@@ -1764,8 +1772,7 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
     None
 }
 
-/// Non-macOS application-runtime. Unlike the original dead no-op, every method now
-/// does the most useful thing the **pure-winit** surface allows (NO new system
+/// Linux/BSD application-runtime using the **pure-winit** surface (NO new system
 /// libraries — see [`AppRt::window_set_background_color`] and `toolbar.rs` for the
 /// deferred GTK4 work): the appearance method drives `winit::Window::set_theme` so
 /// the client-side-decoration light/dark variant honours config `window_theme`; the
@@ -1773,9 +1780,11 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
 /// the window title from it; the menu install delegates to the menu stub; and
 /// notification delivery forwards to `notify::spawn_delivery`'s channel-draining
 /// stub. The terminal renders + input works; only the genuinely OS-native chrome a
-/// header bar would add (which needs gtk4 system libs) is deferred. Zero-sized.
+/// header bar would add (which needs gtk4 system libs) is deferred.
 #[cfg(all(not(target_os = "macos"), not(windows)))]
-pub(crate) struct AppRtLinux;
+pub(crate) struct AppRtLinux {
+    pub(crate) probe_preferences: bool,
+}
 
 #[cfg(all(not(target_os = "macos"), not(windows)))]
 impl AppRt for AppRtLinux {
@@ -1914,7 +1923,7 @@ impl AppRt for AppRtLinux {
     /// share) with the `gsettings` CLI — see [`gnome_reduce_motion`]. Any failure
     /// answers `false`, so config `motion` alone decides.
     fn reduce_motion(&self) -> bool {
-        gnome_reduce_motion()
+        self.probe_preferences && gnome_reduce_motion()
     }
 
     /// No OS notification to observe off macOS: `None` (the caller keeps the
@@ -1925,8 +1934,7 @@ impl AppRt for AppRtLinux {
 }
 
 /// The concrete application-runtime the `App` stores, selected at compile time:
-/// [`AppRtMacOS`] on macOS, [`AppRtLinux`] everywhere else. Zero-sized, so the
-/// `App.apprt` field costs nothing.
+/// [`AppRtMacOS`] on macOS, `AppRtWindows` on Windows, [`AppRtLinux`] elsewhere.
 #[cfg(target_os = "macos")]
 pub(crate) type PlatformAppRt = AppRtMacOS;
 
@@ -1940,20 +1948,41 @@ pub(crate) type PlatformAppRt = AppRtLinux;
 
 /// Construct the platform application-runtime for this build target. The single
 /// place `App` mints its `apprt` field, so the cfg lives here, not at the
-/// construction sites.
+/// construction sites. Unit-test Apps keep native preference reads disabled;
+/// explicit platform tests can construct a native instance themselves.
 pub(crate) fn platform_apprt() -> PlatformAppRt {
     #[cfg(target_os = "macos")]
     {
-        AppRtMacOS
+        AppRtMacOS {
+            probe_preferences: !cfg!(test),
+        }
     }
     #[cfg(windows)]
     {
-        crate::platform_win::AppRtWindows
+        crate::platform_win::AppRtWindows {
+            probe_preferences: !cfg!(test),
+        }
     }
     #[cfg(all(not(target_os = "macos"), not(windows)))]
     {
-        AppRtLinux
+        AppRtLinux {
+            probe_preferences: !cfg!(test),
+        }
     }
+}
+
+/// The three display-accessibility reads [`AppRtMacOS`] answers
+/// [`AppRt::reduce_motion`] and [`AppRt::native_appearance_preferences`] with, asked
+/// once and dropped: the boot's off-thread warm (`warm_accessibility_reads` in
+/// `lib.rs`), so AppKit's first, slow answer is made before the UI thread asks.
+/// Its own pool: a worker thread has none of its own.
+#[cfg(target_os = "macos")]
+pub(crate) fn warm_accessibility_reads() {
+    aterm_objc::autoreleasepool(|_| {
+        let apprt = platform_apprt();
+        let _ = apprt.native_appearance_preferences();
+        let _ = apprt.reduce_motion();
+    });
 }
 
 /// The retained reduce-motion notification observer [`AppRt::observe_reduce_motion`]
@@ -2091,7 +2120,11 @@ fn gnome_animations_disabled(stdout: &str) -> bool {
 /// `bound`; otherwise kill it and answer `None`. The child's stdin is null and
 /// its stderr discarded, so nothing it does can reach the terminal.
 #[cfg(any(all(not(target_os = "macos"), not(windows)), test))]
-fn read_bounded_stdout(program: &str, args: &[&str], bound: std::time::Duration) -> Option<String> {
+pub(crate) fn read_bounded_stdout(
+    program: &str,
+    args: &[&str],
+    bound: std::time::Duration,
+) -> Option<String> {
     use std::io::Read as _;
     let mut child = aterm_uds::spawnfd::command(program)
         .args(args)

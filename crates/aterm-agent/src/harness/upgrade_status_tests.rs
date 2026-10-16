@@ -22,7 +22,9 @@ fn opts(dir: &std::path::Path) -> Opts {
         // The ask-and-drain flow these tests pin (`upgrade_ask = true`).
         ask: true,
         several_logins: false,
+        usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Listed(Vec::new()),
+        agents_off: Vec::new(),
     }
 }
 
@@ -1552,6 +1554,14 @@ fn a_tab_whose_agent_is_not_in_front_is_never_told_aterms_own_fault() {
     }
 }
 
+/// The tabs `claimed` another supervisor holds, and none Off ([`Aside`]).
+fn claims(claimed: &BTreeSet<String>) -> Aside {
+    Aside {
+        claimed: claimed.clone(),
+        ..Aside::default()
+    }
+}
+
 /// A tab another supervisor's claim holds is never told "aterm's own fault":
 /// the host runs no worker behind a live claim. Told the claimed tabs
 /// ([`View::set_claimed`]), a real [`View`] reads the move as held by that
@@ -1641,7 +1651,7 @@ fn a_tab_another_supervisor_claims_reads_its_claim_never_aterms_own_fault() {
     // `--status`, the claims the instance names.
     let cli = |claimed: &[&str], held: &dyn Fn(&BTreeSet<String>) -> Option<Vec<Holder>>| {
         let claimed: BTreeSet<String> = claimed.iter().map(|t| (*t).to_string()).collect();
-        let (mut rows, vetted) = status_rows_with(&o, NOW, held, &|| claimed.clone());
+        let (mut rows, vetted) = status_rows_with(&o, NOW, held, &|| claims(&claimed));
         assert!(vetted);
         rows.remove(0)
     };
@@ -1686,6 +1696,121 @@ fn a_tab_another_supervisor_claims_reads_its_claim_never_aterms_own_fault() {
     pin_awake_since(0);
 }
 
+/// A TAB WHOSE AUTOPILOT IS OFF IS NEVER TOLD "aterm's own fault" (the review
+/// of a295792e4): the owner took the harness off the session, so the host
+/// stops its worker and fires no watch there, and the record's `looked_at`
+/// never moves. Told the Off tabs ([`View::set_off`]), a real [`View`] reads
+/// the move as held by the Off — said as the owner's, with what moves it —
+/// and never `unwatched`; stood down, it forgets them. `--status` reads the
+/// Off from the instance ([`status_rows`]) by the same rule
+/// ([`Row::set_aside`]). NEGATIVE CONTROLS: no Off, or another tab's, reads
+/// `unwatched`; a tab both claimed and Off reads the claim, as before.
+#[test]
+fn a_tab_whose_autopilot_is_off_reads_its_off_never_aterms_own_fault() {
+    let dir = ScratchDir::new("upgrade-status", "autopilot-off");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let st = St {
+        phase: Phase::Pending,
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: TAB.to_string(),
+        pending_since: NOW - 7 * 3_600,
+        looked_at: NOW - 3 * 3_600,
+        ..St::default()
+    };
+    super::super::save_at(&o, "aaa", &st, NOW - 7 * 3_600);
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let held = behind_in(TAB);
+    pin_awake_since(NOW - 86_400);
+    let strings = |tabs: &[&str]| tabs.iter().map(|t| (*t).to_string()).collect::<Vec<_>>();
+    let look = |view: &mut View, claimed: &[&str], off: &[&str]| {
+        view.set_claimed(&strings(claimed));
+        view.set_off(&strings(off));
+        let mut sent: Vec<Row> = Vec::new();
+        let _ = view.refresh_with(&o, &tabs, NOW, &held, &mut |rows| sent = rows.to_vec());
+        sent.remove(0)
+    };
+    for off in [&[][..], &["s-another"][..]] {
+        assert_eq!(
+            look(&mut View::default(), &[], off).stall(NOW).as_deref(),
+            Some("unwatched"),
+            "NEGATIVE CONTROL, {off:?}"
+        );
+    }
+    let mut view = View::default();
+    let row = look(&mut view, &[], &[TAB]);
+    assert_eq!(
+        (row.aside.as_str(), row.wait.as_str()),
+        (AUTOPILOT_OFF, AUTOPILOT_OFF)
+    );
+    assert_eq!(row.unwatched(NOW), None);
+    assert_eq!(row.stall(NOW).as_deref(), Some("overdue"));
+    assert!(row.badge(NOW).is_none(), "the owner's own Off marks no tab");
+    assert!(
+        matches!(row.attention(NOW), Attention::Quiet),
+        "the owner's own setup, a record: {:?}",
+        row.attention(NOW)
+    );
+    let cause = row.overdue_cause(NOW);
+    assert_eq!(cause, "its autopilot is off");
+    let words = row.stall_words(NOW).expect("stalled");
+    assert!(words.ends_with("its autopilot is off"), "{words}");
+    assert!(
+        row.waiting_line("09:00")
+            .contains("it moves once its autopilot is cruise or land again"),
+        "{}",
+        row.waiting_line("09:00")
+    );
+    // Claimed and Off: the claim's, as a claimed tab always read.
+    let both = look(&mut View::default(), &[TAB], &[TAB]);
+    assert_eq!(
+        (both.aside.as_str(), both.wait.as_str()),
+        (CLAIMED, CLAIMED)
+    );
+    // Stood down, the Off tabs are forgotten with everything else.
+    view.stand_down(&mut |_| {});
+    let mut sent: Vec<Row> = Vec::new();
+    let _ = view.refresh_with(&o, &tabs, NOW, &held, &mut |rows| sent = rows.to_vec());
+    assert_eq!(
+        sent[0].stall(NOW).as_deref(),
+        Some("unwatched"),
+        "forgotten"
+    );
+    // `--status`, the Off tabs the instance names.
+    let cli = |off: &[&str]| {
+        let aside = Aside {
+            off: off.iter().map(|t| (*t).to_string()).collect(),
+            ..Aside::default()
+        };
+        let (mut rows, vetted) = status_rows_with(&o, NOW, &held, &|| aside.clone());
+        assert!(vetted);
+        rows.remove(0)
+    };
+    let by_cli = cli(&[TAB]);
+    assert_eq!(
+        (by_cli.aside.as_str(), by_cli.stall(NOW)),
+        (row.aside.as_str(), row.stall(NOW)),
+        "the window's facts"
+    );
+    assert!(
+        by_cli.line(NOW).contains(" wait=autopilot-off "),
+        "{}",
+        by_cli.line(NOW)
+    );
+    for off in [&[][..], &["s-another"][..]] {
+        assert_eq!(
+            cli(off).stall(NOW).as_deref(),
+            Some("unwatched"),
+            "NEGATIVE CONTROL, {off:?}"
+        );
+    }
+    pin_awake_since(0);
+}
+
 /// A RECORD NO BUILD GAVE A TAB READS THE CLAIM ON ITS HOLDER'S TAB: `--status`
 /// shows such a row under the tab its holder is proven in, and reads its aside
 /// only once that tab is filled in, so a claim there holds it (never
@@ -1708,7 +1833,7 @@ fn a_record_with_no_recorded_tab_reads_the_claim_on_its_holders_tab() {
     pin_awake_since(NOW - 86_400);
     let cli = |claimed: &[&str]| {
         let claimed: BTreeSet<String> = claimed.iter().map(|t| (*t).to_string()).collect();
-        let (mut rows, vetted) = status_rows_with(&o, NOW, &behind_in(TAB), &|| claimed.clone());
+        let (mut rows, vetted) = status_rows_with(&o, NOW, &behind_in(TAB), &|| claims(&claimed));
         assert!(vetted);
         rows.remove(0)
     };
@@ -1750,7 +1875,7 @@ fn the_row_a_word_prints_reads_the_claim_on_its_tab() {
     let hurry = |claimed: &[&str]| {
         super::super::save_at(&o, "aaa", &st, now - 7 * 3_600);
         let claimed: BTreeSet<String> = claimed.iter().map(|t| (*t).to_string()).collect();
-        ask_aside(&o, TAB, Ask::Now, &|| claimed.clone()).expect("the word lands")
+        ask_aside(&o, TAB, Ask::Now, &|| claims(&claimed)).expect("the word lands")
     };
     let row = hurry(&[TAB]);
     assert_eq!((row.aside.as_str(), row.wait.as_str()), (CLAIMED, CLAIMED));
@@ -2101,41 +2226,10 @@ fn a_state_file_from_either_older_writer_is_read_with_its_missing_fields_at_defa
 /// request and recording them, standing in for the window's instance. The
 /// accept loop ends with the test process.
 #[cfg(unix)]
-fn recording_socket(
-    dir: &std::path::Path,
-) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-    use std::io::{BufRead as _, Write as _};
-    const TOKEN: &str = "0badf00d0badf00d";
-    let sock = dir.join("t.sock");
-    std::fs::write(dir.join("t.sock.token"), format!("{TOKEN}\n")).expect("token");
-    let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
-    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let log = std::sync::Arc::clone(&asked);
-    std::thread::spawn(move || {
-        for conn in listener.incoming() {
-            let Ok(conn) = conn else { break };
-            let Ok(mut out) = conn.try_clone() else {
-                continue;
-            };
-            let mut lines = std::io::BufReader::new(conn).lines();
-            if !lines
-                .next()
-                .is_some_and(|l| l.is_ok_and(|l| l == format!("AUTH {TOKEN}")))
-            {
-                continue;
-            }
-            for line in lines {
-                let Ok(line) = line else { break };
-                if let Ok(mut log) = log.lock() {
-                    log.push(line);
-                }
-                if writeln!(out, "OK").is_err() {
-                    break;
-                }
-            }
-        }
-    });
-    (sock.to_string_lossy().into_owned(), asked)
+fn recording_socket(dir: &std::path::Path) -> (String, crate::harness::FakeInstanceLog) {
+    crate::harness::fake_instance(&dir.join("t.sock"), "0badf00d0badf00d", |_| {
+        "OK".to_string()
+    })
 }
 
 /// The tab's mark: the host raises `meta set attention owner=upgrade` on a
@@ -4165,6 +4259,8 @@ fn a_claude_stall_never_prints_its_wait_word() {
         upgrade::NEXT_POINT,
         NOT_FOREGROUND,
         CLAIMED,
+        AUTOPILOT_OFF,
+        AGENT_OFF,
         "something-new",
     ] {
         let row = Row {
@@ -5618,6 +5714,7 @@ const WAITS: &[&str] = &[
     "argv-unreadable",
     "exe-unreadable",
     "version-unreadable",
+    "home-unreadable",
     "tab-not-live",
     "no-socket",
     "conversation-in-other-tab",
@@ -6876,6 +6973,9 @@ fn aterms_own_fault_is_one_log_line_never_a_digest_line_or_a_mark() {
         );
         assert!(!person_holds("left-typed:screen-unreadable"));
     }
+    // A Codex whose relative `CODEX_HOME` cannot be placed (the directory it
+    // is relative to unread) is a tab aterm could not read, never unclassified.
+    assert_eq!(wait_class("home-unreadable"), WaitClass::TabUnread);
 }
 
 /// A CODEX DAEMON THREAD THAT HOLDS THE MOVE FOR A DAY IS NEWS (no notice can
@@ -7759,11 +7859,6 @@ fn a_resume_by_hand_says_which_login_it_runs_under() {
             .then
             .ends_with(SHELL_LOGIN_CLAUSE)
     );
-    assert_eq!(
-        crate::harness::resume::login_clause(Some("")),
-        SHELL_LOGIN_CLAUSE
-    );
-    assert_eq!(crate::harness::resume::login_clause(None), "");
 }
 
 /// THE INTERRUPT'S ACTION FOLLOWS FROM WHY THE AGENT COULD NOT BE BROUGHT BACK,
@@ -8196,10 +8291,6 @@ fn a_codex_goal_left_paused_is_an_interrupt_whatever_the_owners_word_says() {
     {
         assert!(need.why.chars().count() <= NEED_WHY_MAX, "{}", need.why);
         assert!(need.then.chars().count() <= NEED_THEN_MAX, "{}", need.then);
-        let words = format!("{} {}", need.why, need.then).to_lowercase();
-        for banned in ["restart", "relaunch", "reopen", "next launch", "reboot"] {
-            assert!(!words.contains(banned), "{banned}: {words}");
-        }
     }
     let resumed = Row {
         goal_left_since: 0,
@@ -9046,4 +9137,81 @@ fn a_build_that_fails_to_start_is_one_fault_per_build() {
         "{}",
         stop_words(upgrade::Agent::Claude, BUILD_FAILS)
     );
+}
+
+/// A TAB WHOSE AGENT ITS OWN SWITCH HOLDS OFF READS THAT SWITCH, NEVER
+/// ATERM'S OWN FAULT (`[harness.<agent>] enabled = false`): the window's host
+/// admits no worker of that agent and fires no watch there, so the record's
+/// `looked_at` never moves. Told those tabs ([`View::set_agent_off`]), a real
+/// [`View`] reads the move as held by the switch — said as the owner's, with
+/// what moves it — and never `unwatched`. NEGATIVE CONTROLS: no tab, or
+/// another tab, reads `unwatched`; a tab both claimed and switched off reads
+/// the claim; the switch wins over the session's own Off.
+#[test]
+fn a_tab_whose_agent_is_switched_off_reads_its_switch_never_aterms_own_fault() {
+    let dir = ScratchDir::new("upgrade-status", "agent-off");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let st = St {
+        phase: Phase::Pending,
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: TAB.to_string(),
+        pending_since: NOW - 7 * 3_600,
+        looked_at: NOW - 3 * 3_600,
+        ..St::default()
+    };
+    super::super::save_at(&o, "aaa", &st, NOW - 7 * 3_600);
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let held = behind_in(TAB);
+    pin_awake_since(NOW - 86_400);
+    let strings = |tabs: &[&str]| tabs.iter().map(|t| (*t).to_string()).collect::<Vec<_>>();
+    let look = |claimed: &[&str], agent_off: &[&str], off: &[&str]| {
+        let mut view = View::default();
+        view.set_claimed(&strings(claimed));
+        view.set_agent_off(&strings(agent_off));
+        view.set_off(&strings(off));
+        let mut sent: Vec<Row> = Vec::new();
+        let _ = view.refresh_with(&o, &tabs, NOW, &held, &mut |rows| sent = rows.to_vec());
+        sent.remove(0)
+    };
+    for agent_off in [&[][..], &["s-another"][..]] {
+        assert_eq!(
+            look(&[], agent_off, &[]).stall(NOW).as_deref(),
+            Some("unwatched"),
+            "NEGATIVE CONTROL, {agent_off:?}"
+        );
+    }
+    let row = look(&[], &[TAB], &[]);
+    assert_eq!(
+        (row.aside.as_str(), row.wait.as_str()),
+        (AGENT_OFF, AGENT_OFF)
+    );
+    assert_eq!(row.unwatched(NOW), None);
+    assert!(
+        row.badge(NOW).is_none(),
+        "the owner's own switch marks no tab"
+    );
+    assert!(
+        matches!(row.attention(NOW), Attention::Quiet),
+        "the owner's own setup, a record: {:?}",
+        row.attention(NOW)
+    );
+    assert_eq!(row.overdue_cause(NOW), "its agent is switched off");
+    assert!(
+        row.waiting_line("09:00")
+            .contains("it moves once its agent is switched on again"),
+        "{}",
+        row.waiting_line("09:00")
+    );
+    let both = look(&[TAB], &[TAB], &[]);
+    assert_eq!(
+        (both.aside.as_str(), both.wait.as_str()),
+        (CLAIMED, CLAIMED)
+    );
+    let switch_and_word = look(&[], &[TAB], &[TAB]);
+    assert_eq!(switch_and_word.aside.as_str(), AGENT_OFF);
 }

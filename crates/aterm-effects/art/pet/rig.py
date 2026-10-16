@@ -11,9 +11,9 @@ import math
 VB_W = 244.0
 VB_H = 148.0
 GROUND = 114.0          # rig-space chain target for the paw CENTRES
-# Where the lowest INK of a planted pose lands in the viewbox. The emitter puts
-# the sprite's bottom edge on the text baseline, so this is the cat's floor.
-# Six units of slack under it absorbs the outline's outward cap.
+# Where the lowest ink of a planted pose lands in the viewbox. The emitter puts
+# the sprite's bottom edge on the text baseline, so this is the cat's floor; the
+# five units under it absorb the outline's outward cap.
 GROUND_INK = 143.0
 OX = 34.0               # rig -> viewbox offset, sized by the widest pose (leap)
 K = 0.5523              # circle -> cubic magic constant
@@ -152,7 +152,7 @@ def limb(pts, radii, smooth=False, cap_start=True, cap_end=True):
         d += [f"L {P(*p)}" for p in left[1:]]
 
     # round cap at the far end: semicircle from left[-1] to right[-1], bulging
-    # ALONG the limb's direction of travel
+    # along the limb's direction of travel
     if cap_end:
         d.append(_cap(left[-1], right[-1], radii[-1], _dir(pts[-2], pts[-1])))
     else:

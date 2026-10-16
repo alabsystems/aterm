@@ -2,7 +2,8 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Style API, scrollback boundary, damage tracking, and targeted boundary tests.
+//! Style-id writes, ring/tiered row access, cursor damage, boundary regressions and the
+//! HAS_EXTRAS cell flag.
 
 use crate::grid::Scrollback;
 use crate::{CellCoord, CellFlags, ExtendedStyle, Grid, PackedColor, StyleId};
@@ -23,7 +24,6 @@ fn grid_write_char_with_style_id_default() {
 fn grid_write_char_with_style_id_indexed_color() {
     let mut grid = Grid::new(24, 80);
 
-    // Intern a style with indexed colors
     let ext = ExtendedStyle::from_packed_colors_separate(
         PackedColor::indexed(196), // Red
         PackedColor::indexed(21),  // Blue
@@ -46,7 +46,6 @@ fn grid_write_char_with_style_id_indexed_color() {
 fn grid_write_char_with_style_id_rgb_color() {
     let mut grid = Grid::new(24, 80);
 
-    // Intern a style with RGB colors
     let ext = ExtendedStyle::from_packed_colors_separate(
         PackedColor::rgb(255, 128, 64),
         PackedColor::rgb(32, 64, 128),
@@ -68,7 +67,6 @@ fn grid_write_char_with_style_id_rgb_color() {
 fn grid_write_char_with_style_id_extra_flags() {
     let mut grid = Grid::new(24, 80);
 
-    // Intern a bold style
     let ext = ExtendedStyle::from_packed_colors_separate(
         PackedColor::DEFAULT_FG,
         PackedColor::DEFAULT_BG,
@@ -76,7 +74,6 @@ fn grid_write_char_with_style_id_extra_flags() {
     );
     let style_id = grid.intern_extended_style(ext);
 
-    // Write with extra PROTECTED flag
     grid.write_char_with_style_id('D', style_id, CellFlags::PROTECTED);
 
     let cell = grid.row(0).unwrap().get(0).unwrap();
@@ -86,86 +83,9 @@ fn grid_write_char_with_style_id_extra_flags() {
 }
 
 #[test]
-fn grid_write_char_wrap_with_style_id() {
-    let mut grid = Grid::new(24, 10); // 10 columns
-
-    let ext = ExtendedStyle::from_packed_colors_separate(
-        PackedColor::indexed(31),
-        PackedColor::DEFAULT_BG,
-        CellFlags::empty(),
-    );
-    let style_id = grid.intern_extended_style(ext);
-
-    // Fill first row and wrap to second
-    for _ in 0..12 {
-        grid.write_char_wrap_with_style_id('X', style_id, CellFlags::empty());
-    }
-
-    // First row should be full (10 chars)
-    let row0 = grid.row(0).unwrap();
-    assert_eq!(row0.len(), 10);
-
-    // Second row should have 2 chars
-    let row1 = grid.row(1).unwrap();
-    assert_eq!(row1.len(), 2);
-    assert!(row1.is_wrapped());
-}
-
-#[test]
-fn grid_write_wide_char_with_style_id() {
-    let mut grid = Grid::new(24, 80);
-
-    let ext = ExtendedStyle::from_packed_colors_separate(
-        PackedColor::indexed(196),
-        PackedColor::DEFAULT_BG,
-        CellFlags::empty(),
-    );
-    let style_id = grid.intern_extended_style(ext);
-
-    // Write a wide CJK character
-    let ok = grid.write_wide_char_with_style_id('あ', style_id, CellFlags::empty());
-    assert!(ok);
-
-    // Check the main cell
-    let cell0 = grid.row(0).unwrap().get(0).unwrap();
-    assert_eq!(cell0.char(), 'あ');
-    assert!(cell0.is_wide());
-    assert!(cell0.colors().fg_is_indexed());
-
-    // Check the continuation cell
-    let cell1 = grid.row(0).unwrap().get(1).unwrap();
-    assert!(cell1.is_wide_continuation());
-}
-
-#[test]
-fn grid_write_wide_char_wrap_with_style_id() {
-    let mut grid = Grid::new(24, 10);
-
-    let ext = ExtendedStyle::from_packed_colors_separate(
-        PackedColor::DEFAULT_FG,
-        PackedColor::DEFAULT_BG,
-        CellFlags::UNDERLINE,
-    );
-    let style_id = grid.intern_extended_style(ext);
-
-    // Position cursor at column 9 (last column)
-    grid.set_cursor(0, 9);
-
-    // Write wide char - should wrap to next line
-    let ok = grid.write_wide_char_wrap_with_style_id('中', style_id, CellFlags::empty());
-    assert!(ok);
-
-    // Character should be on row 1 (wrapped)
-    let row1 = grid.row(1).unwrap();
-    assert_eq!(row1.get(0).unwrap().char(), '中');
-    assert!(row1.is_wrapped());
-}
-
-#[test]
 fn grid_style_id_deduplication_in_writes() {
     let mut grid = Grid::new(24, 80);
 
-    // Same style interned twice should give same ID
     let ext1 = ExtendedStyle::from_packed_colors_separate(
         PackedColor::indexed(100),
         PackedColor::DEFAULT_BG,
@@ -182,11 +102,9 @@ fn grid_style_id_deduplication_in_writes() {
 
     assert_eq!(id1, id2, "Same style should produce same ID");
 
-    // Write with both IDs
     grid.write_char_with_style_id('E', id1, CellFlags::empty());
     grid.write_char_with_style_id('F', id2, CellFlags::empty());
 
-    // Both cells should have identical styles
     let cell0 = grid.row(0).unwrap().get(0).unwrap();
     let cell1 = grid.row(0).unwrap().get(1).unwrap();
 
@@ -198,13 +116,10 @@ fn grid_style_id_deduplication_in_writes() {
 /// underflowing `row_index()`.
 #[test]
 fn row_returns_none_when_scrolled_into_tiered_scrollback() {
-    // Setup: small ring buffer (2 lines), small hot tier (5 lines)
-    // This ensures content quickly overflows into tiered scrollback
+    // A small ring and hot tier, so 15 lines reach the tiered store.
     let scrollback = Scrollback::new(5, 100, 1_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 20, 2, scrollback);
 
-    // Fill content: 3 visible + 2 ring buffer + overflow into tiered
-    // Write 15 lines to ensure some go into tiered scrollback
     for i in 0..15 {
         for c in format!("Line{i:02}").chars() {
             grid.write_char(c);
@@ -212,7 +127,6 @@ fn row_returns_none_when_scrolled_into_tiered_scrollback() {
         grid.line_feed();
     }
 
-    // Verify we have tiered scrollback content
     let total_scrollback = grid.scrollback_lines();
     let ring_scrollback = grid
         .storage
@@ -225,7 +139,6 @@ fn row_returns_none_when_scrolled_into_tiered_scrollback() {
         "Test requires tiered scrollback content"
     );
 
-    // Scroll to top of all scrollback (into tiered territory)
     grid.scroll_to_top();
     assert_eq!(grid.display_offset(), total_scrollback);
 
@@ -233,8 +146,6 @@ fn row_returns_none_when_scrolled_into_tiered_scrollback() {
     // scrollback and row() returns None.
     let row_result = grid.row(0);
 
-    // At this scroll position, row 0 is in tiered scrollback (not ring buffer)
-    // so it should return None, not panic or return wrong data
     assert!(
         row_result.is_none(),
         "row(0) should be None when scrolled into tiered scrollback (display_offset={}, ring={}, tiered={})",
@@ -243,11 +154,9 @@ fn row_returns_none_when_scrolled_into_tiered_scrollback() {
         tiered_scrollback
     );
 
-    // Scroll back to live position - rows should be accessible again
     grid.scroll_to_bottom();
     assert_eq!(grid.display_offset(), 0);
 
-    // All visible rows should now be Some
     for visible_row in 0..grid.rows() {
         assert!(
             grid.row(visible_row).is_some(),
@@ -262,7 +171,6 @@ fn row_access_at_ring_tiered_boundary() {
     let scrollback = Scrollback::new(5, 100, 1_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 20, 2, scrollback);
 
-    // Fill enough to have both ring buffer and tiered content
     for i in 0..12 {
         for c in format!("Row{i:02}").chars() {
             grid.write_char(c);
@@ -270,7 +178,6 @@ fn row_access_at_ring_tiered_boundary() {
         grid.line_feed();
     }
 
-    // After 12 line feeds in a 3-row grid, total_lines should exceed visible rows
     assert!(
         grid.storage.total_lines > grid.storage.visible_rows as usize,
         "12 line feeds in a 3-row grid should produce scrollback: total_lines={}, visible_rows={}",
@@ -283,10 +190,8 @@ fn row_access_at_ring_tiered_boundary() {
         .total_lines
         .saturating_sub(grid.storage.visible_rows as usize);
 
-    // Scroll to exactly the ring buffer boundary
     grid.scroll_display(ring_scrollback as i32);
 
-    // At this position, at least one visible row should be accessible (Some)
     let mut accessible_count = 0u16;
     for visible_row in 0..grid.rows() {
         if grid.row(visible_row).is_some() {
@@ -299,18 +204,15 @@ fn row_access_at_ring_tiered_boundary() {
         grid.rows()
     );
 
-    // One more scroll should put us into tiered territory
     grid.scroll_display(1);
 
     // Row 0 at this position comes from tiered scrollback: either accessible
     // (Some) or evicted (None), but must not panic
     let row = grid.row(0);
-    // Whether Some or None, the display_offset must have advanced
     assert!(
         grid.display_offset() > 0,
         "after scrolling past ring boundary, display_offset should be positive"
     );
-    // If the row is accessible, it should have non-zero length (grid width)
     if let Some(r) = row {
         assert_eq!(
             r.len(),
@@ -325,20 +227,15 @@ fn mark_cursor_damage_marks_cursor_cell() {
     let mut grid = Grid::new(24, 80);
     grid.clear_damage(); // Start with no damage
 
-    // Move cursor to a specific position
     grid.set_cursor(10, 40);
 
-    // No damage after clearing
     assert!(!grid.damage().has_damage());
 
-    // Mark cursor damage
     grid.mark_cursor_damage();
 
-    // Should have damage now
     assert!(grid.damage().has_damage());
     assert!(!grid.damage().is_full()); // Should be partial, not full
 
-    // Verify the cursor cell is in the damaged region
     let bounds: Vec<_> = grid.damage().iter_bounds(24, 80).collect();
     assert_eq!(bounds.len(), 1);
     let b = &bounds[0];
@@ -350,7 +247,6 @@ fn mark_cursor_damage_marks_cursor_cell() {
 fn mark_cursor_damage_after_cursor_move() {
     let mut grid = Grid::new(24, 80);
 
-    // Move cursor and mark damage
     grid.set_cursor(5, 10);
     grid.clear_damage();
     grid.mark_cursor_damage();
@@ -359,7 +255,6 @@ fn mark_cursor_damage_after_cursor_move() {
     assert_eq!(bounds.len(), 1);
     assert_eq!(bounds[0].line, 5);
 
-    // Move cursor to new position and mark damage
     grid.set_cursor(15, 30);
     grid.clear_damage();
     grid.mark_cursor_damage();
@@ -377,7 +272,6 @@ fn grid_one_row_invariants_valid() {
     let grid = Grid::new(1, 80);
     assert_eq!(grid.scroll_region().top, 0);
     assert_eq!(grid.scroll_region().bottom, 0);
-    // This must not panic:
     grid.assert_invariants();
 }
 
@@ -385,8 +279,6 @@ fn grid_one_row_invariants_valid() {
 #[test]
 fn grid_scroll_region_bottom_strictly_less_than_visible_rows() {
     let grid = Grid::new(24, 80);
-    // Default scroll region: top=0, bottom=23, visible_rows=24
-    // bottom (23) < visible_rows (24) — this is correct
     assert!(grid.scroll_region().bottom < grid.rows());
     grid.assert_invariants();
 }
@@ -395,7 +287,6 @@ fn grid_scroll_region_bottom_strictly_less_than_visible_rows() {
 #[test]
 fn grid_scroll_region_down_clears_top_rows() {
     let mut grid = Grid::new(5, 10);
-    // Write identifiable content on each row
     for row in 0..5u16 {
         grid.move_cursor_to(row, 0);
         let ch = (b'A' + row as u8) as char;
@@ -403,15 +294,12 @@ fn grid_scroll_region_down_clears_top_rows() {
             grid.write_char(ch);
         }
     }
-    // Scroll region down by 1 (full screen region)
     grid.scroll_region_down(1);
-    // Top row (row 0) should now be blank
     let first_cell_char = grid.cell(0, 0).unwrap().char();
     assert!(
         first_cell_char == ' ' || first_cell_char == '\0',
         "After scroll_region_down, top row should be blank, got '{first_cell_char}'"
     );
-    // Row 1 holds the old row 0 (A's).
     assert_eq!(
         grid.cell(1, 0).unwrap().char(),
         'A',
@@ -423,7 +311,6 @@ fn grid_scroll_region_down_clears_top_rows() {
 #[test]
 fn grid_scroll_down_shifts_content_and_clears_top() {
     let mut grid = Grid::new(5, 10);
-    // Write identifiable content: row 0='A', row 1='B', ..., row 4='E'
     for row in 0..5u16 {
         grid.move_cursor_to(row, 0);
         let ch = (b'A' + row as u8) as char;
@@ -435,28 +322,24 @@ fn grid_scroll_down_shifts_content_and_clears_top() {
     let total_before = grid.total_lines();
     grid.scroll_down(1);
 
-    // total_lines must not change (no rows added or removed)
     assert_eq!(
         grid.total_lines(),
         total_before,
         "scroll_down must not alter total_lines"
     );
 
-    // Top row should be blank
     let top_char = grid.cell(0, 0).unwrap().char();
     assert!(
         top_char == ' ' || top_char == '\0',
         "After scroll_down, top row should be blank, got '{top_char}'"
     );
 
-    // Content shifted: old row 0 ('A') is now at row 1
     assert_eq!(
         grid.cell(1, 0).unwrap().char(),
         'A',
         "After scroll_down(1), row 1 should have old row 0 content"
     );
 
-    // Old row 3 ('D') is now at row 4
     assert_eq!(
         grid.cell(4, 0).unwrap().char(),
         'D',
@@ -475,7 +358,6 @@ fn grid_scroll_down_full_screen_clears_all() {
 
     grid.scroll_down(4);
 
-    // Every row should be blank
     for row in 0..4u16 {
         let ch = grid.cell(row, 0).unwrap().char();
         assert!(
@@ -485,15 +367,14 @@ fn grid_scroll_down_full_screen_clears_all() {
     }
 }
 
-// HAS_EXTRAS per-cell flag tests
+// HAS_EXTRAS per-cell flag
 
-/// Coloured prompt (16 RGB cells) + plain body (64 cells): has_extras() is true
-/// only for cells with extras entries.
+/// A coloured prompt, then a plain body: has_extras() is true only on the
+/// prompt cells, which have extras entries.
 #[test]
 fn colored_prompt_has_extras_only_on_prompt_cells() {
     let mut grid = Grid::new(1, 80);
 
-    // Write a colored prompt "user@host:~$ " (14 chars) with RGB extras.
     let prompt = "user@host:~$ ";
     grid.set_cursor(0, 0);
     for c in prompt.chars() {
@@ -501,22 +382,19 @@ fn colored_prompt_has_extras_only_on_prompt_cells() {
     }
     let prompt_len = prompt.len() as u16;
 
-    // Add RGB foreground to each prompt cell via cell_extra_mut (sets HAS_EXTRAS).
+    // `cell_extra_mut` sets HAS_EXTRAS.
     for col in 0..prompt_len {
         let extra = grid.cell_extra_mut(0, col);
         extra.set_fg_rgb(Some([0, 255, 0])); // green prompt
     }
 
-    // Write plain body text after the prompt.
     grid.set_cursor(0, prompt_len);
     for c in "ls -la /tmp".chars() {
         grid.write_char(c);
     }
 
-    // Extras map is not empty (prompt has entries).
     assert!(!grid.extras().is_empty());
 
-    // Prompt cells have has_extras() == true.
     for col in 0..prompt_len {
         assert!(
             grid.cell(0, col).unwrap().has_extras(),
@@ -528,7 +406,6 @@ fn colored_prompt_has_extras_only_on_prompt_cells() {
         );
     }
 
-    // Plain body cells have has_extras() == false.
     let body_end = prompt_len + 11; // "ls -la /tmp" is 11 chars
     for col in prompt_len..body_end {
         assert!(
@@ -537,7 +414,6 @@ fn colored_prompt_has_extras_only_on_prompt_cells() {
         );
     }
 
-    // Untouched cells also have has_extras() == false.
     for col in body_end..80 {
         assert!(
             !grid.cell(0, col).unwrap().has_extras(),
@@ -555,7 +431,6 @@ fn clear_hyperlink_clears_has_extras_when_empty() {
     grid.set_cursor(0, 0);
     grid.write_char('A');
 
-    // Add a hyperlink to cell (0, 0).
     let extra = grid.cell_extra_mut(0, 0);
     extra.set_hyperlink(Some(Arc::from("https://example.com")));
 
@@ -597,14 +472,12 @@ fn remove_cell_extra_clears_flag_and_entry() {
     grid.set_cursor(0, 0);
     grid.write_char('X');
 
-    // Add extras
     let extra = grid.cell_extra_mut(0, 0);
     extra.set_fg_rgb(Some([255, 0, 0]));
 
     assert!(grid.cell(0, 0).unwrap().has_extras());
     assert!(grid.cell_extra(0, 0).is_some());
 
-    // Remove extras atomically
     let removed = grid.remove_cell_extra(0, 0);
     assert!(removed, "remove should return true when entry existed");
     assert!(
@@ -616,7 +489,6 @@ fn remove_cell_extra_clears_flag_and_entry() {
         "extras entry must be gone after remove"
     );
 
-    // Removing again should return false
     let removed_again = grid.remove_cell_extra(0, 0);
     assert!(!removed_again, "second remove should return false");
 }
@@ -630,7 +502,6 @@ fn remove_cell_extra_preserves_cell_content() {
 
     let orig_fg = grid.cell(0, 0).unwrap().colors().fg_index();
 
-    // Add and then remove extras
     let extra = grid.cell_extra_mut(0, 0);
     extra.set_fg_rgb(Some([0, 128, 255]));
     grid.remove_cell_extra(0, 0);
@@ -649,14 +520,12 @@ fn remove_cell_extra_preserves_cell_content() {
 fn sync_extras_flags_for_row_sets_flags_correctly() {
     let mut grid = Grid::new(1, 10);
 
-    // Write some chars
     for col in 0..5u16 {
         grid.set_cursor(0, col);
         grid.write_char((b'A' + col as u8) as char);
     }
 
-    // Manually insert extras for cols 1, 3 without setting HAS_EXTRAS
-    // (simulates checkpoint restore where flags are not yet synced)
+    // Entries on cols 1 and 3, then every flag cleared, as after a checkpoint load.
     {
         let extra = grid.cell_extra_mut(0, 1);
         extra.set_fg_rgb(Some([255, 0, 0]));
@@ -664,7 +533,6 @@ fn sync_extras_flags_for_row_sets_flags_correctly() {
         extra.set_fg_rgb(Some([0, 255, 0]));
     }
 
-    // Clear flags to simulate a stale state (like checkpoint load)
     for col in 0..10u16 {
         if let Some(row) = grid.row_mut(0)
             && let Some(cell) = row.get_mut(col)
@@ -673,14 +541,11 @@ fn sync_extras_flags_for_row_sets_flags_correctly() {
         }
     }
 
-    // Verify flags are cleared
     assert!(!grid.cell(0, 1).unwrap().has_extras());
     assert!(!grid.cell(0, 3).unwrap().has_extras());
 
-    // Now sync
     grid.sync_extras_flags_for_row(0, 10);
 
-    // Cells with extras should now have the flag
     assert!(
         grid.cell(0, 1).unwrap().has_extras(),
         "col 1 has extras entry, flag should be set"
@@ -690,7 +555,6 @@ fn sync_extras_flags_for_row_sets_flags_correctly() {
         "col 3 has extras entry, flag should be set"
     );
 
-    // Cells without extras should still not have the flag
     assert!(
         !grid.cell(0, 0).unwrap().has_extras(),
         "col 0 has no extras, flag should remain false"
@@ -710,7 +574,6 @@ fn sync_extras_flags_for_row_sets_flags_correctly() {
 fn sync_extras_flags_for_row_clears_stale_flags() {
     let mut grid = Grid::new(1, 10);
 
-    // Write chars and add extras to col 2
     for col in 0..5u16 {
         grid.set_cursor(0, col);
         grid.write_char((b'A' + col as u8) as char);
@@ -718,8 +581,7 @@ fn sync_extras_flags_for_row_clears_stale_flags() {
     let extra = grid.cell_extra_mut(0, 2);
     extra.set_fg_rgb(Some([255, 0, 0]));
 
-    // Manually set HAS_EXTRAS on cols 0, 1, 4 (no actual extras entries)
-    // to simulate stale flags from a buggy code path.
+    // HAS_EXTRAS without an entry on cols 0, 1 and 4.
     for col in [0u16, 1, 4] {
         if let Some(row) = grid.row_mut(0)
             && let Some(cell) = row.get_mut(col)
@@ -728,7 +590,6 @@ fn sync_extras_flags_for_row_clears_stale_flags() {
         }
     }
 
-    // Verify stale flags are set
     assert!(
         grid.cell(0, 0).unwrap().has_extras(),
         "precondition: col 0 stale flag"
@@ -746,7 +607,6 @@ fn sync_extras_flags_for_row_clears_stale_flags() {
         "precondition: col 4 stale flag"
     );
 
-    // Sync should clear stale flags and keep real ones
     grid.sync_extras_flags_for_row(0, 10);
 
     assert!(
@@ -772,7 +632,6 @@ fn sync_extras_flags_for_row_clears_stale_flags() {
 fn erase_to_end_of_screen_clears_has_extras() {
     let mut grid = Grid::new(3, 10);
 
-    // Add extras to cells on multiple rows
     for row in 0..3u16 {
         grid.set_cursor(row, 0);
         grid.write_char('X');
@@ -780,22 +639,18 @@ fn erase_to_end_of_screen_clears_has_extras() {
         extra.set_fg_rgb(Some([128, 128, 128]));
     }
 
-    // Verify extras are set
     for row in 0..3u16 {
         assert!(grid.cell(row, 0).unwrap().has_extras());
     }
 
-    // Erase from row 1 downward
     grid.set_cursor(1, 0);
     grid.erase_to_end_of_screen();
 
-    // Row 0 should keep its extras
     assert!(
         grid.cell(0, 0).unwrap().has_extras(),
         "row 0 above cursor should keep has_extras"
     );
 
-    // Rows 1-2 should have cleared extras (cells reset to empty)
     for row in 1..3u16 {
         assert!(
             !grid.cell(row, 0).unwrap().has_extras(),

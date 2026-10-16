@@ -255,3 +255,238 @@ fn an_idle_events_wake_touches_no_retained_record() {
          {per_target_bound} per target)"
     );
 }
+
+/// A headless window drawn through the real redraw path: a scripted CPU
+/// surface takes the present (`crate::present::scripted`), so every frame
+/// below is `App::redraw_window` end to end, glass included.
+#[cfg(debug_assertions)]
+fn presented_window() -> (App, WindowId, u64) {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let session = app.focused_session_id(wid).expect("the front session");
+    app.windows.get_mut(&wid).expect("fixture window").present = Some(crate::PresentTarget::Cpu {
+        surface: crate::present::CpuSurface::Scripted(Default::default()),
+    });
+    let ws = &app.windows[&wid];
+    assert!(
+        matches!(&ws.present, Some(crate::PresentTarget::Cpu { surface }) if surface.scripted().is_some()),
+        "a scripted surface"
+    );
+    (app, wid, session)
+}
+
+/// Successful presents on `wid`'s scripted surface so far.
+#[cfg(debug_assertions)]
+fn presents(app: &App, wid: WindowId) -> usize {
+    match &app.windows[&wid].present {
+        Some(crate::PresentTarget::Cpu { surface }) => {
+            surface.scripted().map_or(0, |s| s.commits())
+        }
+        _ => 0,
+    }
+}
+
+/// Cell geometries the renderer derived over `frames` presented frames of
+/// `wid`, each after `before` runs (a key's echo, or nothing).
+#[cfg(debug_assertions)]
+fn derivations_over(
+    app: &mut App,
+    wid: WindowId,
+    frames: usize,
+    mut before: impl FnMut(&mut App),
+) -> usize {
+    let _ = work_counts::take_cell_geometry_derivations();
+    for _ in 0..frames {
+        before(app);
+        app.redraw_window(wid);
+    }
+    work_counts::take_cell_geometry_derivations()
+}
+
+/// THE CELL BOX IS DERIVED ONCE PER CHANGE, NEVER PER FRAME: the window's
+/// cell size (`App::win_cell_size`, asked by the frame's layout, the cursor,
+/// the band, the cell-pixel sync and the composer's caret — 4 times a frame
+/// at rest and 6 a keystroke on this window, measured 2026-10-16) is read
+/// from what the renderer kept for the window's px, so a frame at rest and a
+/// keystroke's frame derive nothing. Each derivation reads the face's
+/// metrics, and the macOS default primary (SF Mono, instantiated) parses
+/// the face for them: ~0.2 µs a call.
+///
+/// Every real input of it derives exactly once and is then kept: a window
+/// whose scale changed (a move to another display, `on_scale_factor_changed`
+/// re-resolving its `MetricsView`), a config reload of the baseline (pushed
+/// onto the live renderer, which forgets), one that moves the cell box
+/// (`line_height`, a rebuild), and a font zoom (a new renderer at the new
+/// px). Each reads the new geometry (it is what the face derives now), never
+/// a kept one.
+///
+/// NEGATIVE CONTROLS: each change's first frame derives (the counter counts
+/// the frame's asks), and its answer is the new geometry. Without the kept
+/// answers the rest frames read 4.2 a frame, and without the baseline's
+/// forget the reloaded baseline reads the kept one (both mutation-checked).
+#[cfg(debug_assertions)]
+#[test]
+fn a_frame_derives_the_cell_box_only_when_an_input_changed() {
+    const FRAMES: usize = 20;
+    let (mut app, wid, session) = presented_window();
+    let committed = presents(&app, wid);
+    let _ = derivations_over(&mut app, wid, 2, |_| {});
+    assert!(
+        presents(&app, wid) > committed,
+        "the frames reach the glass"
+    );
+    let rest = derivations_over(&mut app, wid, FRAMES, |_| {});
+    assert_eq!(rest, 0, "frames at rest derive no cell box");
+    let term = app.pool.get(session).expect("session").term.clone();
+    let keys = derivations_over(&mut app, wid, FRAMES, |_| {
+        crate::term_lock(&term).process(b"k");
+    });
+    assert_eq!(keys, 0, "keystroke frames derive no cell box");
+
+    // A SCALE CHANGE: the window's metric record re-resolved at 2x (what
+    // `on_scale_factor_changed` does for an attached window). Its first frame
+    // derives the new px once; the frames after keep it.
+    let px = app.windows[&wid].metrics.font_px;
+    let before = app.win_cell_size(wid);
+    app.windows
+        .get_mut(&wid)
+        .expect("fixture window")
+        .metrics
+        .font_px = px * 2.0;
+    let _ = work_counts::take_cell_geometry_derivations();
+    app.redraw_window(wid);
+    assert_eq!(
+        work_counts::take_cell_geometry_derivations(),
+        1,
+        "CONTROL: a new scale derives once"
+    );
+    let doubled = app.win_cell_size(wid);
+    assert!(
+        doubled.0.abs_diff(2 * before.0) <= 1 && doubled.1.abs_diff(2 * before.1) <= 1,
+        "the new scale's cell box ({before:?} -> {doubled:?})"
+    );
+    assert_eq!(
+        derivations_over(&mut app, wid, FRAMES, |_| {}),
+        0,
+        "kept at 2x"
+    );
+    // Back on the first display: still kept, nothing derived.
+    app.windows
+        .get_mut(&wid)
+        .expect("fixture window")
+        .metrics
+        .font_px = px;
+    assert_eq!(
+        derivations_over(&mut app, wid, FRAMES, |_| {}),
+        0,
+        "kept at 1x"
+    );
+    assert_eq!(app.win_cell_size(wid), before, "the first display's box");
+
+    // A CONFIG RELOAD of the baseline escape hatch (`adjust_baseline`),
+    // through the real admission path: a live push onto the renderer
+    // (`apply_render_knob`), no rebuild, so the renderer itself forgets what
+    // it kept. The reload and its first frame derive once between them.
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("aterm-cell-box-reload")
+        .tempdir()
+        .expect("scratch dir");
+    let dir = scratch.path();
+    let geometry = app.backend.cell_geometry(px);
+    let _ = work_counts::take_cell_geometry_derivations();
+    apply_config_text(&mut app, dir, "adjust_baseline = 3\n");
+    app.redraw_window(wid);
+    assert_eq!(
+        work_counts::take_cell_geometry_derivations(),
+        1,
+        "CONTROL: a reloaded baseline derives once"
+    );
+    assert_eq!(
+        app.backend.cell_geometry(px),
+        (geometry.0, geometry.1, geometry.2 + 3),
+        "the same box, its baseline 3 px down"
+    );
+    assert_eq!(
+        derivations_over(&mut app, wid, FRAMES, |_| {}),
+        0,
+        "kept after the baseline's reload"
+    );
+
+    // A CONFIG RELOAD that moves the cell box (`line_height`), through the
+    // real admission path: a rebuild, whose new renderer has kept nothing.
+    apply_config_text(&mut app, dir, "line_height = 1.5\n");
+    let _ = work_counts::take_cell_geometry_derivations();
+    app.redraw_window(wid);
+    assert_eq!(
+        work_counts::take_cell_geometry_derivations(),
+        1,
+        "CONTROL: a reloaded line height derives once"
+    );
+    let taller = app.win_cell_size(wid);
+    assert_eq!(taller.0, before.0, "the same advance");
+    assert!(
+        taller.1 > before.1,
+        "a taller cell ({before:?} -> {taller:?})"
+    );
+    assert_eq!(app.cell_size(), taller, "the renderer's own box at this px");
+    assert_eq!(
+        derivations_over(&mut app, wid, FRAMES, |_| {}),
+        0,
+        "kept after the reload"
+    );
+
+    // A FONT ZOOM: the zoom's own transaction asks the outgoing renderer at
+    // the new px (`refresh_all_window_metrics` syncing the cell pixel size)
+    // before the rebuild replaces it, and the new renderer, which has kept
+    // nothing, derives on its first frame: once per renderer, then kept.
+    let _ = work_counts::take_cell_geometry_derivations();
+    app.set_font_px(px + 4.0);
+    app.redraw_window(wid);
+    assert_eq!(
+        work_counts::take_cell_geometry_derivations(),
+        2,
+        "CONTROL: a zoom derives once on each renderer"
+    );
+    let zoomed = app.win_cell_size(wid);
+    assert!(
+        (app.windows[&wid].metrics.font_px - (px + 4.0)).abs() < 0.5,
+        "the window took the zoom"
+    );
+    assert_eq!(app.cell_size(), zoomed, "the zoomed renderer's own box");
+    assert!(
+        zoomed.1 > taller.1,
+        "a bigger cell ({taller:?} -> {zoomed:?})"
+    );
+    assert_eq!(
+        derivations_over(&mut app, wid, FRAMES, |_| {}),
+        0,
+        "kept after the zoom"
+    );
+}
+
+/// Apply `text` as `aterm.toml` through the real admission path (the
+/// prepared generation a config watcher hands the App).
+#[cfg(debug_assertions)]
+fn apply_config_text(app: &mut App, dir: &std::path::Path, text: &str) {
+    let path = dir.join("aterm.toml");
+    std::fs::write(&path, text).expect("write config");
+    let observation =
+        crate::native_config_service::VersionedConfigService::observe_path(&path, false)
+            .expect("observe");
+    let config: Config = aterm_toml::from_str(text).expect("valid toml");
+    let assets = config.resolve_asset_catalog();
+    let path_feed_fps = config.path_feed_fingerprints();
+    let sparkle = config.prepare_sparkle_runtime();
+    app.apply_prepared_config_generation(crate::native_font_catalog::PreparedConfigGeneration {
+        observation,
+        config,
+        values: std::collections::BTreeMap::new(),
+        disk_faults: std::sync::Arc::default(),
+        assets,
+        path_feed_fps,
+        sparkle,
+        fonts: None,
+        warnings: Vec::new(),
+        font_refusals: Vec::new(),
+    });
+}

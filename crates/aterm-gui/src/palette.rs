@@ -16,6 +16,13 @@
 //! `section`). Menu activation still converges on `Wake::MenuAction`; native activation is
 //! generation checked before it can become `AppEvent::Action`.
 //!
+//! A **Theme** section follows the menu rows: one row per theme the catalog can draw
+//! ([`PaletteTheme`], built-ins then loaded theme files), its appearance as the hint.
+//! Highlighting one previews it ([`PaletteState::take_theme_highlight_change`], read by
+//! `App::sync_palette_theme_preview` once per event-loop turn), Enter writes it, and
+//! closing the palette reverts. View ▸ Choose Theme… opens the palette scoped to that
+//! section ([`PaletteState::themes_only`]).
+//!
 //! Mirrors the [`crate::about`] overlay's pure-model + tray-painter shape and reuses the
 //! settings [`Roles`] colour system.
 
@@ -93,19 +100,29 @@ pub(crate) struct NativeCommandTarget {
     pub(crate) action: ActionId,
 }
 
-/// The two command domains share pixels, filtering, controls, and accessibility while
+/// The command domains share pixels, filtering, controls, and accessibility while
 /// keeping their dispatch authorities distinct.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PaletteTarget {
     Menu(MenuAction),
     Native(NativeCommandTarget),
+    /// A Theme-section row: the theme id `theme = "…"` takes (a built-in's canonical
+    /// name or a theme file's stem). Highlighting previews it; activating writes it.
+    Theme(String),
 }
 
 impl PaletteTarget {
     fn menu(&self) -> Option<MenuAction> {
         match self {
             Self::Menu(action) => Some(*action),
-            Self::Native(_) => None,
+            Self::Native(_) | Self::Theme(_) => None,
+        }
+    }
+
+    fn theme(&self) -> Option<&str> {
+        match self {
+            Self::Theme(id) => Some(id),
+            Self::Menu(_) | Self::Native(_) => None,
         }
     }
 
@@ -113,6 +130,46 @@ impl PaletteTarget {
         match self {
             Self::Menu(action) => Cow::Owned(format!("{action:?}")),
             Self::Native(target) => Cow::Borrowed(target.action.as_str()),
+            Self::Theme(_) => Cow::Borrowed("Theme"),
+        }
+    }
+}
+
+/// The Theme section's chip, and the word the theme rows' filter haystack carries.
+pub(crate) const THEME_SECTION: &str = "Theme";
+
+/// The Theme section's last row: Settings ▸ Themes, the Theme Showcase.
+pub(crate) const BROWSE_THEMES_LABEL: &str = "Browse all themes\u{2026}";
+
+/// One theme the palette offers: a theme the catalog can draw (a built-in, or a theme
+/// file that loaded). Built by `App::palette_themes` from the admitted catalog, so the
+/// palette itself reads no file and resolves nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PaletteTheme {
+    /// What `theme = "…"` takes.
+    pub(crate) id: String,
+    /// The row's words: the theme's own name, verbatim.
+    pub(crate) label: String,
+    /// The appearance it is drawn for, shown as the row's hint.
+    pub(crate) appearance: aterm_types::Appearance,
+    /// The theme the config draws (checked).
+    pub(crate) current: bool,
+}
+
+impl PaletteTheme {
+    fn row(self) -> PaletteRow {
+        PaletteRow {
+            section: Cow::Borrowed(THEME_SECTION),
+            label: Cow::Owned(self.label),
+            action: PaletteTarget::Theme(self.id),
+            key: "",
+            mods: MenuMods::None,
+            shortcut: Cow::Borrowed(match self.appearance {
+                aterm_types::Appearance::Dark => "dark",
+                aterm_types::Appearance::Light => "light",
+            }),
+            enabled: true,
+            checked: self.current.then_some(true),
         }
     }
 }
@@ -318,7 +375,73 @@ impl PaletteState {
             pointer_armed: None,
             realized_since: None,
             realized_frozen: false,
+            themes_only: false,
+            theme_previewed: None,
         }
+    }
+
+    /// Append the Theme section: one row per theme, in the order given. The row the
+    /// cursor starts on counts as already previewed, so opening the palette changes
+    /// nothing on screen.
+    pub(crate) fn with_themes(mut self, themes: Vec<PaletteTheme>) -> Self {
+        self.rows.retain(|row| row.section != THEME_SECTION);
+        self.rows.extend(themes.into_iter().map(PaletteTheme::row));
+        // The section ends on the way to every theme: Settings ▸ Themes, the
+        // Theme Showcase, where a theme is tried on a live stage and its fonts
+        // and colors tuned.
+        self.rows.push(PaletteRow {
+            section: Cow::Borrowed(THEME_SECTION),
+            label: Cow::Borrowed(BROWSE_THEMES_LABEL),
+            action: PaletteTarget::Menu(MenuAction::BrowseThemes),
+            key: "",
+            mods: MenuMods::None,
+            shortcut: Cow::Borrowed(""),
+            enabled: true,
+            checked: None,
+        });
+        self.clamp_scroll();
+        self.theme_previewed = self.highlighted_theme().map(str::to_string);
+        self
+    }
+
+    /// Scope the palette to its Theme section (View ▸ Choose Theme…): only theme rows
+    /// pass the filter, and the cursor starts on the checked row (the theme the config
+    /// draws), which counts as already previewed.
+    pub(crate) fn themes_only(mut self) -> Self {
+        self.themes_only = true;
+        let current = self
+            .filtered_indices()
+            .position(|i| self.rows[i].checked == Some(true));
+        self.selected = current.unwrap_or(0);
+        self.scroll = 0;
+        self.clamp_scroll();
+        self.theme_previewed = self.highlighted_theme().map(str::to_string);
+        self
+    }
+
+    /// Whether the palette is scoped to its Theme section.
+    pub(crate) fn is_themes_only(&self) -> bool {
+        self.themes_only
+    }
+
+    /// The theme id under the cursor, when the cursor is on a Theme row.
+    pub(crate) fn highlighted_theme(&self) -> Option<&str> {
+        let idx = self.filtered_indices().nth(self.selected)?;
+        self.rows[idx].action.theme()
+    }
+
+    /// The highlight's theme when it differs from what the palette last asked the App
+    /// to preview, recording it as asked: `Some(Some(id))` to preview `id`,
+    /// `Some(None)` when the highlight left the Theme section, `None` when nothing
+    /// moved. Edge-triggered, so a run of moves inside one event-loop turn costs one
+    /// install, and a preview something else replaced is not fought over.
+    pub(crate) fn take_theme_highlight_change(&mut self) -> Option<Option<String>> {
+        let now = self.highlighted_theme().map(str::to_string);
+        if now == self.theme_previewed {
+            return None;
+        }
+        self.theme_previewed.clone_from(&now);
+        Some(now)
     }
 
     /// Prepend the active native app's command metadata. Native rows deliberately sit above
@@ -371,7 +494,7 @@ impl PaletteState {
         self.pointer_over = None;
         self.pointer_armed = None;
         self.rows
-            .retain(|row| matches!(&row.action, PaletteTarget::Menu(_)));
+            .retain(|row| !matches!(&row.action, PaletteTarget::Native(_)));
         let Some(scope) = scope else {
             self.selected = 0;
             self.scroll = 0;
@@ -661,18 +784,44 @@ impl PaletteState {
         let q = self.query.to_ascii_lowercase();
         (0..self.rows.len()).filter(move |&i| {
             let r = &self.rows[i];
+            if !self.in_scope(r) {
+                return false;
+            }
+            // A theme row's hint is its appearance, so "light" finds the light themes.
+            let hint = if r.action.theme().is_some() {
+                &*r.shortcut
+            } else {
+                ""
+            };
             let hay = r
                 .label
                 .chars()
                 .chain("  ".chars())
                 .chain(r.section.chars())
+                .chain(" ".chars())
+                .chain(hint.chars())
                 .map(|c| c.to_ascii_lowercase());
             fuzzy_subsequence(&q, hay)
         })
     }
 
+    /// Whether `row` belongs to the palette's scope: every row, or only the Theme
+    /// section under View ▸ Choose Theme….
+    fn in_scope(&self, row: &PaletteRow) -> bool {
+        !self.themes_only || row.section == THEME_SECTION
+    }
+
+    /// The rows the scope offers before any filter: the count's denominator.
+    fn scope_len(&self) -> usize {
+        if self.themes_only {
+            self.rows.iter().filter(|r| self.in_scope(r)).count()
+        } else {
+            self.rows.len()
+        }
+    }
+
     fn filtered_count(&self) -> usize {
-        if self.query.is_empty() {
+        if self.query.is_empty() && !self.themes_only {
             self.rows.len()
         } else {
             self.filtered_indices().count()
@@ -848,7 +997,7 @@ impl PaletteState {
     /// `(scroll, total, visible)` for `controls front`: rows scrolled past, the full row
     /// count, and the command rows shown (capped at `MAX_CMD_ROWS`).
     pub(crate) fn scroll_extent(&self) -> (usize, usize, usize) {
-        (self.scroll, self.rows.len(), self.body())
+        (self.scroll, self.scope_len(), self.body())
     }
 
     /// Machine-readable lines for the `controls menu` introspection verb — the SAME rows the
@@ -858,11 +1007,12 @@ impl PaletteState {
         let vis = self.filtered();
         let mut out = Vec::with_capacity(vis.len() + 2);
         out.push(format!(
-            "menu rows={} shown={} selected={} query={:?}",
-            self.rows.len(),
+            "menu rows={} shown={} selected={} query={:?} scope={}",
+            self.scope_len(),
             vis.len(),
             self.selected,
             self.query,
+            if self.themes_only { "themes" } else { "all" },
         ));
         for &i in &vis {
             let r = &self.rows[i];
@@ -879,6 +1029,7 @@ impl PaletteState {
                         target.view.get(),
                         target.generation,
                     ),
+                    PaletteTarget::Theme(id) => format!("theme id={id:?}"),
                 },
                 r.action.control_name(),
                 row_accel(r),
@@ -903,6 +1054,7 @@ impl PaletteState {
         self.query.hash(&mut h);
         self.selected.hash(&mut h);
         self.scroll.hash(&mut h);
+        self.themes_only.hash(&mut h);
         self.rows.len().hash(&mut h);
         for r in &self.rows {
             match &r.action {
@@ -913,6 +1065,10 @@ impl PaletteState {
                 PaletteTarget::Native(target) => {
                     1_u8.hash(&mut h);
                     target.hash(&mut h);
+                }
+                PaletteTarget::Theme(id) => {
+                    2_u8.hash(&mut h);
+                    id.hash(&mut h);
                 }
             }
             r.section.hash(&mut h);
@@ -994,7 +1150,12 @@ pub(crate) fn palette_a11y(state: &PaletteState) -> accesskit::TreeUpdate {
         }
         node
     });
-    list_overlay_a11y("Commands", epoch, state.selected, rows)
+    let root = if state.themes_only {
+        "Themes"
+    } else {
+        "Commands"
+    };
+    list_overlay_a11y(root, epoch, state.selected, rows)
 }
 
 /// The accessibility tree of a list overlay (the palette, the session picker, the
@@ -1098,6 +1259,12 @@ pub(crate) struct PaletteState {
     realized_since: Option<Instant>,
     /// `MotionPolicy::Reduced` snapshot: freeze the realized fade at full alpha.
     realized_frozen: bool,
+    /// Scoped to the Theme section (View ▸ Choose Theme…).
+    themes_only: bool,
+    /// The theme the palette last asked the App to preview (`None`: none, or the
+    /// highlight is off the Theme section) — the edge
+    /// [`Self::take_theme_highlight_change`] detects.
+    theme_previewed: Option<String>,
 }
 
 impl PaletteState {
@@ -1154,6 +1321,7 @@ impl PaletteState {
             match &row.action {
                 PaletteTarget::Menu(action) => action.tag().hash(&mut hash),
                 PaletteTarget::Native(target) => target.hash(&mut hash),
+                PaletteTarget::Theme(id) => id.hash(&mut hash),
             }
             row.enabled.hash(&mut hash);
         }
@@ -1394,9 +1562,13 @@ pub(crate) fn palette_tray(state: &PaletteState, g: &SettingsGeom, theme: Theme)
             text_at(prims, x, row_baseline(y0, ch, size.get()), size, s, color);
         };
 
-    // Title (centred) — "Commands".
+    // Title (centred) — "Commands", or "Themes" when scoped to that section.
     {
-        let title = "Commands";
+        let title = if state.themes_only {
+            "Themes"
+        } else {
+            "Commands"
+        };
         let tsize = TypeStep::Title.px(px);
         let tw = crate::tray_raster::measure_text(title, tsize.get(), TextWeight::Bold);
         let x = (card_x + (card_w - tw) * 0.5).max(card_x + cw);
@@ -1440,7 +1612,7 @@ pub(crate) fn palette_tray(state: &PaletteState, g: &SettingsGeom, theme: Theme)
         prompt,
         rgba(q_color, 0xFF),
     );
-    let count = format!("{}/{}", vis.len(), state.rows.len());
+    let count = format!("{}/{}", vis.len(), state.scope_len());
     let csize = TypeStep::Caption.px(px);
     text(
         &mut prims,
@@ -1555,7 +1727,11 @@ pub(crate) fn palette_tray(state: &PaletteState, g: &SettingsGeom, theme: Theme)
     // Key-hint footer on the last row.
     finish_overlay_card(
         prims,
-        "\u{2191}\u{2193} move   \u{23ce} run   esc close",
+        if state.themes_only {
+            "\u{2191}\u{2193} preview   \u{23ce} keep   esc revert"
+        } else {
+            "\u{2191}\u{2193} move   \u{23ce} run   esc close"
+        },
         layout.card,
         layout.card_rows,
         g,
@@ -2108,6 +2284,106 @@ mod tests {
                 && line.contains("action=editor/save")
                 && line.contains(&expect_line)
         }));
+    }
+
+    fn themes() -> Vec<PaletteTheme> {
+        [
+            ("Default", aterm_types::Appearance::Dark, true),
+            ("Gruvbox Dark", aterm_types::Appearance::Dark, false),
+            ("Gruvbox Light", aterm_types::Appearance::Light, false),
+        ]
+        .into_iter()
+        .map(|(id, appearance, current)| PaletteTheme {
+            id: id.to_string(),
+            label: id.to_string(),
+            appearance,
+            current,
+        })
+        .collect()
+    }
+
+    /// The Theme section follows the menu rows, each row naming its theme as
+    /// its target and its appearance as the hint; the scoped palette shows only
+    /// those rows, starts on the checked one, and its highlight is an edge:
+    /// asked once per move, never for the row it opened on, `Some(None)` when
+    /// it leaves the section.
+    #[test]
+    fn theme_rows_scope_and_highlight_edge() {
+        let mut s = PaletteState::new().with_themes(themes());
+        let menu_rows = PaletteState::new().rows.len();
+        // The three themes, then the section's way to every theme.
+        assert_eq!(s.rows.len(), menu_rows + 4);
+        assert!(
+            s.rows[..menu_rows]
+                .iter()
+                .all(|r| r.action.menu().is_some())
+        );
+        let browse = s.rows.last().expect("the Browse row");
+        assert_eq!(browse.section, THEME_SECTION);
+        assert!(browse.action == MenuAction::BrowseThemes);
+        // Rebuilding the section replaces it, never stacks a second.
+        let rebuilt = PaletteState::new()
+            .with_themes(themes())
+            .with_themes(themes());
+        assert_eq!(rebuilt.rows.len(), menu_rows + 4);
+        assert_eq!(
+            s.take_theme_highlight_change(),
+            None,
+            "opening asks nothing"
+        );
+        let lines = s.controls_lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("target=theme id=\"Gruvbox Light\"")
+                    && l.contains("section=\"Theme\"")),
+            "{lines:?}"
+        );
+        for c in "gruv".chars() {
+            s.push_char(c);
+        }
+        assert_eq!(s.highlighted_theme(), Some("Gruvbox Dark"));
+        assert_eq!(
+            s.take_theme_highlight_change(),
+            Some(Some("Gruvbox Dark".to_string()))
+        );
+        assert_eq!(s.take_theme_highlight_change(), None, "unmoved, unasked");
+        s.move_selection(1);
+        assert_eq!(
+            s.take_theme_highlight_change(),
+            Some(Some("Gruvbox Light".to_string()))
+        );
+        while !s.query.is_empty() {
+            s.backspace();
+        }
+        assert_eq!(
+            s.take_theme_highlight_change(),
+            Some(None),
+            "left the section"
+        );
+
+        let mut scoped = PaletteState::new().with_themes(themes()).themes_only();
+        assert!(scoped.is_themes_only());
+        assert_eq!(scoped.filtered().len(), 4);
+        assert_eq!(scoped.scroll_extent().1, 4, "the count is of the scope");
+        assert_eq!(
+            scoped.highlighted_theme(),
+            Some("Default"),
+            "on the checked row"
+        );
+        assert_eq!(scoped.take_theme_highlight_change(), None);
+        scoped.move_selection(-1);
+        assert_eq!(
+            scoped.highlighted_theme(),
+            None,
+            "wraps in scope, onto Browse all themes…"
+        );
+        assert_eq!(scoped.take_theme_highlight_change(), Some(None));
+        scoped.move_selection(-1);
+        assert_eq!(scoped.highlighted_theme(), Some("Gruvbox Light"));
+        // A native scope change keeps the Theme rows.
+        scoped.replace_native_commands(None);
+        assert_eq!(scoped.filtered().len(), 4);
     }
 
     #[test]

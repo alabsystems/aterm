@@ -130,8 +130,6 @@ fn cell_extras_shift_region_down_by_zero_is_noop() {
 
 #[test]
 fn shift_region_up_single_row_region_deletes_only_top() {
-    // Region where top == bottom: single-row region.
-    // shift_region_up_by(5, 5, 1) should delete row 5 only.
     let mut extras = CellExtras::new();
     for row in 4..=6u16 {
         extras
@@ -156,7 +154,6 @@ fn shift_region_up_single_row_region_deletes_only_top() {
 
 #[test]
 fn shift_region_up_n_equals_region_size_deletes_all() {
-    // Region [2, 5] with n=4: all 4 rows in region should be deleted.
     let mut extras = CellExtras::new();
     for row in 0..8u16 {
         extras
@@ -165,10 +162,8 @@ fn shift_region_up_n_equals_region_size_deletes_all() {
     }
     assert_eq!(extras.len(), 8);
 
-    // n == (bottom - top + 1) = 4: entire region deleted.
     extras.shift_region_up_by(2, 5, 4);
 
-    // Rows 0, 1 (before region) and 6, 7 (after region) survive.
     assert!(
         extras.get(CellCoord::new(0, 0)).is_some(),
         "row 0 preserved"
@@ -194,7 +189,6 @@ fn shift_region_up_n_equals_region_size_deletes_all() {
 
 #[test]
 fn shift_region_down_n_exceeds_region_drops_all_in_region() {
-    // Region [1, 3] with n=5: all rows shifted beyond bottom are dropped.
     let mut extras = CellExtras::new();
     for row in 0..5u16 {
         extras
@@ -204,8 +198,6 @@ fn shift_region_down_n_exceeds_region_drops_all_in_region() {
 
     extras.shift_region_down_by(1, 3, 5);
 
-    // Rows 0 and 4 are outside the region and kept. Shifting rows 1-3 by 5
-    // saturates drop_start to 0, so every region row is dropped.
     assert!(
         extras.get(CellCoord::new(0, 0)).is_some(),
         "row 0 preserved"

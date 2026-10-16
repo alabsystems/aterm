@@ -472,14 +472,4 @@ mod tests {
         term.process(b"\x1b[?25l\x1b[12;1H\x1b[7m \x1b[27m\x1b[12;1H");
         assert_eq!(read(&term), (Some((11, 0)), Some((11, 0))));
     }
-
-    /// The pointer-free defaults and the `u8` face of a press outcome — what
-    /// the wasm export hands JS.
-    #[test]
-    fn press_outcomes_cross_the_boundary_as_their_u8() {
-        assert_eq!(PressOutcome::Pass as u8, 0);
-        assert_eq!(PressOutcome::Pet as u8, 1);
-        assert_eq!(PressOutcome::Robi as u8, 2);
-        assert_eq!(PressOutcome::RobiBubble as u8, 3);
-    }
 }

@@ -4,12 +4,11 @@
 ## int aterm_objc_try(void *data, void (*body)(void *), void (*on_exc)(void *, id))
 ##
 ## The x86_64 counterpart of objc_try_aarch64.s, for the compat slice of the
-## universal binary; from the probe's asmsrc-x86.s (`clang -arch x86_64 -S`).
-## Same five external symbols, same LSDA shape, same Rust-panic pass-through.
-## Assembled by a cross `cargo build --target x86_64-apple-darwin` (a `check`
-## never assembles it) with `options(att_syntax)`, since clang emits AT&T and
-## `global_asm!` defaults to Intel on x86; the development box cannot execute
-## this slice.
+## universal binary (`clang -arch x86_64 -S`). Same five external symbols, same
+## LSDA shape, same Rust-panic pass-through. Only a cross build for
+## `x86_64-apple-darwin` assembles it (a `check` does not), with
+## `options(att_syntax)`, since clang emits AT&T and `global_asm!` defaults to
+## Intel on x86. No test executes this slice.
 	.section	__TEXT,__text,regular,pure_instructions
 	.globl	_aterm_objc_try
 	.p2align	4

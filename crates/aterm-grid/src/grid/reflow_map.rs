@@ -7,7 +7,7 @@
 
 use crate::CellExtra;
 use crate::CellFlags;
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, debug_assertions))]
 use crate::test_counters::count_reflow_cell_ops;
 
 /// Maps a copied cell's source index back to its [`CellCoord`] during extras
@@ -103,7 +103,6 @@ fn remap_copied_extra(
     let Some(old_extras) = extras_ctx.old_extras else {
         return;
     };
-    // Single-row copies compute the coord; the merge path indexes its table.
     let Some(coord) = source_coord(extras_ctx, src_index) else {
         return;
     };
@@ -153,17 +152,16 @@ fn is_image_blank(extras_ctx: &ExtrasCopyCtx<'_>, src_index: usize) -> bool {
         .is_some_and(|extra| extra.image().is_some())
 }
 
-/// Copy cells into a row, replacing wide chars that can't fit in narrow terminals.
+/// Copy cells into a row, blanking wide chars that cannot fit.
 ///
 /// `content_len` is where the source's content ends (an index into `cells`):
-/// every copied cell before it is content, a printed blank included, and the
-/// row's length covers it, as the write path counts a printed space. `Row::set`
-/// alone advances the length only for non-empty cells, so a printed space at a
-/// chunk end would stop being content: tiered history (staged at the row's
-/// length) would join the words around it, and a cursor after it would be
-/// clamped onto it. Cells past `content_len` (an autowrap row's trailing pad,
-/// the ConPTY cursor row's blanks through the cursor) and blank image tiles
-/// are copied but not counted.
+/// every copied cell before it, a printed blank included, is inside the row's
+/// length, as the write path counts a printed space. `Row::set` counts only
+/// non-empty cells, so without this a printed space at a chunk end would fall
+/// out of the content and tiered history (staged at the row's length) would
+/// join the words around it. Cells past `content_len` (an autowrap row's
+/// trailing pad, the ConPTY cursor row's blanks through the cursor) and blank
+/// image tiles are copied but not counted.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn copy_cells_to_row(
     new_row: &mut Row,
@@ -175,7 +173,7 @@ pub(super) fn copy_cells_to_row(
     dest_row: u16,
     extras_ctx: &mut ExtrasCopyCtx<'_>,
 ) {
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(any(test, debug_assertions))]
     count_reflow_cell_ops(actual_end.saturating_sub(cell_offset));
 
     let mut j = 0u16;
@@ -259,6 +257,26 @@ pub(super) fn chunk_cells_to_rows(
         // `adjust_chunk_boundary` ends a chunk before `chunk_end` only to move
         // a wide head that would straddle the edge onto the next row.
         if actual_end < chunk_end {
+            // Recreate the print path's BCE blank from the wide glyph that
+            // wraps here. The old hole was non-content and was omitted from
+            // the logical line, so an independently erased/recoloured old
+            // hole has no historical paint to restore.
+            let col = new_cols - 1;
+            let mut blank = crate::Cell::bce_blank(cells[actual_end].colors());
+            if blank.colors().bg_is_rgb()
+                && let Some(rgb) = extras_ctx.old_extras.and_then(|extras| {
+                    let coord = source_coord(extras_ctx, actual_end)?;
+                    extras.bg_rgb_for(coord.row, coord.col)
+                })
+            {
+                let mut extra = CellExtra::default();
+                extra.set_bg_rgb(Some(rgb));
+                extras_ctx
+                    .new_extras
+                    .set(CellCoord::new(row_u16(new_rows.len()), col), extra);
+                blank.set_has_extras(true);
+            }
+            row.set(col, blank);
             row.set_early_wrap_hole(true);
         }
         for point in points.iter_mut() {
@@ -288,11 +306,10 @@ pub(super) fn chunk_cells_to_rows(
 /// the new rows once its line is chunked (`None` until then).
 ///
 /// An offset past the line's content lands on the line's last row. The live
-/// cursor is pulled back to the content's end there (the Native rule this
-/// module has always applied to it); a `keeps_gap` point (the saved cursor)
-/// keeps its offset, so a column a program saved past its output survives a
-/// widening, and a narrowing clamps it only to the new width, as xterm, which
-/// never moves the slot, would restore it.
+/// cursor is pulled back to the content's end there; a `keeps_gap` point (the
+/// saved cursor) keeps its offset, so a column a program saved past its output
+/// survives a widening, and a narrowing clamps it only to the new width, as
+/// xterm (which never moves the slot) would restore it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct TrackedPoint {
     pub(super) offset: Option<usize>,
@@ -337,17 +354,14 @@ mod tests {
             Some("https://example.com")
         );
         assert_eq!(copied.underline_color(), Some([7, 8, 9]));
-        // Map-only copying is the historical negative control: it keeps the
-        // old map colors although the ring is what the live renderer sees.
+        // A map-only copy would keep the stale map colours; the ring is what
+        // the renderer shows.
         assert_ne!(old.get(coord).unwrap().fg_rgb(), copied.fg_rgb());
         assert_ne!(old.get(coord).unwrap().bg_rgb(), copied.bg_rgb());
     }
 
-    // adjust_chunk_boundary
-
     #[test]
     fn adjust_chunk_boundary_no_wide_chars() {
-        // Simple ASCII cells: boundary should remain unchanged.
         let cells = [
             Cell::new('A'),
             Cell::new('B'),
@@ -361,8 +375,7 @@ mod tests {
 
     #[test]
     fn adjust_chunk_boundary_wide_char_at_boundary() {
-        // Wide char at position 1, chunk_end=2 means cells[1] is WIDE.
-        // Boundary should back up to 1 to avoid splitting the wide char.
+        // cells[1] is WIDE: the boundary backs up to 1 rather than split it.
         let cells = [
             Cell::new('A'),
             Cell::with_style(
@@ -379,14 +392,12 @@ mod tests {
             ),
             Cell::new('B'),
         ];
-        // chunk_end=2, cells[1] is WIDE -> back up to 1
         assert_eq!(adjust_chunk_boundary(&cells, 0, 2), 1);
     }
 
     #[test]
     fn adjust_chunk_boundary_wide_char_not_at_boundary() {
-        // Wide char at position 0, chunk_end=3: cells[2] is WIDE_CONTINUATION (not WIDE).
-        // Boundary should remain at 3.
+        // cells[2] is WIDE_CONTINUATION, not WIDE: the boundary stays at 3.
         let cells = [
             Cell::with_style(
                 'W',
@@ -423,8 +434,6 @@ mod tests {
                 CellFlags::WIDE_CONTINUATION,
             ),
         ];
-        // chunk_end=1, cells[0] is WIDE -> back up to 0 == cell_offset.
-        // Forward progress: actual_end = cell_offset + min(2, 2-0) = 2.
         assert_eq!(adjust_chunk_boundary(&cells, 0, 1), 2);
     }
 
@@ -444,11 +453,8 @@ mod tests {
     #[test]
     fn adjust_chunk_boundary_empty_cells() {
         let cells: [Cell; 0] = [];
-        // chunk_end=0, cell_offset=0: no adjustment needed.
         assert_eq!(adjust_chunk_boundary(&cells, 0, 0), 0);
     }
-
-    // cursor_in_chunk
 
     #[test]
     fn cursor_in_chunk_within_range() {
@@ -465,16 +471,14 @@ mod tests {
 
     #[test]
     fn cursor_in_chunk_at_end_non_last() {
-        // cursor at offset 5 in chunk [0..5), not last chunk (cells_len=10).
-        // 5 is not < 5, so not in range.
+        // Offset 5 in chunk [0..5), not the last of 10 cells: out of range.
         let result = cursor_in_chunk(5, 10, 0, 5, 0);
         assert_eq!(result, None);
     }
 
     #[test]
     fn cursor_in_chunk_at_end_last_chunk() {
-        // cursor at offset 10, chunk [5..10), last chunk (cells_len=10).
-        // 10 <= 10 (last chunk), so in range.
+        // Offset 10 in the last chunk [5..10) of 10 cells: in range (`<=`).
         let result = cursor_in_chunk(10, 10, 5, 10, 2);
         assert_eq!(result, Some((2, 5))); // col = 10 - 5 = 5
     }
@@ -506,8 +510,6 @@ mod tests {
         assert_eq!(result, Some((0, 0)));
     }
 
-    // source_coords_for_row
-
     #[test]
     fn source_coords_for_row_basic() {
         let coords = source_coords_for_row(5, 3);
@@ -537,8 +539,6 @@ mod tests {
         assert_eq!(coords[0], CellCoord::new(3, 0));
         assert_eq!(coords[79], CellCoord::new(3, 79));
     }
-
-    // copy_cells_to_row — requires Row allocation
 
     #[test]
     fn copy_cells_to_row_basic_ascii() {
@@ -603,7 +603,6 @@ mod tests {
 
     #[test]
     fn copy_cells_to_row_wide_char_in_narrow_terminal() {
-        // When new_cols < 2, wide chars should be replaced with space.
         let mut pages = PageStore::new();
         let mut new_row = unsafe { Row::new(1, &mut pages) };
         let cells = [
@@ -638,7 +637,6 @@ mod tests {
             &mut extras_ctx,
         );
 
-        // Wide char replaced with space, spacer skipped.
         let cell = new_row.get(0).unwrap();
         assert_eq!(cell.char_data(), ' ' as u16);
         assert!(!cell.flags().contains(CellFlags::WIDE));
@@ -656,7 +654,6 @@ mod tests {
             new_extras: &mut new_extras,
         };
 
-        // cell_offset == actual_end: no cells to copy.
         copy_cells_to_row(
             &mut new_row,
             &cells,
@@ -669,8 +666,6 @@ mod tests {
         );
         assert!(new_row.is_empty());
     }
-
-    // chunk_cells_to_rows — requires PageStore/Row allocation
 
     /// The pages (first, so a caller's binding drops them after the rows),
     /// the chunked rows and where each tracked cursor landed.
@@ -723,13 +718,11 @@ mod tests {
     #[test]
     fn chunk_cells_to_rows_single_chunk() {
         let cells = [Cell::new('A'), Cell::new('B'), Cell::new('C')];
-        // new_cols=5 fits all 3 cells in one row.
         let (_pages, new_rows, _) = chunk(&cells, 5, [None, None]);
         assert_eq!(new_rows.len(), 1);
         assert_eq!(new_rows[0].get(0).unwrap().char_data(), 'A' as u16);
         assert_eq!(new_rows[0].get(1).unwrap().char_data(), 'B' as u16);
         assert_eq!(new_rows[0].get(2).unwrap().char_data(), 'C' as u16);
-        // First row should not be wrapped.
         assert!(!new_rows[0].is_wrapped());
     }
 
@@ -741,14 +734,12 @@ mod tests {
             Cell::new('C'),
             Cell::new('D'),
         ];
-        // new_cols=2: [AB] and [CD].
         let (_pages, new_rows, _) = chunk(&cells, 2, [None, None]);
         assert_eq!(new_rows.len(), 2);
         assert_eq!(new_rows[0].get(0).unwrap().char_data(), 'A' as u16);
         assert_eq!(new_rows[0].get(1).unwrap().char_data(), 'B' as u16);
         assert_eq!(new_rows[1].get(0).unwrap().char_data(), 'C' as u16);
         assert_eq!(new_rows[1].get(1).unwrap().char_data(), 'D' as u16);
-        // First row not wrapped, second is wrapped.
         assert!(!new_rows[0].is_wrapped());
         assert!(new_rows[1].is_wrapped());
     }
@@ -773,7 +764,6 @@ mod tests {
     #[test]
     fn chunk_cells_to_rows_single_column() {
         let cells = [Cell::new('A'), Cell::new('B')];
-        // new_cols=1: each cell gets its own row.
         let (_pages, new_rows, _) = chunk(&cells, 1, [None, None]);
         assert_eq!(new_rows.len(), 2);
         assert_eq!(new_rows[0].get(0).unwrap().char_data(), 'A' as u16);

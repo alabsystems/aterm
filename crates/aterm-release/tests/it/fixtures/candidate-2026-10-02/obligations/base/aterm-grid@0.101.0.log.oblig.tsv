@@ -1,0 +1,241 @@
+# aterm trust obligations 1
+package	aterm-grid
+unit	cargo-target(package="aterm-grid") (2026-10-02 fixture: the report was not kept)
+functions	149
+total	234
+proved	147
+o	PackedColors::set_fg_indexed	shift:left	crates/aterm-grid/src/cell_colors.rs	173	18	173	61	unrecorded	(Self::MODE_INDEXED << Self::FG_MODE_SHIFT)	shift overflow (Shl)
+o	PackedColors::set_bg_indexed	overflow	crates/aterm-grid/src/cell_colors.rs	183	18	183	39	unrecorded	((index as u32) << 8)	arithmetic overflow (Shl)
+o	PackedColors::set_bg_indexed	shift:left	crates/aterm-grid/src/cell_colors.rs	183	18	183	39	unrecorded	((index as u32) << 8)	shift overflow (Shl)
+o	PackedColors::set_bg_indexed	shift:left	crates/aterm-grid/src/cell_colors.rs	184	18	184	61	unrecorded	(Self::MODE_INDEXED << Self::BG_MODE_SHIFT)	shift overflow (Shl)
+o	<DamagedRowIterator as Iterator>::next	hardened_panic_boundary	crates/aterm-grid/src/damage/iter.rs	37	20	37	33	unrecorded	*current += 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	a::new	assert	crates/aterm-grid/src/damage/iter.rs	76	4	84	5	unrecorded	pub(crate) fn new(bits: &'a [u64], max_row: u16) -> Self { … }	assertion: panic freedom: no assertion, `unreachable!`, or panic is reachable
+o	<BitsetRowIterator as Iterator>::next	hardened_panic_boundary	crates/aterm-grid/src/damage/iter.rs	114	32	114	56	unrecorded	self.bits[self.word_idx]	hardened boundary (panic_boundary): mir_assert::BoundsCheck: MIR bounds-check assert can panic; hardened code needs a proven index precondition
+o	<BitsetRowIterator as Iterator>::next	slice	crates/aterm-grid/src/damage/iter.rs	114	32	114	56	unrecorded	self.bits[self.word_idx]	slice bounds check
+o	#[derive(Debug)]@L65	unreach	crates/aterm-grid/src/damage/mod.rs	65	9	65	14	proved	Debug	unreachable code reached
+o	#[derive(Clone)]@L65	assert	crates/aterm-grid/src/damage/mod.rs	65	16	65	21	proved	Clone	assertion: panic freedom: no assertion, `unreachable!`, or panic is reachable
+o	CellExtra::set_complex_char	hardened_unsafe_operation	crates/aterm-grid/src/extra.rs	486	28	486	43	proved	s.map(Box::new)	assertion: [unsafe:sep:alloc] allocation result null check for core::option::Option::<alloc::sync::Arc<str>>::map::<alloc::boxed::Box<alloc::sync::Arc<str>>, fn
+o	CellExtra::set_image	hardened_unsafe_operation	crates/aterm-grid/src/extra.rs	559	12	559	28	proved	Box::new(layers)	assertion: [unsafe:sep:alloc] allocation result null check for alloc::boxed::Box::<aterm_alloc::small_vec::SmallVec<aterm_grid::extra::ImageRef, 1>>::new::<__tr
+o	CellExtra::retain_images	bounds	crates/aterm-grid/src/extra.rs	586	21	586	30	unrecorded	slice[at]	index out of bounds
+o	ComplexCharRing::ring_row	overflow:sub	crates/aterm-grid/src/extra_collection.rs	76	12	76	33	unrecorded	r - self.visible_rows	arithmetic overflow (Sub)
+o	RgbColorRing::ring_row	overflow:sub	crates/aterm-grid/src/extra_collection.rs	353	12	353	33	unrecorded	r - self.visible_rows	arithmetic overflow (Sub)
+o	RingSpans::shift_rect_down	overflow:sub	crates/aterm-grid/src/extra_collection.rs	737	12	737	20	unrecorded	src -= 1	arithmetic overflow (Sub)
+o	shift_left_in	overflow:sub	crates/aterm-grid/src/extra_collection.rs	806	26	806	40	unrecorded	(h - keep_end)	arithmetic overflow (Sub)
+o	CellExtras::set_complex_char_ring	hardened_unsafe_operation	crates/aterm-grid/src/extra_collection.rs	1000	35	1000	85	proved	Box::new(ComplexCharRing::new(visible_rows, cols))	assertion: [unsafe:sep:alloc] allocation result null check for alloc::boxed::Box::<aterm_grid::extra_collection::ComplexCharRing>::new::<__trust_args@#
+o	CellExtras::set_mixed_wide_ring	hardened_unsafe_operation	crates/aterm-grid/src/extra_collection.rs	1037	35	1037	85	proved	Box::new(ComplexCharRing::new(visible_rows, cols))	assertion: [unsafe:sep:alloc] allocation result null check for alloc::boxed::Box::<aterm_grid::extra_collection::ComplexCharRing>::new::<__trust_args@#
+o	CellExtras::set_rgb_ring_range	hardened_unsafe_operation	crates/aterm-grid/src/extra_collection.rs	1115	35	1115	82	proved	Box::new(RgbColorRing::new(visible_rows, cols))	assertion: [unsafe:sep:alloc] allocation result null check for alloc::boxed::Box::<aterm_grid::extra_collection::RgbColorRing>::new::<__trust_args@#
+o	CellExtras::apply_offset_and_shift_only	overflow:sub	crates/aterm-grid/src/extra_collection.rs	1928	47	1928	64	unrecorded	coord.row - total	arithmetic overflow (Sub)
+o	CellExtras::shift_region_up_by	overflow:sub	crates/aterm-grid/src/extra_collection_shifts.rs	47	26	47	44	unrecorded	coord.row - offset	arithmetic overflow (Sub)
+o	CellExtras::shift_region_down_by	overflow:sub	crates/aterm-grid/src/extra_collection_shifts.rs	91	26	91	44	unrecorded	coord.row - offset	arithmetic overflow (Sub)
+o	CellExtras::shift_rect_up_by	overflow:sub	crates/aterm-grid/src/extra_collection_shifts.rs	138	26	138	44	unrecorded	coord.row - offset	arithmetic overflow (Sub)
+o	CellExtras::shift_rect_down_by	overflow:sub	crates/aterm-grid/src/extra_collection_shifts.rs	189	26	189	44	unrecorded	coord.row - offset	arithmetic overflow (Sub)
+o	<Grid as BufferAccess>::line_wide_continuations	unbounded_allocation	crates/aterm-grid/src/grid/buffer_access.rs	94	12	96	26	unrecorded	(0..cols) … .collect()	unbounded allocation in `Iterator::collect` (count `(- cols 0)`): bulk allocation may reach or exceed 268435456 elements: bound the size (e.g. `#[requires(n < B
+o	<Grid as BufferAccess>::is_line_wrapped	overflow:sub	crates/aterm-grid/src/grid/buffer_access.rs	118	48	118	70	unrecorded	-(i64::from(line)) - 1	arithmetic overflow (Sub)
+o	line_to_visible_row	assert	crates/aterm-grid/src/grid/buffer_access.rs	137	0	139	1	unrecorded	fn line_to_visible_row(line: i32) -> Option<u16> { … }	assertion: panic freedom: no assertion, `unreachable!`, or panic is reachable
+o	scrollback_row	overflow:sub	crates/aterm-grid/src/grid/buffer_access.rs	145	34	145	56	unrecorded	-(i64::from(line)) - 1	arithmetic overflow (Sub)
+o	Grid::memory_used	unreach	crates/aterm-grid/src/grid/content_queries.rs	32	4	70	5	unrecorded	pub fn memory_used(&self) -> usize { … }	unreachable code reached
+o	Grid::memory_used	overflow:sub	crates/aterm-grid/src/grid/content_queries.rs	44	21	44	27	unrecorded	extras	arithmetic overflow (Sub)
+o	Grid::memory_used	overflow:sub	crates/aterm-grid/src/grid/content_queries.rs	52	18	52	30	unrecorded	undo.entries	arithmetic overflow (Sub)
+o	Grid::memory_used	overflow:sub	crates/aterm-grid/src/grid/content_queries.rs	53	25	53	38	unrecorded	&undo.entries	arithmetic overflow (Sub)
+o	Grid::memory_used	overflow:sub	crates/aterm-grid/src/grid/content_queries.rs	57	33	57	39	unrecorded	extras	arithmetic overflow (Sub)
+o	Grid::row_ansi_text_screen	overflow:sub	crates/aterm-grid/src/grid/content_queries.rs	326	54	326	66	unrecorded	90 + idx - 8	arithmetic overflow (Sub)
+o	Grid::row_ansi_text_screen	overflow:sub	crates/aterm-grid/src/grid/content_queries.rs	338	54	338	67	unrecorded	100 + idx - 8	arithmetic overflow (Sub)
+o	Grid::copy_rect	unreach	crates/aterm-grid/src/grid/erase.rs	1311	4	1534	5	proved	pub fn copy_rect( … }	unreachable code reached
+o	Grid::copy_rect	hardened_panic_boundary	crates/aterm-grid/src/grid/erase.rs	1334	26	1334	46	proved	src_bottom - src_top	hardened boundary (panic_boundary): mir_assert::Overflow(Sub): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::copy_rect	hardened_panic_boundary	crates/aterm-grid/src/grid/erase.rs	1335	25	1335	45	proved	src_right - src_left	hardened boundary (panic_boundary): mir_assert::Overflow(Sub): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	OlderHistory::build	hardened_unsafe_operation	crates/aterm-grid/src/grid/history_carry.rs	169	19	169	34	proved	Box::new(store)	assertion: [unsafe:sep:alloc] allocation result null check for alloc::boxed::Box::<aterm_scrollback::Scrollback>::new::<__trust_args@#
+o	Grid::history_lines_since_fence	overflow:sub	crates/aterm-grid/src/grid/history_carry.rs	269	36	269	53	unrecorded	from - now.oldest	arithmetic overflow (Sub)
+o	Grid::assert_wide_char_consistent	unreach	crates/aterm-grid/src/grid/invariants.rs	110	4	134	5	proved	pub fn assert_wide_char_consistent(&self) { … }	unreachable code reached
+o	Grid::assert_wide_char_consistent	overflow:add	crates/aterm-grid/src/grid/invariants.rs	116	57	116	64	proved	col + 1	arithmetic overflow (Add)
+o	Grid::assert_wide_char_consistent	hardened_panic_boundary	crates/aterm-grid/src/grid/invariants.rs	121	28	121	35	proved	col + 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::assert_wide_char_consistent	overflow:add	crates/aterm-grid/src/grid/invariants.rs	121	28	121	35	proved	col + 1	arithmetic overflow (Add)
+o	Grid::insert_chars	unreach	crates/aterm-grid/src/grid/line_ops.rs	28	4	65	5	proved	pub fn insert_chars(&mut self, count: u16) { … }	unreachable code reached
+o	Grid::insert_chars	hardened_panic_boundary	crates/aterm-grid/src/grid/line_ops.rs	41	34	41	58	proved	right_bound - cursor_col	hardened boundary (panic_boundary): mir_assert::Overflow(Sub): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::delete_chars	unreach	crates/aterm-grid/src/grid/line_ops.rs	74	4	103	5	proved	pub fn delete_chars(&mut self, count: u16) { … }	unreachable code reached
+o	Grid::delete_chars	hardened_panic_boundary	crates/aterm-grid/src/grid/line_ops.rs	84	34	84	58	proved	right_bound - cursor_col	hardened boundary (panic_boundary): mir_assert::Overflow(Sub): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::insert_chars_margin	unreach	crates/aterm-grid/src/grid/line_ops.rs	111	4	148	5	proved	pub fn insert_chars_margin(&mut self, count: u16, left_right_margin_mode: bool) { … }	unreachable code reached
+o	Grid::delete_chars_margin	unreach	crates/aterm-grid/src/grid/line_ops.rs	156	4	192	5	proved	pub fn delete_chars_margin(&mut self, count: u16, left_right_margin_mode: bool) { … }	unreachable code reached
+o	Grid::erase_chars	unreach	crates/aterm-grid/src/grid/line_ops.rs	215	4	249	5	proved	pub fn erase_chars(&mut self, count: u16) { … }	unreachable code reached
+o	Grid::erase_chars	hardened_panic_boundary	crates/aterm-grid/src/grid/line_ops.rs	221	34	221	58	proved	right_bound - cursor_col	hardened boundary (panic_boundary): mir_assert::Overflow(Sub): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::erase_chars	overflow:sub	crates/aterm-grid/src/grid/line_ops.rs	221	34	221	58	proved	right_bound - cursor_col	arithmetic overflow (Sub)
+o	Grid::erase_chars	hardened_panic_boundary	crates/aterm-grid/src/grid/line_ops.rs	229	60	229	78	proved	cursor_col + count	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::erase_chars	overflow:add	crates/aterm-grid/src/grid/line_ops.rs	229	60	229	78	proved	cursor_col + count	arithmetic overflow (Add)
+o	Grid::erase_chars	hardened_panic_boundary	crates/aterm-grid/src/grid/line_ops.rs	245	15	245	33	proved	cursor_col + count	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::erase_chars	overflow:add	crates/aterm-grid/src/grid/line_ops.rs	245	15	245	33	proved	cursor_col + count	arithmetic overflow (Add)
+o	Grid::insert_lines	unreach	crates/aterm-grid/src/grid/line_ops.rs	265	4	352	5	proved	pub fn insert_lines(&mut self, count: usize) { … }	unreachable code reached
+o	Grid::insert_lines	hardened_panic_boundary	crates/aterm-grid/src/grid/line_ops.rs	306	52	306	63	proved	end_row - 1	hardened boundary (panic_boundary): mir_assert::Overflow(Sub): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::insert_lines	hardened_panic_boundary	crates/aterm-grid/src/grid/line_ops.rs	311	40	311	59	proved	end_row - start_row	hardened boundary (panic_boundary): mir_assert::Overflow(Sub): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::insert_lines	overflow:sub	crates/aterm-grid/src/grid/line_ops.rs	311	40	311	59	proved	end_row - start_row	arithmetic overflow (Sub)
+o	Grid::insert_lines	hardened_panic_boundary	crates/aterm-grid/src/grid/line_ops.rs	342	38	342	57	proved	end_row - start_row	hardened boundary (panic_boundary): mir_assert::Overflow(Sub): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::insert_lines	overflow:sub	crates/aterm-grid/src/grid/line_ops.rs	342	38	342	57	proved	end_row - start_row	arithmetic overflow (Sub)
+o	Grid::insert_lines_margined	unreach	crates/aterm-grid/src/grid/line_ops.rs	362	4	495	5	proved	pub fn insert_lines_margined(&mut self, count: usize, left_right_margin_mode: bool) { … }	unreachable code reached
+o	Grid::insert_lines_margined	hardened_panic_boundary	crates/aterm-grid/src/grid/line_ops.rs	416	34	416	50	proved	top + dst_offset	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::insert_lines_margined	overflow:add	crates/aterm-grid/src/grid/line_ops.rs	416	34	416	50	proved	top + dst_offset	arithmetic overflow (Add)
+o	Grid::back_index	hardened_panic_boundary	crates/aterm-grid/src/grid/line_ops.rs	1012	51	1012	59	unrecorded	left + 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::sever_top_row_continuation	unreach	crates/aterm-grid/src/grid/reflow.rs	695	4	708	5	proved	fn sever_top_row_continuation(&mut self) { … }	unreachable code reached
+o	Grid::sever_top_row_continuation	hardened_panic_boundary	crates/aterm-grid/src/grid/reflow.rs	704	18	704	55	proved	(self.storage.ring_head + hist) % len	hardened boundary (panic_boundary): mir_assert::RemainderByZero: MIR zero-divisor assert can panic; hardened code needs a proven nonzero precondition
+o	Grid::sever_top_row_continuation	remzero	crates/aterm-grid/src/grid/reflow.rs	704	18	704	55	proved	(self.storage.ring_head + hist) % len	remainder by zero
+o	Grid::migrate_complex_ring_to_extras	unreach	crates/aterm-grid/src/grid/reflow.rs	717	4	747	5	proved	fn migrate_complex_ring_to_extras(&mut self) { … }	unreachable code reached
+o	Grid::migrate_rgb_ring_to_extras	unreach	crates/aterm-grid/src/grid/reflow.rs	762	4	805	5	proved	fn migrate_rgb_ring_to_extras(&mut self) { … }	unreachable code reached
+o	Grid::keep_keys_across_bottom_rows	unreach	crates/aterm-grid/src/grid/reflow.rs	1468	4	1480	5	proved	fn keep_keys_across_bottom_rows(&mut self, rows: BottomRows) { … }	unreachable code reached
+o	Grid::keep_keys_across_bottom_rows	unreach	crates/aterm-grid/src/grid/reflow.rs	1469	20	1472	9	proved	|counter: u64| match rows { … }	unreachable code reached
+o	Grid::merge_continuation_rows	assert	crates/aterm-grid/src/grid/reflow.rs	1955	42	1955	94	unrecorded	|col| CellCoord::new(row_u16(row_idx), row_u16(col))	assertion: panic freedom: no assertion, `unreachable!`, or panic is reachable
+o	adjust_chunk_boundary	overflow:sub	crates/aterm-grid/src/grid/reflow_map.rs	51	8	51	23	unrecorded	actual_end -= 1	arithmetic overflow (Sub)
+o	adjust_chunk_boundary	overflow:sub	crates/aterm-grid/src/grid/reflow_map.rs	54	41	54	66	unrecorded	cells.len() - cell_offset	arithmetic overflow (Sub)
+o	remap_copied_extra	unreach	crates/aterm-grid/src/grid/reflow_map.rs	93	0	147	1	proved	fn remap_copied_extra( … }	unreachable code reached
+o	copy_cells_to_row	unreach	crates/aterm-grid/src/grid/reflow_map.rs	150	0	194	1	proved	pub(super) fn copy_cells_to_row( … }	unreachable code reached
+o	copy_cells_to_row	hardened_panic_boundary	crates/aterm-grid/src/grid/reflow_map.rs	188	12	188	18	proved	j += 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	copy_cells_to_row	overflow:add	crates/aterm-grid/src/grid/reflow_map.rs	188	12	188	18	proved	j += 1	arithmetic overflow (Add)
+o	chunk_cells_to_rows	unreach	crates/aterm-grid/src/grid/reflow_map.rs	201	0	240	1	proved	pub(super) fn chunk_cells_to_rows( … }	unreachable code reached
+o	Grid::trailing_blank_rows_below_cursor	unreach	crates/aterm-grid/src/grid/reflow_pullback.rs	40	4	54	5	proved	pub(super) fn trailing_blank_rows_below_cursor(&self) -> usize { … }	unreachable code reached
+o	#[derive(Debug)]@L66	unreach	crates/aterm-grid/src/grid/resize_undo.rs	66	9	66	14	proved	Debug	unreachable code reached
+o	Grid::admit_resize_undo	hardened_unsafe_operation	crates/aterm-grid/src/grid/resize_undo.rs	170	44	179	14	proved	Box::new(ResizeUndo { … })	assertion: [unsafe:sep:alloc] allocation result null check for alloc::boxed::Box::<aterm_grid::grid::resize_undo::ResizeUndo>::new::<__trust_args@#
+o	Grid::seal_resize_undo	unreach	crates/aterm-grid/src/grid/resize_undo.rs	186	4	206	5	proved	pub(super) fn seal_resize_undo(&mut self) { … }	unreachable code reached
+o	Grid::take_undo_rows	unreach	crates/aterm-grid/src/grid/resize_undo.rs	223	4	269	5	proved	pub(super) fn take_undo_rows(&mut self, grow: usize, cols: u16) -> Vec<BottomRow> { … }	unreachable code reached
+o	Grid::drain_lazy_bounded	unreach	crates/aterm-grid/src/grid/scroll.rs	916	4	942	5	proved	pub fn drain_lazy_bounded(&mut self, max_lines: usize) -> usize { … }	unreachable code reached
+o	Grid::scroll_region_up_history_free	hardened_panic_boundary	crates/aterm-grid/src/grid/scroll.rs	1113	20	1113	30	unrecorded	bottom + 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	append_plain_run	hardened_panic_boundary	crates/aterm-grid/src/grid/scroll_convert.rs	142	18	142	26	unrecorded	from + 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	append_plain_run	overflow:add	crates/aterm-grid/src/grid/scroll_convert.rs	160	8	160	16	unrecorded	end += 1	arithmetic overflow (Add)
+o	DeferredLine::new	assert	crates/aterm-grid/src/grid/scroll_convert.rs	244	55	244	74	proved	|| Box::new(extras)	assertion: panic freedom: no assertion, `unreachable!`, or panic is reachable
+o	DeferredLine::new	hardened_unsafe_operation	crates/aterm-grid/src/grid/scroll_convert.rs	244	58	244	74	proved	Box::new(extras)	assertion: [unsafe:sep:alloc] allocation result null check for alloc::boxed::Box::<aterm_grid::grid::scroll_convert::ScrolledRowExtras>::new::<__trust_args@5939
+o	DeferredLine::materialize_no_extras	hardened_panic_boundary	crates/aterm-grid/src/grid/scroll_convert.rs	428	12	428	20	unrecorded	idx += 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	CellPool::take	assert	crates/aterm-grid/src/grid/scroll_convert.rs	693	4	703	5	proved	fn take(&mut self) -> Vec<Cell> { … }	assertion: panic freedom: no assertion, `unreachable!`, or panic is reachable
+o	CellPool::put	overflow:add	crates/aterm-grid/src/grid/scroll_convert.rs	718	8	718	32	unrecorded	self.pooled_cells += cap	arithmetic overflow (Add)
+o	LazyBuffer::front_rows_over	hardened_panic_boundary	crates/aterm-grid/src/grid/scroll_convert.rs	843	12	843	18	unrecorded	n += 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::row_to_line_no_extras	hardened_panic_boundary	crates/aterm-grid/src/grid/scroll_convert.rs	1377	12	1377	20	unrecorded	idx += 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::extract_image_spans_into	hardened_panic_boundary	crates/aterm-grid/src/grid/scroll_convert.rs	1720	20	1720	27	unrecorded	at += 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	fill_row_into	unreach	crates/aterm-grid/src/grid/scroll_fill.rs	34	0	105	1	proved	pub(crate) fn fill_row_into( … }	unreachable code reached
+o	fill_row_into	overflow:sub	crates/aterm-grid/src/grid/scroll_fill.rs	100	16	100	27	proved	budget -= 1	arithmetic overflow (Sub)
+o	Grid::unscroll_from_scrollback	unreach	crates/aterm-grid/src/grid/scroll_unscroll.rs	38	4	149	5	proved	pub fn unscroll_from_scrollback(&mut self, n: usize) -> usize { … }	unreachable code reached
+o	Grid::try_get_history_line	overflow:sub	crates/aterm-grid/src/grid/scrollback_access.rs	86	27	86	46	unrecorded	idx - actual_tiered	arithmetic overflow (Sub)
+o	Grid::try_get_history_line	overflow:sub	crates/aterm-grid/src/grid/scrollback_access.rs	93	27	93	46	unrecorded	idx - actual_tiered	arithmetic overflow (Sub)
+o	Grid::try_get_history_line	overflow:sub	crates/aterm-grid/src/grid/scrollback_access.rs	93	27	93	59	unrecorded	idx - actual_tiered - lazy_count	arithmetic overflow (Sub)
+o	Grid::get_history_line	unreach	crates/aterm-grid/src/grid/scrollback_access.rs	146	4	154	5	proved	pub fn get_history_line(&self, idx: usize) -> Option<Cow<'_, Line>> { … }	unreachable code reached
+o	Grid::try_history_line_rev	overflow:sub	crates/aterm-grid/src/grid/scrollback_access.rs	167	34	167	53	unrecorded	total - 1 - rev_idx	arithmetic overflow (Sub)
+o	Iterator for HistoryLines::next	unreach	crates/aterm-grid/src/grid/scrollback_access.rs	452	4	485	5	proved	fn next(&mut self) -> Option<Self::Item> { … }	unreachable code reached
+o	Iterator for HistoryLines::next	overflow:add	crates/aterm-grid/src/grid/scrollback_access.rs	457	8	457	21	proved	self.idx += 1	arithmetic overflow (Add)
+o	#[derive(Debug)]@L74	unreach	crates/aterm-grid/src/grid/scrollback_offload.rs	74	22	74	27	proved	Debug	unreachable code reached
+o	grown_from_live	assert	crates/aterm-grid/src/grid/scrollback_offload.rs	88	0	93	1	unrecorded	fn grown_from_live(rows: usize, at_counter: u64, counter: u64) -> usize { … }	assertion: panic freedom: no assertion, `unreachable!`, or panic is reachable
+o	DetachedReaderAim::resolve	unreach	crates/aterm-grid/src/grid/scrollback_offload.rs	102	4	114	5	proved	fn resolve(self, counter: u64, sb: usize, restored: usize) -> usize { … }	unreachable code reached
+o	PendingScrollbackReflow::reflow	unreach	crates/aterm-grid/src/grid/scrollback_offload.rs	378	4	386	5	proved	pub fn reflow(self) -> ReflowedScrollback { … }	unreachable code reached
+o	PendingScrollbackReflow::reflow_step	unreach	crates/aterm-grid/src/grid/scrollback_offload.rs	425	4	627	5	proved	pub fn reflow_step(mut self, max_lines: usize) -> ReflowStep { … }	unreachable code reached
+o	carve_completed_runs	unreach	crates/aterm-grid/src/grid/scrollback_offload.rs	639	0	658	1	proved	fn carve_completed_runs( … }	unreachable code reached
+o	Grid::reattach_reflowed_scrollback_or_redetach	unreach	crates/aterm-grid/src/grid/scrollback_offload.rs	1023	4	1100	5	proved	pub fn reattach_reflowed_scrollback_or_redetach( … }	unreachable code reached
+o	Grid::reattach_ring_history	unreach	crates/aterm-grid/src/grid/scrollback_offload.rs	1131	4	1164	5	proved	fn reattach_ring_history(&mut self, mut ring_out: Vec<Line>, new_cols: u16) { … }	unreachable code reached
+o	Grid::reconcile_pending_scrollback_settings	unreach	crates/aterm-grid/src/grid/scrollback_offload.rs	1171	4	1186	5	proved	fn reconcile_pending_scrollback_settings(&mut self) { … }	unreachable code reached
+o	Grid::take_scrollback_lines	unreach	crates/aterm-grid/src/grid/scrollback_reflow.rs	33	4	60	5	proved	pub(super) fn take_scrollback_lines(&mut self) -> Vec<Line> { … }	unreachable code reached
+o	Grid::take_ring_scrollback_lines	unreach	crates/aterm-grid/src/grid/scrollback_reflow.rs	77	4	135	5	proved	pub(super) fn take_ring_scrollback_lines(&mut self) -> Vec<Line> { … }	unreachable code reached
+o	Grid::take_ring_scrollback_lines	overflow:add	crates/aterm-grid/src/grid/scrollback_reflow.rs	111	50	111	55	proved	i + 1	arithmetic overflow (Add)
+o	Grid::restore_reflowed_scrollback	unreach	crates/aterm-grid/src/grid/scrollback_reflow.rs	145	4	185	5	proved	pub(super) fn restore_reflowed_scrollback(&mut self, mut lines: Vec<Line>, new_cols: u16) { … }	unreachable code reached
+o	Grid::prepend_ring_scrollback_lines	unreach	crates/aterm-grid/src/grid/scrollback_reflow.rs	193	4	264	5	proved	pub(super) fn prepend_ring_scrollback_lines(&mut self, lines: Vec<Line>, new_cols: u16) { … }	unreachable code reached
+o	Grid::prepend_ring_scrollback_lines	hardened_unsafe_operation	crates/aterm-grid/src/grid/scrollback_reflow.rs	235	21	235	37	proved	Box::new(extras)	assertion: [unsafe:sep:alloc] allocation result null check for alloc::boxed::Box::<aterm_grid::grid::scroll_convert::ScrolledRowExtras>::new::<__trust_args@5939
+o	reflow_scrollback_lines	hardened_panic_boundary	crates/aterm-grid/src/grid/scrollback_reflow.rs	323	8	323	14	unrecorded	i += 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	reflow_scrollback_lines	hardened_panic_boundary	crates/aterm-grid/src/grid/scrollback_reflow.rs	325	12	325	18	unrecorded	i += 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	emit_logical_line	hardened_panic_boundary	crates/aterm-grid/src/grid/scrollback_reflow.rs	464	8	464	16	unrecorded	idx += 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	collect_units	hardened_panic_boundary	crates/aterm-grid/src/grid/scrollback_reflow.rs	533	33	533	37	unrecorded	w[0]	hardened boundary (panic_boundary): mir_assert::BoundsCheck: MIR bounds-check assert can panic; hardened code needs a proven index precondition
+o	collect_units	slice	crates/aterm-grid/src/grid/scrollback_reflow.rs	533	33	533	37	unrecorded	w[0]	slice bounds check
+o	collect_units	hardened_panic_boundary	crates/aterm-grid/src/grid/scrollback_reflow.rs	533	51	533	55	unrecorded	w[1]	hardened boundary (panic_boundary): mir_assert::BoundsCheck: MIR bounds-check assert can panic; hardened code needs a proven index precondition
+o	collect_units	slice	crates/aterm-grid/src/grid/scrollback_reflow.rs	533	51	533	55	unrecorded	w[1]	slice bounds check
+o	collect_units	hardened_panic_boundary	crates/aterm-grid/src/grid/scrollback_reflow.rs	542	21	542	25	unrecorded	w[0]	hardened boundary (panic_boundary): mir_assert::BoundsCheck: MIR bounds-check assert can panic; hardened code needs a proven index precondition
+o	collect_units	slice	crates/aterm-grid/src/grid/scrollback_reflow.rs	542	21	542	25	unrecorded	w[0]	slice bounds check
+o	collect_units	hardened_panic_boundary	crates/aterm-grid/src/grid/scrollback_reflow.rs	542	39	542	43	unrecorded	w[1]	hardened boundary (panic_boundary): mir_assert::BoundsCheck: MIR bounds-check assert can panic; hardened code needs a proven index precondition
+o	collect_units	slice	crates/aterm-grid/src/grid/scrollback_reflow.rs	542	39	542	43	unrecorded	w[1]	slice bounds check
+o	collect_units	hardened_panic_boundary	crates/aterm-grid/src/grid/scrollback_reflow.rs	579	12	579	25	unrecorded	span_idx += 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	collect_units	assert	crates/aterm-grid/src/grid/scrollback_reflow.rs	583	20	583	39	unrecorded	|s| s.contains(col)	assertion: panic freedom: no assertion, `unreachable!`, or panic is reachable
+o	collect_units	hardened_panic_boundary	crates/aterm-grid/src/grid/scrollback_reflow.rs	586	12	586	23	unrecorded	ul_idx += 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	collect_units	assert	crates/aterm-grid/src/grid/scrollback_reflow.rs	590	20	590	39	unrecorded	|s| s.contains(col)	assertion: panic freedom: no assertion, `unreachable!`, or panic is reachable
+o	SearchContent for Grid::get_row_text	unreach	crates/aterm-grid/src/grid/search_content.rs	18	4	38	5	proved	fn get_row_text(&mut self, row: usize) -> Option<String> { … }	unreachable code reached
+o	SearchContent for Grid::is_row_wrapped	unreach	crates/aterm-grid/src/grid/search_content.rs	40	4	55	5	proved	fn is_row_wrapped(&self, row: usize) -> bool { … }	unreachable code reached
+o	#[derive(Debug)]@L49	unreach	crates/aterm-grid/src/grid/state/storage.rs	49	9	49	14	proved	Debug	unreachable code reached
+o	GridStorage::recycle_rows	unreach	crates/aterm-grid/src/grid/state/storage.rs	336	4	342	5	proved	pub(crate) fn recycle_rows(&mut self, range: std::ops::Range<usize>) { … }	unreachable code reached
+o	GridStorage::row_index	overflow:sub	crates/aterm-grid/src/grid/state/storage.rs	473	27	473	53	unrecorded	base - self.display_offset	arithmetic overflow (Sub)
+o	GridStorage::shift_visible_rows_up	overflow:sub	crates/aterm-grid/src/grid/state/storage.rs	506	23	506	35	unrecorded	(bottom - n)	arithmetic overflow (Sub)
+o	GridStorage::shift_visible_rows_down	overflow:sub	crates/aterm-grid/src/grid/state/storage.rs	534	26	534	45	unrecorded	(base + bottom - n)	arithmetic overflow (Sub)
+o	GridStorage::shift_visible_rows_down	overflow:sub	crates/aterm-grid/src/grid/state/storage.rs	535	24	535	36	unrecorded	(bottom - n)	arithmetic overflow (Sub)
+o	GridStorage::push_ring_extras	hardened_unsafe_operation	crates/aterm-grid/src/grid/state/storage.rs	558	17	558	36	proved	Box::new(extracted)	assertion: [unsafe:sep:alloc] allocation result null check for alloc::boxed::Box::<aterm_grid::grid::scroll_convert::ScrolledRowExtras>::new::<__trust_args@5939
+o	GridStorage::row_past_viewport	unreach	crates/aterm-grid/src/grid/state/storage.rs	608	4	614	5	proved	pub(crate) fn row_past_viewport(&self, visible_row: u16) -> Option<&Row> { … }	unreachable code reached
+o	GridStorage::row_mut_with_effective_cols	unreach	crates/aterm-grid/src/grid/state/storage.rs	645	4	710	5	proved	pub(crate) fn row_mut_with_effective_cols( … }	unreachable code reached
+o	GridStorage::sync_all_extras_flags	overflow:sub	crates/aterm-grid/src/grid/state/storage.rs	784	31	784	52	unrecorded	base - display_offset	arithmetic overflow (Sub)
+o	GridStorage::resize_viewport_state	unreach	crates/aterm-grid/src/grid/state/storage.rs	848	4	894	5	proved	pub(crate) fn resize_viewport_state(&mut self, new_rows: u16, new_cols: u16) { … }	unreachable code reached
+o	Grid::tab	unreach	crates/aterm-grid/src/grid/tab_ops.rs	31	4	55	5	proved	pub fn tab(&mut self) { … }	unreachable code reached
+o	Grid::tab_margin	unreach	crates/aterm-grid/src/grid/tab_ops.rs	64	4	97	5	proved	pub fn tab_margin(&mut self, left_right_margin_mode: bool) { … }	unreachable code reached
+o	Grid::tab_n_margin	unreach	crates/aterm-grid/src/grid/tab_ops.rs	117	4	121	5	proved	pub fn tab_n_margin(&mut self, n: u16, left_right_margin_mode: bool) { … }	unreachable code reached
+o	Grid::back_tab	unreach	crates/aterm-grid/src/grid/tab_ops.rs	130	4	151	5	proved	pub fn back_tab(&mut self) { … }	unreachable code reached
+o	Grid::back_tab_margin	unreach	crates/aterm-grid/src/grid/tab_ops.rs	183	4	206	5	proved	pub fn back_tab_margin(&mut self, left_right_margin_mode: bool, origin_mode: bool) { … }	unreachable code reached
+o	Grid::back_tab_n_margin	unreach	crates/aterm-grid/src/grid/tab_ops.rs	224	4	228	5	proved	pub fn back_tab_n_margin(&mut self, n: u16, left_right_margin_mode: bool, origin_mode: bool) { … }	unreachable code reached
+o	a::marks	unreach	crates/aterm-grid/src/grid/visible_row_view.rs	120	4	132	5	proved	pub fn marks(self) -> impl Iterator<Item = char> + Clone + 'a { … }	unreachable code reached
+o	Grid::visible_row_view	hardened_panic_boundary	crates/aterm-grid/src/grid/visible_row_view.rs	315	26	315	31	unrecorded	d - 1	hardened boundary (panic_boundary): mir_assert::Overflow(Sub): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::screen_row_view	unreach	crates/aterm-grid/src/grid/visible_row_view.rs	419	4	428	5	proved	pub fn screen_row_view(&self, screen_row: u16) -> VisibleRowView<'_> { … }	unreachable code reached
+o	Grid::row_text_screen_into	unreach	crates/aterm-grid/src/grid/visible_row_view.rs	465	4	487	5	proved	pub fn row_text_screen_into(&self, screen_row: u16, out: &mut String) -> bool { … }	unreachable code reached
+o	Grid::row_text_screen_into	unbounded_allocation	crates/aterm-grid/src/grid/visible_row_view.rs	476	8	476	33	proved	out.reserve(len as usize)	unbounded allocation in `Vec::reserve` (count `_`): bulk allocation may reach or exceed 268435456 elements: bound the size (e.g. `#[requires(n < BOUND)]` or a
+o	stale_extras_cols	unreach	crates/aterm-grid/src/grid/write.rs	30	0	41	1	proved	pub(super) fn stale_extras_cols(row: &crate::Row, start: u16, end: u16) -> Vec<u16> { … }	unreachable code reached
+o	Grid::remove_stale_extras	unreach	crates/aterm-grid/src/grid/write.rs	56	4	60	5	proved	pub(super) fn remove_stale_extras(&mut self, row: u16, cols: Vec<u16>) { … }	unreachable code reached
+o	Grid::write_char	unreach	crates/aterm-grid/src/grid/write.rs	201	4	230	5	proved	pub fn write_char(&mut self, c: char) { … }	unreachable code reached
+o	Grid::resolve_style_to_colors	unreach	crates/aterm-grid/src/grid/write.rs	237	4	271	5	proved	pub fn resolve_style_to_colors( … }	unreachable code reached
+o	Grid::write_cell_run	unreach	crates/aterm-grid/src/grid/write.rs	319	4	423	5	proved	pub fn write_cell_run( … }	unreachable code reached
+o	Grid::write_ascii_blast	unreach	crates/aterm-grid/src/grid/write.rs	430	4	535	5	proved	pub fn write_ascii_blast(&mut self, ascii: &[u8]) -> usize { … }	unreachable code reached
+o	Grid::write_ascii_blast	hardened_panic_boundary	crates/aterm-grid/src/grid/write.rs	517	26	517	51	proved	cursor_col + to_write_u16	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::write_ascii_blast	overflow:add	crates/aterm-grid/src/grid/write.rs	517	26	517	51	proved	cursor_col + to_write_u16	arithmetic overflow (Add)
+o	Grid::write_ascii_run_styled_packed	unreach	crates/aterm-grid/src/grid/write.rs	563	4	684	5	proved	pub fn write_ascii_run_styled_packed( … }	unreachable code reached
+o	Grid::write_ascii_run_styled_packed	hardened_panic_boundary	crates/aterm-grid/src/grid/write.rs	666	26	666	51	proved	cursor_col + to_write_u16	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::write_ascii_run_styled_packed	overflow:add	crates/aterm-grid/src/grid/write.rs	666	26	666	51	proved	cursor_col + to_write_u16	arithmetic overflow (Add)
+o	Grid::set_cell_complex_char	unreach	crates/aterm-grid/src/grid/write.rs	708	4	727	5	proved	pub fn set_cell_complex_char(&mut self, row: u16, col: u16, s: &str) { … }	unreachable code reached
+o	Grid::write_char_at_cursor_packed	unreach	crates/aterm-grid/src/grid/write_split.rs	33	4	56	5	proved	pub fn write_char_at_cursor_packed(&mut self, c: char, colors: PackedColors, flags: CellFlags) { … }	unreachable code reached
+o	Grid::write_wide_char_at_cursor_packed_ecols	unreach	crates/aterm-grid/src/grid/write_split.rs	80	4	108	5	proved	pub fn write_wide_char_at_cursor_packed_ecols( … }	unreachable code reached
+o	Grid::blank_wide_wrap_tail	unreach	crates/aterm-grid/src/grid/write_split.rs	142	4	177	5	proved	fn blank_wide_wrap_tail(&mut self, ecols: u16, fill: Cell) { … }	unreachable code reached
+o	Grid::advance_cursor_wide_wrap_ecols	unreach	crates/aterm-grid/src/grid/write_split.rs	291	4	316	5	proved	pub fn advance_cursor_wide_wrap_ecols(&mut self, effective_cols: u16) { … }	unreachable code reached
+o	Grid::write_wide_autowrap_fast	unreach	crates/aterm-grid/src/grid/write_split.rs	327	4	385	5	proved	pub fn write_wide_autowrap_fast( … }	unreachable code reached
+o	Grid::write_emoji_autowrap_fast	unreach	crates/aterm-grid/src/grid/write_split.rs	396	4	455	5	proved	pub fn write_emoji_autowrap_fast(&mut self, c: char, colors: PackedColors, flags: CellFlags) { … }	unreachable code reached
+o	Grid::write_narrow_autowrap_fast	unreach	crates/aterm-grid/src/grid/write_split.rs	470	4	522	5	proved	pub fn write_narrow_autowrap_fast(&mut self, c: char, colors: PackedColors, flags: CellFlags) { … }	unreachable code reached
+o	Grid::write_wide_run_autowrap	unreach	crates/aterm-grid/src/grid/write_split.rs	534	4	665	5	proved	pub fn write_wide_run_autowrap( … }	unreachable code reached
+o	Grid::write_wide_run_autowrap	hardened_panic_boundary	crates/aterm-grid/src/grid/write_split.rs	589	16	589	24	proved	pos += 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::write_wide_run_autowrap	overflow:add	crates/aterm-grid/src/grid/write_split.rs	589	16	589	24	proved	pos += 1	arithmetic overflow (Add)
+o	Grid::write_mixed_wide_run_autowrap	unreach	crates/aterm-grid/src/grid/write_split.rs	826	4	961	5	proved	pub fn write_mixed_wide_run_autowrap( … }	unreachable code reached
+o	Grid::write_mixed_wide_run_autowrap	hardened_panic_boundary	crates/aterm-grid/src/grid/write_split.rs	877	16	877	24	proved	pos += 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::write_mixed_wide_run_autowrap	overflow:add	crates/aterm-grid/src/grid/write_split.rs	877	16	877	24	proved	pos += 1	arithmetic overflow (Add)
+o	Grid::write_ascii_run_with_extras	unreach	crates/aterm-grid/src/grid/write_split.rs	1009	4	1154	5	proved	pub fn write_ascii_run_with_extras( … }	unreachable code reached
+o	Grid::write_ascii_run_with_extras	hardened_panic_boundary	crates/aterm-grid/src/grid/write_split.rs	1122	20	1122	45	proved	cursor_col + to_write_u16	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::write_ascii_run_with_extras	overflow:add	crates/aterm-grid/src/grid/write_split.rs	1122	20	1122	45	proved	cursor_col + to_write_u16	arithmetic overflow (Add)
+o	Grid::write_ascii_run_with_extras	hardened_panic_boundary	crates/aterm-grid/src/grid/write_split.rs	1138	26	1138	51	proved	cursor_col + to_write_u16	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Grid::write_ascii_run_with_extras	overflow:add	crates/aterm-grid/src/grid/write_split.rs	1138	26	1138	51	proved	cursor_col + to_write_u16	arithmetic overflow (Add)
+o	row_u16	assert	crates/aterm-grid/src/lib.rs	108	0	110	1	unrecorded	pub fn row_u16(idx: usize) -> u16 { … }	assertion: panic freedom: no assertion, `unreachable!`, or panic is reachable
+o	Page::new	assert	crates/aterm-grid/src/page.rs	101	4	106	5	unrecorded	pub(crate) fn new() -> Box<Self> { … }	assertion: panic freedom: no assertion, `unreachable!`, or panic is reachable
+o	Page::new	hardened_unsafe_operation	crates/aterm-grid/src/page.rs	103	8	105	10	proved	Box::new(Self { … })	assertion: [unsafe:sep:alloc] allocation result null check for alloc::boxed::Box::<aterm_grid::page::Page>::new::<__trust_args@#>
+o	<Page as Default>::default	assert	crates/aterm-grid/src/page.rs	119	4	123	5	unrecorded	fn default() -> Self { … }	assertion: panic freedom: no assertion, `unreachable!`, or panic is reachable
+o	PageStore::alloc_page	hardened_panic_boundary	crates/aterm-grid/src/page_store.rs	223	37	223	46	unrecorded	page.data	hardened boundary (panic_boundary): mir_assert::MisalignedPointerDereference: MIR runtime assert can panic; hardened code needs a proved precondition
+o	Row::insert_chars_fill	overflow:sub	crates/aterm-grid/src/row/char_ops.rs	99	26	99	34	unrecorded	cols - 1	arithmetic overflow (Sub)
+o	Row::delete_chars_bounded_fill	overflow:sub	crates/aterm-grid/src/row/char_ops.rs	314	27	314	44	unrecorded	(col + count - 1)	arithmetic overflow (Sub)
+o	Row::delete_chars_bounded_fill	overflow:add	crates/aterm-grid/src/row/char_ops.rs	337	40	337	61	unrecorded	src_start + shift_len	arithmetic overflow (Add)
+o	Row::fixup_wide_boundary	slice	crates/aterm-grid/src/row/clear.rs	296	28	296	48	proved	self.cells[left - 1]	slice bounds check
+o	Row::fixup_wide_boundary	slice	crates/aterm-grid/src/row/clear.rs	297	27	297	43	proved	self.cells[left]	slice bounds check
+o	Row::fixup_wide_boundary	hardened_panic_boundary	crates/aterm-grid/src/row/clear.rs	310	39	310	48	unrecorded	right + 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Row::is_cell_protected	slice	crates/aterm-grid/src/row/clear.rs	337	20	337	35	proved	self.cells[col]	slice bounds check
+o	Row::is_cell_protected	slice	crates/aterm-grid/src/row/clear.rs	352	22	352	41	proved	self.cells[col - 1]	slice bounds check
+o	Row::is_cell_protected	slice	crates/aterm-grid/src/row/clear.rs	354	19	354	38	proved	self.cells[col - 1]	slice bounds check
+o	Row::is_cell_wide_continuation	slice	crates/aterm-grid/src/row/clear.rs	373	20	373	35	proved	self.cells[col]	slice bounds check
+o	Row::is_cell_wide_continuation	slice	crates/aterm-grid/src/row/clear.rs	386	19	386	38	proved	self.cells[col - 1]	slice bounds check
+o	Row::selective_clear_range	slice	crates/aterm-grid/src/row/clear.rs	413	19	413	42	proved	self.cells[start_usize]	slice bounds check
+o	Row::selective_clear_range	slice	crates/aterm-grid/src/row/clear.rs	416	19	416	46	proved	self.cells[start_usize - 1]	slice bounds check
+o	Row::selective_clear_range	hardened_panic_boundary	crates/aterm-grid/src/row/clear.rs	436	27	436	34	unrecorded	col + 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Row::selective_wipe_range	slice	crates/aterm-grid/src/row/clear.rs	500	19	500	42	proved	self.cells[start_usize]	slice bounds check
+o	Row::selective_wipe_range	slice	crates/aterm-grid/src/row/clear.rs	503	19	503	46	proved	self.cells[start_usize - 1]	slice bounds check
+o	Row::selective_wipe_range	slice	crates/aterm-grid/src/row/clear.rs	508	16	508	43	proved	self.cells[start_usize - 1]	slice bounds check
+o	Row::selective_wipe_range	slice	crates/aterm-grid/src/row/clear.rs	518	16	518	39	proved	self.cells[start_usize]	slice bounds check
+o	Row::selective_wipe_range	hardened_panic_boundary	crates/aterm-grid/src/row/clear.rs	527	27	527	34	unrecorded	col + 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Row::selective_clear	hardened_panic_boundary	crates/aterm-grid/src/row/clear.rs	573	72	573	79	unrecorded	col + 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	u16_from_usize	assert	crates/aterm-grid/src/row/mod.rs	24	0	26	1	unrecorded	fn u16_from_usize(value: usize) -> u16 { … }	assertion: panic freedom: no assertion, `unreachable!`, or panic is reachable
+o	#[derive(Debug)]@L75	unreach	crates/aterm-grid/src/row/mod.rs	75	9	75	14	proved	Debug	unreachable code reached
+o	Row::cells_mut_with_fixup	slice	crates/aterm-grid/src/row/mod.rs	361	38	361	61	proved	self.cells[old_len - 1]	slice bounds check
+o	Row::fixup_wide_chars_in_range	hardened_panic_boundary	crates/aterm-grid/src/row/write.rs	266	50	266	57	unrecorded	col + 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	Row::fixup_wide_chars_in_range	overflow:add	crates/aterm-grid/src/row/write.rs	266	50	266	57	unrecorded	col + 1	arithmetic overflow (Add)
+o	Row::write_wide_char_packed	overflow:sub	crates/aterm-grid/src/row/write.rs	350	44	350	55	unrecorded	old_len - 1	arithmetic overflow (Sub)
+o	GridCursorState::default_tab_stops	unbounded_allocation	crates/aterm-grid/src/state/cursor.rs	170	12	170	60	unrecorded	(0..cols).map(|c| c > 0 && c % 8 == 0).collect()	unbounded allocation in `Iterator::collect` (count `(- cols 0)`): bulk allocation may reach or exceed 268435456 elements: bound the size (e.g. `#[requires(n < B
+o	#[derive(Debug)]@L18	unreach	crates/aterm-grid/src/state/presentation.rs	18	9	18	14	proved	Debug	unreachable code reached
+o	#[derive(PartialEq)]@L18	unreach	crates/aterm-grid/src/state/presentation.rs	18	29	18	38	proved	PartialEq	unreachable code reached
+o	merge_bands	slice	crates/aterm-grid/src/state/presentation.rs	169	19	169	27	unrecorded	bands[i]	slice bounds check
+o	merge_bands	hardened_panic_boundary	crates/aterm-grid/src/state/presentation.rs	174	12	174	20	unrecorded	out += 1	hardened boundary (panic_boundary): mir_assert::Overflow(Add): MIR arithmetic assert can panic; hardened code needs proven arithmetic preconditions
+o	SelectionDamage::from_merged	overflow:add	crates/aterm-grid/src/state/presentation.rs	279	38	279	43	unrecorded	i + 1	arithmetic overflow (Add)
+o	SelectionDamage::from_merged	slice	crates/aterm-grid/src/state/presentation.rs	294	25	294	32	proved	[..len]	slice bounds check
+o	SelectionDamage::from_merged	slice	crates/aterm-grid/src/state/presentation.rs	294	53	294	60	proved	[..len]	slice bounds check
+o	#[derive(Debug)]@L168	unreach	crates/aterm-grid/src/style.rs	168	9	168	14	proved	Debug	unreachable code reached
+end	234

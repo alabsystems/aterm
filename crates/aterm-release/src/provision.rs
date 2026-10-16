@@ -7,16 +7,18 @@
 //! "Publishing" is the load-bearing word: a machine on the roster builds what it signs,
 //! so the audit proves the whole stack — the self-hosted Trust stage2 toolchain (a real
 //! smoke-compile under the native-lane rustflags, via the same `gates` probes the cut
-//! runs), the trust-named gate drivers (`targo`/`tippy`/`ty`/`trustdoc`), the doc-tool
+//! runs), the trust-named check drivers (`targo`/`tippy`/`ty`/`trustdoc`), the doc-tool
 //! farm link (`~/.local/bin/trustdoc`, repaired in place when safely mechanical —
 //! [`doc_tool_check`]), the front door (`targo` and `trustc` from the store's stage2 bin
 //! answering `--version` — every host lane is `targo --unverified …`, and no rustup is
 //! needed; a rustup `trust` link is reported beside it, informationally), the
-//! stable `x86_64-apple-darwin` slice of the universal binary, Apple's packaging tools,
+//! stable `x86_64-apple-darwin` slice of the universal binary, the stable std of the
+//! foreign cells `verify release` type-checks, Apple's packaging tools,
 //! the Developer ID identity, a
 //! LIVE-tested notarytool credential, the credentials profile, `gh` auth and the
-//! channel token. On a machine with none of that, the front door is
-//! `tools/bootstrap-publisher.sh`, which acquires the toolchain and hands off here.
+//! channel token. On a machine with none of that, the front door is `aterm pkg install
+//! trust`, then this verb: a full run first ACQUIRES the stock exceptions it audits
+//! ([`acquire`]: rustup, the stable slices, the wasm32 pin, rustup's `trust` link).
 //!
 //! The order is the safety argument:
 //!
@@ -64,6 +66,12 @@ use crate::ledger::{Error, Result};
 use crate::publish::step;
 #[cfg(unix)]
 use crate::{channel, gates, machines, publish, sign};
+
+// By path: `tests/it` compiles this file by `#[path]`, where a bare `mod` would resolve
+// beside it.
+#[cfg(unix)]
+#[path = "provision/acquire.rs"]
+mod acquire;
 
 /// POSIX-only, exactly like the engine it drives: `atpkg-keys` compiles empty on
 /// Windows (`#![cfg(unix)]`), because the master phrase is read from `/dev/tty`.
@@ -321,6 +329,13 @@ pub fn run_provision(
         "build stack",
         "the toolchain and SDK a cut compiles with",
     );
+    // What the audit below would only report missing, a full run acquires first.
+    if !check_only {
+        let homes = acquire::Homes::from_env(Path::new(&home));
+        acquire::run(repo, &homes, &acquire::System, &mut |line| {
+            step("acquire", line);
+        });
+    }
     // The two checks below run only behind a PROVEN stage2. Without one they had nothing
     // to look at and returned a Skip whose whole content was "see the toolchain line" —
     // two full lines carrying nothing, in the densest part of the output, directly under
@@ -340,6 +355,7 @@ pub fn run_provision(
     // still gets told its doc driver is missing in the same pass.
     record("doc tool", doc_tool_check(&home, check_only), &mut checks);
     record("x86 slice", x86_slice_check(), &mut checks);
+    record("foreign cells", foreign_cells_check(), &mut checks);
     record("apple sdk", apple_clt_check(), &mut checks);
 
     phase(
@@ -1421,7 +1437,7 @@ fn toolchain_check(repo: &Path) -> (Check, Option<PathBuf>) {
             Check::Fail {
                 what: e.to_string(),
                 fix: format!(
-                    "tools/bootstrap-publisher.sh — it does the whole stack\n\
+                    "aterm pkg install trust, then re-run this verb\n\
                      or, by hand:\n  {}",
                     gates::TRUST_TOOLCHAIN_REMEDIES.replace('\n', "\n  ")
                 ),
@@ -1445,9 +1461,8 @@ fn verifiers_check(bin: &Path) -> Check {
             bin.display()
         ))
     } else {
-        // Not `bootstrap-publisher.sh`: it resolves an existing stage2 and stops, so it
-        // would report success over exactly this gap. A stage2 missing its tools has to
-        // be replaced or rebuilt.
+        // A stage2 missing its tools has to be replaced or rebuilt: resolving another one
+        // would report success over exactly this gap.
         Check::Fail {
             what: format!("{} missing from {}", missing.join(" + "), bin.display()),
             // The config key had no FILE and named a tool that is not in the missing
@@ -1455,8 +1470,8 @@ fn verifiers_check(bin: &Path) -> Check {
             // the command.
             fix: format!(
                 "aterm pkg install trust   (then `aterm pkg doctor` to confirm the store)\n\
-                 or, from source: set `tools` in $HOME/trust/bootstrap.toml to include every \
-                 driver above, then rebuild {}",
+                 or, from source: set `tools` in the Trust checkout's bootstrap.toml to \
+                 include every driver above, then rebuild {}",
                 gates::TRUST_FROM_SOURCE
             ),
         }
@@ -1753,6 +1768,39 @@ fn x86_slice_check() -> Check {
     }
 }
 
+/// The std targets `verify release`'s `cells` check compiles the foreign cells for, on
+/// upstream stable (Trust has none of them). A release needs every check, so a missing
+/// one would refuse it during verification, after the build: the audit asks first.
+#[cfg(unix)]
+const FOREIGN_CELL_TARGETS: [&str; 4] = [
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "aarch64-unknown-linux-gnu",
+    "wasm32-unknown-unknown",
+];
+
+/// [`FOREIGN_CELL_TARGETS`] installed on upstream stable.
+#[cfg(unix)]
+fn foreign_cells_check() -> Check {
+    match gates::stable_targets_missing(&FOREIGN_CELL_TARGETS) {
+        Ok(missing) if missing.is_empty() => Check::Pass(
+            "stable carries the std of every foreign cell `verify release` type-checks".into(),
+        ),
+        Ok(missing) => Check::Fail {
+            what: format!(
+                "stable has no std for {} — `verify release` could not run its `cells` check, \
+                 and a release needs every check",
+                missing.join(", ")
+            ),
+            fix: format!("rustup target add {} --toolchain stable", missing.join(" ")),
+        },
+        Err(e) => Check::Fail {
+            what: e.to_string(),
+            fix: "install rustup, then `rustup toolchain install stable`".into(),
+        },
+    }
+}
+
 /// Apple's bundle/sign/package command-line tools — the cut shells all of them.
 #[cfg(unix)]
 fn apple_clt_check() -> Check {
@@ -1941,6 +1989,7 @@ pub fn audit(repo: &Path, id: &str) -> Vec<Finding> {
     }
     found.push(("doc tool", doc_tool_check(&home, true)));
     found.push(("x86 slice", x86_slice_check()));
+    found.push(("foreign cells", foreign_cells_check()));
     found.push(("apple sdk", apple_clt_check()));
     let (apple, apple_sha1) = apple_identity_check(id, false, None);
     found.push((crate::apple::APPLE_LABEL, apple));
@@ -2829,7 +2878,7 @@ mod tests {
     use aterm_update_core::roster::{Machine, SUPPORTED_SCHEMA};
 
     /// A synthetic paper phrase, built at runtime so no phrase-shaped literal exists in
-    /// this file (grep_guard B7 scans it).
+    /// this file (the census guard `key-material` reads it).
     fn seed() -> atpkg_keys::master::MasterSeed {
         let phrase = "2".repeat(52);
         atpkg_keys::master::parse_master(&phrase)
@@ -3314,6 +3363,29 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stage2 missing its verifiers is rebuilt in a Trust checkout, never in a home
+    /// folder's: the remedy names the checkout's `bootstrap.toml` and carries the one
+    /// from-source command.
+    #[test]
+    fn a_stage2_missing_its_verifiers_is_rebuilt_in_a_trust_checkout() {
+        let bin = std::env::temp_dir().join(format!("provision-verifiers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bin);
+        std::fs::create_dir_all(&bin).unwrap();
+        match verifiers_check(&bin) {
+            Check::Fail { what, fix } => {
+                assert!(
+                    what.starts_with("targo + tippy + ty + trustdoc missing"),
+                    "{what}"
+                );
+                assert!(!fix.contains('~'), "a home folder: {fix}");
+                assert!(fix.contains("the Trust checkout's bootstrap.toml"), "{fix}");
+                assert!(fix.contains(gates::TRUST_FROM_SOURCE), "{fix}");
+            }
+            other => panic!("an empty bin is missing every verifier: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&bin);
     }
 
     #[test]

@@ -70,7 +70,7 @@ impl Default for VoteScratch {
 /// ([`simhash_ctx_bitsliced`]) ships, licensed by its equivalence
 /// certificate: the ay QF_BV single-column miter plus lane-independence lift
 /// (`crates/aterm-spec-models/proofs/ay/sparkle_v2/`, re-checked fail-closed by
-/// `aterm-spec/tests/sparkle_v2_ay_certificates.rs`) and the 10k-voter-set
+/// `spec-check ay`) and the 10k-voter-set
 /// battery below. The reference vote loop is the battery's oracle. If that gate
 /// goes red, switch this back to `Reference` in the same change.
 pub const SIMHASH_KERNEL: SimhashKernel = SimhashKernel::BitSliced;

@@ -45,9 +45,9 @@ fn freeze_budget_widens_on_retries_and_for_an_explicit_apply() {
     }
 }
 
-/// Rung 0 is seeded from a timed capture: `clamp(1.5 × capture, 20 ms, 80 ms)`.
-/// A desk capturing in 22 ms gets 33 ms at once instead of missing 20 ms and
-/// re-parking. Nothing measured, or under 14 ms, stays 20 ms.
+/// Rung 0 is seeded from a timed capture: `clamp(1.5 × capture, 20 ms, 80 ms)`, so a desk
+/// capturing in 22 ms gets 33 ms at once instead of missing 20 ms and re-parking. Nothing
+/// measured, or a capture of 13⅓ ms or less, stays 20 ms.
 #[test]
 fn rung_zero_is_seeded_from_the_timed_capture_within_its_clamp() {
     use super::{FREEZE_RUNG0_CEILING, FREEZE_RUNG0_FLOOR, freeze_rung0_from_capture};
@@ -121,8 +121,8 @@ fn every_seed_keeps_the_ladder_strictly_wider_rung_over_rung() {
     }
 }
 
-/// The ledger's record is a PRIOR: no record is the default, a record seeds
-/// rung 0 from its capture and names the build that took it.
+/// The ledger's record is a prior: no record is the default, a record seeds rung 0 from its
+/// capture and names the build that took it.
 #[test]
 fn the_ledgers_last_timed_capture_seeds_a_lane_that_times_none() {
     assert_eq!(FreezeSeed::from_prior(None), FreezeSeed::Default);

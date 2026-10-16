@@ -2,14 +2,16 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm drive answer @<worker> [--box TOKEN] <answer>`: a controlling session
-//! types its own choice into a worker's Claude Code question dialog
-//! (AskUserQuestion). The worker's window hands the dialog over when the
-//! session's word is `ask` (`aterm ctl @<worker> meta set questions ask`); the
-//! controller reads it (`aterm drive phase`) and answers it with this.
+//! types its own choice into a worker's question — Claude Code's question
+//! dialog (AskUserQuestion), or Codex's `Question 1/1`. The worker's window
+//! hands the question over when the session's word is `ask` (`aterm ctl
+//! @<worker> meta set questions ask`); the controller reads it (`aterm drive
+//! phase`) and answers it with this. The question is read by the worker's own
+//! program's reader ([`Session::program_reader`]), as the window reads it.
 //!
-//! One screen at a time, through the window supervisor's own keys
-//! ([`Session::press_question`]): the focus moved one row per key, each move
-//! seen landing, then Enter guarded on the chosen row under the
+//! One screen at a time, through the window supervisor's own keys. On Claude
+//! Code's dialog ([`Session::press_question`]): the focus moved one row per
+//! key, each move seen landing, then Enter guarded on the chosen row under the
 //! screen-generation fence. Never a digit, Esc, `n`, or a key on the free-text
 //! row, chat row or review's cancel; a person keying meanwhile gets it
 //! (`LEFT`). The answer:
@@ -23,26 +25,39 @@
 //!   multi-select;
 //! * `human`: nothing typed, `LEFT`.
 //!
+//! On a question read by its ANSWERS' ROLES (Codex's: no dialog read whole),
+//! the window's own key for it ([`Session::press_one_guarded`]): the answer's
+//! digit, which Codex chooses at once, guarded on the question's title row and
+//! fenced on the screen generation — never unfenced (a host that cannot fence
+//! it, or turns the fenced key away, is NOT-SERVED with nothing typed), and
+//! never Enter, Esc or the digit of its last row (`None of the above`, which
+//! asks for the person's own words). The answer is `<n>` or an answer's exact
+//! label (case folded), `recommended` (the window's own: the `(Recommended)`
+//! answer, else the first) or `human`; a person who keyed within the grace
+//! gets it (`LEFT`).
+//!
 //! Anything else is refused: free text is a person's to type. `long-term` and
 //! `short-term`, where they name no option, are refused with the `meta set
 //! questions <word>` that has the window answer by that policy (the one writer
-//! of its text, which remembers writing it). `--box TOKEN` refuses a dialog
-//! whose token ([`question_box_token`]) differs, so an answer never lands on
+//! of its text, which remembers writing it). `--box TOKEN` refuses a question
+//! whose token ([`prompt_box_token`]) differs, so an answer never lands on
 //! another question.
 //!
 //! Prints one line: `ANSWERED @<w> enters=<k> answer=<what> next=<…>` (exit
-//! 0), `LEFT @<w> <why>` (exit 0), `NO-BOX @<w> …` (exit 1), `REFUSED @<w>
-//! <why>` (exit 2, nothing typed), `NOT-SERVED @<w> <why> (enters=<k>)` (exit
-//! 3: the host or the dialog did not take the answer as decided).
+//! 0; `enters=` counts the keys that answered: the dialog's Enters, Codex's
+//! one digit), `LEFT @<w> <why>` (exit 0), `NO-BOX @<w> …` (exit 1), `REFUSED
+//! @<w> <why>` (exit 2, nothing typed), `NOT-SERVED @<w> <why> (enters=<k>)`
+//! (exit 3: the host or the question did not take the answer as decided).
 
 use std::io::Write;
 
-use aterm_phase::{QuestionDialog, QuestionForm, QuestionOption};
+use aterm_phase::{Opt, QuestionDialog, QuestionForm, QuestionOption, Role};
 
 use super::super::policy::approval::{Answer, AnswerTarget, Choice, Decision, QuestionPriority};
 use super::super::policy::question::{
     Pane, answer_question, focus_position, recommended_set, target_focus,
 };
+use super::super::policy::row_guard;
 use super::*;
 
 /// No question dialog on the screen.
@@ -73,11 +88,43 @@ pub fn question_box_token(dialog: &QuestionDialog) -> String {
     }
     name.push('\u{1e}');
     name.push_str(question);
+    token_of(&name)
+}
+
+/// The TOKEN of a question read by its answers' roles (Codex's: no dialog
+/// read whole): eight hex digits over its title, its question and its
+/// options' labels — the same on every read of that screen, another for
+/// another question.
+fn role_box_token(prompt: &aterm_phase::PromptV2) -> String {
+    let mut name = format!("roles\u{1f}{}\u{1e}{}", prompt.title, prompt.description);
+    for o in &prompt.options {
+        name.push('\u{1f}');
+        name.push_str(&o.label);
+    }
+    token_of(&name)
+}
+
+/// The token `phase` prints as `box` and `--box` names: a dialog's
+/// ([`question_box_token`]), else, for a question read by its answers' roles,
+/// [`role_box_token`]; `None` for any other box (a question with no answer
+/// read has nothing to answer).
+#[must_use]
+pub fn prompt_box_token(prompt: &aterm_phase::PromptV2) -> Option<String> {
+    match &prompt.question_dialog {
+        Some(dialog) => Some(question_box_token(dialog)),
+        None => (prompt.kind == PromptKind::Question
+            && prompt.options.iter().any(|o| o.role == Role::Answer))
+        .then(|| role_box_token(prompt)),
+    }
+}
+
+/// Eight hex digits over `name`.
+fn token_of(name: &str) -> String {
     let h = aterm_hash::fnv1a_64(name.as_bytes());
     format!("{:08x}", (h ^ (h >> 32)) & 0xffff_ffff)
 }
 
-/// What one screen's answer is, planned against the dialog as read.
+/// What one screen's answer is, planned against the question as read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Plan {
     /// Nothing typed: the person answers.
@@ -88,6 +135,18 @@ enum Plan {
         targets: Vec<AnswerTarget>,
         said: String,
     },
+    /// The digit of a question read by its answers' roles.
+    Digit(Digit),
+}
+
+/// An answer's digit on a question read by its answers' roles (Codex's),
+/// which chooses at once: `n`, guarded on the question's title row
+/// (`guard`); `said` names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Digit {
+    n: u8,
+    guard: String,
+    said: String,
 }
 
 /// The option an answer word names on `options`: its number, or its label
@@ -102,8 +161,31 @@ fn option_named<'a>(options: &'a [QuestionOption], word: &str) -> Option<&'a Que
         .find(|o| o.label.trim().eq_ignore_ascii_case(word))
 }
 
-/// Plan `answer` on the dialog on display (module header), for the worker
-/// `who`. `Err` is the refusal: nothing is typed.
+/// Why `answer` is refused as the text priority `p` (module header): the
+/// window's policy, never an answer typed from here. Its text is written by
+/// the loop that remembers writing it, and an out-of-process write would be a
+/// second owner of the free-text row; the session's word asks the window to.
+fn policy_refusal(answer: &str, who: &str, p: QuestionPriority) -> String {
+    format!(
+        "{answer:?} is a question policy, not an answer: `aterm ctl {who} meta set questions \
+         {}` has the window answer this session's questions by it (an answer here is an \
+         option, `submit`, `recommended` or `human`)",
+        p.word()
+    )
+}
+
+/// Why `answer`, which names no option, is refused: a text priority's
+/// [`policy_refusal`], else free text, a person's to type.
+fn names_no_option(answer: &str, who: &str) -> String {
+    match QuestionPriority::parse(answer).filter(|p| p.text().is_some()) {
+        Some(p) => policy_refusal(answer, who, p),
+        None => format!("{answer:?} names no option: a free-text answer is a person's to type"),
+    }
+}
+
+/// Plan `answer` on the question on display (module header), for the worker
+/// `who`: a dialog read whole, else by its answers' roles ([`plan_by_role`]).
+/// `Err` is the refusal: nothing is typed.
 fn plan(
     prompt: &aterm_phase::PromptV2,
     rows: &[String],
@@ -111,7 +193,7 @@ fn plan(
     who: &str,
 ) -> Result<Plan, String> {
     let Some(dialog) = prompt.question_dialog.as_ref() else {
-        return Err("the dialog was not read whole".to_string());
+        return plan_by_role(prompt, rows, answer, who);
     };
     let answer = answer.trim();
     if answer.eq_ignore_ascii_case("human") {
@@ -181,24 +263,10 @@ fn plan(
             )),
         };
     }
-    // A text priority is the window's policy, never an answer typed from here
-    // (where it names no option on the tab): its text is written by the loop
-    // that remembers writing it, and an out-of-process write would be a
-    // second owner of the free-text row. The session's word asks the window
-    // to.
+    // A text priority is refused where it names no option on the tab
+    // ([`policy_refusal`]).
     let policy = QuestionPriority::parse(answer).filter(|p| p.text().is_some());
-    let refused_policy = |p: QuestionPriority| {
-        format!(
-            "{answer:?} is a question policy, not an answer: `aterm ctl {who} meta set questions \
-             {}` has the window answer this session's questions by it (an answer here is an \
-             option, `submit`, `recommended` or `human`)",
-            p.word()
-        )
-    };
-    let free_text = || match policy {
-        Some(p) => refused_policy(p),
-        None => format!("{answer:?} names no option: a free-text answer is a person's to type"),
-    };
+    let free_text = || names_no_option(answer, who);
     match &dialog.form {
         QuestionForm::Single { options, .. } | QuestionForm::Preview { options, .. } => {
             let o = option_named(options, answer).ok_or_else(free_text)?;
@@ -249,7 +317,7 @@ fn plan(
             said: "submit".to_string(),
         }),
         QuestionForm::Review { .. } => Err(match policy {
-            Some(p) => refused_policy(p),
+            Some(p) => policy_refusal(answer, who, p),
             None => format!(
                 "{answer:?} on the review tab: `submit` sends the answers shown, `human` leaves it"
             ),
@@ -258,14 +326,101 @@ fn plan(
     }
 }
 
-/// The question on display, for `next=`: its text, `review`, or `none`.
-fn next_of(rows: &[String]) -> String {
-    match aterm_phase::parse_prompt_v2(rows).and_then(|p| p.question_dialog) {
+/// Plan `answer` on a question read by its ANSWERS' ROLES (Codex's `Question
+/// 1/1`, which no dialog reader reads whole), as the window answers one: by
+/// the answer's digit, guarded on the question's title row. `recommended` is
+/// the window's own pick under the `recommended` priority (its
+/// `(Recommended)` answer, else the first; an unmarked destructive question
+/// its one refusal), refused where the window would hand it over. An option
+/// that is no answer (the last row, `None of the above`) asks for the
+/// person's own words, and is refused as free text. `Err` is the refusal:
+/// nothing is typed.
+fn plan_by_role(
+    prompt: &aterm_phase::PromptV2,
+    rows: &[String],
+    answer: &str,
+    who: &str,
+) -> Result<Plan, String> {
+    let answer = answer.trim();
+    if answer.eq_ignore_ascii_case("human") {
+        return Ok(Plan::Human);
+    }
+    if !prompt.options.iter().any(|o| o.role == Role::Answer) {
+        return Err("the dialog was not read whole".to_string());
+    }
+    if answer.eq_ignore_ascii_case("recommended") {
+        let decision = answer_question(
+            prompt,
+            rows,
+            QuestionPriority::Recommended,
+            None,
+            false,
+            Pane::of(rows),
+        );
+        return match decision {
+            Decision::Approve {
+                choice: Choice::Digit(n),
+                guard,
+                subject,
+                ..
+            } => Ok(Plan::Digit(Digit {
+                n,
+                guard,
+                said: subject,
+            })),
+            Decision::Approve { .. } | Decision::Decline { .. } => {
+                Err("the window's own answer is no question key".to_string())
+            }
+            Decision::Escalate { reason } => Err(format!(
+                "the window would not answer this dialog itself: {reason}"
+            )),
+        };
+    }
+    let named = |o: &&Opt| match answer.parse::<u8>() {
+        Ok(n) => o.n == Some(n),
+        Err(_) => o.label.trim().eq_ignore_ascii_case(answer),
+    };
+    let Some(o) = prompt.options.iter().find(named) else {
+        return Err(names_no_option(answer, who));
+    };
+    let Some(n) = o.n.filter(|_| o.role == Role::Answer) else {
+        return Err(format!(
+            "{:?} asks for the person's own words: a free-text answer is a person's to type",
+            o.label
+        ));
+    };
+    // The guard binds the digit to this question: a head off the rows read
+    // has no title row to bind it to.
+    if prompt.head_off_screen {
+        return Err(format!(
+            "the question's head is off the screen: {}",
+            prompt.title
+        ));
+    }
+    let Some(guard) = rows.get(prompt.span.0).map(|r| row_guard(r)) else {
+        return Err("the question's title row is not on the rows read".to_string());
+    };
+    Ok(Plan::Digit(Digit {
+        n,
+        guard,
+        said: o.label.clone(),
+    }))
+}
+
+/// The question on display, read by `reader`, for `next=`: its text,
+/// `review`, or `none`.
+fn next_of(reader: &dyn ScreenReader, rows: &[String]) -> String {
+    let Some(p) = reader.prompt(rows) else {
+        return "none".to_string();
+    };
+    match p.question_dialog {
         Some(d) => match (&d.form, d.question()) {
             (QuestionForm::Review { .. }, _) => "review".to_string(),
             (_, Some(q)) => q.text.clone(),
             _ => "question".to_string(),
         },
+        None if p.kind == PromptKind::Question && !p.description.is_empty() => p.description,
+        None if p.kind == PromptKind::Question => "question".to_string(),
         None => "none".to_string(),
     }
 }
@@ -275,16 +430,16 @@ fn next_of(rows: &[String]) -> String {
 pub struct AnswerOpts {
     /// The controller's answer (module header).
     pub answer: String,
-    /// `--box`: the dialog's token the answer was decided on.
+    /// `--box`: the question's token the answer was decided on.
     pub box_token: Option<String>,
     /// A person's quiet before a key goes (`[harness] human_grace_s`): one
-    /// who keyed within it gets the dialog (`LEFT`).
+    /// who keyed within it gets the question (`LEFT`).
     pub grace: Duration,
 }
 
 impl<C: Ctl> Session<'_, C> {
-    /// Answer the question dialog on display (module header): one line to
-    /// `out`, the exit code back.
+    /// Answer the question on display (module header): one line to `out`,
+    /// the exit code back.
     pub fn answer(&mut self, opts: &AnswerOpts, out: &mut dyn Write) -> Result<u8, String> {
         let who = self.sid.clone().unwrap_or_else(|| "@self".to_string());
         let who = if who.starts_with('@') {
@@ -297,30 +452,38 @@ impl<C: Ctl> Session<'_, C> {
             Ok(code)
         };
         let mut screen = self.screen().map_err(fail_text)?;
-        let Some(prompt) = aterm_phase::parse_prompt_v2(&screen.rows)
-            .filter(|p| p.kind == aterm_phase::PromptKind::Question)
+        // The worker's own program reads the question, as its window does:
+        // Claude Code's dialog, or Codex's by its answers' roles.
+        let reader = self.program_reader(&screen.rows)?;
+        let Some(prompt) = reader
+            .prompt(&screen.rows)
+            .filter(|p| p.kind == PromptKind::Question)
         else {
             return say(
                 format!("NO-BOX {who} no question dialog on the screen"),
                 EXIT_NO_BOX,
             );
         };
-        if let (Some(want), Some(dialog)) = (&opts.box_token, prompt.question_dialog.as_ref()) {
-            let on = question_box_token(dialog);
-            if !on.eq_ignore_ascii_case(want.trim()) {
-                return say(
-                    format!(
-                        "REFUSED {who} the dialog on the screen is box={on}, not the box={} the \
-                         answer was for: nothing typed",
-                        want.trim()
-                    ),
-                    EXIT_REFUSED,
-                );
-            }
+        if let (Some(want), Some(on)) = (&opts.box_token, prompt_box_token(&prompt))
+            && !on.eq_ignore_ascii_case(want.trim())
+        {
+            return say(
+                format!(
+                    "REFUSED {who} the dialog on the screen is box={on}, not the box={} the \
+                     answer was for: nothing typed",
+                    want.trim()
+                ),
+                EXIT_REFUSED,
+            );
         }
         let (targets, said) = match plan(&prompt, &screen.rows, &opts.answer, &who) {
             Ok(Plan::Human) => return say(format!("LEFT {who} human: nothing typed"), 0),
             Ok(Plan::Keys { targets, said }) => (targets, said),
+            Ok(Plan::Digit(digit)) => {
+                let (line, code) =
+                    self.answer_digit(&who, reader, &prompt, &screen, &digit, opts.grace)?;
+                return say(line, code);
+            }
             Err(why) => return say(format!("REFUSED {who} {why}"), EXIT_REFUSED),
         };
         let mut keys = 0usize;
@@ -396,10 +559,90 @@ impl<C: Ctl> Session<'_, C> {
         say(
             format!(
                 "ANSWERED {who} enters={keys} answer={said} next={}",
-                next_of(&screen.rows)
+                next_of(reader, &screen.rows)
             ),
             0,
         )
+    }
+
+    /// Press `digit` on the question read by its answers' roles on `screen`
+    /// (module header): the window's own key for it
+    /// ([`Self::press_one_guarded`]), guarded on the question's title row and
+    /// fenced on the screen generation ([`Fence::Required`]: never pressed
+    /// without it), and only while a person has been quiet for `grace` by
+    /// the read's stamp. The line and the exit code back.
+    fn answer_digit(
+        &mut self,
+        who: &str,
+        reader: &dyn ScreenReader,
+        prompt: &aterm_phase::PromptV2,
+        screen: &Screen,
+        digit: &Digit,
+        grace: Duration,
+    ) -> Result<(String, u8), String> {
+        if let HumanInput::Ago(ms) = screen.human
+            && u128::from(ms) < grace.as_millis()
+        {
+            return Ok((
+                format!(
+                    "LEFT {who} a person gave the session input: the question is theirs \
+                     (enters=0)"
+                ),
+                0,
+            ));
+        }
+        // Never unfenced: the guard names only the title row, which another
+        // question draws the same (`Question 1/1 (1 unanswered)`). A host
+        // without the fence, a read without a generation, and a fenced key
+        // the host turns away (where the window's own press would drop the
+        // fence and go on under the row guard alone) are NOT-SERVED, nothing
+        // typed.
+        let why = match self
+            .press_one_guarded(
+                prompt,
+                &digit.guard,
+                &digit.n.to_string(),
+                screen,
+                Fence::Required,
+            )
+            .map_err(fail_text)?
+        {
+            Pressing::Done(Press::Pressed { seq }) => {
+                let _ = self.wait(&["seq", &seq.to_string()], STRAY_SETTLE);
+                let _ = self.wait(&["idle", SETTLE_MS], SETTLE_CAP);
+                let now = self.screen().map_err(fail_text)?;
+                return Ok((
+                    format!(
+                        "ANSWERED {who} enters=1 answer={} next={}",
+                        digit.said,
+                        next_of(reader, &now.rows)
+                    ),
+                    0,
+                ));
+            }
+            Pressing::Done(Press::Changed { .. }) => {
+                "the question changed under the key (a person, or the worker)".to_string()
+            }
+            Pressing::Done(Press::Skipped { .. }) => {
+                "the guarded row was not on the screen when the key went".to_string()
+            }
+            // A digit press moves no focus, yields to no stamp and writes no
+            // text: none of these is its answer.
+            Pressing::Done(Press::Unseen { .. } | Press::Yielded { .. } | Press::Typed { .. }) => {
+                "the key was not seen through".to_string()
+            }
+            // Only the unfenced fallback withholds (a survey open over the
+            // box), and `Fence::Required` never takes it.
+            Pressing::Withheld => "the host has no guarded key".to_string(),
+            Pressing::Halted { why }
+            | Pressing::Refused { why }
+            | Pressing::Unconfirmed { why, .. }
+            | Pressing::Lost { why, .. } => why,
+        };
+        Ok((
+            format!("NOT-SERVED {who} {why} (enters=0)"),
+            EXIT_NOT_SERVED,
+        ))
     }
 }
 
@@ -538,11 +781,11 @@ mod tests {
         assert_eq!(
             planned(f::QUESTION_MULTISELECT, "recommended").map(|p| match p {
                 Plan::Keys { targets, .. } => targets,
-                Plan::Human => Vec::new(),
+                Plan::Human | Plan::Digit(_) => Vec::new(),
             }),
             planned(f::QUESTION_MULTISELECT, "1, 3").map(|p| match p {
                 Plan::Keys { targets, .. } => targets,
-                Plan::Human => Vec::new(),
+                Plan::Human | Plan::Digit(_) => Vec::new(),
             }),
             "the explicit answer's keys"
         );
@@ -608,5 +851,106 @@ mod tests {
                 assert_ne!(a, b, "{all:?}");
             }
         }
+    }
+
+    /// A Codex screen, read by Codex's reader, and its rows.
+    fn codex(text: &str) -> (aterm_phase::PromptV2, Vec<String>) {
+        let rows = f::screen(text);
+        let p = aterm_phase::Program::Codex
+            .reader()
+            .prompt(&rows)
+            .expect("a Codex box");
+        (p, rows)
+    }
+
+    /// Codex's question, read by its answers' roles: a number or an
+    /// answer's exact label (case folded) is that answer's digit, guarded on
+    /// the question's title row; `recommended` is the window's own pick (the
+    /// `(Recommended)` answer); `human` types nothing. Measured on 0.156.1
+    /// and 0.157.1. Negative controls: the last row (`None of the above`)
+    /// asks for the person's own words, a word or a number that names no
+    /// option is free text (`submit` too: there is no review), a text
+    /// priority is the window's policy, and a question whose head is off the
+    /// rows has no title row to guard the digit on.
+    #[test]
+    fn a_codex_question_is_answered_by_an_answers_digit_under_its_title_row() {
+        use aterm_phase::codex::fixtures as cx;
+        for fixture in [cx::QUESTION, cx::QUESTION_0157] {
+            let (p, rows) = codex(fixture);
+            assert!(p.question_dialog.is_none(), "read by its answers' roles");
+            let title = rows
+                .iter()
+                .find(|r| r.trim() == "Question 1/1 (1 unanswered)")
+                .expect("the title row");
+            let digit = |n, said: &str| {
+                Ok(Plan::Digit(Digit {
+                    n,
+                    guard: row_guard(title),
+                    said: said.to_string(),
+                }))
+            };
+            let planned = |answer: &str| plan(&p, &rows, answer, "@s-w");
+            assert_eq!(planned("2"), digit(2, "sub"));
+            assert_eq!(planned(" SUB "), digit(2, "sub"));
+            assert_eq!(
+                planned("subtract (recommended)"),
+                digit(1, "subtract (Recommended)")
+            );
+            assert_eq!(
+                planned("recommended"),
+                digit(1, "Question 1/1 (1 unanswered) → subtract (Recommended)")
+            );
+            assert_eq!(planned("human"), Ok(Plan::Human));
+            for own in ["3", "none of the above"] {
+                let err = planned(own).expect_err(own);
+                assert!(
+                    err.contains("\"None of the above\" asks for the person's own words"),
+                    "{own}: {err}"
+                );
+            }
+            for bad in ["4", "subtract", "whatever you think", "submit"] {
+                let err = planned(bad).expect_err(bad);
+                assert!(
+                    err.contains("names no option: a free-text answer is a person's"),
+                    "{bad}: {err}"
+                );
+            }
+            let err = planned("long-term").expect_err("a policy");
+            assert!(
+                err.contains("meta set questions long-term"),
+                "the session word: {err}"
+            );
+            let cut = aterm_phase::PromptV2 {
+                head_off_screen: true,
+                ..p.clone()
+            };
+            let err = plan(&cut, &rows, "2", "@s-w").expect_err("no title row");
+            assert!(err.contains("head is off the screen"), "{err}");
+        }
+    }
+
+    /// A question read by its answers' roles has a token of its own, over its
+    /// title, its question and its labels: the same on every read, another
+    /// for another question. A dialog's token stays its dialog's. Negative
+    /// control: a box that is no question has none.
+    #[test]
+    fn a_codex_question_has_a_box_token_and_another_box_none() {
+        use aterm_phase::codex::fixtures as cx;
+        let token = prompt_box_token(&codex(cx::QUESTION).0).expect("a question's token");
+        assert_eq!(token.len(), 8);
+        assert_eq!(
+            prompt_box_token(&codex(cx::QUESTION).0),
+            Some(token.clone())
+        );
+        let other = cx::QUESTION.replace("be called?", "be named?");
+        assert_ne!(prompt_box_token(&codex(&other).0), Some(token.clone()));
+        let relabelled = cx::QUESTION.replace("2. sub  ", "2. minus");
+        assert_ne!(prompt_box_token(&codex(&relabelled).0), Some(token));
+        let (claude, _) = read(f::QUESTION_ONE);
+        assert_eq!(
+            prompt_box_token(&claude),
+            claude.question_dialog.as_ref().map(question_box_token)
+        );
+        assert_eq!(prompt_box_token(&codex(cx::BOX_EXEC).0), None);
     }
 }

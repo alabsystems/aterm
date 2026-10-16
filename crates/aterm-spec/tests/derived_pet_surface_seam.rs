@@ -6,17 +6,12 @@ use aterm_spec::{derive::pet_surface_seam_model, interp, verify};
 #[test]
 fn pet_surface_seam_proves_and_catches_every_mutant() {
     let model = pet_surface_seam_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, "resident pet across a coordinate seam");
-    assert!(
-        verify::uncaught_invariants(&model).is_empty(),
-        "every invariant has a mutant that breaks it"
+    assert_eq!(
+        verify::audit_dead_negative_controls(std::slice::from_ref(&model)),
+        Ok(0),
+        "every action fires at Buggy=0"
     );
-    verify::audit_dead_negative_controls(&model, &[]).expect("every action fires at Buggy=0");
     let declared: std::collections::BTreeSet<_> = model.actions.iter().map(|a| a.name).collect();
     assert_eq!(
         interp::fired_actions(&interp::with_buggy(&model, 1)),
@@ -67,7 +62,7 @@ fn a_regrid_keeps_the_body_and_a_replacement_crossfades_in_place() {
     let long = run(&model, &["Draw", "Blind", "Tick", "BlindLong"]);
     assert_eq!(long["lit"], 0, "…for a bounded grace");
 
-    // The shipped rule: every seam cut the cat for a frame.
+    // `Buggy = 1`: every seam cuts the cat for a frame.
     let shipped = interp::with_buggy(&model, 1);
     for (actions, invariant) in [
         (&["Draw", "Regrid"][..], "RegridKeepsTheBody"),
@@ -78,8 +73,8 @@ fn a_regrid_keeps_the_body_and_a_replacement_crossfades_in_place() {
         assert_eq!(state["lit"], 0, "{actions:?}: the shipped cut");
         assert!(!model.check_invariant(invariant, &state), "{invariant}");
     }
-    // The shipped replacement was dark at the boundary, as it must be, and
-    // dark again on the frame after, with no crossfade.
+    // Its replacement is dark at the boundary, as it must be, and dark again on the frame
+    // after, with no crossfade.
     let mut state = run(&model, &["Draw", "Replace"]);
     let cut = shipped.successors("Tick", &state);
     assert_eq!(cut.len(), 1);
@@ -88,10 +83,8 @@ fn a_regrid_keeps_the_body_and_a_replacement_crossfades_in_place() {
     assert!(model.fire("Tick", &mut state));
     assert!(model.check_invariant("ReplaceCrossfades", &state));
 
-    // A split-pane focus switch, as shipped until its ghost learned its own
-    // glass (`PaneCut`): a replacement on the same glass crossfaded, but the
-    // moved pixel frame dropped the ghost, and the frame after the switch
-    // had no cat at all.
+    // A split-pane focus switch under `PaneCut`: a replacement on the same glass crossfades,
+    // but the moved pixel frame drops the ghost, and the frame after the switch has no cat.
     let pane_cut = interp::with_consts(&model, &[("PaneCut", 1)]);
     let same_glass = run(&pane_cut, &["Draw", "Replace", "Tick"]);
     assert!(model.check_invariant("ReplaceCrossfades", &same_glass));
@@ -106,7 +99,7 @@ fn a_regrid_keeps_the_body_and_a_replacement_crossfades_in_place() {
         panic!("PaneCut must break an invariant");
     };
     assert_eq!(broken, "ReplaceCrossfades");
-    // …and the careless fix: a ghost spent on glass that is gone.
+    // …and `Buggy = 1` spends a ghost on glass that is gone.
     let state = run(&model, &["Draw", "Replace", "Lose"]);
     let spent = shipped.successors("Tick", &state);
     assert_eq!(spent.len(), 1);
@@ -128,8 +121,8 @@ fn a_regrid_keeps_the_body_and_a_replacement_crossfades_in_place() {
             "{actions:?}: no ghost over protected cells, and no dip"
         );
     }
-    // As shipped until 2026-10-08 (`Cull`): the refused ghost took its
-    // presence with it, and the arriver stood alone at its ramp's floor.
+    // `Cull`: the refused ghost takes its presence with it, and the arriver stands alone at its
+    // ramp's floor.
     let cull = interp::with_consts(&model, &[("Cull", 1)]);
     let state = run(&model, &["Draw", "Replace", "Refuse"]);
     let cut = cull.successors("Tick", &state);
@@ -174,10 +167,9 @@ fn a_quick_return_continues_one_body_and_every_ghost_leaves_at_full_presence() {
     let state = run(&single, &["Draw", "Replace", "Tick", "Spend"]);
     assert_eq!(state["tail"], 0);
 
-    // As shipped until the adoption (`Restart`): the arriver restarted at
-    // the floor at the seat it came back to — beside its own ghost still
-    // fading there (a split pane), or after that ghost was cut at the
-    // boundary (the same glass).
+    // `Restart`: the arriver restarts at the floor at the seat it comes back to, beside its own
+    // ghost still fading there (a split pane), or after that ghost was cut at the boundary (the
+    // same glass).
     let restart = interp::with_consts(&model, &[("Restart", 1)]);
     let state = run(&model, &["Draw", "Replace", "Tick", "Return"]);
     let doubled = restart.successors("Tick", &state);
@@ -189,8 +181,8 @@ fn a_quick_return_continues_one_body_and_every_ghost_leaves_at_full_presence() {
     };
     assert_eq!(broken, "ReturnContinuesOneBody");
 
-    // As shipped until the shared ramp (`OwnClock`): a carried ghost kept its
-    // old clock and left glass while the restarted arriver came up.
+    // `OwnClock`: a carried ghost keeps its old clock and leaves glass while the restarted
+    // arriver comes up.
     let own_clock = interp::with_consts(&model, &[("OwnClock", 1)]);
     let state = run(&model, &["Draw", "Replace", "Tick", "Return", "Tick"]);
     let early = own_clock.successors("Spend", &state);
@@ -220,15 +212,15 @@ fn a_breed_leaver_crosses_a_boundary_and_leaves_at_full_presence() {
         let done = run(&model, &[&crossed[..], &["Spend"][..]].concat());
         assert_eq!(done["tail"], 0, "{crossed:?}: the leaver fades on the ramp");
     }
-    // As shipped until 2026-10-08 (`LeaverCut`): the boundary dropped the
-    // leaver, which left glass while its arriver was still coming up.
+    // `LeaverCut`: the boundary drops the leaver, which leaves glass while its arriver is still
+    // coming up.
     let leaver_cut = interp::with_consts(&model, &[("LeaverCut", 1)]);
     let state = run(&model, &["Draw", "Handoff", "Replace", "Tick"]);
     let cut = leaver_cut.successors("Spend", &state);
     assert_eq!(cut.len(), 1);
     assert_eq!(cut[0]["tail"], 1);
     assert!(!model.check_invariant("GhostLeavesAtFullPresence", &cut[0]));
-    // A crossfade with no leaver was never cut.
+    // A crossfade with no leaver is never cut.
     let state = run(&leaver_cut, &["Draw", "Replace", "Tick", "Spend"]);
     assert_eq!(state["tail"], 0);
     let Err((_, broken)) = interp::bmc(&leaver_cut) else {

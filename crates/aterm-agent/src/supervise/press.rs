@@ -9,8 +9,10 @@
 //! `short-term`, its policy text written into the free-text row by one fenced
 //! `send`, [`Session::press_question_text`], never with an Enter); a
 //! decline's focus move, Tab, text and Enter ([`Session::press_decline`]:
-//! never a digit, never unfenced); and the survey switch's `0`
-//! ([`Session::dismiss_survey`]).
+//! never a digit, never unfenced); a Codex question's note under a text
+//! word ([`Session::press_codex_note`]: arrows, Tab, the text, Enter, each
+//! decided on a fresh read, never a digit or Esc); and the survey switch's
+//! `0` ([`Session::dismiss_survey`]).
 //!
 //! **What binds the `1` to the box that was judged.** The guard is the
 //! judged row itself, anchored ([`super::super::policy::row_guard`]): the
@@ -37,7 +39,8 @@ use super::super::policy::approval::{
     Answer, AnswerTarget, DeclineStep, QuestionPriority, decline_step,
 };
 use super::super::policy::question::{
-    MAX_QUESTION_FOCUS_STEPS, focus_position, focus_row, option_label, target_focus,
+    MAX_QUESTION_FOCUS_STEPS, NoteStep, focus_position, focus_row, note_step, option_label,
+    roles_question_key, target_focus,
 };
 use super::approval_loop::PendingKind;
 use super::*;
@@ -59,6 +62,28 @@ const MAX_DECLINE_UNSEEN_READS: u32 = 5;
 /// Why a decline is not carried out on a host that stamps no person's input.
 const UNSTAMPED: &str = "this host does not stamp a person's input, and a decline's keystrokes \
                          could cross a person's";
+
+/// The most keystrokes a note takes ([`Session::press_codex_note`]): the
+/// focus moved across a question's answers onto `None of the above` (as far
+/// as a question's focus is ever moved, [`MAX_QUESTION_FOCUS_STEPS`]), then
+/// Tab, the text and Enter.
+const MAX_NOTE_STEPS: u32 = MAX_QUESTION_FOCUS_STEPS + 3;
+
+/// Why a note is not written on a host that stamps no person's input.
+const UNSTAMPED_NOTE: &str = "this host does not stamp a person's input, and a note's keystrokes \
+                              could cross a person's";
+
+/// What a note's keystroke is judged landed by: the focused answer's index
+/// and the notes field's text (`None` while it is closed).
+type NoteState = (Option<usize>, Option<String>);
+
+/// The state of the question `q` read from `rows` ([`NoteState`]).
+fn note_state(q: &aterm_phase::PromptV2, rows: &[String]) -> NoteState {
+    (
+        q.options.iter().position(|o| o.focused),
+        aterm_phase::codex::question_notes(rows).map(|n| n.text),
+    )
+}
 
 /// What makes a box the same box for a decline ([`Session::press_decline`]):
 /// its kind, whether its head is off the screen, its command, and the
@@ -884,6 +909,13 @@ impl<C: Ctl> Session<'_, C> {
     /// [`Pressing::Refused`]; every other `ERR` (`no such session`,
     /// `badregex`) is an error, never an approval.
     ///
+    /// Under [`Fence::Required`] nothing is pressed without the generation
+    /// fence: a host that does not name it, a read that carried no generation,
+    /// or a fenced key the host turns away (a usage line, a bare `ERR`) is
+    /// [`Pressing::Unconfirmed`] (no retry), the fence never dropped and no
+    /// fallback taken — either downgrade refused, since a question's title
+    /// alone cannot tell successive questions with the same heading apart.
+    ///
     /// A lost connection is [`Pressing::Lost`]: a press whose answer never
     /// came is not an approval, and is not sent again as it was; the loop
     /// rides the connection out, then reads and decides again
@@ -896,7 +928,19 @@ impl<C: Ctl> Session<'_, C> {
         guard: &str,
         digit: &str,
         seen: &Screen,
+        need: Fence,
     ) -> Result<Pressing, Fail> {
+        let unfenced = |turned_away: Option<String>| {
+            let mut why =
+                "this host cannot fence a question's key on the screen generation".to_string();
+            if let Some(said) = turned_away {
+                why.push_str(&format!(": {said}"));
+            }
+            Ok(Pressing::Unconfirmed { why, retry: false })
+        };
+        if need == Fence::Required && self.caps.key_if == Some(false) {
+            return unfenced(None);
+        }
         if self.caps.key_if != Some(false) {
             // The fence needs both halves: a host that names it (`help key`,
             // asked once) and a read that carried the generation it names.
@@ -905,6 +949,9 @@ impl<C: Ctl> Session<'_, C> {
             } else {
                 None
             };
+            if need == Fence::Required && fence.is_none() {
+                return unfenced(None);
+            }
             loop {
                 let args = super::super::policy::key_args(guard, digit, fence.as_deref());
                 let mut words: Vec<&str> = vec!["key"];
@@ -934,6 +981,15 @@ impl<C: Ctl> Session<'_, C> {
                     return Ok(Pressing::Refused { why });
                 }
                 if r.unknown_form() {
+                    if need == Fence::Required {
+                        // Turned away: nothing was written, and nothing is
+                        // pressed without the fence.
+                        return unfenced(Some(format!(
+                            "`key {args}` was answered `{}`, and nothing was pressed without \
+                             the fence",
+                            r.err_text()
+                        )));
+                    }
                     if fence.take().is_some() {
                         // The fence is what it did not know: the row guard
                         // alone, from now on.
@@ -945,6 +1001,11 @@ impl<C: Ctl> Session<'_, C> {
                 }
                 return Err(Fail::Hard(why));
             }
+        }
+        if need == Fence::Required {
+            // Never reached (each way out of the fenced loop above returns
+            // under `Required`), and never the unfenced fallback if it were.
+            return unfenced(None);
         }
         let now = self.screen()?;
         let reader = self.reader(&now.rows);
@@ -1036,10 +1097,11 @@ impl<C: Ctl> Session<'_, C> {
     ///
     /// `person`: the person count of the read the dialog was judged on, for
     /// a press whose EVERY key is fenced on it as well (`key if-human=<n>
-    /// …`: the usage-limit dialog's grant row) — a person who keyed since
-    /// that read skips the key, arrow or answer (`OK skipped reason=person`),
-    /// and the dialog is decided again under their hold. `None`: the keys
-    /// every other focus press writes.
+    /// …`: the usage-limit dialog's grant row, and the folder-trust dialog's
+    /// keys) — a person who keyed since that read skips the key, arrow or
+    /// answer (`OK skipped reason=person`, [`Press::Yielded`]), and the
+    /// dialog is decided again under their hold. `None`: the keys every other
+    /// focus press writes.
     ///
     /// [`Session::focus_key_tried`] says, for a press that was lost, whether
     /// the answering key had been reached: an arrow chooses nothing.
@@ -1103,6 +1165,10 @@ impl<C: Ctl> Session<'_, C> {
                 return Ok(p);
             }
             let at = r.seq().unwrap_or(now.seq);
+            // A person keyed since the read the key is fenced on: theirs.
+            if r.skipped_person() {
+                return Ok(Pressing::Done(Press::Yielded { seq: at }));
+            }
             if r.skipped_changed() {
                 return Ok(Pressing::Done(Press::Changed { seq: at }));
             }
@@ -1150,7 +1216,9 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(p);
         }
         let at = r.seq().unwrap_or(now.seq);
-        Ok(Pressing::Done(if r.skipped_changed() {
+        Ok(Pressing::Done(if r.skipped_person() {
+            Press::Yielded { seq: at }
+        } else if r.skipped_changed() {
             Press::Changed { seq: at }
         } else if r.skipped() {
             Press::Skipped { seq: at }
@@ -1346,6 +1414,190 @@ impl<C: Ctl> Session<'_, C> {
             self.wait(&["idle", SETTLE_MS], SETTLE_CAP)?;
             now = self.screen()?;
         }
+    }
+
+    /// A Codex question's NOTE under a text word (`Choice::Note`, decided by
+    /// `policy/question.rs`'s `note_answer`): the keystrokes [`note_step`]
+    /// decides on each fresh read — the focus moved onto `None of the above`
+    /// with arrows (a digit answers at once), Tab to open its notes field,
+    /// the word's fixed text in one fenced `send` ([`Self::question_text`],
+    /// which remembers it as the loop's own), and Enter once a read shows the
+    /// field holding exactly that text — every key `key [if-human=<the read's
+    /// person count>] if-gen=<the read> if=<the row as drawn> <key>`, one in
+    /// flight: each one's effect seen on a settled read before the next.
+    ///
+    /// * **Never Esc, never Tab in an open field, never a digit**: Esc or Tab
+    ///   there clears the text (measured on 0.163.0), Esc on the dialog
+    ///   interrupts the turn, and a digit answers before any note.
+    /// * **Never written twice.** A keystroke a read does not show yet is
+    ///   waited on (a read like the one it was decided on), up to
+    ///   [`MAX_DECLINE_UNSEEN_READS`] reads, a text drawing in (a strict
+    ///   prefix of it) the same; then handed over ([`Pressing::Unconfirmed`]).
+    ///   A Tab whose field never read open latches the question's FALLBACK
+    ///   ([`approval_loop::QuestionMemory::fell_back`], `NOTES_UNREAD`) and
+    ///   is [`Press::Changed`]: the next decision answers it with its
+    ///   recommended answer while the field reads closed. The text is the
+    ///   loop's own only while it remembers writing it
+    ///   ([`approval_loop::QuestionMemory::typed`]); an Enter on it goes once
+    ///   per question ([`approval_loop::QuestionMemory::note_entered`]).
+    /// * **A person's hand wins**: a read whose stamp says a person keyed
+    ///   within `grace` is [`Press::Yielded`]; a host that stamps nothing, or
+    ///   fences no key or send on the screen generation, writes nothing.
+    ///
+    /// A question gone from a read, or another question there, is
+    /// [`Press::Changed`]: decided again. [`Press::Pressed`] is the Enter,
+    /// written.
+    pub(super) fn press_codex_note(
+        &mut self,
+        priority: QuestionPriority,
+        seen: &Screen,
+        grace: Duration,
+    ) -> Result<Pressing, Fail> {
+        let unconfirmed = |why: &str| {
+            Ok(Pressing::Unconfirmed {
+                why: why.to_string(),
+                retry: false,
+            })
+        };
+        let Some(text) = priority.text() else {
+            return unconfirmed("the recommended policy writes no note");
+        };
+        if self.caps.key_if == Some(false)
+            || !self.gen_fence_known()?
+            || !self.send_fence_known()?
+        {
+            return unconfirmed("this host cannot fence a keystroke on the screen generation");
+        }
+        let program = self.program.clone();
+        let question_on = move |rows: &[String]| {
+            aterm_phase::read(program.as_deref(), rows, None)
+                .prompt
+                .filter(|p| {
+                    p.kind == aterm_phase::PromptKind::Question && p.question_dialog.is_none()
+                })
+        };
+        let Some(first) = question_on(&seen.rows) else {
+            return Ok(Pressing::Done(Press::Skipped { seq: seen.seq }));
+        };
+        let key = roles_question_key(&first);
+        let mut now = seen.clone();
+        let mut written = 0;
+        // The keystroke last written, and the question as it was read when
+        // that keystroke was decided.
+        let mut last: Option<(NoteStep, NoteState)> = None;
+        let mut unseen = 0;
+        loop {
+            let Some(q) = question_on(&now.rows).filter(|q| roles_question_key(q) == key) else {
+                return Ok(Pressing::Done(Press::Changed { seq: now.seq }));
+            };
+            let state = note_state(&q, &now.rows);
+            if let Some((step, was)) = &last {
+                let drawing = matches!(step, NoteStep::Type { .. })
+                    && state
+                        .1
+                        .as_deref()
+                        .is_some_and(|t| t.len() < text.len() && text.starts_with(t));
+                if *was == state || drawing {
+                    unseen += 1;
+                    if unseen > MAX_DECLINE_UNSEEN_READS {
+                        if matches!(step, NoteStep::Open { .. }) {
+                            self.question.fell_back.insert(key);
+                            return Ok(Pressing::Done(Press::Changed { seq: now.seq }));
+                        }
+                        return unconfirmed(&format!(
+                            "the question did not show the {} the note wrote, and a keystroke is \
+                             never written twice",
+                            step.name()
+                        ));
+                    }
+                    self.wait(&["seq", &now.seq.to_string()], STRAY_SETTLE)?;
+                    self.wait(&["idle", SETTLE_MS], SETTLE_CAP)?;
+                    now = self.screen()?;
+                    continue;
+                }
+            }
+            unseen = 0;
+            let own = self.question.typed.get(&key).copied();
+            let step = match note_step(&q, &now.rows, priority, own) {
+                Ok(step) => step,
+                Err(why) => return unconfirmed(&why),
+            };
+            match now.human {
+                HumanInput::Unknown => return unconfirmed(UNSTAMPED_NOTE),
+                human if !person_quiet(human, grace) => {
+                    return Ok(Pressing::Done(Press::Yielded { seq: now.seq }));
+                }
+                _ => {}
+            }
+            if written >= MAX_NOTE_STEPS {
+                return unconfirmed("the note took more keystrokes than a question has rows");
+            }
+            let enter = matches!(step, NoteStep::Enter { .. });
+            if enter && self.question.note_entered.as_deref() == Some(key.as_str()) {
+                return unconfirmed(
+                    "the note was entered once and the question still holds it: an Enter is \
+                     never sent twice",
+                );
+            }
+            let Some(generation) = now.generation.clone() else {
+                return unconfirmed("the read carried no screen generation to fence on");
+            };
+            let person = now.human_seq.map(|n| format!("if-human={n}"));
+            let keyed = match &step {
+                NoteStep::Type { guard } => {
+                    self.question_text(guard, text, &now, &key, priority)?
+                }
+                NoteStep::Move { down, guard } => {
+                    let arrow = if *down { "down" } else { "up" };
+                    let (r, args) =
+                        self.fenced_key(guard, arrow, &generation, person.as_deref())?;
+                    self.note_keyed(&r, &args, now.seq)?
+                }
+                NoteStep::Open { guard } => {
+                    let (r, args) =
+                        self.fenced_key(guard, "tab", &generation, person.as_deref())?;
+                    self.note_keyed(&r, &args, now.seq)?
+                }
+                NoteStep::Enter { guard } => {
+                    let (r, args) =
+                        self.fenced_key(guard, "enter", &generation, person.as_deref())?;
+                    self.note_keyed(&r, &args, now.seq)?
+                }
+            };
+            let at = match keyed {
+                Keyed::Written(at) => at,
+                Keyed::Not(p) => {
+                    // An Enter whose answer never came may have been written.
+                    if enter && matches!(p, Pressing::Lost { .. }) {
+                        self.question.note_entered = Some(key);
+                    }
+                    return Ok(p);
+                }
+            };
+            written += 1;
+            if enter {
+                self.question.note_entered = Some(key);
+                return Ok(Pressing::Done(Press::Pressed { seq: at }));
+            }
+            last = Some((step, state));
+            // Its effect drawn and settled, then read.
+            self.wait(&["seq", &at.to_string()], STRAY_SETTLE)?;
+            self.wait(&["idle", SETTLE_MS], SETTLE_CAP)?;
+            now = self.screen()?;
+        }
+    }
+
+    /// A note's fenced key ([`Self::press_codex_note`]) as [`Keyed`]: refused
+    /// ([`Self::refused_press`]; one whose answer never came latches the
+    /// dialog's word, as it may have been written), skipped, or written.
+    fn note_keyed(&mut self, r: &CtlReply, args: &str, seen: u64) -> Result<Keyed, Fail> {
+        if let Some(p) = self.refused_press(r, args)? {
+            if matches!(p, Pressing::Lost { .. }) {
+                self.latch_question_word();
+            }
+            return Ok(Keyed::Not(p));
+        }
+        Ok(self.written_or_not(r, seen))
     }
 
     /// `key [if-human=<n>] if-gen=<generation> if=<guard> <key>`: the

@@ -26,25 +26,14 @@ fn title_stack_targets(params: &[u16]) -> (bool, bool) {
 }
 
 impl TerminalHandler<'_> {
-    /// Handle XTWINOPS (`CSI Ps ; Ps ; Ps t`).
-    ///
-    /// Manipulation goes through the platform callback; title push/pop and
-    /// some reports are handled in-core.
-    ///
-    /// The window-operations mint authority is consulted once per dispatch
-    /// against the host's `allow_window_ops`. When authorized, a
-    /// [`WindowOpsCapability`] is minted and passed to the handlers that call
-    /// [`TerminalHandler::invoke_window_callback`]; otherwise no capability
-    /// exists and those paths are unreachable. `response_cap` separately gates
-    /// the report subcommands' `send_response` calls. Title-stack operations
-    /// (CSI 22t / 23t) need no capability.
-    ///
-    /// See [`super::window_auth`] and [`super::response_capability`].
+    /// Handle XTWINOPS (`CSI Ps ; Ps ; Ps t`). A [`WindowOpsCapability`] is
+    /// minted once per dispatch (a matching policy rule wins over
+    /// `allow_window_ops`); without one, manipulation and reports are
+    /// unreachable. `response_cap` separately gates the replies. The title stack
+    /// (22/23 t) needs no capability. See [`super::window_auth`].
     pub(super) fn handle_xtwinops(&mut self, response_cap: &ResponseCapability, params: &[u16]) {
         let ps = params.first().copied().unwrap_or(0);
         let mint_authority = WindowMintAuthority::new();
-        // With a policy installed, a matching rule wins over the
-        // `allow_window_ops` bool; otherwise the bool decides.
         let window_cap = mint_authority
             .try_mint_with_engine(self.policy.xtwinops_gate(ps), self.modes.allow_window_ops);
 
@@ -57,10 +46,9 @@ impl TerminalHandler<'_> {
                 }
             }
             None => {
-                // No capability: drop manipulation (1-10), geometry/position/size
-                // queries (11-19) and title reports (20-21), which change host
-                // window state or leak information for fingerprinting. Only the
-                // title stack (22-23) proceeds: it touches neither the callback
+                // No capability: drop 1-21 (manipulation, geometry queries, title
+                // reports), which change host window state or leak data for
+                // fingerprinting. The title stack touches neither the callback
                 // nor the PTY.
                 if let 1..=21 = ps {
                     return;
@@ -86,10 +74,6 @@ impl TerminalHandler<'_> {
         params: &[u16],
         cap: &WindowOpsCapability,
     ) -> bool {
-        // Subcommands 1-2 (iconify/de-iconify), 3 (move), 4 (resize pixels),
-        // 8 (resize cells), 9 (maximize) and 10 (fullscreen) let a remote program
-        // manipulate the window: move is denied and resizes are clamped to safe
-        // minimums. The unauthorized case never reaches this function.
         match ps {
             1 => {
                 self.invoke_window_callback(WindowOperation::DeIconify, cap);
@@ -161,24 +145,20 @@ impl TerminalHandler<'_> {
         true
     }
 
-    /// Dispatch XTWINOPS report subcommands (11-21). Reached only with a minted
-    /// [`WindowOpsCapability`]; `response_cap` gates the replies.
+    /// Dispatch XTWINOPS reports (11-21); `response_cap` gates the replies.
     ///
-    /// A report needs a synchronous value. The GUI's window callback declines
-    /// every report (its window ops post an async wake, which cannot carry a
-    /// reply), so a report is answered only from state the engine holds:
-    ///
+    /// A report needs a synchronous value, and the GUI's window callback declines
+    /// every report (its window ops post an async wake), so the engine answers
+    /// from state it holds when the callback does not:
     /// - `18 t` (text area in cells): the grid.
-    /// - `14 t` (text area in pixels) and `16 t` (cell size in pixels): the grid
-    ///   and the cell box the host reported via
-    ///   [`super::Terminal::set_cell_pixel_size`]; silent until reported (see
-    ///   [`Self::report_cell_size_pixels`]).
-    /// - `20 t` / `21 t` (icon label, window title): the engine's title state.
+    /// - `14 t` (text area in pixels) and `16 t` (cell in pixels): the grid and
+    ///   the cell box from [`super::Terminal::set_cell_pixel_size`]; silent until
+    ///   reported.
+    /// - `20 t` / `21 t`: the engine's icon label and window title.
     ///
-    /// The rest have no in-core truth and stay silent: `11 t` window state,
-    /// `13 t` position, `14 ; 2 t` whole-window pixels (padding and decoration
-    /// unknown), `15 t` / `19 t` screen size. An unanswered query lets an app
-    /// fall back; a fabricated number cannot be told from a real one.
+    /// The rest have no in-core answer: `11 t` state, `13 t` position, `14 ; 2 t`
+    /// whole-window pixels, `15 t` / `19 t` screen size. An unanswered query lets
+    /// an app fall back; a fabricated number cannot be told from a real one.
     fn handle_window_reports(
         &mut self,
         response_cap: &ResponseCapability,
@@ -339,12 +319,10 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// CSI 16 t: the size of one character cell in pixels, which image-capable
-    /// TUIs use to size pictures in rows; answered from the cell box the host
-    /// reported via [`super::Terminal::set_cell_pixel_size`].
-    ///
-    /// Silent while nothing has been reported: the engine's 8x16 placeholder
-    /// (used for inline-image footprints) is not a measurement.
+    /// CSI 16 t: one cell in pixels (image-capable TUIs size pictures with it),
+    /// from the cell box the host reported via
+    /// [`super::Terminal::set_cell_pixel_size`]. Silent until then: the engine's
+    /// 8x16 placeholder (for inline-image footprints) is not a measurement.
     fn report_cell_size_pixels(
         &mut self,
         response_cap: &ResponseCapability,
@@ -477,8 +455,8 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Filter a title for reporting: strip escape sequences and control
-    /// characters against title injection.
+    /// Filter a title for reporting: strip control characters (ESC included)
+    /// against title injection.
     fn filter_title_for_report(title: &str) -> String {
         title.chars().filter(|c| !c.is_control()).collect()
     }
@@ -651,13 +629,9 @@ mod tests {
         );
     }
 
-    // =====================================================================
-    // XTWINOPS pixel reports
-    //
-    // 14t/16t are what image-capable TUIs ask before sizing a picture. The GUI
-    // host declines every callback report, so these answer from the grid and
-    // the host's reported cell box, and stay silent without one.
-    // =====================================================================
+    // XTWINOPS pixel reports (14t/16t), which image-capable TUIs ask before
+    // sizing a picture: the GUI host declines callback reports, so these answer
+    // from the grid and the host's cell box, and stay silent without one.
 
     /// A window with `allow_window_ops` alone — no window callback, exactly
     /// the shape of a real GUI session, whose callback declines reports.

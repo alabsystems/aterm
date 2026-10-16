@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared `0x00RRGGBB` color math for the sparkle-words v2 effects
-//! (docs/sparkle-words-v2-design.md §4.2/§4.3/§6.4/§6.5): the ink-pair hue
-//! nudge, HSV round-trip, and WCAG relative luminance.
-//!
-//! A leaf module so `nova.rs` and the host can use it without depending on
+//! Shared `0x00RRGGBB` color math: HSV round-trip, the sparkle-words v2 ink-pair
+//! hue nudge (docs/sparkle-words-v2-design.md §4.2/§4.3/§6.4/§6.5), and WCAG
+//! relative luminance. A leaf module, so its users need not depend on
 //! `word_decorations.rs`.
 
 /// Rotate a `0x00RRGGBB` color's hue by the §4.2 nudge code (`0..=15` →

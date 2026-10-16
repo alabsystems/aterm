@@ -1,6 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
+#[path = "vendor_plan_effects_tests.rs"]
+mod vendor_plan_effects;
+
 /// THE PRODUCTION HALF of `cli.rs`, for the source scans below.
 ///
 /// This module lives in `cli_tests.rs`, declared out of line at the end of `cli.rs`
@@ -3255,6 +3258,13 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
     assert!(!line.contains("consent"), "{line}");
     assert!(line.contains("the next pass installs it"), "{line}");
     let _ = std::fs::remove_file(layout.shim(&crate::store::ToolName::new("codex").unwrap()));
+    // A COMMAND's stub names the program whose install lays it.
+    crate::stub::write_pending_stub(&layout, &crate::store::ToolName::new("targo").unwrap())
+        .unwrap();
+    let line = which_line(&layout, "targo", Some(&managed_only)).unwrap();
+    assert!(line.starts_with("targo → "), "{line}");
+    assert!(line.ends_with("(now: aterm pkg install trust)"), "{line}");
+    let _ = std::fs::remove_file(layout.shim(&crate::store::ToolName::new("targo").unwrap()));
     // A recorded non-shim state reads back verbatim.
     let unserved = crate::state::unavailable("x86_64-unknown-linux-gnu", "macOS only");
     record_status(
@@ -3506,10 +3516,6 @@ fn a_rolled_back_row_records_what_happened_and_which_prints_it() {
     assert_eq!(words, "managed 7345 — rolled back from 8606");
     assert!(crate::state::is_managed(&words));
     assert_eq!(crate::state::managed_pin(&words), None, "no pin is claimed");
-    assert!(
-        crate::vendor_direct::retired_wording(&words).is_none(),
-        "no retired index wording: {words}"
-    );
     let layout = temp_layout("rolled-back-row");
     let row = crate::ProgramStatus {
         installed_build: Some(7345),
@@ -3622,7 +3628,7 @@ fn default_set_disk_refusal_names_the_peak_its_gates_enforce() {
         ],
     );
     let units = [rustc.clone()];
-    let r = set_disk_refusal(&units, 4 * GIB, prefix).expect("refuses");
+    let r = set_disk_refusal(&units, 0, 4 * GIB, prefix).expect("refuses");
     // The figures are the contract: the peak need, what is free, the
     // shortfall, the volume — and no `install` offered for a tuple member.
     for figure in ["5.4 GiB", "4.0 GiB", "1.4 GiB", "/Users//x/.aterm"] {
@@ -3639,13 +3645,45 @@ fn default_set_disk_refusal_names_the_peak_its_gates_enforce() {
     );
     // Freed to exactly the need: the set passes, and so does the gate it stands for.
     let need = crate::flow::peak_need([rustc.bytes]) + crate::cost::FREE_FLOOR;
-    assert!(set_disk_refusal(&units, need, prefix).is_none());
+    assert!(set_disk_refusal(&units, 0, need, prefix).is_none());
     assert!(crate::cost::disk_ok(
         rustc.bytes.need(),
         need,
         crate::cost::FREE_FLOOR
     ));
-    assert!(set_disk_refusal(&units, need - 1, prefix).is_some());
+    assert!(set_disk_refusal(&units, 0, need - 1, prefix).is_some());
+}
+
+/// AGENTS LANDING BESIDE THE SET ARE IN ITS FIGURE. A set that fits by itself, beside
+/// agents that need 2 GiB at once and fit by themselves, is refused when the volume cannot
+/// hold both at the same time — the line names the joint need and why — and passes at
+/// exactly that need.
+#[test]
+fn default_set_disk_refusal_counts_the_agents_landing_beside_it() {
+    let prefix = std::path::Path::new("/Users//x/.aterm");
+    let units = [unit(None, &[("ay", 2 * GIB, GIB)])];
+    let set = crate::flow::peak_need(units.iter().map(|u| u.bytes));
+    let have = set + crate::cost::FREE_FLOOR + GIB;
+    assert!(
+        set_disk_refusal(&units, 0, have, prefix).is_none(),
+        "the set fits alone"
+    );
+    assert!(
+        crate::cost::disk_ok(2 * GIB, have, crate::cost::FREE_FLOOR),
+        "and so do the agents"
+    );
+    let r = set_disk_refusal(&units, 2 * GIB, have, prefix).expect("not both at once");
+    let need = crate::cost::human_bytes(set + 2 * GIB + crate::cost::FREE_FLOOR);
+    assert!(
+        r.line.contains(&format!(
+            "needs {need} with the agents installing beside it"
+        )),
+        "{}",
+        r.line
+    );
+    let joint = set + 2 * GIB + crate::cost::FREE_FLOOR;
+    assert!(set_disk_refusal(&units, 2 * GIB, joint, prefix).is_none());
+    assert!(set_disk_refusal(&units, 2 * GIB, joint - 1, prefix).is_some());
 }
 
 /// The offer is a unit whose own gate passes: an ungrouped program whose archive and
@@ -3657,7 +3695,7 @@ fn default_set_disk_refusal_offers_only_an_ungrouped_program_its_gate_admits() {
     let prefix = std::path::Path::new("/Users//x/.aterm");
     let ay = unit(None, &[("ay", 5 * GIB / 2, GIB)]);
     let trust = unit(None, &[("trust", 4 * GIB, GIB)]);
-    let r = set_disk_refusal(&[ay.clone(), trust], 4 * GIB, prefix).expect("refuses");
+    let r = set_disk_refusal(&[ay.clone(), trust], 0, 4 * GIB, prefix).expect("refuses");
     assert!(!r.line.contains("aterm pkg install"), "{}", r.line);
     assert_eq!(
         r.rows[0],
@@ -3669,7 +3707,7 @@ fn default_set_disk_refusal_offers_only_an_ungrouped_program_its_gate_admits() {
         &[("trust", 3 * GIB, GIB), ("trust-cg", 100 * MIB, 50 * MIB)],
     );
     let ty = unit(None, &[("ty", 300 * MIB, 100 * MIB)]);
-    let r = set_disk_refusal(&[rustc.clone(), ty], 4 * GIB, prefix).expect("refuses");
+    let r = set_disk_refusal(&[rustc.clone(), ty], 0, 4 * GIB, prefix).expect("refuses");
     assert!(
         r.line
             .ends_with(", or install ty alone: aterm pkg install ty"),
@@ -3698,7 +3736,7 @@ fn default_set_disk_refusal_offers_only_an_ungrouped_program_its_gate_admits() {
         ],
     );
     let trust = unit(None, &[("trust", 4 * GIB, GIB)]);
-    let r = set_disk_refusal(&[small, trust.clone()], 4 * GIB, prefix).expect("refuses");
+    let r = set_disk_refusal(&[small, trust.clone()], 0, 4 * GIB, prefix).expect("refuses");
     assert!(!r.line.contains("aterm pkg install"), "{}", r.line);
     assert_eq!(
         r.rows[2],
@@ -3738,7 +3776,7 @@ fn a_refused_set_rewrites_every_member_row_and_spares_a_held_one() {
         }),
     })
     .expect("every landing unit is known");
-    let r = set_disk_refusal(&units, 5 * GIB, prefix).expect("7 GiB on 5 GiB refuses");
+    let r = set_disk_refusal(&units, 0, 5 * GIB, prefix).expect("7 GiB on 5 GiB refuses");
     assert!(
         r.line
             .ends_with("free 3.0 GiB, or install ay alone: aterm pkg install ay"),
@@ -3803,10 +3841,10 @@ fn set_units_leave_out_the_units_the_pass_lands_nothing_of() {
             },
         }]
     );
-    assert!(set_disk_refusal(&units, have, prefix).is_none());
+    assert!(set_disk_refusal(&units, 0, have, prefix).is_none());
     // The same tuple counted: the set refuses — what leaving it out spares.
     let units = set_units(&planned, lands(bytes(4 * GIB))).expect("all known");
-    assert!(set_disk_refusal(&units, have, prefix).is_some());
+    assert!(set_disk_refusal(&units, 0, have, prefix).is_some());
     assert_eq!(
         units[1],
         SetUnit {
@@ -3886,16 +3924,6 @@ fn pin_unpin_and_dev_linked_lines_are_exact() {
         dev_linked_line("ay"),
         "atpkg: ay is dev-linked; run `aterm pkg unlink ay` to install ALab's build"
     );
-    for line in [
-        pin_line("claude", v, true, true, PinPeers::Alone),
-        pin_line("claude", v, false, true, PinPeers::Alone),
-        dev_linked_line("claude"),
-    ] {
-        assert!(
-            crate::vendor_direct::retired_wording(&line).is_none(),
-            "no retired index wording, no store id: {line}"
-        );
-    }
 }
 
 /// A coherence-group member is held by ANY member's pin: the update pass's group gate
@@ -4263,7 +4291,7 @@ fn cmd_selfupdate_refuses_forwards_and_never_takes_the_lock() {
     // which nothing in this repo bounds. Measured 2026-09-24 with other agents
     // building: 0.2–3.5 s for a new file's first `exec` against under 11 ms for its
     // second, and this lane up to 5.7 s end to end for its 1 s wait, every slow run
-    // silent on `lock-waiting:`. A gate run met 26 s — `seed-busy:`, no
+    // silent on `lock-waiting:`. A loaded test run met 26 s — `seed-busy:`, no
     // `lock-waiting:` — against the 20 s ceiling this lane used to put on `elapsed`,
     // and 21 s of delay put in front of the child's `exec` reproduces that failure
     // exactly: a wait that ended on time, failed for process creation. The child's
@@ -4502,7 +4530,7 @@ fn which_names_the_self_update_switch_as_a_trailing_fix_line() {
     let landing_only = crate::platform::sh_landing_prelude(
         "claude",
         &layout.prefix,
-        &layout.landing_marker(&claude_tool),
+        &layout.landing_dir().join(claude_tool.as_str()),
         &crate::stub::co_located_atpkg_path(),
     );
     crate::platform::install_twin_to_env(&twin, &target, &env, &landing_only).unwrap();
@@ -4643,18 +4671,13 @@ fn the_hand_over_predicate_reads_the_sh_block_and_never_the_cmd_twin_or_bin() {
     let cmd_target = Path::new(
         "C:\\Program Files (x86)\\aterm\\pkg\\store\\claude\\2026091601\\bin\\claude.exe",
     );
-    let cmd_prelude =
-        crate::platform::cmd_selfupdate_prelude("claude", cmd_prefix, cmd_atpkg, verbs);
-    assert!(
-        !twin_carries_hand_over(
-            crate::platform::cmd_shim_content_twin(cmd_target, &env, &cmd_prelude).as_bytes()
-        ),
-        "the .cmd twin renders no block, so the sentence is never claimed on Windows"
-    );
-    let mut older_cmd_prelude = cmd_prelude.clone();
-    older_cmd_prelude.push_str(&crate::platform::cmd_landing_prelude(
-        "claude", cmd_prefix, cmd_marker, cmd_atpkg,
+    // The `.cmd` twin renders no block (`twin_prelude`'s Windows arm is empty), so the
+    // sentence is never claimed on Windows — nor over an older twin's landing block.
+    assert!(!twin_carries_hand_over(
+        crate::platform::cmd_shim_content_twin(cmd_target, &env, "").as_bytes()
     ));
+    let older_cmd_prelude =
+        crate::platform::cmd_landing_prelude("claude", cmd_prefix, cmd_marker, cmd_atpkg);
     assert!(!twin_carries_hand_over(
         crate::platform::cmd_shim_content_twin(cmd_target, &env, &older_cmd_prelude).as_bytes()
     ));
@@ -7130,7 +7153,10 @@ fn lane_refuses_stock_rust_and_reads_the_command_after_the_separator() {
 /// signed index (a metered releases listing, verification, a floor record — under the
 /// store lock) BEFORE asking whether anything was installed, though for a non-empty
 /// store both outcomes printed the same line. The resolve now runs only for an empty
-/// store, where its verdict is the point.
+/// store a typed `aterm pkg seed` asks about, where its verdict is the point: the
+/// window's own seed (`--wait-lock`) never resolves, since the update right behind it
+/// says the same verdict (`a_window_seed_asks_no_index_and_a_typed_one_does`, in
+/// `tests/seed_disabled.rs`, drives both at the process edge).
 #[test]
 fn the_seedless_lane_resolves_the_index_only_for_an_empty_store() {
     use std::cell::Cell;
@@ -7191,9 +7217,13 @@ fn the_seedless_lane_resolves_the_index_only_for_an_empty_store() {
         "report_seedless_posture must decide through seedless_serves_us: {body}"
     );
     let call = &routed[0];
+    assert!(
+        body.contains("let served_without_index = !crate::active_builds(layout).is_empty()"),
+        "the store question is the shim view: {body}"
+    );
     let holds = call
-        .find("!crate::active_builds(layout).is_empty()")
-        .expect("the store-holds-builds argument is the shim view");
+        .find("served_without_index")
+        .expect("the store question is the first argument");
     let fetcher = call
         .find("resolve_fetcher(layout)")
         .expect("the fetcher is built inside the call");
@@ -7214,6 +7244,51 @@ fn the_seedless_lane_resolves_the_index_only_for_an_empty_store() {
              store question"
         );
     }
+}
+
+/// THE SEED NEVER CALLS A MACHINE EMPTY-HANDED WHILE A VENDOR-DIRECT PROGRAM IS STILL TO
+/// LAND (2026-10-15, measured on a scratch store): agy and muse are in no index, so an
+/// `exclude` naming every index program and claude and codex left `seed_serviceable` empty,
+/// and the first launch said `seed-unusable: [packages].exclude narrows the toolset to
+/// nothing installable` while the pass right behind it installed both.
+#[test]
+fn a_wanted_vendor_program_serves_the_seed_without_the_index() {
+    let darwin = "aarch64-apple-darwin";
+    let none = std::collections::BTreeSet::new();
+    let excluding = |names: Vec<String>| crate::config::PackagesConfig {
+        exclude: Some(names),
+        ..Default::default()
+    };
+    let programs = || {
+        crate::vendor_direct::VENDORS
+            .iter()
+            .map(|s| s.program.to_string())
+    };
+    assert!(vendor_set_wanted_on(
+        darwin,
+        &crate::config::PackagesConfig::default(),
+        &none
+    ));
+    // Every vendor program excluded: the index alone answers.
+    assert!(!vendor_set_wanted_on(
+        darwin,
+        &excluding(programs().collect()),
+        &none
+    ));
+    // One left still serves; an uninstall takes it out as an exclude does.
+    let all_but_muse = excluding(programs().filter(|p| p != "muse").collect());
+    assert!(vendor_set_wanted_on(darwin, &all_but_muse, &none));
+    assert!(!vendor_set_wanted_on(
+        darwin,
+        &all_but_muse,
+        &std::collections::BTreeSet::from(["muse".to_string()])
+    ));
+    // Off darwin Meta's binary is unserved: wanted there, it promises nothing.
+    assert!(!vendor_set_wanted_on(
+        "x86_64-unknown-linux-gnu",
+        &all_but_muse,
+        &none
+    ));
 }
 
 /// THE WINDOW'S OWN PASS IS NOT TOLD TO INSTALL WHAT IT IS INSTALLING (2026-09-23
@@ -7747,9 +7822,9 @@ fn the_network_lane_names_the_size_and_the_off_switches() {
     // The GUI strips exactly this prefix…
     assert!(
         line.starts_with(&format!(
-            "atpkg: {NET_STARTING_MARKER}installing {} program(s) over the network: ay, \
-             claude, ",
-            set.len()
+            "atpkg: {NET_STARTING_MARKER}installing {} program(s) over the network: {} — ",
+            set.len(),
+            set.join(", ")
         )),
         "{line}"
     );
@@ -8230,21 +8305,13 @@ fn read_only_paths_need_no_store_lock() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// REGRESSION: no ambient state may supply the verification anchor.
-///
-/// `ATPKG_ROOTKEY_OVERRIDE` used to swap which root key anchored verification,
-/// and could supply one to a build that had none — an environment variable
-/// deciding trust. The anchor is now the committed paper-master keyset and only
-/// that, so setting the old variable must change nothing.
+/// The committed paper-master keyset alone arms the verification anchor: no
+/// ambient state may supply one, so no environment variable decides trust.
 #[test]
-fn no_environment_variable_can_supply_the_verification_anchor() {
-    // NO `set_var` HERE, deliberately. The claim is that the anchor is a
-    // COMPILED constant and the variable is not consulted at all — and
-    // `effective_anchor` reads no environment (only the store's own durable
-    // roster floor), which is the property under test. Mutating the
-    // process-global environment to demonstrate that would race every other
-    // test in this binary (cargo runs them on threads) to prove something the
-    // source already settles, and the lint that flags it is right.
+fn the_committed_keyset_alone_arms_the_anchor() {
+    // `effective_anchor` reads the compiled keyset and the store's own durable
+    // roster floor, never the environment; mutating the process-global
+    // environment to show it would race every other test in this binary.
     let layout = temp_layout("anchor");
     assert_eq!(
         effective_anchor(&layout).is_armed(),
@@ -8255,8 +8322,6 @@ fn no_environment_variable_can_supply_the_verification_anchor() {
         effective_anchor(&layout).is_armed(),
         "and in THIS tree it is armed (2026-08-15), so the CLI's anchor is live"
     );
-    // No env lookup reaches it: aterm-update-core's `tests/env_reads.rs` fails on any
-    // `ATPKG_*` read in shipped code that is not on its allow-list.
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
@@ -8343,7 +8408,6 @@ fn a_newer_generation_rebases_a_floor_a_machine_drove_out_of_reach() {
 // REGISTRY so the production `DirFetcher` serves them (§14).
 
 use ring::signature::{Ed25519KeyPair, KeyPair};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::sig::testkit;
@@ -8417,10 +8481,7 @@ fn make_archive(dir: &Path, prog: &str, build: u64) -> PathBuf {
     tar.extend(entry(&format!("bin/{prog}"), b"#!/bin/true\n"));
     tar.resize(tar.len() + 1024, 0);
     let path = dir.join(format!("{prog}-{build}.tar.zst"));
-    let f = std::fs::File::create(&path).unwrap();
-    let mut enc = zstd::Encoder::new(f, 0).unwrap();
-    enc.write_all(&tar).unwrap();
-    enc.finish().unwrap();
+    std::fs::write(&path, crate::extract::fixtures::zstd_bytes(&tar)).unwrap();
     path
 }
 
@@ -8445,6 +8506,7 @@ fn write_pkg_for_triple(dir: &Path, prog: &str, build: u64, triple: &str) {
         10_000_000,
         10_000,
         crate::extract::ExtractOptions::default(),
+        crate::extract::FrameChecksum::IfPresent,
     )
     .unwrap()
     .root();
@@ -8776,6 +8838,87 @@ fn a_translated_pass_replaces_an_earlier_passs_unreachable_row() {
     );
     let _ = std::fs::remove_dir_all(&layout.prefix);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE UPDATE SAYS THE SEED'S VERDICT, LINE FOR LINE. The window's own seed asks no index
+/// any more (`report_seedless_posture`, a `--wait-lock` caller), so the update right behind
+/// it — which resolves the index anyway — is where an unserved architecture or a toolset
+/// narrowed to nothing reaches the window's card: its empty-store arm prints the line the
+/// seed printed for that verdict, beside its stderr sentence and its exit 2. A pass that
+/// never resolved an index has no verdict about the machine and prints none (the negative
+/// control: offline is not "unserved").
+#[test]
+fn the_updates_empty_store_verdict_prints_the_seeds_unusable_line() {
+    let names = |n: &[&str]| n.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+    let cfg = crate::config::PackagesConfig {
+        exclude: Some(names(&["ay", "ny", "zz", "lk", "claude", "codex"])),
+        ..Default::default()
+    };
+    let trust = crate::vendor_direct::lane::world::trust();
+    let seams = PassSeams {
+        anchor: |_| test_anchor(),
+        now: || 1,
+        trust: &trust,
+        shell_hooks: no_shell_hooks,
+        rustup_seam: &no_rustup_seam,
+        progress: None,
+        path: Some(std::ffi::OsString::new()),
+        warm_agents: record_warm,
+        translated: || false,
+        flip_policy: || crate::quiet::FlipPolicy::Now,
+        running: &no_processes,
+    };
+    let narrowed = Narrowing {
+        excluded: names(&["ay", "lk", "ny", "zz"]),
+        removed: Vec::new(),
+    }
+    .verdict(current_triple())
+    .0;
+    let unserved = unserved_sentence(current_triple(), &names(&["riscv64gc-unknown-linux-gnu"]));
+    for (case, published_for, expected) in [
+        ("narrowed", Some(current_triple()), Some(narrowed)),
+        (
+            "unserved",
+            Some("riscv64gc-unknown-linux-gnu"),
+            Some(unserved),
+        ),
+        ("unreachable", None, None),
+    ] {
+        let dir = scratch(&format!("update-unusable-{case}"));
+        if let Some(triple) = published_for {
+            write_registry_at(&dir, "stable", 46);
+            for (prog, build) in [("ay", 18), ("ny", 7), ("lk", 3), ("zz", 5)] {
+                write_pkg_for_triple(&dir, prog, build, triple);
+            }
+        }
+        let layout = temp_layout(&format!("update-unusable-{case}"));
+        let _ = take_markers_said();
+        let code = run_recorded_update_pass(
+            &layout,
+            &cfg,
+            &crate::DirFetcher::new(dir.clone()),
+            &std::collections::BTreeMap::new(),
+            true,
+            &seams,
+        );
+        let unusable: Vec<String> = take_markers_said()
+            .into_iter()
+            .filter(|line| line.contains(SEED_UNUSABLE_MARKER))
+            .collect();
+        if expected.is_some() {
+            assert_eq!(code, 2, "{case}: the empty store's verdict exits 2");
+        }
+        assert_eq!(
+            unusable,
+            expected
+                .iter()
+                .map(|why| seed_unusable_line(why))
+                .collect::<Vec<_>>(),
+            "{case}"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// ONE PASS, ONE VERIFY-SELECT. `apply_channel` resolved and verified the signed
@@ -10309,6 +10452,240 @@ fn default_set_bootstrap_skips_a_partial_tuple_whose_installed_pin_is_unpublishe
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A [`crate::DirFetcher`] that records, in order, every manifest pair it was asked to
+/// PREFETCH (`true`) and every one it was then asked to READ (`false`).
+struct PrefetchRecorder {
+    inner: crate::DirFetcher,
+    asked: std::cell::RefCell<Vec<(bool, String, u64)>>,
+}
+impl crate::flow::Fetcher for PrefetchRecorder {
+    fn index_candidates(&self) -> Result<Vec<crate::Candidate>, String> {
+        crate::flow::Fetcher::index_candidates(&self.inner)
+    }
+    fn pkg_manifest(
+        &self,
+        repo: &str,
+        program: &str,
+        build: u64,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        self.asked
+            .borrow_mut()
+            .push((false, program.to_string(), build));
+        crate::flow::Fetcher::pkg_manifest(&self.inner, repo, program, build)
+    }
+    fn prefetch_manifests(&self, pins: &[(String, String, u64)]) {
+        let mut asked = self.asked.borrow_mut();
+        for (_, program, build) in pins {
+            asked.push((true, program.clone(), *build));
+        }
+    }
+    fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
+        crate::flow::Fetcher::download(&self.inner, repo, asset, dest)
+    }
+    fn source_id(&self) -> String {
+        crate::flow::Fetcher::source_id(&self.inner)
+    }
+}
+
+// THE SET'S MANIFESTS AT ONCE. Before the set completion reads its first manifest, every
+// pinned manifest its missing-triple prescan reads has been asked for in one prefetch: one
+// at a time they were twenty GETs, four seconds ahead of the announcement. Every read the
+// pass then makes is of a pair it asked for at once.
+#[test]
+fn the_set_completion_asks_its_manifests_at_once_before_reading_one() {
+    let dir = scratch("prefetch-prescan");
+    write_registry(&dir, "stable");
+    let layout = temp_layout("prefetch-prescan");
+    let fetcher = PrefetchRecorder {
+        inner: crate::DirFetcher::new(dir.clone()),
+        asked: std::cell::RefCell::new(Vec::new()),
+    };
+    let out = install_default_set(
+        &layout,
+        &fetcher,
+        &test_anchor(),
+        &crate::config::PackagesConfig::default(),
+        0,
+    );
+    assert_eq!(out.index_error, None);
+    assert_eq!(
+        crate::active_builds(&layout).get("ay").copied(),
+        Some(18),
+        "a real pass: the missing members installed"
+    );
+    let asked = fetcher.asked.into_inner();
+    let first_read = asked
+        .iter()
+        .position(|(prefetch, ..)| !prefetch)
+        .expect("the pass read manifests");
+    let mut prefetched: Vec<(&str, u64)> = asked[..first_read]
+        .iter()
+        .map(|(_, program, build)| (program.as_str(), *build))
+        .collect();
+    prefetched.sort_unstable();
+    assert_eq!(
+        prefetched,
+        [("ay", 18), ("lk", 3), ("ny", 7), ("zz", 5)],
+        "every pin the prescan reads, asked before the first read: {asked:?}"
+    );
+    for (_, program, build) in asked[first_read..].iter().filter(|(p, ..)| !p) {
+        assert!(
+            prefetched.contains(&(program.as_str(), *build)),
+            "{program}@{build} was read without being asked at once: {asked:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A [`crate::DirFetcher`] a pass may share, recording which thread asked for each archive;
+/// with `refuse`, every download fails as a dropped link does.
+struct SharedDownloads {
+    inner: crate::DirFetcher,
+    asked: std::sync::Mutex<Vec<(String, String)>>,
+    refuse: bool,
+}
+impl crate::flow::Fetcher for SharedDownloads {
+    fn index_candidates(&self) -> Result<Vec<crate::Candidate>, String> {
+        crate::flow::Fetcher::index_candidates(&self.inner)
+    }
+    fn pkg_manifest(
+        &self,
+        repo: &str,
+        program: &str,
+        build: u64,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        crate::flow::Fetcher::pkg_manifest(&self.inner, repo, program, build)
+    }
+    fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
+        let thread = std::thread::current().name().unwrap_or("").to_string();
+        self.asked.lock().unwrap().push((asset.to_string(), thread));
+        if self.refuse {
+            return Err(String::from("curl: (6) Could not resolve host"));
+        }
+        crate::flow::Fetcher::download(&self.inner, repo, asset, dest)
+    }
+    fn shared(&self) -> Option<&(dyn crate::flow::Fetcher + Sync)> {
+        Some(self)
+    }
+    fn source_id(&self) -> String {
+        crate::flow::Fetcher::source_id(&self.inner)
+    }
+}
+
+// THE SET COMPLETION FETCHES AHEAD. With a fetcher it may share, every archive of the set —
+// the tuple's members and the singleton after them — comes off the download-ahead lane's
+// thread, once each, while the pass's own thread stages and flips.
+#[test]
+fn the_set_completion_takes_its_archives_from_the_download_ahead_lane() {
+    let dir = scratch("set-ahead");
+    write_group_registry(&dir, "stable", true);
+    let layout = temp_layout("set-ahead");
+    let fetcher = SharedDownloads {
+        inner: crate::DirFetcher::new(dir.clone()),
+        asked: std::sync::Mutex::default(),
+        refuse: false,
+    };
+    let out = install_default_set(
+        &layout,
+        &fetcher,
+        &test_anchor(),
+        &crate::config::PackagesConfig::default(),
+        0,
+    );
+    assert_eq!(out.failures, 0);
+    let active = crate::active_builds(&layout);
+    for (program, build) in [("ay", 18u64), ("ta", 4), ("tb", 6)] {
+        assert_eq!(active.get(program).copied(), Some(build), "{program}");
+    }
+    let mut asked = fetcher.asked.into_inner().unwrap();
+    asked.sort();
+    assert_eq!(
+        asked
+            .iter()
+            .map(|(asset, thread)| (asset.as_str(), thread.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("ay-18.tar.zst", "atpkg-download-ahead"),
+            ("ta-4.tar.zst", "atpkg-download-ahead"),
+            ("tb-6.tar.zst", "atpkg-download-ahead"),
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A SET THE DISK CHECK COULD NOT SIZE STARTS NO LANE. tb's signed manifest does not arrive, so
+// the set's bytes are unknown: planning a lane would ask for that manifest once more (a
+// connect timeout apiece on a dead link) before the first unit starts. The set lands one
+// download at a time on the pass's own thread, as it always did — the tuple refused, ay in.
+#[test]
+fn a_set_whose_size_is_unknown_lands_without_the_download_ahead_lane() {
+    let dir = scratch("set-ahead-unsized");
+    write_group_registry(&dir, "stable", false);
+    let layout = temp_layout("set-ahead-unsized");
+    let fetcher = SharedDownloads {
+        inner: crate::DirFetcher::new(dir.clone()),
+        asked: std::sync::Mutex::default(),
+        refuse: false,
+    };
+    let out = install_default_set(
+        &layout,
+        &fetcher,
+        &test_anchor(),
+        &crate::config::PackagesConfig::default(),
+        0,
+    );
+    assert_eq!(out.failures, 1, "the tuple, whose tb cannot be fetched");
+    assert_eq!(crate::active_builds(&layout).get("ay").copied(), Some(18));
+    let asked = fetcher.asked.into_inner().unwrap();
+    assert!(
+        asked.iter().any(|(asset, _)| asset == "ay-18.tar.zst"),
+        "{asked:?}"
+    );
+    assert!(
+        asked
+            .iter()
+            .all(|(_, thread)| thread != "atpkg-download-ahead"),
+        "{asked:?}"
+    );
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// EVERY ARCHIVE LOST IS THE PASS'S OWN FETCH FAULT. Offline, the lane's first download fails
+// and the pass fetches the rest itself: each failure the set completion counts is a fault on
+// the pass's thread, which is the equation its offline verdict reads.
+#[test]
+fn a_set_whose_every_download_fails_counts_each_failure_as_a_fetch_fault() {
+    let dir = scratch("set-ahead-offline");
+    write_group_registry(&dir, "stable", true);
+    let layout = temp_layout("set-ahead-offline");
+    let fetcher = SharedDownloads {
+        inner: crate::DirFetcher::new(dir.clone()),
+        asked: std::sync::Mutex::default(),
+        refuse: true,
+    };
+    let faults = crate::flow::fetch_faults();
+    let out = install_default_set(
+        &layout,
+        &fetcher,
+        &test_anchor(),
+        &crate::config::PackagesConfig::default(),
+        0,
+    );
+    assert_eq!(out.failures, 2, "the tuple and the singleton");
+    assert_eq!(
+        crate::flow::fetch_faults().wrapping_sub(faults),
+        out.failures,
+        "every failure a fetch fault: {:?}",
+        fetcher.asked.lock().unwrap()
+    );
+    assert!(crate::active_builds(&layout).is_empty());
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // §7 narrowing: an `exclude` that leaves part of a coherence tuple out refuses
 // the WHOLE group (loud diagnostic, not a failure) — a deliberately partial
 // tuple is exactly the split the transaction exists to prevent — while the
@@ -10566,7 +10943,8 @@ fn pending_state_lines(layout: &crate::store::Layout, tool: &str) -> Vec<String>
     let mut say = |line: String| out.push(line);
     let mut io = PendingIo {
         say: &mut say,
-        wait: false,
+        wait: None,
+        asker: crate::progress::Asker::Script,
     };
     pending_state(layout, tool, &mut io);
     out
@@ -10579,7 +10957,8 @@ fn pending_state_waiting(layout: &crate::store::Layout, tool: &str) -> (Vec<Stri
     let mut say = |line: String| out.push(line);
     let mut io = PendingIo {
         say: &mut say,
-        wait: true,
+        wait: Some(WaitShow::Meter),
+        asker: crate::progress::Asker::Person,
     };
     let next = pending_state(layout, tool, &mut io);
     (out, next)
@@ -10606,8 +10985,8 @@ fn pending_not_started_names_the_next_act() {
     );
     assert_eq!(
         bump_contents(&l),
-        "trust\n",
-        "the wish is recorded for the next pass"
+        "trust unattended\n",
+        "the wish is recorded for the next pass, a script's"
     );
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
@@ -10681,12 +11060,384 @@ fn pending_on_a_terminal_waits_for_a_program_on_its_way() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
+/// An archive the set completion fetched AHEAD waits, whole, for the pass to reach its
+/// program: a person waiting for it bumps it as they would a queued one — its stage has
+/// not started — while one whose bytes are still moving is left where it is.
+#[test]
+fn pending_on_a_terminal_bumps_a_download_that_waits_for_the_pass() {
+    let l = temp_layout("pend-wait-ahead");
+    std::fs::write(
+        l.progress_file(),
+        live_snapshot(
+            "{\"ay\":{\"phase\":\"download\",\"bytes_done\":43,\"bytes_total\":43},\
+             \"ty\":{\"phase\":\"download\",\"bytes_done\":40,\"bytes_total\":86},\
+             \"trust\":{\"phase\":\"extract\"}}",
+            "[]",
+        ),
+    )
+    .unwrap();
+    let (lines, next) = pending_state_waiting(&l, "ty");
+    assert_eq!(next, PendingNext::WaitThenRun, "{lines:?}");
+    assert_eq!(bump_contents(&l), "", "moving: not bumped");
+    let (lines, next) = pending_state_waiting(&l, "ay");
+    assert_eq!(next, PendingNext::WaitThenRun, "{lines:?}");
+    assert_eq!(bump_contents(&l), "ay\n", "waiting for the pass: bumped");
+    let _ = std::fs::remove_dir_all(&l.prefix);
+}
+
+/// A COMMAND ANSWERS WITH ITS PROGRAM'S STATE (2026-10-15): `targo` is `trust`'s, so the
+/// progress row read, the bump written and the install named are `trust`'s, and an
+/// unattended caller (no terminal) waits for it too — told the bound, not Ctrl-C.
+#[test]
+fn a_command_stub_reports_and_waits_for_its_program() {
+    let l = temp_layout("pend-command");
+    std::fs::write(
+        l.progress_file(),
+        live_snapshot(
+            "{\"trust\":{\"phase\":\"download\",\"bytes_done\":4100000,\"bytes_total\":9800000}}",
+            "[\"trust\"]",
+        ),
+    )
+    .unwrap();
+    let lines = pending_state_lines(&l, "targo");
+    assert!(
+        lines[0].starts_with("atpkg: targo comes with trust:"),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|x| x.contains("trust is being installed (41%, 4.1 of 9.8 MB)")),
+        "trust's row, not a missing `targo` row: {lines:?}"
+    );
+    let mut out: Vec<String> = Vec::new();
+    let mut say = |line: String| out.push(line);
+    let mut io = PendingIo {
+        say: &mut say,
+        wait: Some(WaitShow::Lines),
+        asker: crate::progress::Asker::Script,
+    };
+    assert_eq!(
+        pending_state(&l, "targo", &mut io),
+        PendingNext::WaitThenRun
+    );
+    assert!(
+        out.iter()
+            .any(|x| x.contains("targo starts as soon as it is installed")
+                && x.contains("waiting at most 15 minutes")),
+        "{out:?}"
+    );
+    // What the wait says every few seconds: the program's share.
+    let file = crate::progress::read_progress(&l).unwrap();
+    assert_eq!(
+        unattended_wait_line("targo", "trust", file.programs.get("trust")),
+        "atpkg: targo is being installed (trust 41%)"
+    );
+    // Nothing installing: the bump names the program the installer can act on.
+    let _ = std::fs::remove_file(l.progress_file());
+    let lines = pending_state_lines(&l, "trustc");
+    assert!(
+        lines
+            .iter()
+            .any(|x| x.contains("nothing is installing right now")),
+        "{lines:?}"
+    );
+    assert_eq!(bump_contents(&l), "trust unattended\n", "{lines:?}");
+    let _ = std::fs::remove_dir_all(&l.prefix);
+}
+
+/// A PROMISED PASS IS WAITED FOR before it begins (`pass-owed.json`, the window's first-run
+/// seed or an update about to plan): an unattended `targo` waits for `trust`, bumped first,
+/// where it used to find nothing installing — and keeps waiting through the begun pass's
+/// first seconds, before its plan lands, where a planned pass that leaves `trust` out is
+/// the honesty edge. A promise whose owner is gone, or whose deadline passed, keeps nobody
+/// waiting: the not-running answer, as with no promise at all.
+#[test]
+fn a_promised_pass_is_waited_for_until_it_plans() {
+    fn lines_waiting_unattended(l: &crate::store::Layout) -> (Vec<String>, PendingNext) {
+        let mut out: Vec<String> = Vec::new();
+        let mut say = |line: String| out.push(line);
+        let mut io = PendingIo {
+            say: &mut say,
+            wait: Some(WaitShow::Lines),
+            asker: crate::progress::Asker::Script,
+        };
+        let next = pending_state(l, "targo", &mut io);
+        (out, next)
+    }
+    let l = temp_layout("pend-promised");
+    crate::progress::promise_pass(&l, std::process::id(), crate::progress::SEED_PROMISE_SECS);
+    let (lines, next) = lines_waiting_unattended(&l);
+    assert_eq!(next, PendingNext::WaitThenRun, "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|x| x.contains("starting your toolchain install")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|x| x.contains("trust is on its way")
+            && x.contains("targo starts as soon as it is installed")
+            && x.contains("waiting at most 15 minutes")),
+        "{lines:?}"
+    );
+    assert_eq!(
+        bump_contents(&l),
+        "trust unattended\n",
+        "bumped before the wait, for a script"
+    );
+    // A caller that cannot wait is told the program is requested first.
+    let lines = pending_state_lines(&l, "targo");
+    assert!(
+        lines.iter().any(|x| x.contains("requested first")),
+        "{lines:?}"
+    );
+
+    // The pass begun, its plan not in yet: still the promise's wait, never the edge…
+    std::fs::write(l.progress_file(), live_snapshot("{}", "[]")).unwrap();
+    let (lines, next) = lines_waiting_unattended(&l);
+    assert_eq!(next, PendingNext::WaitThenRun, "{lines:?}");
+    assert!(
+        !lines
+            .iter()
+            .any(|x| x.contains("no longer part of the default set")),
+        "{lines:?}"
+    );
+    // …which the same planned pass, the promise retired, is (the negative control).
+    crate::progress::retire_promise(&l);
+    let (lines, next) = lines_waiting_unattended(&l);
+    assert_eq!(next, PendingNext::Done, "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|x| x.contains("no longer part of the default set")),
+        "{lines:?}"
+    );
+    let _ = std::fs::remove_file(l.progress_file());
+
+    // A broken promise: its owner gone, or past its deadline.
+    let gone = std::process::Command::new("/usr/bin/true")
+        .spawn()
+        .map(|mut c| {
+            let pid = c.id();
+            let _ = c.wait();
+            pid
+        })
+        .expect("a reaped child's pid");
+    crate::progress::promise_pass(&l, gone, crate::progress::SEED_PROMISE_SECS);
+    let (lines, next) = lines_waiting_unattended(&l);
+    assert_eq!(next, PendingNext::Done, "owner gone: {lines:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|x| x.contains("nothing is installing right now")),
+        "{lines:?}"
+    );
+    std::fs::write(
+        l.pass_owed_file(),
+        format!(
+            "{{\"v\":1,\"owner\":{},\"until_unix\":{}}}",
+            std::process::id(),
+            now_secs() - 1
+        ),
+    )
+    .unwrap();
+    let (lines, next) = lines_waiting_unattended(&l);
+    assert_eq!(next, PendingNext::Done, "deadline passed: {lines:?}");
+    let _ = std::fs::remove_dir_all(&l.prefix);
+}
+
+/// A failed pass left before the command began is not the promised successor,
+/// including when both clocks round to the same Unix second.
+#[test]
+fn a_promised_wait_does_not_adopt_an_unchanged_same_second_failure() {
+    let l = temp_layout("pending-same-second-old-failure");
+    let began = now_secs();
+    let sink = crate::progress::ProgressSink::create(&l.progress_file(), "net").unwrap();
+    sink.plan(&[("trust".into(), 1)]);
+    sink.finished(
+        "trust",
+        crate::progress::Phase::Failed,
+        Some("old failure".into()),
+    );
+    sink.finish();
+    let mut initial = crate::progress::read_progress(&l).unwrap();
+    // An exact controlled second, without waiting for a wall-clock boundary.
+    initial.started_unix = began;
+    initial.heartbeat_unix = began;
+    initial.ended_unix = Some(began);
+    std::fs::write(l.progress_file(), aterm_json::to_string(&initial).unwrap()).unwrap();
+    crate::progress::promise_pass(&l, std::process::id(), crate::progress::SEED_PROMISE_SECS);
+    let owed = crate::progress::pass_owed(&l, began);
+    assert!(owed);
+    let snapshot = crate::progress::read_progress(&l).unwrap();
+    let selected = pending_wait_file(Some(&snapshot), Some(&initial), false, false);
+    let failed = selected
+        .and_then(|file| file.programs.get("trust"))
+        .is_some_and(|row| row.phase == crate::progress::Phase::Failed);
+    assert_eq!(pending_wait_step(owed, false, failed), WaitStep::Wait);
+}
+
+/// A real successor that begins and ends between looks still owns its failure,
+/// even if every coarse timestamp and program row equals the preceding pass.
+#[test]
+fn a_pending_wait_reports_a_same_second_successor_failure() {
+    let l = temp_layout("pending-same-second-new-failure");
+    let began = now_secs();
+    let finish = || {
+        let sink = crate::progress::ProgressSink::create(&l.progress_file(), "net").unwrap();
+        sink.plan(&[("trust".into(), 1)]);
+        sink.finished(
+            "trust",
+            crate::progress::Phase::Failed,
+            Some("same reason".into()),
+        );
+        sink.finish();
+        let mut file = crate::progress::read_progress(&l).unwrap();
+        file.started_unix = began;
+        file.heartbeat_unix = began;
+        file.ended_unix = Some(began);
+        std::fs::write(l.progress_file(), aterm_json::to_string(&file).unwrap()).unwrap();
+        file
+    };
+    let initial = finish();
+    crate::progress::promise_pass(&l, std::process::id(), crate::progress::SEED_PROMISE_SECS);
+    assert!(crate::progress::pass_owed(&l, began));
+    let successor = finish();
+    assert!(initial.generation.is_some());
+    assert_ne!(
+        initial.generation, successor.generation,
+        "a new pass has its own identity"
+    );
+    crate::progress::retire_promise(&l);
+    let owed = crate::progress::pass_owed(&l, began);
+    assert!(!owed);
+    let selected = pending_wait_file(Some(&successor), Some(&initial), false, false)
+        .expect("the successor terminal snapshot belongs to this wait");
+    assert_eq!(
+        selected.programs["trust"].phase,
+        crate::progress::Phase::Failed
+    );
+    assert_eq!(pending_wait_step(owed, false, true), WaitStep::Fail);
+}
+
+#[test]
+fn a_legacy_terminal_snapshot_requires_an_observed_live_pass() {
+    let began = now_secs();
+    let live: crate::progress::ProgressFile = aterm_json::from_str(&format!(
+        "{{\"v\":1,\"pid\":{},\"pass\":\"net\",\"started_unix\":{began},\
+         \"heartbeat_unix\":{began},\"programs\":{{\"trust\":{{\"phase\":\"queued\"}}}}}}",
+        std::process::id()
+    ))
+    .unwrap();
+    assert!(
+        live.generation.is_none(),
+        "an older writer supplies no generation"
+    );
+    let mut ended = live.clone();
+    ended.pid = None;
+    ended.ended_unix = Some(began);
+    ended.programs.get_mut("trust").unwrap().phase = crate::progress::Phase::Failed;
+    assert!(pending_wait_file(Some(&ended), Some(&live), false, true).is_some());
+    assert!(pending_wait_file(Some(&ended), Some(&ended), false, false).is_none());
+    assert!(pending_wait_file(Some(&ended), None, false, false).is_none());
+    ended.generation = Some("unrecognized-identity".into());
+    assert!(pending_wait_file(Some(&ended), None, false, false).is_none());
+}
+
+/// A WHOLE UPDATE PROMISES ITS PLAN ON A FIRST INSTALL, OR OVER A PROMISE IT FINDS: a
+/// routine pass — an ALab program already active — makes none, so a stub for a program it
+/// will not plan (held, unserved here) answers with its recorded reason at once instead of
+/// waiting for that plan; the window seed's live promise it takes over; and a pass that does
+/// not plan the set promises nothing.
+#[test]
+fn a_whole_update_promises_its_plan_only_on_a_first_install_or_over_a_promise() {
+    let l = temp_layout("update-promise-gate");
+    let now = now_secs();
+    assert!(update_promises_its_plan(&l, true, now), "a first install");
+    assert!(!update_promises_its_plan(&l, false, now), "no set to plan");
+    make_live(&l, "trust", 1);
+    assert!(!update_promises_its_plan(&l, true, now), "a routine pass");
+    crate::progress::promise_pass(&l, std::process::id(), crate::progress::SEED_PROMISE_SECS);
+    assert!(
+        update_promises_its_plan(&l, true, now),
+        "the seed's promise, taken over"
+    );
+    assert!(!update_promises_its_plan(&l, false, now));
+    let _ = std::fs::remove_dir_all(&l.prefix);
+}
+
+/// THE PROMISE ENDS WHERE THE PLAN BEGINS: a pass promised before it began retires the
+/// promise once its plan is in `progress.json`, the pass still live, so a stub reads the
+/// pass's own rows from then on. A pass that stops before it plans — its index
+/// unresolvable — leaves the promise to the update's return ([`PromiseEnds`]).
+#[test]
+fn a_promised_pass_retires_its_promise_once_its_plan_lands() {
+    let _gate = crate::progress::PASS_TEST_GATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = || aterm_time::unix_secs().unwrap();
+    let cfg = crate::config::PackagesConfig::default();
+    // Negative control: nothing to resolve, so no plan, and the promise stands.
+    let empty = scratch("promise-plan-empty");
+    let layout = temp_layout("promise-plan-unresolved");
+    crate::progress::promise_pass(&layout, std::process::id(), 60);
+    assert!(crate::progress::begin_pass(
+        &layout.progress_file(),
+        NET_PASS
+    ));
+    let out = install_default_set(
+        &layout,
+        &CountingFetcher::new(empty.clone()),
+        &test_anchor(),
+        &cfg,
+        0,
+    );
+    crate::progress::end_pass();
+    assert!(out.index_error.is_some(), "the fixture resolves nothing");
+    assert!(
+        crate::progress::pass_owed(&layout, now()),
+        "no plan landed, so the promise stands"
+    );
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+
+    let dir = scratch("promise-plan");
+    write_registry(&dir, "stable");
+    let layout = temp_layout("promise-plan");
+    crate::progress::promise_pass(&layout, std::process::id(), 60);
+    assert!(crate::progress::begin_pass(
+        &layout.progress_file(),
+        NET_PASS
+    ));
+    let out = install_default_set(
+        &layout,
+        &CountingFetcher::new(dir.clone()),
+        &test_anchor(),
+        &cfg,
+        0,
+    );
+    let live = crate::progress::live_snapshot().expect("the pass is still live");
+    crate::progress::end_pass();
+    assert_eq!(out.index_error, None);
+    assert!(
+        !live.queue.is_empty() || !live.programs.is_empty(),
+        "the plan landed"
+    );
+    assert!(
+        !crate::progress::pass_owed(&layout, now()) && !layout.pass_owed_file().exists(),
+        "and the promise is retired"
+    );
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
 /// TIER-1: the stub's REAL decision ([`pending_wait_step`]) against the derived model
 /// `AtpkgPendingWait`, at every reachable deciding state — the model's reads mapped
-/// onto the function's inputs in the order `wait_then_run` makes them (the pass, then
-/// the shim), which the scan at the end pins. Negative control: the decision the stub
-/// could have made instead — "the pass ended, so it failed", asked before the shim —
-/// disagrees with the model at a reachable state, so agreement is never vacuous.
+/// onto the function's inputs in the order `wait_then_run` makes them (the promise, then
+/// the pass, then the shim), which the scan at the end pins. Negative control: the decision
+/// the stub could have made instead — "the pass ended, so it failed", asked before the shim
+/// — disagrees with the model at a reachable state, so agreement is never vacuous.
 #[test]
 fn the_pending_wait_decision_refines_the_derived_model() {
     use aterm_spec::derive::atpkg_pending_wait_model;
@@ -10704,7 +11455,7 @@ fn the_pending_wait_decision_refines_the_derived_model() {
             }
         }
     }
-    let deciding: Vec<_> = seen.iter().filter(|s| s["step"] == 1).collect();
+    let deciding: Vec<_> = seen.iter().filter(|s| s["step"] == 2).collect();
     assert!(
         deciding.len() >= 6,
         "the explorer reached the decisions: {deciding:?}"
@@ -10723,8 +11474,15 @@ fn the_pending_wait_decision_refines_the_derived_model() {
         ["DecideWait"] => WaitStep::Wait,
         ref other => panic!("exactly one decision is enabled at {s:?}: {other:?}"),
     };
+    // `running` is what the promise and the pass read together say: a pass is coming; and
+    // `failed` is the pass saying it will not bring the program: a failed row, or a plan
+    // that left it out (`left_out`).
     let inputs = |s: &std::collections::BTreeMap<&'static str, i64>| {
-        (s["seen"] == 1, s["shim"] == 1, s["row"] == 4)
+        (
+            s["coming"] == 1,
+            s["shim"] == 1,
+            s["row"] == 4 || s["left"] == 1,
+        )
     };
     for s in &deciding {
         let (running, installed, failed) = inputs(s);
@@ -10751,7 +11509,8 @@ fn the_pending_wait_decision_refines_the_derived_model() {
         }),
         "the comparison must be able to fail"
     );
-    // The ORDER the mapping assumes: `wait_then_run` reads the pass, then the shim.
+    // The ORDER the mapping assumes: `wait_then_run` reads the promise, then the pass, then
+    // the shim.
     let production = production_half(include_str!("cli.rs"));
     let start = production
         .find("\nfn wait_then_run(")
@@ -10759,13 +11518,19 @@ fn the_pending_wait_decision_refines_the_derived_model() {
     let body = &production[start..];
     let body = &body[..body[1..].find("\nfn ").map_or(body.len(), |i| i + 1)];
     let in_loop = &body[body.find("let outcome = loop").expect("the poll loop")..];
+    let promise = in_loop
+        .find("pass_owed(layout, now)")
+        .expect("the promise read");
     let pass = in_loop
         .find("read_progress(layout)")
         .expect("the pass read");
     let shim = in_loop
         .find("crate::which(layout, tool)")
         .expect("the shim read");
-    assert!(pass < shim, "the pass is read before the shim: {in_loop}");
+    assert!(
+        promise < pass && pass < shim,
+        "the promise is read before the pass, and the pass before the shim: {in_loop}"
+    );
 }
 
 /// A pass that installs something ELSE (a person's `update`, another program's
@@ -10787,7 +11552,7 @@ fn pending_is_not_delisted_by_a_pass_that_plans_other_work() {
             .any(|x| x.contains("no longer part of the default set")),
         "{lines:?}"
     );
-    assert_eq!(bump_contents(&l), "trust\n");
+    assert_eq!(bump_contents(&l), "trust unattended\n");
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
@@ -10813,7 +11578,7 @@ fn pending_queued_bumps_and_says_so() {
         ),
         "position + bump + current program: {lines:?}"
     );
-    assert_eq!(bump_contents(&l), "trust\n");
+    assert_eq!(bump_contents(&l), "trust unattended\n");
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
@@ -11005,7 +11770,7 @@ fn pending_over_an_older_extra_stub_is_the_default_set_state() {
             .any(|x| x.contains("EXTRA") || x.contains("[y/N]")),
         "{lines:?}"
     );
-    assert_eq!(bump_contents(&l), "vendorx\n");
+    assert_eq!(bump_contents(&l), "vendorx unattended\n");
     let lines = pending_state_lines(&l, "claude");
     assert!(
         lines[0].contains("Anthropic Claude Code")
@@ -11013,7 +11778,7 @@ fn pending_over_an_older_extra_stub_is_the_default_set_state() {
             && lines[0].contains("not installed yet"),
         "{lines:?}"
     );
-    assert_eq!(bump_contents(&l), "vendorx\nclaude\n");
+    assert_eq!(bump_contents(&l), "vendorx unattended\nclaude unattended\n");
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
@@ -11070,10 +11835,9 @@ fn bumping_a_member_bumps_the_whole_group() {
 
 /// `verify-pkg` IS THE CLIENT'S WHOLE CHAIN, NOT HALF OF IT.
 ///
-/// `tools/atpkg-publish-lib.sh` and step 1 of `tools/atpkg-mirror-public.sh` call this
-/// verb "the client's own rule" and refuse to ship what it refuses — but it checked the
-/// SIGNATURE and printed OK, so a manifest that verifies and cannot be PARSED self-checked
-/// OK, was mirrored, and was then refused by every client (`parse_pkg(&verified).ok()?` →
+/// A publisher that calls this verb "the client's own rule" refuses to ship what it
+/// refuses — but it checked the SIGNATURE and printed OK, so a manifest that verifies and
+/// cannot be PARSED self-checked OK, was mirrored, and was then refused by every client (`parse_pkg(&verified).ok()?` →
 /// `None`) with no pipeline stage having said why. Every body below is signed by the
 /// roster's own machine, so the only thing under test is what the verb does once the
 /// signature holds; the refusal must also NAME the fix, which is what
@@ -11185,9 +11949,8 @@ fn verify_stops_at_the_first_unreadable_file() {
 /// are only reachable once a machine on the roster HAS signed these exact bytes. The
 /// verb reported every one of them as "no machine on that roster signed this index",
 /// which points the publisher at the paper master — re-join, re-key — when the fix is
-/// one line of the index they just authored. `tools/atpkg-index.sh` even promises that
-/// a misread `roster_seq` "comes back as `Reject::SeqMismatch`", a name the verb never
-/// printed.
+/// one line of the index they just authored, and a misread `roster_seq` came back as a
+/// `Reject::SeqMismatch` the verb never named.
 ///
 /// Every body below is signed by the roster's OWN machine through the real chain, so
 /// the only thing under test is what the verb says once the signature holds — and the
@@ -11268,8 +12031,7 @@ fn verify_index_names_the_post_verify_mistake_instead_of_blaming_the_signature()
             good.replace(&format!("machine_id = \"{}\"\n", testkit::MACHINE_ID), ""),
             "machine_id",
         ),
-        // `tools/atpkg-index.sh` reads `roster_seq` with `sed … | head -n1`; a misread
-        // one lands here, and that script promises this refusal is named.
+        // A misread `roster_seq` lands here, and the refusal must name it.
         (
             "seq-mismatch",
             good.replace(
@@ -11381,13 +12143,28 @@ fn world_seams(trust: &crate::vendor_direct::lane::Trust) -> PassSeams<'_> {
 /// A `dir:` registry whose `rustc` tuple is `trust` + `tb`, pinned at trust 4821 and
 /// tb 6 by an index still valid at the world's clock, beside both signed pkgs.
 fn write_toolchain_registry(dir: &Path) {
+    write_toolchain_registry_and(dir, &[]);
+}
+
+/// [`write_toolchain_registry`] with the ungrouped `singletons` `(program, build)` beside
+/// the tuple.
+fn write_toolchain_registry_and(dir: &Path, singletons: &[(&str, u64)]) {
+    let programs: String = singletons
+        .iter()
+        .map(|(p, _)| format!("[programs.{p}]\nrepo = \"{p}\"\n"))
+        .collect();
+    let pins: String = singletons
+        .iter()
+        .map(|(p, b)| format!(", {p} = {b}"))
+        .collect();
     let body = format!(
         "schema = 2\nindex_build = 51\nvalid_until = \"2099-01-01T00:00:00Z\"\n\
          machine_id = \"{id}\"\nroster_seq = {seq}\n\
          [programs.trust]\nrepo = \"trust\"\ncoherence_group = \"rustc\"\n\
          [programs.tb]\nrepo = \"tb\"\ncoherence_group = \"rustc\"\n\
+         {programs}\
          [[channels]]\nname = \"stable\"\nchannel_build = 1\nmin_build = 0\n\
-         pin = {{ trust = 4821, tb = 6 }}\n",
+         pin = {{ trust = 4821, tb = 6{pins} }}\n",
         id = testkit::MACHINE_ID,
         seq = testkit::SEQ
     );
@@ -11400,6 +12177,9 @@ fn write_toolchain_registry(dir: &Path) {
     write_roster(dir);
     write_pkg(dir, "trust", 4821);
     write_pkg(dir, "tb", 6);
+    for (p, b) in singletons {
+        write_pkg(dir, p, *b);
+    }
 }
 
 /// ONE FLIP GATE FOR THE WHOLE UNATTENDED PASS. With a build running from trust 4800, the
@@ -11505,6 +12285,1007 @@ fn an_apply_only_pass_that_flips_trust_re_lays_the_rustup_view() {
     );
     let _ = std::fs::remove_dir_all(&layout.prefix);
     let _ = std::fs::remove_dir_all(&rustup);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE ALAB SET AND THE AGENTS IN ONE FETCHER, worked from several threads at once as the
+/// production fetcher is ([`crate::flow::Fetcher::shared`]): a `dir:` registry for the set
+/// and a vendor world for the agents. With `checkpoints`, three requests wait — each on a
+/// one-minute hang detector — for what only a pass running its lanes side by side asks
+/// first: claude's head for codex's (the vendor plans go out together), claude's payload for
+/// codex's (the agents land two at a time), and the pass's read of a `rustc` member's
+/// manifest once the tuple's archives are moving, for claude's payload (the agents land while
+/// the set installs, not once its toolchain has flipped).
+struct SetBesideVendors {
+    registry: crate::DirFetcher,
+    vendors: crate::vendor_direct::lane::world::Fake,
+    layout: crate::store::Layout,
+    checkpoints: bool,
+    /// Every `head:<program>`, `download:<program>` and `payload:<program>` asked so far.
+    asked: (std::sync::Mutex<Vec<String>>, std::sync::Condvar),
+    /// As each agent's payload was asked for: whether every archive of `set` was in, and
+    /// whether trust was live.
+    at_payload: std::sync::Mutex<Vec<(String, bool, bool)>>,
+    /// The set's programs, whose archives the agents' bytes wait for.
+    set: &'static [&'static str],
+    /// The live pass's queue as the set's first archive was asked for.
+    queue_at_first_download: std::sync::Mutex<Option<Vec<String>>>,
+    /// trust's archive waits — on the one-minute hang detector — for claude's payload: what
+    /// only a pass that lands a bumped agent beside the tuple asks first.
+    tuple_waits_for_claude: bool,
+    /// Agent payloads downloading now, and the most there ever were at once.
+    payloads_in_flight: (
+        std::sync::atomic::AtomicUsize,
+        std::sync::atomic::AtomicUsize,
+    ),
+    /// As each agent's payload was asked for: whether a pass was still promised, and the
+    /// live plan's rows.
+    owed_at_payload: std::sync::Mutex<Vec<(String, bool, Vec<String>)>>,
+}
+
+impl SetBesideVendors {
+    fn new(registry: &Path, layout: &crate::store::Layout, checkpoints: bool) -> Self {
+        Self {
+            registry: crate::DirFetcher::new(registry.to_path_buf()),
+            vendors: crate::vendor_direct::lane::world::Fake::default(),
+            layout: layout.clone(),
+            checkpoints,
+            asked: Default::default(),
+            at_payload: std::sync::Mutex::default(),
+            set: &["tb", "trust"],
+            queue_at_first_download: std::sync::Mutex::default(),
+            tuple_waits_for_claude: false,
+            payloads_in_flight: Default::default(),
+            owed_at_payload: std::sync::Mutex::default(),
+        }
+    }
+
+    /// Wait — on the one-minute hang detector — until the live pass's row for `program` says
+    /// its landing has begun (its build is noted) and it still waits, queued, for its bytes.
+    fn wait_until_waiting_for_the_link(&self, program: &str) {
+        let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        while !crate::progress::live_snapshot()
+            .and_then(|file| file.programs.get(program).cloned())
+            .is_some_and(|row| row.build.is_some() && row.phase == crate::progress::Phase::Queued)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{program}'s landing never waited for the link"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    fn note(&self, what: String) {
+        self.asked.0.lock().unwrap().push(what);
+        self.asked.1.notify_all();
+    }
+
+    fn wait_for(&self, what: &str) {
+        if self.checkpoints {
+            self.wait_until(what);
+        }
+    }
+
+    fn was_asked(&self, what: &str) -> bool {
+        self.asked.0.lock().unwrap().iter().any(|a| a == what)
+    }
+
+    fn wait_until(&self, what: &str) {
+        let asked = self.asked.0.lock().unwrap();
+        let (_asked, wait) = self
+            .asked
+            .1
+            .wait_timeout_while(asked, aterm_spec::wait::MUST_HAPPEN, |asked| {
+                !asked.iter().any(|a| a == what)
+            })
+            .unwrap();
+        assert!(!wait.timed_out(), "{what} was never asked for");
+    }
+}
+
+impl crate::flow::Fetcher for SetBesideVendors {
+    fn index_candidates(&self) -> Result<Vec<crate::Candidate>, String> {
+        self.registry.index_candidates()
+    }
+
+    fn pkg_manifest(
+        &self,
+        repo: &str,
+        program: &str,
+        build: u64,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        if matches!(program, "trust" | "tb")
+            && (self.was_asked("download:trust") || self.was_asked("download:tb"))
+        {
+            self.wait_for("payload:claude");
+        }
+        self.registry.pkg_manifest(repo, program, build)
+    }
+
+    fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
+        self.registry.download(repo, asset, dest)
+    }
+
+    fn download_for(
+        &self,
+        program: &str,
+        repo: &str,
+        asset: &str,
+        dest: &Path,
+        _: u64,
+    ) -> Result<(), String> {
+        self.note(format!("download:{program}"));
+        self.queue_at_first_download
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| {
+                crate::progress::live_snapshot().map_or_else(Vec::new, |file| file.queue)
+            });
+        if program == "trust" && self.tuple_waits_for_claude {
+            self.wait_until("payload:claude");
+        }
+        let fetched = self.registry.download(repo, asset, dest);
+        if fetched.is_ok() {
+            self.note(format!("downloaded:{program}"));
+        }
+        fetched
+    }
+
+    fn vendor_get(
+        &self,
+        program: &str,
+        url: &str,
+        cap: u64,
+        if_none_match: Option<&str>,
+    ) -> Result<crate::flow::VendorGet, crate::flow::VendorFetchError> {
+        self.vendors.vendor_get(program, url, cap, if_none_match)
+    }
+
+    fn vendor_head(
+        &self,
+        program: &str,
+        url: &str,
+        cap: u64,
+        if_none_match: Option<&str>,
+    ) -> Result<crate::flow::VendorGet, crate::flow::VendorFetchError> {
+        self.note(format!("head:{program}"));
+        if program == "claude" {
+            self.wait_for("head:codex");
+        }
+        self.vendors.vendor_head(program, url, cap, if_none_match)
+    }
+
+    fn vendor_content_length(
+        &self,
+        program: &str,
+        url: &str,
+    ) -> Result<u64, crate::flow::VendorFetchError> {
+        self.vendors.vendor_content_length(program, url)
+    }
+
+    fn vendor_download(
+        &self,
+        program: &str,
+        url: &str,
+        dest: &Path,
+        cap: u64,
+    ) -> Result<(), crate::flow::VendorFetchError> {
+        self.at_payload.lock().unwrap().push((
+            program.to_string(),
+            self.set
+                .iter()
+                .all(|p| self.was_asked(&format!("downloaded:{p}"))),
+            crate::active_builds(&self.layout).contains_key("trust"),
+        ));
+        self.owed_at_payload.lock().unwrap().push((
+            program.to_string(),
+            crate::progress::pass_owed(&self.layout, now_secs()),
+            crate::progress::live_snapshot()
+                .map(|file| file.programs.into_keys().collect())
+                .unwrap_or_default(),
+        ));
+        use std::sync::atomic::Ordering::SeqCst;
+        let (now, most) = &self.payloads_in_flight;
+        most.fetch_max(now.fetch_add(1, SeqCst) + 1, SeqCst);
+        self.note(format!("payload:{program}"));
+        let other = if program == "claude" {
+            "codex"
+        } else {
+            "claude"
+        };
+        if self.checkpoints && !self.was_asked(&format!("payload:{other}")) {
+            // The other lane's landing begins while the first agent's bytes are in flight,
+            // and waits for the link, its row still queued: the lanes land side by side, and
+            // only their bytes take turns.
+            self.wait_until_waiting_for_the_link(other);
+        }
+        let paid = self.vendors.vendor_download(program, url, dest, cap);
+        now.fetch_sub(1, SeqCst);
+        paid
+    }
+
+    fn source_id(&self) -> String {
+        self.registry.source_id()
+    }
+
+    fn shared(&self) -> Option<&(dyn crate::flow::Fetcher + Sync)> {
+        Some(self)
+    }
+}
+
+/// The agents a first run lands beside its set: claude and codex (agy and muse, which the
+/// vendor world does not publish, left out).
+fn claude_and_codex_wanted() -> crate::config::PackagesConfig {
+    crate::config::PackagesConfig {
+        exclude: Some(vec!["agy".to_string(), "muse".to_string()]),
+        ..Default::default()
+    }
+}
+
+/// A FIRST RUN LANDS ITS AGENTS BESIDE ITS SET UNDER ONE ANNOUNCEMENT. On an empty store
+/// whose index resolves, the vendor plans go out together; no agent's payload is asked for
+/// until every archive of the set is in (a pass landing the agents first, or beside the
+/// set's own downloads, fails here), and the agents then land while the set installs — the
+/// pass's read of a `rustc` manifest at its stage waits for claude's payload, so a pass
+/// holding the agents until the toolchain has flipped never finishes — two at a time,
+/// taking turns at the download alone: codex's lane reaches its download while claude's is in
+/// flight, and its bytes move only once claude's are in (two payloads at once fail here, and
+/// a lane that held its turn past the download never lets codex's row move). One
+/// `net-starting:`
+/// names both lanes before any byte, one terminal answers it with both, every row is its
+/// own lane's, no stub stands over an agent's shim, and the rustup view follows trust at
+/// its flip and again at the pass end.
+#[test]
+fn an_empty_store_lands_its_agents_beside_its_set_under_one_announcement() {
+    use crate::vendor_direct::lane::world::{self, native_exe};
+    let _gate = crate::progress::PASS_TEST_GATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("beside-registry");
+    write_toolchain_registry_and(&dir, &[("ay", 18)]);
+    let layout = temp_layout("beside-store");
+    let mut f = SetBesideVendors::new(&dir, &layout, true);
+    f.set = &["ay", "tb", "trust"];
+    f.vendors
+        .publish_claude("2.1.281", &native_exe("claude 2.1.281"));
+    f.vendors.publish_codex_default("0.157.0");
+    let trust = world::trust();
+    let views = std::sync::Mutex::new(Vec::new());
+    let seam = |layout: &crate::store::Layout| {
+        views
+            .lock()
+            .unwrap()
+            .push(crate::active_builds(layout).get("trust").copied());
+    };
+    let mut seams = world_seams(&trust);
+    seams.path = Some(std::ffi::OsString::new());
+    seams.rustup_seam = &seam;
+    let _ = take_markers_said();
+    assert!(crate::progress::begin_pass(
+        &layout.progress_file(),
+        NET_PASS
+    ));
+    let code = run_update_pass(
+        &layout,
+        &claude_and_codex_wanted(),
+        &f,
+        &std::collections::BTreeMap::new(),
+        true,
+        &seams,
+    );
+    crate::progress::end_pass();
+    assert_eq!(code, 0);
+    assert_eq!(
+        f.payloads_in_flight
+            .1
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one agent's bytes at a time"
+    );
+    let markers = take_markers_said();
+    let starts: Vec<&String> = markers
+        .iter()
+        .filter(|m| m.contains(NET_STARTING_MARKER))
+        .collect();
+    assert_eq!(starts.len(), 1, "one announcement: {markers:?}");
+    assert!(
+        starts[0].starts_with(&format!(
+            "atpkg: {NET_STARTING_MARKER}installing 5 program(s) over the network: claude, \
+             codex, ay, tb, trust — "
+        )),
+        "{}",
+        starts[0]
+    );
+    let terminals: Vec<&String> = markers
+        .iter()
+        .filter(|m| {
+            m.contains(NET_INSTALLED_MARKER)
+                || m.contains(NET_FAILED_MARKER)
+                || m.contains(SEED_DONE_MARKER)
+        })
+        .collect();
+    assert_eq!(
+        terminals,
+        [&format!(
+            "atpkg: {NET_INSTALLED_MARKER}ay, claude, codex, tb, trust"
+        )],
+        "one terminal answers it"
+    );
+    let at_payload = f.at_payload.lock().unwrap().clone();
+    assert_eq!(
+        at_payload
+            .iter()
+            .map(|(agent, tuple_in, _)| (agent.as_str(), *tuple_in))
+            .collect::<Vec<_>>(),
+        [("claude", true), ("codex", true)],
+        "the agents' bytes wait for the set's, and move in the order the lanes took them: \
+         claude, taken first, has the link first"
+    );
+    assert!(
+        !at_payload[0].2,
+        "claude's bytes move before the toolchain flips"
+    );
+    let active = crate::active_builds(&layout);
+    assert_eq!(
+        (active.get("trust"), active.get("tb"), active.get("ay")),
+        (Some(&4821), Some(&6), Some(&18))
+    );
+    let rows = crate::status::read(&layout).unwrap().programs;
+    assert_eq!(rows["claude"].state, "managed 2.1.281 — Anthropic latest");
+    assert_eq!(rows["codex"].state, "managed 0.157.0 — OpenAI latest");
+    assert_eq!(rows["trust"].installed_build, Some(4821));
+    for agent in ["claude", "codex"] {
+        assert!(
+            !crate::stub::pending_stub_exists(&layout, agent),
+            "{agent}: its shim, not a stub"
+        );
+    }
+    assert_eq!(
+        *views.lock().unwrap(),
+        [Some(4821), Some(4821)],
+        "the view follows trust at its flip, and the pass end re-lays it"
+    );
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A FIRST RUN'S QUEUE READS IN THE ORDER ITS BYTES MOVE, and the agents' lane meters on
+/// the pass it rides. While the `rustc` tuple downloads, the queue a pending stub reads its
+/// place in names the tuple first and the agents after it — never claude "next in line"
+/// ahead of a toolchain it waits for — and each agent's row, landed on a thread of its own,
+/// ends `done` on the one live pass.
+#[test]
+fn a_first_runs_queue_names_the_toolchain_before_the_agents_that_wait_for_it() {
+    use crate::vendor_direct::lane::world::{self, native_exe};
+    let _gate = crate::progress::PASS_TEST_GATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("beside-queue-registry");
+    write_toolchain_registry_and(&dir, &[("ay", 18)]);
+    let layout = temp_layout("beside-queue-store");
+    let f = SetBesideVendors::new(&dir, &layout, false);
+    f.vendors
+        .publish_claude("2.1.281", &native_exe("claude 2.1.281"));
+    f.vendors.publish_codex_default("0.157.0");
+    let trust = world::trust();
+    let mut seams = world_seams(&trust);
+    seams.path = Some(std::ffi::OsString::new());
+    crate::progress::append_bump(
+        &layout,
+        &crate::store::ToolName::new("trust").unwrap(),
+        crate::progress::Asker::Person,
+    )
+    .unwrap();
+    assert!(crate::progress::begin_pass(
+        &layout.progress_file(),
+        NET_PASS
+    ));
+    let code = run_update_pass(
+        &layout,
+        &claude_and_codex_wanted(),
+        &f,
+        &std::collections::BTreeMap::new(),
+        true,
+        &seams,
+    );
+    let file = crate::progress::live_snapshot().expect("the pass is live");
+    crate::progress::end_pass();
+    assert_eq!(code, 0);
+    assert_eq!(
+        f.queue_at_first_download.lock().unwrap().as_deref(),
+        Some(&["tb", "trust", "claude", "codex", "ay"].map(String::from)[..])
+    );
+    for agent in ["claude", "codex"] {
+        assert_eq!(
+            file.programs[agent].phase,
+            crate::progress::Phase::Done,
+            "{agent}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A PERSON WHO TYPED AN AGENT'S NAME DOES NOT WAIT FOR THE TOOLCHAIN. Its pending stub
+/// bumps it ("bumped first when still queued, so the wait is short"); the agents ride
+/// behind the `rustc` tuple, so the bumped one lands at once beside it — trust's archive
+/// waits for claude's payload, and a lane that ignored the bump never asks for it — while
+/// an agent nobody asked for still waits for the set's archives.
+#[test]
+fn a_bumped_agent_lands_beside_the_toolchain_not_after_it() {
+    use crate::vendor_direct::lane::world::{self, native_exe};
+    let dir = scratch("beside-bump-registry");
+    write_toolchain_registry(&dir);
+    let layout = temp_layout("beside-bump-store");
+    let mut f = SetBesideVendors::new(&dir, &layout, false);
+    f.tuple_waits_for_claude = true;
+    f.vendors
+        .publish_claude("2.1.281", &native_exe("claude 2.1.281"));
+    f.vendors.publish_codex_default("0.157.0");
+    crate::progress::append_bump(
+        &layout,
+        &crate::store::ToolName::new("claude").unwrap(),
+        crate::progress::Asker::Person,
+    )
+    .unwrap();
+    let trust = world::trust();
+    let mut seams = world_seams(&trust);
+    seams.path = Some(std::ffi::OsString::new());
+    let code = run_update_pass(
+        &layout,
+        &claude_and_codex_wanted(),
+        &f,
+        &std::collections::BTreeMap::new(),
+        true,
+        &seams,
+    );
+    assert_eq!(code, 0);
+    assert_eq!(
+        f.at_payload
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(agent, tuple_in, _)| (agent.as_str(), *tuple_in))
+            .collect::<Vec<_>>(),
+        [("claude", false), ("codex", true)],
+        "claude, asked for, beside the tuple; codex after the set's archives"
+    );
+    let active = crate::active_builds(&layout);
+    assert!(
+        ["trust", "tb", "claude", "codex"]
+            .iter()
+            .all(|p| active.contains_key(*p))
+    );
+    assert!(
+        crate::progress::read_bump(&layout).is_empty(),
+        "the completed request is consumed"
+    );
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// AN AGENT A SCRIPT ASKED FOR WAITS FOR THE TOOLCHAIN'S BYTES, THEN GOES FIRST. A script's
+/// `codex --version` (no terminal) bumps codex as a person's stub does, but nobody is waiting
+/// at a terminal: codex's bytes wait for every archive of the set like any agent's, and once
+/// the gate opens codex is the request taken first, ahead of claude's place in the table.
+#[test]
+fn a_script_bumped_agent_waits_for_the_toolchain_then_goes_first() {
+    use crate::vendor_direct::lane::world::{self, native_exe};
+    let _gate = crate::progress::PASS_TEST_GATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("beside-script-bump-registry");
+    write_toolchain_registry(&dir);
+    let layout = temp_layout("beside-script-bump-store");
+    let f = SetBesideVendors::new(&dir, &layout, false);
+    f.vendors
+        .publish_claude("2.1.281", &native_exe("claude 2.1.281"));
+    f.vendors.publish_codex_default("0.157.0");
+    crate::progress::append_bump(
+        &layout,
+        &crate::store::ToolName::new("codex").unwrap(),
+        crate::progress::Asker::Script,
+    )
+    .unwrap();
+    let trust = world::trust();
+    let mut seams = world_seams(&trust);
+    seams.path = Some(std::ffi::OsString::new());
+    assert!(crate::progress::begin_pass(
+        &layout.progress_file(),
+        NET_PASS
+    ));
+    let code = run_update_pass(
+        &layout,
+        &claude_and_codex_wanted(),
+        &f,
+        &std::collections::BTreeMap::new(),
+        true,
+        &seams,
+    );
+    let file = crate::progress::live_snapshot().expect("the pass is live");
+    crate::progress::end_pass();
+    assert_eq!(code, 0);
+    let mut at_payload = f.at_payload.lock().unwrap().clone();
+    at_payload.sort();
+    assert_eq!(
+        at_payload
+            .iter()
+            .map(|(agent, set_in, _)| (agent.as_str(), *set_in))
+            .collect::<Vec<_>>(),
+        [("claude", true), ("codex", true)],
+        "codex, a script's request, waits for the set's archives like claude"
+    );
+    assert!(
+        file.programs["codex"].bumped && !file.programs["claude"].bumped,
+        "codex is taken as the request it is, first, and claude in its turn"
+    );
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// [`write_toolchain_registry`] whose index publishes no channel this client follows (an
+/// Intel Mac before x86_64 lands reads the same: no channel for its machine).
+fn write_channelless_registry(dir: &Path) {
+    write_toolchain_registry(dir);
+    let body = std::fs::read_to_string(dir.join("index.toml"))
+        .unwrap()
+        .replace("name = \"stable\"", "name = \"elsewhere\"");
+    std::fs::write(dir.join("index.toml"), body.as_bytes()).unwrap();
+    std::fs::write(
+        dir.join("index.toml.sig"),
+        sign(&RELEASE_SEED, body.as_bytes()),
+    )
+    .unwrap();
+}
+
+/// NO CHANNEL HERE, AND THE PROMISE GOES WITH THE PLAN THAT SAYS SO. A first run's set
+/// completion finds no channel for this machine and plans nothing: the promise a stub waits
+/// on goes then, so `targo` hears the truth at once rather than when the update exits. When
+/// the agents the set was to carry land alone after it, their plan takes the promise over —
+/// a stub waiting for claude never reads it gone before claude's row is up — and goes with it.
+#[test]
+fn a_set_with_no_channel_hands_its_promise_to_the_plan_that_comes_next() {
+    use crate::vendor_direct::lane::world::{self, native_exe};
+    let _gate = crate::progress::PASS_TEST_GATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("no-channel-registry");
+    write_channelless_registry(&dir);
+    let trust = world::trust();
+    let mut seams = world_seams(&trust);
+    seams.path = Some(std::ffi::OsString::new());
+    let pass = |layout: &crate::store::Layout,
+                f: &SetBesideVendors,
+                cfg: &crate::config::PackagesConfig| {
+        crate::progress::promise_pass(
+            layout,
+            std::process::id(),
+            crate::progress::SEED_PROMISE_SECS,
+        );
+        assert!(crate::progress::begin_pass(
+            &layout.progress_file(),
+            NET_PASS
+        ));
+        let code = run_update_pass(
+            layout,
+            cfg,
+            f,
+            &std::collections::BTreeMap::new(),
+            true,
+            &seams,
+        );
+        crate::progress::end_pass();
+        code
+    };
+
+    // The agents land alone: at each one's payload its plan is up and the promise gone.
+    let layout = temp_layout("no-channel-agents");
+    let f = SetBesideVendors::new(&dir, &layout, false);
+    f.vendors
+        .publish_claude("2.1.281", &native_exe("claude 2.1.281"));
+    f.vendors.publish_codex_default("0.157.0");
+    assert_eq!(pass(&layout, &f, &claude_and_codex_wanted()), 1);
+    let owed = f.owed_at_payload.lock().unwrap().clone();
+    assert_eq!(owed.len(), 2, "{owed:?}");
+    for (agent, owed, rows) in &owed {
+        assert!(!owed, "{agent}: the agents' plan took the promise with it");
+        assert!(
+            ["claude", "codex"]
+                .iter()
+                .all(|a| rows.iter().any(|r| r == a)),
+            "{agent}: its plan is up: {rows:?}"
+        );
+    }
+    assert!(
+        crate::active_builds(&layout).contains_key("claude"),
+        "and they land"
+    );
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+
+    // Nothing to land after it: the set completion's empty plan retires the promise.
+    let layout = temp_layout("no-channel-alone");
+    let f = SetBesideVendors::new(&dir, &layout, false);
+    let none = crate::config::PackagesConfig {
+        exclude: Some(
+            crate::vendor_direct::VENDORS
+                .iter()
+                .map(|spec| spec.program.to_string())
+                .collect(),
+        ),
+        ..Default::default()
+    };
+    assert_eq!(pass(&layout, &f, &none), 1);
+    assert!(
+        !crate::progress::pass_owed(&layout, now_secs()),
+        "the set's plan of nothing retired the promise"
+    );
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A SET UNIT THE DOWNLOAD-AHEAD LANE DOES NOT FETCH KEEPS THE GATE SHUT ON THE LANE'S WORD.
+/// `ay`'s row carries no compressed size, so the lane leaves it to the pass, which fetches it
+/// inline; the lane's last archive in is then not the set's, and the agents' gate waits for
+/// the pass's own rule (no tuple left to land): every agent's bytes move after trust flips.
+#[test]
+fn a_unit_the_lane_does_not_fetch_keeps_the_agents_behind_the_toolchain() {
+    use crate::vendor_direct::lane::world::{self, native_exe};
+    let dir = scratch("beside-unfetched-registry");
+    write_toolchain_registry_and(&dir, &[("ay", 18)]);
+    let manifest = dir.join("pkg-ay-18.toml");
+    let body = std::fs::read_to_string(&manifest)
+        .unwrap()
+        .replace("size = 100", "size = 0");
+    std::fs::write(&manifest, body.as_bytes()).unwrap();
+    std::fs::write(
+        dir.join("pkg-ay-18.toml.sig"),
+        sign(&RELEASE_SEED, body.as_bytes()),
+    )
+    .unwrap();
+    let layout = temp_layout("beside-unfetched-store");
+    let mut f = SetBesideVendors::new(&dir, &layout, false);
+    f.set = &["ay", "tb", "trust"];
+    f.vendors
+        .publish_claude("2.1.281", &native_exe("claude 2.1.281"));
+    f.vendors.publish_codex_default("0.157.0");
+    let trust = world::trust();
+    let mut seams = world_seams(&trust);
+    seams.path = Some(std::ffi::OsString::new());
+    let code = run_update_pass(
+        &layout,
+        &claude_and_codex_wanted(),
+        &f,
+        &std::collections::BTreeMap::new(),
+        true,
+        &seams,
+    );
+    assert_eq!(code, 0);
+    let at_payload = f.at_payload.lock().unwrap().clone();
+    assert_eq!(at_payload.len(), 2, "{at_payload:?}");
+    assert!(
+        at_payload.iter().all(|(_, _, trust_live)| *trust_live),
+        "the agents' bytes wait for trust's flip: {at_payload:?}"
+    );
+    let active = crate::active_builds(&layout);
+    assert!(
+        ["ay", "trust", "tb", "claude", "codex"]
+            .iter()
+            .all(|p| active.contains_key(*p)),
+        "{active:?}"
+    );
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A REFUSED SET LEAVES ITS AGENTS TO LAND ALONE, AND THE PROMISE WITH THEM. A volume that
+/// cannot hold the set refuses it up front, so the agents it was to carry land after it on
+/// their own; the set completion's empty plan keeps the promise for theirs — a stub waiting
+/// for claude never reads it gone before claude's row is up — and the agents' plan retires it.
+#[test]
+fn a_refused_set_keeps_the_promise_for_the_agents_it_leaves_behind() {
+    use crate::vendor_direct::lane::world::{self, native_exe};
+    let _gate = crate::progress::PASS_TEST_GATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("refused-set-registry");
+    write_toolchain_registry(&dir);
+    // trust's tree is larger than any volume: the set is refused before it moves a byte.
+    let manifest = dir.join("pkg-trust-4821.toml");
+    let body = std::fs::read_to_string(&manifest).unwrap().replace(
+        "disk_installed = 1048576",
+        "disk_installed = 1125899906842624",
+    );
+    std::fs::write(&manifest, body.as_bytes()).unwrap();
+    std::fs::write(
+        dir.join("pkg-trust-4821.toml.sig"),
+        sign(&RELEASE_SEED, body.as_bytes()),
+    )
+    .unwrap();
+    let layout = temp_layout("refused-set-store");
+    let f = SetBesideVendors::new(&dir, &layout, false);
+    f.vendors
+        .publish_claude("2.1.281", &native_exe("claude 2.1.281"));
+    f.vendors.publish_codex_default("0.157.0");
+    let trust = world::trust();
+    let mut seams = world_seams(&trust);
+    seams.path = Some(std::ffi::OsString::new());
+    let cfg = claude_and_codex_wanted();
+    let index = crate::resolve_verified_index(
+        &f,
+        &layout,
+        &(seams.anchor)(&layout),
+        build_floor(&layout),
+        (seams.now)(),
+    )
+    .expect("the registry's index");
+    let installed = std::collections::BTreeMap::new();
+    let (mut vendor, fresh) = vendor_plan(
+        &layout,
+        &f,
+        &cfg,
+        &installed,
+        VendorLanes {
+            update_installed: true,
+            complete_the_set: true,
+        },
+        Some(&index),
+        &seams,
+    );
+    assert!(!fresh.pending.is_empty(), "the agents are fresh");
+    let mut rider = VendorRider {
+        fresh,
+        trust: seams.trust,
+        warm: seams.warm_agents,
+        landed: None,
+    };
+    crate::progress::promise_pass(
+        &layout,
+        std::process::id(),
+        crate::progress::SEED_PROMISE_SECS,
+    );
+    assert!(crate::progress::begin_pass(
+        &layout.progress_file(),
+        NET_PASS
+    ));
+    let flip = crate::quiet::FlipGate {
+        policy: crate::quiet::FlipPolicy::Now,
+        now: (seams.now)(),
+        running: seams.running,
+    };
+    let net = install_default_set_beside(
+        &layout,
+        &f,
+        &(seams.anchor)(&layout),
+        &cfg,
+        Consent::Explicit,
+        (seams.now)(),
+        Some(&index),
+        seams.path.as_deref(),
+        &flip,
+        &std::collections::BTreeSet::new(),
+        SetCompanions {
+            vendor: Some(&mut rider),
+            toolchain_flipped: &|_| {},
+        },
+    );
+    assert_eq!(net.failures, 1, "the set is refused");
+    assert!(
+        rider.landed.is_none(),
+        "and its agents are left to land alone"
+    );
+    assert!(
+        crate::progress::pass_owed(&layout, now_secs()),
+        "the set's plan kept the promise for the agents' plan"
+    );
+    land_fresh_alone(
+        &layout,
+        &f,
+        Consent::Explicit,
+        &rider.fresh,
+        &mut vendor,
+        &seams,
+        true,
+    );
+    crate::progress::end_pass();
+    let owed = f.owed_at_payload.lock().unwrap().clone();
+    assert!(
+        !owed.is_empty()
+            && owed.iter().all(|(_, owed, rows)| {
+                !owed
+                    && ["claude", "codex"]
+                        .iter()
+                        .all(|a| rows.iter().any(|r| r == a))
+            }),
+        "the agents' plan took the promise with it: {owed:?}"
+    );
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// AN AGENT THAT FAILS BESIDE THE SET CANCELS NOTHING: the set lands whole, the terminal
+/// names what arrived, the pass exits 1 for the agents, and each agent's row is its own
+/// lane's failure — never the set's "installing" row it was painted with before its bytes
+/// moved.
+#[test]
+fn an_agent_failing_beside_the_set_leaves_the_set_and_its_own_row() {
+    use crate::vendor_direct::lane::world::{self, native_exe};
+    let dir = scratch("beside-fail-registry");
+    write_toolchain_registry(&dir);
+    let layout = temp_layout("beside-fail-store");
+    let f = SetBesideVendors::new(&dir, &layout, false);
+    f.vendors
+        .publish_claude("2.1.281", &native_exe("claude 2.1.281"));
+    f.vendors.publish_codex_default("0.157.0");
+    f.vendors.downloads_fail.set(true);
+    crate::progress::append_bump(
+        &layout,
+        &crate::store::ToolName::new("codex").unwrap(),
+        crate::progress::Asker::Person,
+    )
+    .unwrap();
+    let trust = world::trust();
+    let mut seams = world_seams(&trust);
+    seams.path = Some(std::ffi::OsString::new());
+    let _ = take_markers_said();
+    let code = run_update_pass(
+        &layout,
+        &claude_and_codex_wanted(),
+        &f,
+        &std::collections::BTreeMap::new(),
+        true,
+        &seams,
+    );
+    assert_eq!(code, 1);
+    let markers = take_markers_said();
+    assert!(
+        markers.contains(&format!("atpkg: {NET_INSTALLED_MARKER}tb, trust")),
+        "{markers:?}"
+    );
+    let active = crate::active_builds(&layout);
+    assert_eq!(
+        (active.get("trust"), active.get("claude")),
+        (Some(&4821), None)
+    );
+    let rows = crate::status::read(&layout).unwrap().programs;
+    for agent in ["claude", "codex"] {
+        assert!(
+            rows[agent].state.starts_with("error: "),
+            "{agent}: {}",
+            rows[agent].state
+        );
+    }
+    assert_eq!(
+        crate::progress::read_bump(&layout),
+        ["codex"],
+        "a failed requested agent keeps its priority for the next pass"
+    );
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_requested_agent_waiting_for_its_signature_keeps_its_priority() {
+    use crate::vendor_direct::lane::world::{self, native_exe};
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let dir = scratch("beside-deferred-bump-registry");
+    write_toolchain_registry(&dir);
+    let layout = temp_layout("beside-deferred-bump-store");
+    let f = SetBesideVendors::new(&dir, &layout, false);
+    f.vendors
+        .publish_claude("2.1.281", &native_exe("claude 2.1.281"));
+    f.vendors.publish_codex_default("0.157.0");
+    crate::progress::append_bump(
+        &layout,
+        &crate::store::ToolName::new("claude").unwrap(),
+        crate::progress::Asker::Person,
+    )
+    .unwrap();
+    let trust = world::trust_timing_out();
+    let mut seams = world_seams(&trust);
+    seams.path = Some(std::ffi::OsString::new());
+    let code = run_update_pass(
+        &layout,
+        &claude_and_codex_wanted(),
+        &f,
+        &std::collections::BTreeMap::new(),
+        true,
+        &seams,
+    );
+    assert_eq!(
+        code, 0,
+        "a signature check that did not finish is no failure"
+    );
+    assert!(crate::active_builds(&layout).contains_key("trust"));
+    assert!(!crate::active_builds(&layout).contains_key("claude"));
+    assert_eq!(
+        crate::progress::read_bump(&layout),
+        ["claude"],
+        "the requested agent is still pending"
+    );
+    let installed = crate::active_builds(&layout);
+    assert_eq!(
+        run_update_pass(
+            &layout,
+            &claude_and_codex_wanted(),
+            &f,
+            &installed,
+            true,
+            &seams,
+        ),
+        0
+    );
+    assert_eq!(
+        crate::progress::read_bump(&layout),
+        ["claude"],
+        "the next pass keeps the pending request after the store is no longer empty"
+    );
+    let trust = world::trust();
+    let mut seams = world_seams(&trust);
+    seams.path = Some(std::ffi::OsString::new());
+    assert_eq!(
+        run_update_pass(
+            &layout,
+            &claude_and_codex_wanted(),
+            &f,
+            &crate::active_builds(&layout),
+            true,
+            &seams,
+        ),
+        0
+    );
+    assert!(crate::active_builds(&layout).contains_key("claude"));
+    assert!(
+        crate::progress::read_bump(&layout).is_empty(),
+        "the request is consumed when the signature check finishes and the agent lands"
+    );
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// WITH NO INDEX, THE AGENTS STILL LAND (design §1.5) — alone and first, under their own
+/// announcement and terminal, while the set completion that follows can do nothing.
+#[test]
+fn a_failed_index_resolve_lands_the_agents_alone() {
+    use crate::vendor_direct::lane::world::{self, native_exe};
+    let dir = scratch("beside-no-index");
+    let layout = temp_layout("beside-no-index-store");
+    let f = SetBesideVendors::new(&dir, &layout, false);
+    f.vendors
+        .publish_claude("2.1.281", &native_exe("claude 2.1.281"));
+    f.vendors.publish_codex_default("0.157.0");
+    let trust = world::trust();
+    let mut seams = world_seams(&trust);
+    seams.path = Some(std::ffi::OsString::new());
+    let _ = take_markers_said();
+    let code = run_update_pass(
+        &layout,
+        &claude_and_codex_wanted(),
+        &f,
+        &std::collections::BTreeMap::new(),
+        true,
+        &seams,
+    );
+    assert_ne!(code, 0, "the index lane failed");
+    let markers: Vec<String> = take_markers_said()
+        .into_iter()
+        .filter(|m| m.contains(NET_STARTING_MARKER) || m.contains(NET_INSTALLED_MARKER))
+        .collect();
+    assert_eq!(markers.len(), 2, "{markers:?}");
+    assert!(
+        markers[0].contains("installing 2 program(s) over the network: claude, codex — "),
+        "{}",
+        markers[0]
+    );
+    assert_eq!(
+        markers[1],
+        format!("atpkg: {NET_INSTALLED_MARKER}claude, codex")
+    );
+    let active = crate::active_builds(&layout);
+    assert!(active.contains_key("claude") && active.contains_key("codex"));
+    let _ = std::fs::remove_dir_all(&layout.prefix);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -14300,6 +16081,7 @@ fn a_vendor_rollback_moves_to_the_retained_build_without_the_index() {
             legacy_index: None,
             asked: false,
             now: world::NOW,
+            download_turn: None,
         };
         lane::install_one(&lane, spec, false)
     };
@@ -14366,7 +16148,6 @@ fn a_vendor_rollback_moves_to_the_retained_build_without_the_index() {
         "atpkg: rolled back claude from 2.1.282 to 2.1.281; `aterm pkg pin claude` holds it \
          there (otherwise the next update returns it to Anthropic's latest)"
     );
-    assert_eq!(crate::vendor_direct::retired_wording(&line), None);
     // Already pinned, the vendor lane leaves it where it lands: the index lane's words.
     let pinned = vendor_rolled_back_line(spec, "2.1.282", "2.1.281", true);
     assert_eq!(
@@ -14374,7 +16155,6 @@ fn a_vendor_rollback_moves_to_the_retained_build_without_the_index() {
         "atpkg: rolled back claude from 2.1.282 to 2.1.281; it is pinned, so updates leave \
          it there until `aterm pkg unpin claude`"
     );
-    assert_eq!(crate::vendor_direct::retired_wording(&pinned), None);
     // gc keeps below the live build the one this verb lands on: .283 live, .282 and .281
     // retained (a session still running .281 kept it through a pass), and the latch
     // yanking .282. `atpkg gc`'s own call reclaims the yanked .282 and keeps .281, so
@@ -14443,6 +16223,7 @@ fn a_kept_legacy_row_never_carries_another_builds_root() {
             legacy_index: None,
             asked: false,
             now: world::NOW,
+            download_turn: None,
         };
         let outcome = lane::install_one(&lane, spec, true);
         assert!(
@@ -14461,6 +16242,87 @@ fn a_kept_legacy_row_never_carries_another_builds_root() {
     let row = keep();
     assert_eq!(row.installed_build, Some(b));
     assert_eq!(row.tree_root, root_a);
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+}
+
+/// A vendor program its vendor serves this machine nothing for carries the canonical
+/// `unavailable on <target>: <hint>` row — the state `doctor` reads as no fault — recorded
+/// once, with no build, and never a failure of the pass.
+#[test]
+fn an_unserved_vendor_program_records_the_unavailable_row() {
+    use crate::vendor_direct::lane::world::{self, Fake};
+    use crate::vendor_direct::lane::{self, Verdict};
+    use crate::vendor_direct::policy::Policy;
+    let layout = world::layout("unserved-row");
+    let f = Fake::default();
+    let trust = world::trust();
+    let none = Policy::default();
+    let triple = "x86_64-unknown-linux-gnu";
+    let lane = lane::Lane {
+        layout: &layout,
+        fetcher: &f,
+        triple,
+        policy: &none,
+        trust: &trust,
+        legacy_index: None,
+        asked: false,
+        now: world::NOW,
+        download_turn: None,
+    };
+    let spec = crate::vendor_direct::spec("muse").unwrap();
+    let outcome = lane::install_one(&lane, spec, false);
+    let Verdict::Unavailable { state } = &outcome.verdict else {
+        panic!("{outcome:?}");
+    };
+    let mut pass = VendorPass::default();
+    report_vendor(&layout, &outcome, &mut pass, false, world::NOW);
+    assert_eq!((pass.failures, pass.reached), (0, false));
+    let row = crate::status::read(&layout).unwrap().programs["muse"].clone();
+    assert_eq!(row.state, *state);
+    assert!(
+        row.state
+            .starts_with(&format!("{}{triple}: ", crate::state::UNAVAILABLE_PREFIX)),
+        "{}",
+        row.state
+    );
+    assert_eq!(row.installed_build, None);
+    assert!(f.gets.borrow().is_empty());
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+}
+
+/// `install muse` — and `update muse` while it is not installed — where Meta serves
+/// nothing: the door asks no index and no host, and answers the lane's state whole, the
+/// canonical non-error state the verb prints on stdout with a clean exit (as the index
+/// lane's `NoArtifact`) and records as the row.
+#[test]
+fn an_unserved_vendor_install_answers_the_unavailable_state() {
+    use crate::vendor_direct::lane::{Verdict, world};
+    let layout = world::layout("unserved-install");
+    let f = world::Fake::default();
+    let req = crate::InstallRequest {
+        channel: "stable",
+        program: "muse",
+        triple: "x86_64-unknown-linux-gnu",
+        installed: None,
+    };
+    let outcome = crate::flow::vendor_install_outcome(
+        &f,
+        &layout,
+        &world_anchor(&layout),
+        build_floor(&layout),
+        &req,
+        crate::vendor_direct::spec("muse").unwrap(),
+        &world::trust(),
+        world::NOW,
+    );
+    assert_eq!((f.gets.borrow().len(), f.index_reads.get()), (0, 0));
+    let Verdict::Unavailable { state } = outcome.verdict.clone() else {
+        panic!("{outcome:?}");
+    };
+    let e = outcome.into_install(&layout).unwrap_err();
+    assert!(matches!(e, crate::FlowError::VendorUnavailable(_)), "{e:?}");
+    assert_eq!(canonical_non_error_state(&e), Some(state.clone()));
+    assert_eq!(failed_install_state(&e), Some(state));
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
@@ -14506,6 +16368,7 @@ fn a_vendor_rollback_returns_to_the_legacy_build_the_first_vendor_install_replac
         legacy_index: None,
         asked: false,
         now: world::NOW,
+        download_turn: None,
     };
     assert!(matches!(
         lane::install_one(&lane, spec, false).verdict,
@@ -14543,10 +16406,6 @@ fn a_vendor_rollback_returns_to_the_legacy_build_the_first_vendor_install_replac
     assert_eq!(row.installed_build, Some(2_026_091_901));
     assert_eq!(row.state, "managed 2026091901 — rolled back from 2.1.281");
     assert!(row.tree_root.is_empty(), "no root was ever recorded for it");
-    let line = vendor_rolled_back_line(spec, "2.1.281", "build 2026091901", false);
-    for text in [&row.state, &line] {
-        assert_eq!(crate::vendor_direct::retired_wording(text), None, "{text}");
-    }
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
@@ -14598,6 +16457,7 @@ fn a_rollback_to_the_legacy_build_is_attested_by_its_kept_root() {
             legacy_index: index,
             asked: false,
             now: world::NOW,
+            download_turn: None,
         };
         let outcome = lane::install_one(&lane, spec, held);
         record_vendor_status(layout, &outcome, world::NOW);

@@ -60,9 +60,8 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-/// An owned COM interface pointer (any interface — released through the
-/// `IUnknown` prefix every vtable shares), so `?`-style early returns cannot
-/// leak a reference.
+/// An owned COM interface pointer of any interface, released through the shared
+/// `IUnknown` prefix, so an early return cannot leak a reference.
 pub(crate) struct Com(pub(crate) *mut c_void);
 
 impl Drop for Com {
@@ -77,8 +76,8 @@ impl Drop for Com {
     }
 }
 
-/// A failed step: which call, and its HRESULT — the whole error surface of a
-/// COM caller (one warn line; a shell nicety that fails must never be louder).
+/// A failed step: which call, and its HRESULT. A failing shell nicety costs one warn
+/// line, never more.
 pub(crate) type StepError = (&'static str, i32);
 
 pub(crate) fn check(hr: i32, step: &'static str) -> Result<(), StepError> {

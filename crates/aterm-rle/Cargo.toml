@@ -13,7 +13,7 @@ description = "Run-Length Encoding container for terminal cell attributes"
 # None — pure std
 
 [dev-dependencies]
-# None — tests use only std
+aterm-spec = { workspace = true }
 
 [lints]
 workspace = true

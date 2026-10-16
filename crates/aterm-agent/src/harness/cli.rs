@@ -10,8 +10,7 @@
 //! A reader. The supervisor that ACTS — presses a proven-safe approval,
 //! continues a turn, switches a model at a bucket limit, escalates — is the
 //! one engine in [`crate::supervise`], hosted by the window and started by
-//! `aterm drive watch|supervise`. The verbs of the deleted second stack are
-//! refused by name ([`DELETED`]) with where the capability went.
+//! `aterm drive watch|supervise`.
 //!
 //! * `usage` folds THIS session's transcripts — the one Claude Code names in
 //!   the environment it gives its tools (`CLAUDE_CODE_SESSION_ID`, else
@@ -24,10 +23,15 @@
 //!   ([`usage_label`]).
 //! * `limits` reads the session's SCREEN over the control socket (the one
 //!   interface) through the engine's own readers: the wall the last turn
-//!   ended on ([`aterm_phase::wall`], the one wall classifier — the engine's
-//!   turn-end policy acts on the same reading) and the windows the vendor
-//!   painted on its `/usage` panel ([`usage::usage_panel_windows`]), each
-//!   reset placed by the supervisor's own clock ([`limit::parse_reset`]).
+//!   ended on, by the grammar of the program `status` names in front
+//!   ([`aterm_phase::identify`] — the engine's turn-end policy acts on the
+//!   same reading), and the windows the vendor painted: Claude Code's `/usage`
+//!   panel ([`usage::usage_panel_windows`]), each reset placed by the
+//!   supervisor's own clock ([`limit::parse_reset`]), or Codex's `/status`
+//!   card ([`usage::codex_status_windows`]), each reset placed in the zone its
+//!   TUI draws in ([`limits_view`]); a Codex wall's reset is the one the
+//!   window's harness placed in that zone, where `status` publishes it
+//!   (`reset_at=`, [`limits_view_placed`]).
 //! * `disk` measures, and removes only a named safelist class under
 //!   `disk.apply = true`: for build directories, an idle cargo profile's
 //!   `incremental/` under cargo's own locks ([`disk::target`]), and below the
@@ -42,18 +46,27 @@
 //!   this machine recorded of each account ([`super::accounts`]), and prints
 //!   each one's condition and which is next. Its sub-forms WRITE, and only
 //!   files: `add` appends a roster row and makes that login's directory,
-//!   `use` records the owner's pin, `check` records what each login answers
-//!   to `claude auth status --json` — exit status and the one key `loggedIn`,
-//!   nothing else of that output read, printed or kept. `login` runs the
-//!   vendor's own sign-in flow at a terminal. NOTHING HERE TOUCHES A SESSION:
-//!   the move these facts feed is the WINDOW's — its supervisor relaunches a
-//!   hosted Claude Code under the pinned account at its next turn end,
-//!   under the next listed account at a usage limit and, under `early`,
-//!   AHEAD of one (aterm-gui's `harness_host`) — and the report and `use`
-//!   say what is built (that move, the usage probe that samples for it, and
-//!   the limit reset, which ships off and has never been run against a real
-//!   wall) and that none of it has been observed with two real accounts
-//!   ([`ACCOUNTS_ROTATION`]).
+//!   `use` records the owner's pin, and `login` runs the vendor's own
+//!   sign-in flow at a terminal and, after a flow that exits 0, records what
+//!   that one new login answers to `claude auth status --json` — exit status
+//!   and the one key `loggedIn`, nothing else of that output read, printed
+//!   or kept. A flow that fails runs nothing more under any login: that
+//!   command spends an idle login's single-use refresh token, and only a
+//!   login minted seconds ago has nothing to refresh
+//!   ([`run_accounts_login`]). `adopt-default` lists this machine's own
+//!   login as a renewable row, and `renew` renews a login before it ends:
+//!   the vendor's sign-in into a new staging directory, ONE check in that
+//!   home whose address is compared in memory with the row's, and only on a
+//!   match the row bound to the new login ([`run_accounts_renew`]); then the
+//!   same on each other machine named, over SSH.
+//!   NOTHING HERE TOUCHES A SESSION: the move these facts feed is the
+//!   WINDOW's — its supervisor relaunches a hosted Claude Code under the
+//!   pinned account at its next turn end, under the next listed account at a
+//!   usage limit and, under `early`, AHEAD of one (aterm-gui's
+//!   `harness_host`) — and the report and `use` say what is built (that
+//!   move, the usage probe that samples for it, and the limit reset, which
+//!   ships off and has never been run against a real wall) and that none of
+//!   it has been observed with two real accounts ([`ACCOUNTS_ROTATION`]).
 //! * `upgrade` is the one verb here that ACTS: it moves a live Claude Code
 //!   session onto a newer build in place, cooperatively
 //!   ([`super::upgrade_drive`]), and a live Codex, its shared daemon first and
@@ -61,19 +74,23 @@
 //!   ([`super::upgrade_codex`]). It restarts the agent process, never answers
 //!   a box or continues a turn; the window's host takes the same steps on its
 //!   own tabs at each session's idle points, under aterm.toml's `[harness]
-//!   upgrade` switch. A hand-run sweep obeys `[harness] enabled`
+//!   upgrade` switch. A hand-run sweep obeys `[harness] enabled` and each
+//!   agent's own `[harness.<agent>] enabled`
 //!   ([`crate::supervise::SupervisorConfig::from_path`], the table's one
 //!   reader).
 //!
 //! The hook bridge (`hook`, `statusline`, `install`, `uninstall`) is retired
 //! ([`RETIRED`]) and answered before anything is parsed ([`main_entry`]).
+//! So is `tap`, the usage tap ([`super::tap`]): Claude Code's own status-line
+//! command on the relaunch lines aterm types under `[harness] usage_tap`,
+//! which writes a reading of its own and prints one line, whatever happens.
 //!
 //! Every subcommand is one pass: read, decide, print, exit; nothing polls.
 //!
 //! * The retired `hook` and `statusline` **always exit 0** and print nothing:
 //!   a bridge script an older `install` wrote still runs them, and Claude Code
 //!   reads a failing hook command as a block (CHANGELOG.md, 0.92.0, "The Claude
-//!   Code hooks.").
+//!   Code hooks."). `tap` always exits 0 too, and always prints one line.
 //! * Every other subcommand exits 0 on success, 1 on a refusal it can
 //!   explain (`limits` with no session answering, an `upgrade` the master
 //!   switch stands down, an `accounts` roster that does not admit, a label
@@ -84,9 +101,9 @@
 //!   later".
 //!
 //! STATUS (docs/README.md honesty ratchet): unit-tested, `limits` against a
-//! scripted control connection, `accounts check` and `login` against a fake
-//! host ([`AccountsHost`]): no test runs `claude`, and neither verb has been
-//! run against a second real account.
+//! scripted control connection, `accounts login` against a fake host
+//! ([`AccountsHost`]): no test runs `claude`, and the verb has not been run
+//! against a second real account.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsString;
@@ -100,6 +117,7 @@ use super::accounts::{self, Auth, Class, Roster};
 use super::align::Captured;
 use super::disk;
 use super::footer;
+use super::profile;
 use super::session_usage::{self, SessionUsage};
 use super::source::Source;
 use super::usage::{self, AccountView, UsageView, rfc3339_utc};
@@ -118,15 +136,6 @@ pub const HARNESS: &str = "claude-harness";
 /// Why `hook`, `statusline`, `install` and `uninstall` are retired.
 pub const RETIRED: &str =
     "aterm installs nothing into an agent; a starting window removes what an older build installed";
-
-/// The verbs deleted with the second harness stack. They are named in the
-/// refusal so a script that still calls one learns where the capability went
-/// rather than reading a bare "unknown subcommand". `switch` stays refused:
-/// no verb moves a session by hand.
-pub const DELETED: &[&str] = &[
-    "status", "mark", "enable", "disable", "align", "caps", "liveness", "recover", "nudge",
-    "switch", "watch", "config",
-];
 
 /// How many rows `ledger` prints when the caller names no count.
 pub const LEDGER_DEFAULT_ROWS: usize = 20;
@@ -163,23 +172,31 @@ pub fn default_config_path() -> Option<PathBuf> {
 pub const USAGE: &str = "\
 aterm harness — read views of the Claude Code harness, and the live agent
 upgrade. The supervisor that acts on a session is the window's own host, by
-default, for every Claude Code and Codex session (`aterm drive watch|supervise`
-runs the same engine from a terminal).
+default, for every Claude Code, Codex and agy session (`aterm drive
+watch|supervise` runs the same engine from a terminal).
 
 USAGE:
-    aterm harness usage [--json]                 this session's tokens per model
-    aterm harness limits [@<sid>] [--json]       the wall and the painted /usage windows on the session's screen
+    aterm harness usage [--json]                 this session's tokens per model, and its usage
+                                                 tap's limits where it has one; from a Codex
+                                                 session's tools, its conversation's, at list ≈$
+    aterm harness limits [@<sid>] [--json]       the wall and the painted /usage or /status windows on the session's screen
     aterm harness disk [<build-dir> ...] [--apply <class>] [--json]
     aterm harness ledger [@<sid>] [<n>] [--json] the supervisor's approval ledger
     aterm harness ledger disk [<n>] [--json]     the disk journal
     aterm harness ledger upgrade [<n>] [--json]  the live upgrade's ledger: every act, and the owner's word
-    aterm harness ledger accounts [<n>] [--json] the accounts ledger: checks, pins, limits, rotations
+    aterm harness ledger accounts [<n>] [--json] the accounts ledger: sign-ins, pins, limits, rotations
     aterm harness accounts [--json]              the Claude Code accounts listed on this machine: each
                                                  one's condition, and which is next
-    aterm harness accounts add <label> [--shared]
+    aterm harness accounts stats [--json]        what Claude Code's profile says of its account: the
+                                                 plan and tier, usage credits, how Fable is billed
+    aterm harness accounts add <label> [--shared] [--email <e>] [--browser <b>]
                                                  list an account: make its login directory, add its row
+    aterm harness accounts adopt-default <label> --email <e> [--browser <b>]
+                                                 list this machine's own login as one renewable row
     aterm harness accounts login <label>         sign it in: Claude Code's own flow, then record whether it took
-    aterm harness accounts check                 ask each login whether it is signed in
+    aterm harness accounts renew [--due | <label>...] [--on <host>,... | --here]
+                                                 renew logins before they end: a staging sign-in, checked
+                                                 against the row's email, then every due login elsewhere
     aterm harness accounts use <label> | --auto  the owner's word: pin one account, or end the pin
     aterm harness upgrade [<sid>] [--dry-run] [--json]
                                                  move live Claude Code sessions onto a newer build
@@ -195,15 +212,13 @@ USAGE:
                                                  the model priority list: show it (availability,
                                                  what is on offer, the target, Claude Code's
                                                  recommendations) or set it
+    aterm harness tap                            the usage tap: Claude Code's status-line command
+                                                 on aterm's relaunch lines (`[harness] usage_tap`)
 
 `hook`, `statusline`, `install` and `uninstall` are RETIRED: aterm installs nothing into
 an agent. `install`/`uninstall` refuse (exit 2); `hook` and `statusline` do nothing and
 exit 0, for a bridge an older build installed. A starting window removes what `install`
 wrote to ~/.claude/settings.json.
-
-`status`, `mark`, `enable`, `disable`, `align`, `caps`, `liveness`, `recover`, `nudge`,
-`switch`, `watch` and `config` are GONE: the engine behind `aterm drive` is the one
-supervisor, and aterm.toml's [harness] table is its policy.
 
 OPTIONS:
     --state <path>      the harness state directory: the disk journal, the upgrade records and ledger,
@@ -223,6 +238,11 @@ OPTIONS:
     --defer <dur>       upgrade <sid>: not for <dur> (90s, 30m, 6h, 2d; at most 30d)
     --skip              upgrade <sid>: stay on the running build until a newer target comes
     --shared            accounts add: the account is `shared` (your other machines draw on it too)
+    --email <e>         accounts add, adopt-default: the account's address, which its renewal is checked against
+    --browser <b>       accounts add, adopt-default: the browser profile (display name) holding its claude.ai session
+    --due               accounts renew: every login of this machine that is due or ended
+    --on <host>,...     accounts renew: the machines to renew on next, over ssh (`host` or `host:/abs/aterm`)
+    --here              accounts renew: this machine's logins alone, no other machine (what each one runs)
     --auto              accounts use: end the pin
     --json              the JSON form
     -h, --help          this text; `aterm harness <verb> --help` explains one verb
@@ -241,8 +261,10 @@ CLAUDE_CONFIG_DIR, else ~/.claude) and says so: two sessions in one directory sh
 so the newest may be the other one's; a relative CLAUDE_CONFIG_DIR folds nothing, said.
 A streamed subagent message counts once, at its final figures. It reads up to a 4 GiB
 cap and says PREFIX only when it hits it; a subagent transcript it could not count is
-said (`complete` is false in --json). It carries spend, never a window; the window's
-Claude Code footer shows the same tokens live, and a limit the session hit.
+said (`complete` is false in --json). Its windows (`5h`/`7d`, `windows` in --json) are
+the usage tap's last reading for the Claude Code CLAUDE_PID names in this tab, where
+`[harness] usage_tap` put one on its line (`aterm harness tap --help`); else `?`. The
+window's Claude Code footer shows the same tokens live, and a limit the session hit.
 `acct <label>` (`label` in --json) is `account` unless accounts.toml lists two or more
 accounts and the run is from a Claude Code session's own tools with CLAUDE_PID set: then
 it is the label of the row that process's login names, read from the environment the
@@ -252,15 +274,33 @@ roster that is refused, the newest-transcript pick, and a CLAUDE_PID that is no 
 the Claude Code of the session folded all stay `account`; a credential given by a
 settings file is not seen. No account's limits or state are read here: `aterm harness
 accounts` prints them.
+
+Run from a Codex session's own tools (CODEX_THREAD_ID names its thread) where no Claude
+Code session is named, it folds that thread's conversation instead: the rollout of its
+TUI's own thread (the `session_id` the named thread's rollout gives) and every subagent
+rollout that names it, under CODEX_HOME, else ~/.codex (a relative CODEX_HOME folds
+nothing, said). Each served turn counts once: the last_token_usage of a token_count
+whose running total grew, on the model of the latest turn_context; a fork's copied
+prefix (the burst of its parent's lines it opens with) counts nothing. `in` is the
+uncached input; `cache read` is Codex's cached input. Where the shipped price table
+prices the model, `usd` is its list dollars (≈$, never a bill); a model it does not is
+unpriced (`usd` null). `acct codex`; its windows stay `?` (`aterm harness limits` reads
+Codex's /status card).
 ";
 
 /// `aterm harness limits --help`.
 const HELP_LIMITS: &str = "\
 `limits` reads the session's screen once over the control socket (`text --json tail=40`)
 and prints the wall the last turn ended on (the kind the supervisor acts on, its words and
-its reset) and any windows a painted /usage panel shows. With no @<sid> it
-reads the session it runs in ($ATERM_PARENT_SESSION_ID); with neither it refuses (exit 2)
-rather than read whichever session the socket defaults to. No session answering is exit 1.
+its reset; a Codex's reset where the window's harness placed it, in the Codex's own zone, as
+`status` names it in `reset_at=`), read by the grammar of the program `status` names in front
+(Claude Code's or Codex's), any windows that program painted (Claude Code's /usage panel,
+Codex's /status card, whose `N% left` is printed as what is used and whose resets are placed
+in the Codex's own zone), and `credits=in-use` where Claude Code's own notice says usage
+credits carry the session (`-` otherwise; credits are work going on, never a wall). With no
+@<sid> it reads the session it runs in ($ATERM_PARENT_SESSION_ID); with neither it refuses
+(exit 2) rather than read whichever session the socket defaults to. No session answering is
+exit 1.
 ";
 
 /// `aterm harness disk --help`.
@@ -331,6 +371,29 @@ window's automatic cleanup takes whole before any recent profile; once the volum
 under the floor it does not protect a recently built checkout's cache.
 ";
 
+/// `aterm harness tap --help`.
+const HELP_TAP: &str = "\
+`tap` is not run by hand: it is the status-line command aterm puts on the Claude Code
+relaunch lines it types under `[harness] usage_tap = true` (off by default), an inline
+`--settings` whose statusLine command is `<aterm> harness tap`, refreshed every 10 s.
+Claude Code runs it after every reply and every 10 s, with its own usage figures on stdin;
+it writes them into <aterm state>/harness/claude-harness/rl/<tab>-<pid>.json (0600) and
+prints one line, `5h 42% \u{b7} 7d 61%`, which Claude Code draws under its composer. It
+always exits 0. It is added only on the machine's own login (no CLAUDE_CONFIG_DIR, no
+credential, profile or route of the session's own, no named login but the one `accounts
+renew` bound the machine's one account to), only where nothing in the session's settings
+sets a statusLine, disableAllHooks or an apiKeyHelper when the line is typed, only where
+you passed no --settings, and only from an aterm whose path has no space; a session
+started by hand gets it at its first relaunch (an upgrade, a restart).
+Claude Code puts the line's --settings above your settings files, so a statusLine you set
+later in a tapped session (/statusline, an edited file) shows from its next relaunch,
+which leaves the tap off. A status line from an organization's server settings or a
+plugin is not seen. Switched off, a tapped session keeps its tap, and is still recorded,
+until its next relaunch. The window records the figures for this machine's account
+(`aterm harness accounts`, `usage`); they move no session. A tapped session whose tap
+goes quiet is said once a day in Messages.
+";
+
 /// `aterm harness ledger --help`.
 const HELP_LEDGER: &str = "\
 `ledger` prints the newest rows of the approval ledger the supervisor keeps for one
@@ -344,30 +407,38 @@ const HELP_ACCOUNTS: &str = "\
 `accounts` LISTS THE CLAUDE CODE ACCOUNTS OF THIS MACHINE AND WHAT IS KNOWN OF EACH. The
 roster is `accounts.toml` beside aterm.toml: [[account]] rows of `label`, `class`
 (`dedicated`: this machine's alone; `shared`: your own account that your other machines
-draw on too) and `dir` (the login's directory name; the one row with none is the login
-this machine already has). It ships empty, and with no rows this verb says so, names the
-file it read and the `add` line to run. A file that does not admit — an unknown key, a
-repeated label or dir, a relative dir, two rows with no dir, more than 32 rows — is
-REFUSED whole (exit 1, the reason by name). No credential is stored, read or copied: an
-account is a login you made through Claude Code's own flow, known here only by its label;
-no email, person or organization name is read or printed.
+draw on too), `dir` (the login's directory name; the one row with none is the login
+this machine already has), and optionally `email` and `browser` (below). It ships empty,
+and with no rows this verb says so, names the file it read and the `add` line to run — and,
+where `[harness] usage_tap` recorded this machine's own login, that login's figures and when
+the tap read them (in --json, the one row `main`). A file that does not admit — an unknown
+key, a repeated label, dir or email, a relative dir, an email that is not one address, two
+rows with no dir, more than 32 rows — is REFUSED whole (exit 1, the reason by name, an
+address never quoted). No credential is stored, read or copied: an account is a login you
+made through Claude Code's own flow, known here by its label; an email is read from this
+file alone, and no email, person or organization name is printed or logged.
 THE REPORT: `active: <label>, N of M sessions on it`, then one row per account — label,
 class, condition (`not-enrolled`: no login was made here yet — its login directory is
-missing or holds nothing, and `accounts login <label>` is what fills it; `signed-out`: the
-last check said so; `limited until <time>`: a usage limit stands; `low`: the session
-window at 90% or the week at 97%, until that window resets; `usable`; `unseen`: nothing
-observed yet), `active`, `active:unproven` or `pinned` (`-` for neither), the limit-reset
-offer last read (`offer: N left, use by <time>`, only once one was read), the sessions on
+missing or holds nothing, and `accounts login <label>` is what fills it — `accounts renew
+<label>` for a row with an email; `signed-out`: a login wall right after a session was moved
+onto it (before the move served a turn), a login wall on a row with an email (its login's own
+end, renewed by `accounts renew`), a first login whose flow failed, or the check after a
+sign-in said so (any other login wall records nothing yet); `limited until <time>`: a usage
+limit stands; `low`: the session window at 90% or the week at 97%, until that window resets;
+`usable`; `unseen`:
+nothing observed yet), `active`,
+`active:unproven` or `pinned` (`-` for neither), the limit-reset offer last read (`offer: N left, use by <time>`, only once one was read), the sessions on
 it (`on: @s-…`, `(held: jobs)` for one that could not move) — then `next:`, the account
 a session at a limit would move to, or the time to wait until, and every other account's
 reason by name. The session and week percent, with their resets and when they were
 sampled, are `--json`'s alone (`null` for a figure nobody read, never 0). WHAT MOVES A SESSION is a window's supervisor (`[harness] accounts`, on unless
-`off`): a supervised Claude Code session is relaunched on its own conversation under the
+`off`, and off with Claude Code's own `[harness.claude] enabled = false`): a supervised Claude Code session is relaunched on its own conversation under the
 pinned account (`use`) at its next turn end, and under `next` when its turn ends on a
 usage limit — one session first, the others once that account has served a turn. A
 session waiting at the limit of the very account `use` names is continued where it is.
 `accounts = \"off\"` stops all of that for the window's sessions: nothing is advised,
-moved or proven there, and a session's own limit is still recorded for this report.
+moved or proven there, and a session's own limit is still recorded for this report. (The
+login lifecycle below has its own switch, `[harness] logins`, and goes on under it.)
 UNDER `accounts = \"early\"` (the default) a session is also moved AHEAD of a limit, at
 a plain turn end: off an account another session found at its limit, or one its last
 sample shows `low` by a window more than 15 minutes from its reset, to `next`. `wall`
@@ -422,27 +493,64 @@ hand (both rows, where the first `add` would have listed `main` too).
 Code's own browser flow, in a home of its own so this machine's profile is not touched —
 and, at a terminal, runs it (`claude` from PATH; the dir exactly as the roster spells it,
 because the login is named by a hash of that string) and WAITS for it. When the flow exits
-0 it asks that one login whether it is signed in, as `check` does, prints `<label>: signed
-in | signed out | not enrolled | could not run (<why>)` and records the answer: exit 0 for
-`signed in`, exit 1 for anything else. A `claude` that cannot be started is said (exit 1)
-with nothing asked and nothing recorded. A flow that exits non-zero, Ctrl-C included (on
-unix this command waits through the key), is said (exit 1), and when it left files in the
-login directory (Claude Code writes its start-up files there before any sign-in), that login
-is asked and recorded as above, so the row reads `signed out`, not `unseen`. With stdin
-not a terminal it prints the line, runs nothing and exits 0. With neither USER nor LOGNAME
-set no login can be asked, so the flow is not started (exit 1). The row with no dir is this
-machine's own login: its line is `claude auth login`, run in the default home with neither
-CLAUDE_CONFIG_DIR nor CLAUDE_SECURESTORAGE_CONFIG_DIR set, and asked and recorded alike.
-`accounts check` asks each enrolled login whether it is signed in: `claude auth status
---json` under CLAUDE_SECURESTORAGE_CONFIG_DIR=<dir> (empty for the row with no dir), 20 s
-at most each. A row whose login directory is missing or empty is `not enrolled`: nothing
-is run for it and nothing recorded (`accounts login <label>` first). It reads the exit
-status and the one key `loggedIn`; the rest of that output, which names an email and an
-organization, is never printed, logged or kept. One line per account: `<label>: signed in
-| signed out | not enrolled | could not run (<why>)`; an answer is recorded, with a ledger
-row when it changed. Exit 1 when a login could not be asked — as when neither USER nor
-LOGNAME is set, where Claude Code reports a login that works as signed out: then nothing
-is run and nothing recorded.
+0 it checks that one new login — `claude auth status --json` under
+CLAUDE_SECURESTORAGE_CONFIG_DIR=<dir> (empty for the row with no dir), 20 s at most —
+prints `<label>: signed in | signed out | not enrolled | could not run (<why>)` and records
+the answer: exit 0 for `signed in`, exit 1 for anything else. It reads the exit status and
+the one key `loggedIn`; the rest of that output, which names an email and an organization,
+is never printed, logged or kept. This verb runs that command only then: under a login
+that is not brand new it spends the single-use refresh token (anthropics/claude-code#95822),
+and a token minted seconds ago has nothing to refresh. A FLOW THAT FAILS — it exits
+non-zero, Ctrl-C included (on unix this command waits through the key) — RUNS NOTHING MORE
+UNDER ANY LOGIN (no check follows it) and is said (exit 1). Over a login directory that held
+anything before the flow, and for the row with no dir, nothing is recorded (one an earlier,
+unrecorded flow left its files in stays as it was). Over one that was EMPTY before the flow,
+where the flow left Claude Code's start-up files (written there before any sign-in), the row
+is recorded `signed out`: those files enrol it, and `unseen` would offer it as `next` with
+no login behind it. A flow that left nothing records nothing. A `claude` that cannot be
+started is said (exit 1) with nothing run and nothing recorded. With stdin not a terminal it
+prints the line, runs nothing and exits 0. With neither USER nor LOGNAME set the check would read
+a login that works as signed out, so the flow is not started (exit 1). The row with no dir
+is this machine's own login: its line is `claude auth login`, run in the default home with
+neither CLAUDE_CONFIG_DIR nor CLAUDE_SECURESTORAGE_CONFIG_DIR set, and checked alike.
+THE LOGIN LIFECYCLE (rows with an `email`; docs/DESIGN-claude-accounts-v2-2026-10-15.md §5).
+A row may carry `email` (the account's address) and `browser` (the display name of the
+browser profile that holds its claude.ai session). The address is read from this file to
+hint the sign-in and check a renewal, compared in memory, and never printed, logged or
+kept elsewhere. Such a row's login is `ok` (a turn served in the last 6 h), `idle`, `due`
+(its forecast end within 5 days) or `expired` (a login wall in a session on it), and the
+report adds `login: <state>, renew by <date>`: the forecast is the last renewal plus a
+lifetime learned per login (3 weeks to start, lowered by each end seen and by Claude Code's
+own notice that the login expires in N days), never by running anything under the login.
+`accounts adopt-default <label> --email <e> [--browser <b>]` lists this machine's own login
+(the row with no dir) as such a row; `add --email` lists another.
+`accounts renew [--due | <label>...] [--on <host>,... | --here]` renews each login named,
+and with --due every due or expired one: `CLAUDE_CONFIG_DIR=<state>/accounts/logins/<label>+<n>
+claude auth login --claudeai --email <e>` into a NEW staging directory, its page opened in
+the row's browser profile (aterm's own opener, `aterm-open-url`; else your default browser).
+A flow that exits non-zero (Ctrl-C included) runs nothing more and records nothing. One
+that exits 0 is checked ONCE, in that staging home — `claude auth status --json`, its
+address compared with the row's — and only on a match is the row bound to the new login
+(<state>/accounts/logins.json) and recorded `ok`: sessions on the old login move onto it at
+their next idle turn end (one stopped at its ended login is relaunched there, with its wall's
+continuation) where a window's supervisor relaunches — `[harness] enabled`, Claude Code's
+`[harness.claude] enabled`, `logins`, `relaunch` and `resume_limits` on, which the line says — and it prints the line that starts
+Claude Code under the new login by hand (`CLAUDE_SECURESTORAGE_CONFIG_DIR='<dir>'
+claude --resume`). Another account's address is REFUSED: the staging directory is removed,
+`wrong-account` recorded, and nothing live changes. Then, for each machine `--on` names
+(with --due and no --on, `[harness] hosts`), `ssh -t <host> aterm harness accounts
+renew --due --here` runs there, in this terminal — `--here`: that machine's own logins
+alone, whatever its own hosts list names, so one sitting goes one machine deep — and over
+ssh Claude Code prints its URL and waits for the code you paste at its own prompt (open the
+URL in the profile it names); aterm reads and relays nothing of it. A row with an email signs
+in only this way: `accounts login` refuses it. A window's supervisor never types /login into
+a session on such a login: it waits, asks you once to renew it, and relaunches it once
+renewed. Where it does not wait (`relaunch` or `resume_limits` off, a draft in the composer)
+it flags the tab with the renewal to run, and once renewed with what still holds the tab on
+its old login, which no renewal reaches: the draft (send or clear it, and the tab moves by
+itself), or, where nothing relaunches it, the line `renew` printed (quit Claude Code and
+start it with that line). `[harness] logins = \"off\"` hands the lost login back to /login.
+aterm never deletes a keychain item: each renewal leaves the old one, which nothing reads.
 `accounts use <label>` is THE OWNER'S WORD: the account's recorded limits are cleared and
 it is the active account, pinned. A label that is not listed, not enrolled or signed out
 is refused by name (exit 1). `accounts use --auto` ends the pin. Both are recorded, and a
@@ -450,8 +558,9 @@ window's supervisor acts on them: each supervised Claude Code session moves to t
 account at its next turn end (a session waiting at a limit is told at once, and one
 waiting at that account's own limit is continued there).
 A state file this build cannot read as its own — another schema, unreadable, too large —
-is never written over: `check` and `use` refuse (exit 1, naming the file) and the report
-shows an empty state beside the reason. `accounts` takes no --dry-run and no --sock.
+is never written over: `use` refuses and `login` records nothing (exit 1, naming the file),
+and the report shows an empty state beside the reason. `accounts` takes no --dry-run and
+no --sock.
 `ledger accounts` is the history (<state>/accounts/ledger.jsonl, cut to its newest 1024
 rows past 1 MiB): `wall`, `sample`, `rotate`, `proven`, `struck`, `move`, `probe`,
 `reset-used`, `reset-kept`, `reset-failed`, `auth`, `use`, `unpin`, each with its account,
@@ -459,6 +568,31 @@ session and reason. This command writes `auth`, `use` and `unpin`; a window's su
 writes `wall`, `move`, `rotate`, `proven` and `struck` (with the `auth` and `unpin` they
 bring), under `early` `probe` (a `/usage` read claimed) and `sample` (what it read), and
 with `limit_reset` on the one `reset-…` row of each limit-reset attempt, with its reason.
+`accounts stats [--json]` READS WHAT CLAUDE CODE'S PROFILE SAYS OF ITS ACCOUNT, on demand:
+the `.claude.json` of the home this command's environment names (beside ~/.claude with
+CLAUDE_CONFIG_DIR unset; inside the directory a set one names, ~/.claude itself included;
+in $HOME for an empty one), named `.claude-custom-oauth.json` with
+CLAUDE_CODE_CUSTOM_OAUTH_URL set — or, as Claude Code 2.1.301 does, a `.config.json` in
+the Claude directory (~/.claude, or CLAUDE_CONFIG_DIR's; none is looked for under an
+empty one with no CLAUDE_PID, whose directory is not known) in its place when that is not
+empty, or is empty and writable while the other is absent. It prints the plan (Max, Pro,
+Team, Enterprise) and its tier (`5x`), whether usage credits are `on`, `out` or `off
+(<reason>)` — the word Claude Code keeps from its last served reply — and, as a hint, how
+the plan bills Fable: `Fable included`, `credits only`, `limits end <date>` or `unknown`
+(a flag Claude Code caches under another name or shape than the one read). The account is
+labelled by its home, whichever of its files was read, by the first that applies: the
+roster row of the home where it is enrolled (for ~/.claude.json, CLAUDE_CONFIG_DIR unset
+or empty, the row with no `dir`; for any other, the row whose `dir` names
+CLAUDE_CONFIG_DIR, once its login was made); else `main` for ~/.claude.json; else
+`home-<key6>`. --json adds its key (`c-` and twelve hex digits of a hash of the account's
+own id, the same on every machine) and the billing, seat and display words. The file is
+read by an allowlist: those fields and nothing else — never its API key, its MCP servers'
+env or headers, or the email, names and ids of the login — so none of that is printed or
+kept; the id is hashed as it is read. A home that could not be resolved (a relative
+CLAUDE_CONFIG_DIR with no CLAUDE_PID, or no absolute $HOME), one with no profile, or a
+profile that is not JSON says so (`no-home`, `no-profile`, `not-a-file`, `too-large`,
+`unreadable`). Writes nothing; exit 0. It reads this machine only, Claude Code only, and
+no usage window yet.
 ";
 
 /// `aterm harness upgrade --help`: what moves a session, and when.
@@ -608,7 +742,10 @@ The refusal also names, on stderr, every restart an earlier sweep left part
 way (its agent already signalled): that conversation stays where it stopped
 until the switch is back on. A `false` wins wherever it is: the line written
 below another `[table]` header, which TOML files under that table, still turns
-the sweep off, and `upgrade` says on stderr where it found it.
+the sweep off, and `upgrade` says on stderr where it found it. An agent's own
+`[harness.<agent>] enabled = false` leaves that agent's sessions out of the sweep (said
+on stderr) while the others are swept, and a `--now`/`--defer`/`--skip` on its tab is
+recorded but waits, as under `[harness] enabled = false`.
 A sweep that did not run exits non-zero: `step=busy:another-sweep` (another
 sweeper holds the lock — often the window's own) exits 75, try again later;
 `step=busy:state-unwritable` or `busy:lock-unopenable` exits 1.
@@ -903,6 +1040,20 @@ pub struct Env {
     /// working directory. Then no Claude Code directory is known
     /// ([`Env::claude_dir`]): `~/.claude` is not the one the session writes.
     pub claude_config_unusable: Option<String>,
+    /// The profile Claude Code keeps for the home this command's
+    /// environment names (`.claude.json`, `claude_profile_of`: beside
+    /// `~/.claude` with `CLAUDE_CONFIG_DIR` unset, inside the directory a set
+    /// one names, `$HOME`'s for an empty one); `None` where it cannot be
+    /// named. The home's identity (`stats_label`); `accounts stats` reads
+    /// the file Claude Code reads in its place ([`profile::effective`]), only
+    /// through the allowlist reader ([`profile::read`]).
+    pub claude_profile: Option<PathBuf>,
+    /// `CLAUDE_CODE_CUSTOM_OAUTH_URL` is set and not empty
+    /// ([`profile::custom_oauth`]): Claude Code then names the profile
+    /// `.claude-custom-oauth.json` ([`profile::effective`]).
+    /// aterm strips `CLAUDE_*` from the shells it spawns, so only Claude
+    /// Code's own tools carry it.
+    pub claude_custom_oauth: bool,
     /// The Claude Code session this command runs under, when the vendor named
     /// it: `CLAUDE_CODE_SESSION_ID`, which Claude Code 2.1.283 sets for every
     /// tool it runs. aterm strips `CLAUDE_*` from the shells it spawns, so only
@@ -911,6 +1062,16 @@ pub struct Env {
     /// The Claude Code process this command runs under (`CLAUDE_PID`, set
     /// beside the session id), for a build that names only the process.
     pub claude_pid: Option<u32>,
+    /// The Codex thread this command runs under, when Codex named it:
+    /// `CODEX_THREAD_ID`, which Codex sets for the commands its tools run
+    /// (a thread id, [`super::upgrade_codex::is_thread_id`]). aterm strips
+    /// `CODEX_*` from the shells it spawns, so only Codex's own tools carry
+    /// it.
+    pub codex_thread: Option<String>,
+    /// `CODEX_HOME` as this command's environment sets it, raw: the Codex
+    /// home is it, else `$HOME/.codex`, and a relative one names none
+    /// ([`crate::supervise::codex_usage::codex_home`]).
+    pub codex_home: Option<String>,
     /// Unix seconds. Read once, at the top of [`main_entry`].
     pub now: i64,
     /// The aterm session id (`$ATERM_PARENT_SESSION_ID`), or empty.
@@ -978,7 +1139,14 @@ impl Env {
             std::env::var("HOME").ok().as_deref(),
             || claude_pid.and_then(aterm_sysprobe::process_cwd),
         );
+        let claude_profile = claude_profile_of(
+            home.as_deref(),
+            config_dir.as_deref(),
+            claude_dir.as_deref(),
+        );
         let claude_config_unusable = config_dir.filter(|_| claude_dir.is_none());
+        let claude_custom_oauth =
+            profile::custom_oauth(std::env::var_os("CLAUDE_CODE_CUSTOM_OAUTH_URL").as_deref());
         let claude_session = std::env::var("CLAUDE_CODE_SESSION_ID")
             .ok()
             .filter(|id| footer::is_session_id(id));
@@ -993,8 +1161,14 @@ impl Env {
             home,
             claude_dir,
             claude_config_unusable,
+            claude_profile,
+            claude_custom_oauth,
             claude_session,
             claude_pid,
+            codex_thread: std::env::var("CODEX_THREAD_ID")
+                .ok()
+                .filter(|id| super::upgrade_codex::is_thread_id(id)),
+            codex_home: std::env::var("CODEX_HOME").ok(),
             now,
             sid: std::env::var("ATERM_PARENT_SESSION_ID").unwrap_or_default(),
             sock: None,
@@ -1085,23 +1259,51 @@ pub enum AccountsCmd {
         /// The JSON form.
         json: bool,
     },
-    /// `accounts add <label> [--shared]`: make the login directory, append
-    /// the roster row.
+    /// `accounts add <label> [--shared] [--email <e>] [--browser <b>]`: make
+    /// the login directory, append the roster row.
     Add {
         /// The label as typed; admitted when the verb runs, so an
         /// inadmissible one is a refusal by name (exit 1), not a usage error.
         label: String,
         /// `--shared`, else dedicated.
         class: Class,
+        /// `--email`: the row renews through `accounts renew`.
+        email: Option<String>,
+        /// `--browser`: the profile its sign-in opens in.
+        browser: Option<String>,
+    },
+    /// `accounts adopt-default <label> --email <e> [--browser <b>]`: this
+    /// machine's own login (the row with no `dir`) as one renewable row.
+    AdoptDefault {
+        /// The label as typed.
+        label: String,
+        /// `--email`, required.
+        email: String,
+        /// `--browser`.
+        browser: Option<String>,
+    },
+    /// `accounts renew [<label>…] [--due] [--on <host>,… | --here]`: each
+    /// named login, or every due one, renewed through a staging directory and
+    /// checked before it goes live ([`run_accounts_renew`]); then `renew --due
+    /// --here` on each other machine named.
+    Renew {
+        /// The labels named, in order.
+        labels: Vec<String>,
+        /// `--due`: every login of this machine that is due.
+        due: bool,
+        /// `--on`: the machines to renew on next, over SSH; `None` is
+        /// `[harness] hosts` (read only with `--due`). `--here` is
+        /// `Some` and empty: this machine's logins alone — what a sitting
+        /// runs on each other machine, so that run never goes on to others.
+        on: Option<Vec<String>>,
     },
     /// `accounts login <label>`: the vendor's sign-in flow for that account,
-    /// waited for, and what its login then answers recorded.
+    /// waited for, and — after a flow that exits 0 — what its new login then
+    /// answers recorded.
     Login {
         /// The label as typed.
         label: String,
     },
-    /// `accounts check`: ask each enrolled login whether it is signed in.
-    Check,
     /// `accounts use <label>`: the owner's pin.
     Use {
         /// The label as typed.
@@ -1109,6 +1311,12 @@ pub enum AccountsCmd {
     },
     /// `accounts use --auto`: end the pin.
     Auto,
+    /// `accounts stats [--json]`: what this machine's Claude Code profile
+    /// says of its account. Writes nothing.
+    Stats {
+        /// The JSON form.
+        json: bool,
+    },
 }
 
 /// The owner's word on the live upgrade (`upgrade [<sid>] --status`, `upgrade
@@ -1133,6 +1341,10 @@ pub enum Cmd {
         /// The verb as typed.
         verb: String,
     },
+    /// `tap`: the usage tap ([`super::tap::run`]). The front door runs a
+    /// bare `tap` before anything is parsed ([`main_entry`]); this is the
+    /// same verb reached past a flag.
+    Tap,
     /// The usage view (design §5.2).
     Usage {
         /// The JSON form.
@@ -1217,6 +1429,8 @@ pub enum HelpPage {
     Upgrade,
     /// `upgrade --status --help`: every field of a status line.
     UpgradeStatus,
+    /// `tap --help`: the usage tap.
+    Tap,
 }
 
 /// The text of `page`: for a verb, its lines of [`USAGE`] and then its
@@ -1240,6 +1454,7 @@ pub fn help_page(page: HelpPage) -> String {
             ],
         ),
         HelpPage::UpgradeStatus => ("upgrade", true, &[HELP_UPGRADE_STATUS]),
+        HelpPage::Tap => ("tap", false, &[HELP_TAP]),
     };
     // USAGE's entries: a line naming the verb, and the deeper-indented lines
     // that continue it.
@@ -1299,6 +1514,11 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
     let mut dry_run = false;
     let mut shared = false;
     let mut auto = false;
+    let mut due = false;
+    let mut here = false;
+    let mut email: Option<String> = None;
+    let mut browser: Option<String> = None;
+    let mut on: Option<Vec<String>> = None;
     let mut owner: Vec<OwnerAsk> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -1314,6 +1534,26 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             "--dry-run" => dry_run = true,
             "--shared" => shared = true,
             "--auto" => auto = true,
+            "--due" => due = true,
+            "--here" => here = true,
+            "--email" => {
+                email = Some(value(i, "--email")?);
+                i += 1;
+            }
+            "--browser" => {
+                browser = Some(value(i, "--browser")?);
+                i += 1;
+            }
+            "--on" => {
+                let hosts: Vec<String> = value(i, "--on")?
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|h| !h.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                on.get_or_insert_with(Vec::new).extend(hosts);
+                i += 1;
+            }
             "--status" => owner.push(OwnerAsk::Status),
             "--now" => owner.push(OwnerAsk::Now),
             "--skip" => owner.push(OwnerAsk::Skip),
@@ -1362,6 +1602,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             Some("accounts") => HelpPage::Accounts,
             Some("upgrade") if owner.contains(&OwnerAsk::Status) => HelpPage::UpgradeStatus,
             Some("upgrade") => HelpPage::Upgrade,
+            Some("tap") => HelpPage::Tap,
             _ => HelpPage::Verbs,
         };
         return Ok((Cmd::Help(page), over));
@@ -1380,6 +1621,12 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
         verb @ ("hook" | "statusline" | "install" | "uninstall") => Cmd::Retired {
             verb: verb.to_string(),
         },
+        "tap" => {
+            if rest.len() > 1 {
+                return Err(format!("tap takes no operand, not {:?}", &rest[1..]));
+            }
+            Cmd::Tap
+        }
         "usage" => {
             if rest.len() > 1 {
                 return Err(format!("usage takes no operand, not {:?}", &rest[1..]));
@@ -1444,7 +1691,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                 ));
             }
             match owner.as_slice() {
-                [] => {}
+                [] => Cmd::Upgrade { sid, dry_run, json },
                 [ask] => {
                     if dry_run {
                         return Err(
@@ -1460,24 +1707,21 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                                 .to_string(),
                         );
                     }
-                    return Ok((
-                        Cmd::UpgradeOwner {
-                            sid,
-                            ask: *ask,
-                            json,
-                        },
-                        over,
-                    ));
+                    Cmd::UpgradeOwner {
+                        sid,
+                        ask: *ask,
+                        json,
+                    }
                 }
                 _ => {
                     return Err("one of --status, --now, --defer and --skip at a time".to_string());
                 }
             }
-            Cmd::Upgrade { sid, dry_run, json }
         }
         "accounts" => {
             let form = match &rest[1..] {
                 [] => AccountsCmd::Report { json },
+                ["stats"] => AccountsCmd::Stats { json },
                 ["add", label] => AccountsCmd::Add {
                     label: (*label).to_string(),
                     class: if shared {
@@ -1485,11 +1729,42 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                     } else {
                         Class::Dedicated
                     },
+                    email: email.take(),
+                    browser: browser.take(),
                 },
+                ["adopt-default", label] => AccountsCmd::AdoptDefault {
+                    label: (*label).to_string(),
+                    email: email.take().ok_or_else(|| {
+                        "accounts adopt-default needs --email <address>: the login it renews \
+                         is checked against that address"
+                            .to_string()
+                    })?,
+                    browser: browser.take(),
+                },
+                ["renew", labels @ ..] => {
+                    if labels.is_empty() && !due && on.is_none() {
+                        return Err(
+                            "accounts renew takes --due, the labels to renew, or --on <host>,…"
+                                .to_string(),
+                        );
+                    }
+                    if here && on.is_some() {
+                        return Err(
+                            "accounts renew: --here renews this machine alone and --on names \
+                             others; take one"
+                                .to_string(),
+                        );
+                    }
+                    AccountsCmd::Renew {
+                        labels: labels.iter().map(|l| (*l).to_string()).collect(),
+                        due,
+                        // `--here`: no machine next, whatever the config names.
+                        on: if here { Some(Vec::new()) } else { on.take() },
+                    }
+                }
                 ["login", label] => AccountsCmd::Login {
                     label: (*label).to_string(),
                 },
-                ["check"] => AccountsCmd::Check,
                 ["use"] if auto => AccountsCmd::Auto,
                 ["use", label] if !auto => AccountsCmd::Use {
                     label: (*label).to_string(),
@@ -1503,35 +1778,25 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                 }
                 other => {
                     return Err(format!(
-                        "accounts takes nothing, `add <label> [--shared]`, `login <label>`, \
-                         `check`, or `use <label> | --auto`, not {other:?}"
+                        "accounts takes nothing, `stats`, `add <label> [--shared] [--email <e>] \
+                         [--browser <b>]`, `adopt-default <label> --email <e>`, `login <label>`, \
+                         `renew [--due | <label>…] [--on <host>,…]` or `use <label> | --auto`, not \
+                         {other:?}"
                     ));
                 }
             };
-            if json && !matches!(form, AccountsCmd::Report { .. }) {
+            if json && !matches!(form, AccountsCmd::Report { .. } | AccountsCmd::Stats { .. }) {
                 return Err(
-                    "--json is the report's form (`aterm harness accounts --json`): the other \
-                     forms print lines"
+                    "--json is the report's form (`aterm harness accounts --json`) and \
+                     `accounts stats --json`: the other forms print lines"
                         .to_string(),
                 );
             }
             Cmd::Accounts(form)
         }
-        deleted if DELETED.contains(&deleted) => {
-            // `config` once held the live upgrade's switch: say where it went.
-            let upgrade = if deleted == "config" {
-                " (the live upgrade's switch is `upgrade` in that table)"
-            } else {
-                ""
-            };
-            return Err(format!(
-                "`harness {deleted}` is gone: the supervisor is `aterm drive watch|supervise` \
-                 and aterm.toml's [harness] table is its policy{upgrade}"
-            ));
-        }
         other => return Err(format!("unknown subcommand {other:?}")),
     };
-    if !owner.is_empty() {
+    if !owner.is_empty() && !matches!(cmd, Cmd::UpgradeOwner { .. }) {
         return Err("--status, --now, --defer and --skip belong to `upgrade`".to_string());
     }
     if shared && !matches!(cmd, Cmd::Accounts(AccountsCmd::Add { .. })) {
@@ -1540,14 +1805,25 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
     if auto && !matches!(cmd, Cmd::Accounts(AccountsCmd::Auto)) {
         return Err("--auto belongs to `accounts use`".to_string());
     }
+    // Taken by the forms they belong to above: one left over is on another.
+    if email.is_some() || browser.is_some() {
+        return Err(
+            "--email and --browser belong to `accounts add <label>` and `accounts adopt-default \
+             <label>`"
+                .to_string(),
+        );
+    }
+    if (due || here || on.is_some()) && !matches!(cmd, Cmd::Accounts(AccountsCmd::Renew { .. })) {
+        return Err("--due, --here and --on belong to `accounts renew`".to_string());
+    }
     // A flag `accounts` does not take is refused, never ignored: `add`,
-    // `check`, `login` and `use` WRITE, and one that swallowed `--dry-run`
-    // would write for real under a flag that promises it will not.
+    // `login` and `use` WRITE, and one that swallowed `--dry-run` would
+    // write for real under a flag that promises it will not.
     if matches!(cmd, Cmd::Accounts(_)) {
         if dry_run {
             return Err(
-                "accounts takes no --dry-run: `add`, `login`, `check` and `use` do what they \
-                 say, and the report writes nothing"
+                "accounts takes no --dry-run: `add`, `login` and `use` do what they say, and \
+                 the report writes nothing"
                     .to_string(),
             );
         }
@@ -1596,22 +1872,6 @@ pub fn parse_defer(v: &str) -> Result<u64, String> {
 // ---------------------------------------------------------------------------
 // usage
 // ---------------------------------------------------------------------------
-
-/// The vendor's project directory name for a working directory: every byte
-/// outside `[A-Za-z0-9-]` folded to `-` (as `~/.claude/projects` names them).
-#[must_use]
-pub fn project_dir_name(cwd: &Path) -> String {
-    cwd.to_string_lossy()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
 
 /// How many directory entries the transcript search will look at. A project
 /// directory holds one file per session; this is the fence against a
@@ -1685,7 +1945,9 @@ pub fn pick_transcript(env: &Env) -> Pick {
     {
         return named(entry, "claude-pid");
     }
-    let dir = claude_dir.join("projects").join(project_dir_name(&env.cwd));
+    let dir = claude_dir
+        .join("projects")
+        .join(footer::project_slug(&env.cwd));
     newest_transcript(&dir).map_or(Pick::None, Pick::Newest)
 }
 
@@ -1788,6 +2050,7 @@ fn usage_label(env: &Env, pick: &Pick, process: &dyn ClaudeProcess) -> String {
         let roster = Roster::load(&env.accounts_roster()?)
             .ok()
             .filter(Roster::several)?;
+        let roster = env.accounts_store().bound(&roster, env.now).ok()?;
         let who = accounts::ProcessLogin::of_exec_env(&process.exec_env(pid)?)?;
         let started = process.started(pid)?;
         let entry = footer::session_of_pid(&env.claude_dir()?, pid, Some(started))?;
@@ -1800,9 +2063,29 @@ fn usage_label(env: &Env, pick: &Pick, process: &dyn ClaudeProcess) -> String {
     label().unwrap_or_else(|| USAGE_ACCOUNT.to_owned())
 }
 
+/// THE USAGE TAP'S LAST READING for the Claude Code this command runs under
+/// ([`super::tap::Reading::read`]): its own file, named by this tab
+/// (`ATERM_PARENT_SESSION_ID`, [`Env::sid`]) and `CLAUDE_PID`, written since
+/// the kernel started that process, under the aterm state root the window
+/// keeps it in. `None` — and the windows stay unknown — with no tab, no pid,
+/// no state root, no start record, or no such file.
+fn usage_reading(env: &Env, process: &dyn ClaudeProcess) -> Option<super::tap::Reading> {
+    let pid = env.claude_pid?;
+    let dir = super::tap::rl_dir_in(&env.aterm_state.as_ref()?.join("harness").join(HARNESS));
+    // The kernel is asked only where a file is there to be judged.
+    std::fs::symlink_metadata(dir.join(super::tap::file_name(&env.sid, pid)?)).ok()?;
+    let started = i64::try_from(process.started(pid)?).ok()?;
+    super::tap::Reading::read(&dir, &env.sid, pid, started).map(|(reading, _)| reading)
+}
+
 /// `aterm harness usage`.
 fn run_usage(env: &Env, process: &dyn ClaudeProcess, json: bool, out: &mut dyn Write) -> ExitCode {
     let pick = pick_transcript(env);
+    // A Codex session's own tools name its thread; a Claude Code session the
+    // vendor named still comes first, as before.
+    if let (Pick::Newest(_) | Pick::None, Some(thread)) = (&pick, &env.codex_thread) {
+        return run_codex_usage(env, thread, json, out);
+    }
     let (path, source, pick_word) = match &pick {
         Pick::Named { path, how } => (Some(path.clone()), Source::Transcript, *how),
         Pick::Newest(path) => (Some(path.clone()), Source::TranscriptNewest, "newest-mtime"),
@@ -1818,9 +2101,15 @@ fn run_usage(env: &Env, process: &dyn ClaudeProcess, json: bool, out: &mut dyn W
         (session, refresh, total)
     });
     let mut view = UsageView::new(env.now);
-    if let Some((_, _, total)) = &folded {
+    let reading = usage_reading(env, process);
+    if folded.is_some() || reading.is_some() {
         let mut account = AccountView::new(usage_label(env, &pick, process), true);
-        account.add_transcript(total, &usage::PriceTable::new());
+        if let Some((_, _, total)) = &folded {
+            account.add_transcript(total);
+        }
+        if let Some(reading) = &reading {
+            account.add_reading(reading, env.now);
+        }
         view.accounts.push(account);
     }
     if json {
@@ -1946,49 +2235,315 @@ fn run_usage(env: &Env, process: &dyn ClaudeProcess, json: bool, out: &mut dyn W
     ExitCode::SUCCESS
 }
 
+/// The label `usage` gives a Codex conversation's account: the account
+/// stats' label for Codex's (the design's §3.1). Which login it is is not
+/// read here.
+const USAGE_CODEX_ACCOUNT: &str = "codex";
+
+/// `aterm harness usage` from a Codex session's own tools: every served turn
+/// of the conversation the thread `CODEX_THREAD_ID` names belongs to — its
+/// TUI's own thread and the subagents spawned in it
+/// ([`crate::supervise::codex_usage::conversation_rollouts`]) — in the Codex
+/// home this command's environment names, each turn once and nothing of a
+/// fork's copied prefix ([`super::spend::fold_conversation`]), with the list
+/// dollars of the shipped price table where it prices a model. Its windows
+/// stay unknown.
+fn run_codex_usage(env: &Env, thread: &str, json: bool, out: &mut dyn Write) -> ExitCode {
+    use super::spend;
+    use crate::supervise::codex_usage;
+    // This command runs in the session's tool shell, whose folder need not
+    // be the one the TUI started in: a relative CODEX_HOME places no home
+    // here, and nothing is read.
+    let home = codex_usage::codex_home(
+        env.codex_home.as_deref(),
+        env.home.as_deref().and_then(Path::to_str),
+        None,
+    );
+    let conversation = home
+        .as_deref()
+        .map(|h| codex_usage::conversation_rollouts(h, thread));
+    // The shipped table loads (its own test); one that did not would price
+    // nothing, never guess.
+    let prices = spend::PriceTable::from_toml(spend::PRICES_TOML).unwrap_or_default();
+    let fold = conversation
+        .as_ref()
+        .filter(|c| !c.files.is_empty())
+        .map(|c| {
+            spend::fold_conversation(&c.files, c.own.as_deref(), &prices, MAX_TRANSCRIPT_BYTES)
+        });
+    let mut view = UsageView::new(env.now);
+    if let Some(fold) = &fold {
+        let mut account = AccountView::new(USAGE_CODEX_ACCOUNT, true);
+        for (model, m) in &fold.models {
+            account.spend.insert(
+                model.clone(),
+                usage::SpendView {
+                    input: m.tokens.input,
+                    output: m.tokens.output,
+                    cache_write: m.tokens.cache_write,
+                    cache_read: m.tokens.cache_read,
+                    usd: (!m.unpriced).then_some(m.usd),
+                },
+            );
+        }
+        account.model.clone_from(&fold.model);
+        view.accounts.push(account);
+    }
+    let source = if fold.is_some() {
+        Source::Rollout
+    } else {
+        Source::None
+    };
+    let unread =
+        conversation.as_ref().map_or(0, |c| c.unread) + fold.as_ref().map_or(0, |f| f.unread);
+    let complete = fold.as_ref().is_some_and(|f| f.caught_up && unread == 0);
+    if json {
+        // Schema 1: keys are only ever added, never changed.
+        let mut extra = vec![("codex_thread", Value::from(thread.to_owned()))];
+        if let Some(c) = &conversation {
+            if let Some(own) = &c.own {
+                extra.push(("rollout", Value::from(own.display().to_string())));
+            }
+            extra.push(("conversation", Value::from(c.root.clone())));
+            extra.push(("subagent_rollouts", Value::from(c.subagents as u64)));
+            extra.push(("rollouts_unread", Value::from(unread as u64)));
+        }
+        extra.push(("transcript_pick", Value::from("codex-thread")));
+        if let Some(f) = &fold {
+            extra.push(("turns", Value::from(f.turns)));
+            extra.push(("copied", Value::from(f.copied)));
+            extra.push(("complete", Value::from(complete)));
+            extra.push((
+                "prices_as_of",
+                Value::from(prices.as_of().unwrap_or_default().to_owned()),
+            ));
+        }
+        if home.is_none()
+            && let Some(set) = &env.codex_home
+        {
+            extra.push(("codex_home_unusable", Value::from(set.clone())));
+        }
+        let _ = writeln!(
+            out,
+            "{}",
+            sourced_json("usage", source, &usage::usage_json(&view), extra)
+        );
+        return ExitCode::SUCCESS;
+    }
+    let line = usage::hud_line(&view);
+    let _ = writeln!(out, "{line}  [source={}]", source.as_str());
+    let (Some(c), Some(f), Some(home)) = (&conversation, &fold, &home) else {
+        let why = match (&home, &env.codex_home) {
+            (None, Some(set)) => format!(
+                "CODEX_HOME is {set:?}, not an absolute path: the Codex home it names cannot be \
+                 found from here, and ~/.codex is not it — nothing to fold"
+            ),
+            (None, None) => {
+                "no home directory is known, so no Codex home — nothing to fold".to_owned()
+            }
+            (Some(home), _) => format!(
+                "Codex thread {thread} has written no rollout under {} yet — nothing to fold",
+                home.join("sessions").display()
+            ),
+        };
+        let _ = writeln!(out, "{why}");
+        return ExitCode::SUCCESS;
+    };
+    let all = f
+        .models
+        .values()
+        .fold(usage::TokenUsage::default(), |sum, m| sum.plus(&m.tokens));
+    let priced = f.models.values().all(|m| !m.unpriced);
+    let usd: f64 = f.models.values().map(|m| m.usd).sum();
+    let tokens = if f.models.is_empty() {
+        "no tokens".to_owned()
+    } else {
+        format!(
+            "\u{2191}{} \u{2193}{} \u{00B7} {}",
+            session_usage::tokens_short(all.prompt()),
+            session_usage::tokens_short(all.output),
+            if priced {
+                format!("\u{2248}${usd:.4} (list)")
+            } else {
+                format!("\u{2248}${usd:.4} (list) of the priced models; some unpriced")
+            }
+        )
+    };
+    let _ = writeln!(out, "{} {tokens}", footer::USAGE_MARK);
+    for (model, m) in &f.models {
+        let price = if m.unpriced {
+            "unpriced".to_owned()
+        } else {
+            format!("\u{2248}${:.4} (list)", m.usd)
+        };
+        let approx = if m.approx > 0 {
+            format!(", {} of its turns approximate", m.approx)
+        } else {
+            String::new()
+        };
+        let _ = writeln!(
+            out,
+            "  {model}: in {} (cache write {}, cache read {}), out {}, {} turns \u{00B7} {price}{approx}",
+            m.tokens.input, m.tokens.cache_write, m.tokens.cache_read, m.tokens.output, m.turns
+        );
+    }
+    let mut short = String::new();
+    if f.read >= MAX_TRANSCRIPT_BYTES {
+        short.push_str(&format!(
+            " The fold stopped at its {} GiB cap before the end: these totals are a PREFIX.",
+            MAX_TRANSCRIPT_BYTES >> 30
+        ));
+    } else if !f.caught_up {
+        short.push_str(" A rollout could not be read to its end: these totals are partial.");
+    }
+    if unread > 0 {
+        short.push_str(&format!(
+            " {unread} rollouts that may be this conversation's could not be read: they are NOT in \
+             these totals."
+        ));
+    }
+    // `files` holds the TUI's thread's rollout first, where it was found,
+    // then the subagents'.
+    let folded = match c.files.first() {
+        Some(first) if c.files.len() > c.subagents => format!(
+            "{} (+{} subagent rollouts; {} turns)",
+            first.display(),
+            c.subagents,
+            f.turns
+        ),
+        _ => format!(
+            "{} subagent rollouts ({} turns; its TUI's thread {} has none here)",
+            c.subagents, f.turns, c.root
+        ),
+    };
+    let _ = writeln!(
+        out,
+        "SPEND folded from {folded}, the conversation of Codex thread {thread} \
+         (CODEX_THREAD_ID) under {}. A fork's copied prefix counts nothing ({} copied token \
+         counts).{short} \u{2248}$ is the list price of the table of {}, never a bill. A \
+         rollout's rate-limit windows are not read here: `aterm harness limits` reads Codex's \
+         /status card.",
+        home.display(),
+        f.copied,
+        prices.as_of().unwrap_or("?"),
+    );
+    ExitCode::SUCCESS
+}
+
 // ---------------------------------------------------------------------------
 // limits
 // ---------------------------------------------------------------------------
 
 /// What one screen read says about a limit: the wall the worker's last turn
-/// ended on, read by the engine's own reader ([`aterm_phase::wall`], the one
-/// wall classifier the turn-end policy also decides on), and the windows the
-/// vendor painted on its `/usage` panel ([`usage::usage_panel_windows`]).
-/// Every reset is placed on the clock by the supervisor's grammar
-/// ([`limit::parse_reset`], [`limit::reset_at`]).
+/// ended on, read by the tab's own reader ([`aterm_phase::identify`]: Claude
+/// Code's grammar or Codex's, the one the turn-end policy also decides on),
+/// and the windows the vendor painted: Claude Code's `/usage` panel
+/// ([`usage::usage_panel_windows`]), Codex's `/status` card
+/// ([`usage::codex_status_windows`]). Every reset is placed on the clock by
+/// the supervisor's grammar ([`limit::parse_reset`], [`limit::reset_at`];
+/// the card's by [`limit::parse_card_reset`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LimitsView {
     /// The wall, when the screen shows one.
     pub wall: Option<aterm_phase::Wall>,
     /// The wall's reset as Unix seconds, when its words place one.
     pub resets_at: Option<i64>,
-    /// Each painted window, with its reset placed.
+    /// Each painted window, with its reset placed (`None`: none painted, or
+    /// words or a zone that place none).
     pub windows: Vec<(usage::PanelWindow, Option<i64>)>,
+    /// Usage credits carry the session, by Claude Code's own notice
+    /// ([`aterm_phase::credits::in_use`]): work going on, never a wall.
+    pub credits: bool,
 }
 
-/// [`LimitsView`] of `rows` as of `now`: a reset that names no zone (or one
+/// [`LimitsView`] of `rows`, read by `reader` (the tab's: [`aterm_phase::identify`]
+/// of its `status` `program=`), as of `now`: a reset that names no zone (or one
 /// `zone_offset_at` does not know) is at `local_offset_s`. A zone's offset is
 /// read AT the instant placed for ([`limit::zone_offset_at`] in production), as
 /// the loop that waits for the reset reads it, so a reset across a
 /// daylight-saving change shows the time the supervisor will continue at.
+///
+/// A CODEX TAB's windows are its `/status` card's, and the card names no zone:
+/// codex-rs draws it with the TUI's own clock. `codex_offset_at` is that
+/// zone's offset at an instant (the `TZ` of the TUI's exec environment, else
+/// the machine's: [`super::upgrade_drive::codex_zone_offset_at`]), and a reset
+/// is placed in it as its wall's is (`upgrade_drive::codex_wall_reset`): a
+/// bare clock is the reading's own day, never tomorrow. Unlike a wall's words,
+/// which the daemon may write, the card is the TUI's own drawing, so its
+/// daemon's zone is not asked. `None` there (the TUI unread) places no reset,
+/// never one in this process's zone. Another tab never asks it.
 #[must_use]
 pub fn limits_view(
+    reader: &dyn aterm_phase::ScreenReader,
     rows: &[String],
     now: i64,
     local_offset_s: i64,
     zone_offset_at: &dyn Fn(&str, i64) -> Option<i64>,
+    codex_offset_at: &dyn Fn(i64) -> Option<i64>,
+) -> LimitsView {
+    limits_view_placed(
+        reader,
+        rows,
+        now,
+        local_offset_s,
+        zone_offset_at,
+        codex_offset_at,
+        None,
+    )
+}
+
+/// [`limits_view`], a CODEX tab's wall reset taken from `placed`: where the
+/// window's harness placed it (the tab's `status` `reset_at=`, unix seconds;
+/// `aterm-gui`'s `presence::reset_at_field`), in the Codex's own zone, as
+/// its loop and the tab's countdown place it — the zone the card's windows
+/// are placed in too ([`super::upgrade_drive::codex_zone_offset_at`]). A
+/// Codex prints its `try again at` time in its own process's zone, which a
+/// `TZ` its shell exported sets and this process never sees. `None` (an
+/// aterm that prints no such field, `reset_at=-`, or no harness placing
+/// it): the wall's words placed here, in this process's zone, as before.
+/// Claude Code's wall names its zone and is never taken from it.
+#[must_use]
+pub fn limits_view_placed(
+    reader: &dyn aterm_phase::ScreenReader,
+    rows: &[String],
+    now: i64,
+    local_offset_s: i64,
+    zone_offset_at: &dyn Fn(&str, i64) -> Option<i64>,
+    codex_offset_at: &dyn Fn(i64) -> Option<i64>,
+    placed: Option<i64>,
 ) -> LimitsView {
     let place = |text: &str| {
         limit::parse_reset(text)
             .map(|spec| limit::reset_at_with(&spec, now, local_offset_s, zone_offset_at))
     };
-    let wall = aterm_phase::wall(rows);
-    // The wall's reset is placed as the loop that waits for it places it: a
-    // session window's by the five-hour rule, any other wall's bare clock as
-    // the first occurrence after the print the screen's done row gives, so
-    // `harness limits` says the time the supervisor will continue at.
+    let wall = reader.wall(rows);
+    // Only a Codex wall's reset is placed by its harness (`reset_at=`).
+    let codex = match reader.program() {
+        aterm_phase::Program::Codex => true,
+        aterm_phase::Program::Claude
+        | aterm_phase::Program::Agy
+        | aterm_phase::Program::Muse
+        | aterm_phase::Program::Generic => false,
+    };
+    // The wall's reset is placed as the loop that waits for it places it: on
+    // Claude Code's screen a session window's by the five-hour rule, any other
+    // wall's bare clock as the first occurrence after the print the screen's
+    // done row gives; Codex's where its harness placed them, else where its
+    // words first fall. So `harness limits` says the time the supervisor will
+    // continue at.
     let resets_at = wall.as_ref().and_then(|w| {
+        if codex && let Some(at) = placed {
+            return Some(at);
+        }
         let spec = limit::parse_reset(w.reset.as_deref()?)?;
+        if !crate::supervise::run::places_resets_on_print(reader.program()) {
+            return Some(limit::reset_at_with(
+                &spec,
+                now,
+                local_offset_s,
+                zone_offset_at,
+            ));
+        }
         let window = w.kind == aterm_phase::WallKind::UsageSession
             && limit::names_a_session_window(&w.message);
         let printed = limit::printed_by_the_screen(rows, now, local_offset_s, false);
@@ -2001,22 +2556,50 @@ pub fn limits_view(
             zone_offset_at,
         ))
     });
-    let windows = usage::usage_panel_windows(rows)
-        .into_iter()
-        .map(|w| {
-            let at = w.reset_text.as_deref().and_then(place);
-            (w, at)
-        })
-        .collect();
+    // Each program's own surface: a Claude Code panel left on a Codex tab's
+    // screen is no window of this Codex's.
+    let windows = match reader.program() {
+        aterm_phase::Program::Codex => usage::codex_status_windows(rows)
+            .into_iter()
+            .map(|w| {
+                let at = w
+                    .reset_text
+                    .as_deref()
+                    .and_then(limit::parse_card_reset)
+                    .and_then(|spec| limit::reset_in_zone(&spec, now, 0, codex_offset_at));
+                (w, at)
+            })
+            .collect(),
+        // Neither draws a usage surface anyone measured: no window is read
+        // off their screens.
+        aterm_phase::Program::Agy | aterm_phase::Program::Muse => Vec::new(),
+        aterm_phase::Program::Claude | aterm_phase::Program::Generic => {
+            usage::usage_panel_windows(rows)
+                .into_iter()
+                .map(|w| {
+                    let at = w.reset_text.as_deref().and_then(place);
+                    (w, at)
+                })
+                .collect()
+        }
+    };
     LimitsView {
         wall,
         resets_at,
         windows,
+        credits: match reader.program() {
+            aterm_phase::Program::Claude => aterm_phase::credits::in_use(rows).is_some(),
+            aterm_phase::Program::Codex
+            | aterm_phase::Program::Agy
+            | aterm_phase::Program::Muse
+            | aterm_phase::Program::Generic => false,
+        },
     }
 }
 
 /// The `harness limits` line: `wall=<kind> resets_at=<rfc3339|-> source=grid
-/// message=<words> windows=<name>=<pct>%@<rfc3339|->,…`, or `wall=none …`.
+/// windows=<name>=<pct>%@<rfc3339|->,… credits=<in-use|-> message=<words>`, or
+/// `wall=none …`.
 #[must_use]
 pub fn limits_text(view: &LimitsView) -> String {
     let at = |r: Option<i64>| r.map_or("-".to_string(), rfc3339_utc);
@@ -2029,13 +2612,14 @@ pub fn limits_text(view: &LimitsView) -> String {
             .collect::<Vec<_>>()
             .join(",")
     };
+    let credits = if view.credits { "in-use" } else { "-" };
     match &view.wall {
         None => format!(
-            "wall=none source={} windows={windows} — no wall on the screen",
+            "wall=none source={} windows={windows} credits={credits} — no wall on the screen",
             Source::Grid.as_str()
         ),
         Some(w) => format!(
-            "wall={} resets_at={} source={} windows={windows} message={}",
+            "wall={} resets_at={} source={} windows={windows} credits={credits} message={}",
             w.kind.name(),
             at(view.resets_at),
             Source::Grid.as_str(),
@@ -2046,7 +2630,7 @@ pub fn limits_text(view: &LimitsView) -> String {
 
 /// The `harness limits --json` document, schema 2: `{schema, kind:"limits",
 /// source, wall: null | {kind, message, reset, resets_at}, windows: [{name,
-/// used_pct, reset, resets_at}]}`.
+/// used_pct, reset, resets_at}], credits: "in-use" | null}`.
 #[must_use]
 pub fn limits_json(view: &LimitsView) -> String {
     let at = |r: Option<i64>| r.map_or(Value::Null, |r| Value::from(rfc3339_utc(r)));
@@ -2080,16 +2664,30 @@ pub fn limits_json(view: &LimitsView) -> String {
         })
         .collect();
     o.insert("windows".to_owned(), Value::Array(windows));
+    o.insert(
+        "credits".to_owned(),
+        if view.credits {
+            Value::from("in-use".to_owned())
+        } else {
+            Value::Null
+        },
+    );
     aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
 }
 
-/// `aterm harness limits` through `ctl`: one read, one verdict.
-/// `local_offset_s` places a reset the notice names without a zone.
+/// `aterm harness limits` through `ctl`: the tab's `status`, then one screen
+/// read, one verdict. `local_offset_s` places a reset the notice names
+/// without a zone. `codex_zone` reads the zone a Codex tab's TUI prints in
+/// (`Some(None)`: no `TZ`, the machine's; `None`: unread), asked only where
+/// its `/status` card is on the screen, whose resets name none
+/// ([`limits_view`]).
+#[allow(clippy::too_many_arguments)]
 fn run_limits_with<C: Ctl>(
     ctl: &mut C,
     env: &Env,
     sid: Option<&str>,
     local_offset_s: i64,
+    codex_zone: &dyn Fn(&mut Session<'_, C>) -> Option<Option<String>>,
     json: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -2101,13 +2699,47 @@ fn run_limits_with<C: Ctl>(
         let _ = writeln!(err, "aterm harness limits: no session named; pass @<sid>");
         return ExitCode::from(2);
     };
-    match Session::new(ctl, Some(target.clone())).read_screen() {
+    // The program `status` names as the tab's foreground (`program=`) picks
+    // the grammar its screen is read by. A reply that names none leaves it
+    // to the screen ([`aterm_phase::identify`]); a session that is not there
+    // fails the screen read below.
+    let status = ctl
+        .call(&[target.as_str(), "status"])
+        .ok()
+        .map(|r| r.stdout);
+    let field = |name: &str| {
+        status
+            .as_deref()
+            .and_then(|s| crate::supervise::screen::status_field(s, name))
+    };
+    let program = field("program").map(str::to_owned);
+    // Where the window's harness placed a Codex's wall reset (`reset_at=`,
+    // unix seconds); `-`, or an aterm that prints no such field, places none.
+    let placed = field("reset_at").and_then(|at| at.parse::<i64>().ok());
+    let mut session = Session::new(ctl, Some(target.clone()));
+    match session.read_screen() {
         Ok(screen) => {
-            let view = limits_view(
+            let reader = aterm_phase::identify(program.as_deref(), &screen.rows);
+            let zone = match reader.program() {
+                aterm_phase::Program::Codex
+                    if !usage::codex_status_windows(&screen.rows).is_empty() =>
+                {
+                    codex_zone(&mut session)
+                }
+                _ => None,
+            };
+            let codex_offset_at = |t: i64| {
+                zone.as_ref()
+                    .and_then(|tz| super::upgrade_drive::codex_zone_offset_at(tz.as_deref(), t))
+            };
+            let view = limits_view_placed(
+                reader,
                 &screen.rows,
                 env.now,
                 local_offset_s,
                 &limit::zone_offset_at,
+                &codex_offset_at,
+                placed,
             );
             let text = if json {
                 limits_json(&view)
@@ -2144,7 +2776,22 @@ fn run_limits(
     let mut ctl = RelayCtl::new(endpoint, None);
     // A reset the notice names with no zone is the machine's local time, the
     // clock the vendor painted it in — the engine places it the same way.
-    run_limits_with(&mut ctl, env, sid, limit::tz_offset_s(), json, out, err)
+    // A Codex's card is in its TUI's own zone: the `TZ` of the exec
+    // environment of the tab's foreground process, bound to the tab
+    // (`Session::worker_env`), as its upgrade reads a Codex's zone.
+    run_limits_with(
+        &mut ctl,
+        env,
+        sid,
+        limit::tz_offset_s(),
+        &|session| {
+            let worker = session.worker_env().ok()?;
+            Some(worker.var("TZ").map(str::to_owned))
+        },
+        json,
+        out,
+        err,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3242,6 +3889,56 @@ fn run_ledger(
 /// ([`upgrade_pass`]), kept stable so scripts that key on it still read it.
 pub const UPGRADE_BYPASSED: &str = "refused:bypassed";
 
+/// What keeps the window's host from taking an agent's upgrade steps
+/// ([`window_off`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowOff {
+    /// `[harness] enabled`: no session is supervised.
+    Harness,
+    /// `[harness.<agent>] enabled`: that agent's sessions are not.
+    Agent(aterm_phase::Program),
+    /// `[harness] upgrade`: the window takes no upgrade step.
+    Upgrade,
+}
+
+impl WindowOff {
+    /// The switch as aterm.toml spells it.
+    fn switch(self) -> String {
+        match self {
+            WindowOff::Harness => "[harness] enabled".to_string(),
+            WindowOff::Agent(p) => format!("[harness.{}] enabled", p.name()),
+            WindowOff::Upgrade => "[harness] upgrade".to_string(),
+        }
+    }
+
+    /// Whose upgrades it keeps the window from: every agent's, or one
+    /// agent's.
+    fn upgrades(self) -> String {
+        match self {
+            WindowOff::Harness | WindowOff::Upgrade => "these upgrades".to_string(),
+            WindowOff::Agent(p) => format!("{}'s upgrades", p.product()),
+        }
+    }
+}
+
+/// The switch that keeps the window's host from `agent`'s upgrades — the
+/// master switch, then the agent's own ([`SupervisorConfig::on_for`]), then
+/// `[harness] upgrade` — or `None` while it takes them.
+fn window_off(policy: &SupervisorConfig, agent: super::upgrade::Agent) -> Option<WindowOff> {
+    let program = agent.program();
+    if !policy.on_for(program) {
+        Some(if policy.enabled {
+            WindowOff::Agent(program)
+        } else {
+            WindowOff::Harness
+        })
+    } else if !policy.upgrade {
+        Some(WindowOff::Upgrade)
+    } else {
+        None
+    }
+}
+
 /// `aterm harness upgrade models [set <list>]` — the live upgrade's model
 /// priority list ([`super::upgrade_models`]).
 fn run_upgrade_models(
@@ -3272,7 +3969,10 @@ fn run_upgrade_models(
         // Two or more accounts listed: the home's model caches are whichever
         // login started last, and are not read (`Opts::several_logins`).
         several_logins: accounts::several_listed(env.accounts_roster().as_deref()),
+        // Reads the list, or writes it: no line is typed.
+        usage_tap: None,
         instances: crate::harness::upgrade_drive::Instances::Machine,
+        agents_off: Vec::new(),
     };
     match set {
         Some(list) => match super::upgrade_drive::set_models(&opts, list) {
@@ -3348,7 +4048,24 @@ fn upgrade_opts(
         // Two or more accounts listed: the home's model caches are whichever
         // login started last, and are not read (`Opts::several_logins`).
         several_logins: accounts::several_listed(env.accounts_roster().as_deref()),
+        // `[harness] usage_tap`, under the master switch: a relaunch line
+        // this pass types carries the tap where its gate holds — on the
+        // login of the machine's one account too.
+        usage_tap: (policy.enabled && policy.usage_tap)
+            .then(super::tap::stable_exe)
+            .flatten()
+            .map(|exe| super::tap::Armed {
+                exe,
+                lone_login: accounts::lone_login_at(
+                    env.accounts_roster().as_deref(),
+                    &env.accounts_store(),
+                    env.now,
+                ),
+            }),
         instances: crate::harness::upgrade_drive::Instances::Machine,
+        // `[harness.<agent>] enabled = false`: the pass leaves that agent's
+        // sessions alone, as the window's host does.
+        agents_off: policy.off.clone(),
     })
 }
 
@@ -3356,9 +4073,10 @@ fn upgrade_opts(
 /// --now|--defer|--skip` ([`OwnerAsk`]): the recorded upgrades read, or the
 /// owner's word written ([`super::upgrade_drive::ask`]). Nothing is swept,
 /// typed or signalled. A word the busy lock kept out exits 75, like a step
-/// that could not run; any other refusal exits 1. With `[harness] enabled`
-/// or `upgrade` off the word is still written (it is the owner's) and stderr
-/// says what it waits on: with `enabled` off nothing moves until it is back
+/// that could not run; any other refusal exits 1. With `[harness] enabled`,
+/// the tab's agent's own `[harness.<agent>] enabled` ([`window_off`]) or
+/// `upgrade` off the word is still written (it is the owner's) and stderr
+/// says what it waits on: with an `enabled` off nothing moves until it is back
 /// on; with `upgrade` off the window takes no upgrade step, so the word takes
 /// effect at the next hand-run `aterm harness upgrade <sid>` or once the
 /// switch is back on.
@@ -3412,23 +4130,29 @@ fn run_upgrade_owner(
             }
             // No window watches a record while a switch is off (design
             // `docs/DESIGN-upgrade-never-stuck-2026-09-28.md`, C10): the
-            // window's host stands down, so a record reads `unwatched` by the
-            // owner's own choice, said once, beside the rows.
-            if let Some(path) = env
-                .config
-                .as_deref()
-                .filter(|_| !(policy.enabled && policy.upgrade))
-                && rows
+            // window's host stands down — for every agent, or for the one
+            // whose own switch is off — so a record reads `unwatched` by the
+            // owner's own choice, said once per switch, beside the rows.
+            if let Some(path) = env.config.as_deref() {
+                let mut said: Vec<WindowOff> = Vec::new();
+                for off in rows
                     .iter()
-                    .any(|r| r.stall(now).as_deref() == Some("unwatched"))
-            {
-                let _ = writeln!(
-                    err,
-                    "aterm harness: `[harness] {}` reads off in {}, so no window watches these \
-                     upgrades: `unwatched` here is that switch, not a fault",
-                    if policy.enabled { "upgrade" } else { "enabled" },
-                    path.display()
-                );
+                    .filter(|r| r.stall(now).as_deref() == Some("unwatched"))
+                    .filter_map(|r| window_off(&policy, r.agent))
+                {
+                    if said.contains(&off) {
+                        continue;
+                    }
+                    said.push(off);
+                    let _ = writeln!(
+                        err,
+                        "aterm harness: `{}` reads off in {}, so no window watches {}: \
+                         `unwatched` here is that switch, not a fault",
+                        off.switch(),
+                        path.display(),
+                        off.upgrades()
+                    );
+                }
             }
             if rows.is_empty() && !json {
                 let _ = writeln!(
@@ -3466,25 +4190,30 @@ fn run_upgrade_owner(
                     )
                 );
             }
-            if let Some(path) = env
-                .config
-                .as_deref()
-                .filter(|_| !(policy.enabled && policy.upgrade))
-            {
-                let _ = if policy.enabled {
-                    writeln!(
+            // The switch that keeps the window off this row's agent: the word
+            // stands (it is the owner's) and waits on it.
+            if let Some((path, off)) = env.config.as_deref().zip(window_off(&policy, row.agent)) {
+                let _ = match off {
+                    WindowOff::Upgrade => writeln!(
                         err,
                         "aterm harness: the word is recorded, but `[harness] upgrade` reads off \
                          in {}, so it takes effect at the next `aterm harness upgrade {sid}`",
                         path.display()
-                    )
-                } else {
-                    writeln!(
+                    ),
+                    WindowOff::Harness => writeln!(
                         err,
                         "aterm harness: the word is recorded, but `[harness] enabled` reads off \
                          in {} (Settings: search \"harness\"): nothing moves until it is back on",
                         path.display()
-                    )
+                    ),
+                    // A hand-run sweep leaves that agent's sessions alone too.
+                    WindowOff::Agent(_) => writeln!(
+                        err,
+                        "aterm harness: the word is recorded, but `{}` reads off in {} \
+                         (Settings ▸ Harness): nothing moves until it is back on",
+                        off.switch(),
+                        path.display()
+                    ),
                 };
             }
             ExitCode::SUCCESS
@@ -3517,6 +4246,9 @@ fn run_upgrade_owner(
 /// restart an earlier sweep left in flight ([`stranded`]) and the reader's
 /// notes. `[harness] upgrade` does not gate it: naming the verb is consent.
 /// A `--dry-run` acts on nothing, so it still sweeps, prints and exits 0.
+/// An agent whose own `[harness.<agent>] enabled` reads off is left out of
+/// the sweep ([`super::upgrade_drive::Opts::agents_off`]), said on stderr;
+/// the other agents' sessions are swept as ever.
 ///
 /// A sweep that did not run decided nothing: `busy:another-sweep` exits 75
 /// ([`atpkg::lock::CONTENDED_EXIT`], "try again later"), so a script
@@ -3549,7 +4281,14 @@ fn upgrade_pass(
             "aterm harness: upgrade refused: `[harness] enabled` reads off in {} (Settings: \
              search \"harness\"){}{}",
             path.display(),
-            stranded(&super::upgrade_drive::in_flight(opts)),
+            // The master switch strands every agent's restart, those of an
+            // agent switched off by its own table too.
+            stranded(&super::upgrade_drive::in_flight(
+                &super::upgrade_drive::Opts {
+                    agents_off: Vec::new(),
+                    ..opts.clone()
+                }
+            )),
             if opts.dry_run {
                 "; the lines below are what it would do with the switch on"
             } else {
@@ -3561,6 +4300,34 @@ fn upgrade_pass(
         }
         if !opts.dry_run {
             return ExitCode::from(1);
+        }
+    }
+    if let Some(path) = env.config.as_deref() {
+        for &program in &opts.agents_off {
+            let _ = writeln!(
+                err,
+                "aterm harness: `{}` reads off in {} (Settings ▸ Harness): {}'s sessions are left \
+                 as they are",
+                WindowOff::Agent(program).switch(),
+                path.display(),
+                program.product()
+            );
+        }
+        // The restarts an earlier sweep began for an agent switched off now
+        // stay stopped until its switch is on again: named, as the master
+        // switch's refusal names them, since no lane this sweep runs carries
+        // them — unless that refusal (a dry run under the master switch off)
+        // has named every one already.
+        if policy.enabled && !opts.agents_off.is_empty() {
+            let ours = super::upgrade_drive::in_flight(opts);
+            let every = super::upgrade_drive::in_flight(&super::upgrade_drive::Opts {
+                agents_off: Vec::new(),
+                ..opts.clone()
+            });
+            let left: Vec<String> = every.into_iter().filter(|s| !ours.contains(s)).collect();
+            if let Some(words) = stranded(&left).strip_prefix("; ") {
+                let _ = writeln!(err, "aterm harness: {words}");
+            }
         }
     }
     let mut code = ExitCode::SUCCESS;
@@ -3715,21 +4482,22 @@ pub const ACCOUNTS_ROTATION: &str = "rotation: a supervised session follows the 
 /// ([`accounts::StayWhy::NotListed`]).
 pub const ACCOUNTS_OWN_LABEL: &str = "main";
 
-/// How long one `claude auth status --json` may run (`accounts check`). A
-/// bound, not a budget: MEASURED 2026-10-01 on 2.1.286, the command answered
-/// in under a second, signed in or not — and a `claude` that is not going to
-/// answer (one was measured hanging on `--version` too) is stopped here and
-/// said as `could not run`.
+/// How long one `claude auth status --json` may run (the check after an
+/// `accounts login` flow that exits 0, [`auth_status_of`]). A bound, not a
+/// budget: MEASURED 2026-10-01 on 2.1.286, the command answered in under a
+/// second, signed in or not — and a `claude` that is not going to answer
+/// (one was measured hanging on `--version` too) is stopped here and said as
+/// `could not run`.
 pub const AUTH_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// The most of that command's stdout that is read. The document is a few
 /// hundred bytes; one cut at this cap does not parse and is `could not run`.
 pub const MAX_AUTH_STDOUT: usize = 64 * 1024;
 
-/// What `accounts check` and `accounts login` need of the machine beyond
-/// files: the two `claude` runs, whether stdin is a terminal, and the clock
-/// once a login flow has ended. Injected, so a verb's test runs no `claude`;
-/// [`LiveAccounts`] is the shipped one.
+/// What `accounts login` needs of the machine beyond files: its two `claude`
+/// runs (the flow, and the check after a flow that exits 0), whether stdin
+/// is a terminal, and the clock once the flow has ended. Injected, so the
+/// verb's test runs no `claude`; [`LiveAccounts`] is the shipped one.
 pub trait AccountsHost {
     /// Whether stdin is a terminal. Only then is the login flow run: it
     /// opens a browser and waits for a person.
@@ -3738,6 +4506,8 @@ pub trait AccountsHost {
     /// Run `claude auth status --json` with [`accounts::LOGIN_ENV`] set to
     /// `login` — a row's `dir` verbatim, or the empty string for this
     /// machine's own login — bounded, and hand back its exit and its stdout.
+    /// Asked ONLY of a login a flow that exited 0 has just made
+    /// ([`auth_status_of`] says why).
     ///
     /// THE STDOUT IS NOT TO BE SHOWN: it names an email and an organization.
     /// Its one reader is [`login_check`], which takes the exit status and the
@@ -3769,6 +4539,100 @@ pub trait AccountsHost {
     /// so what it left is stamped by this and not by [`Env::now`], which was
     /// read before the wait.
     fn now(&self) -> i64;
+
+    /// A RENEWAL'S SIGN-IN ([`run_accounts_renew`]): `claude auth login
+    /// --claudeai --email <email>` on this terminal, WAITED FOR, with
+    /// [`accounts::HOME_ENV`] set to `home` — the new staging directory —
+    /// and [`accounts::LOGIN_ENV`] removed, so the new login is that
+    /// directory's own keychain item and no live session's ([`renew_command`]).
+    /// `browser` says what opens the page. Answers the flow's exit code.
+    ///
+    /// # Errors
+    ///
+    /// Why `claude` could not be started.
+    fn renew_flow(&self, home: &str, email: &str, browser: &RenewBrowser) -> Result<i32, String> {
+        let _ = (home, email, browser);
+        Err("this host renews nothing".to_string())
+    }
+
+    /// THE CHECK AFTER A RENEWAL'S FLOW EXITED 0: `claude auth status --json`
+    /// IN THE STAGING HOME — [`accounts::HOME_ENV`] set to `home`,
+    /// [`accounts::LOGIN_ENV`] removed — bounded, its exit and stdout handed
+    /// back. In that home because the address it answers is that home's own
+    /// record of the sign-in (READ in the 2.1.300 bundle: `email` is the
+    /// home's `.claude.json` `oauthAccount`); asked under the shared home it
+    /// would answer the shared home's address. A token minted seconds ago
+    /// has nothing to refresh, so this run cannot spend it.
+    ///
+    /// THE STDOUT IS NOT TO BE SHOWN OR LOGGED: its one reader is
+    /// [`status_facts`], which compares the address in memory and drops it.
+    ///
+    /// # Errors
+    ///
+    /// Why it did not run, never any of its output.
+    fn status_in_home(&self, home: &str) -> Result<Captured, String> {
+        let _ = home;
+        Err("this host checks nothing".to_string())
+    }
+
+    /// `ssh -t <host> <aterm> harness accounts renew --due --here` (`argv`
+    /// after the host), its stdio this process's, WAITED FOR: the remote
+    /// machine's own renewal, run in one sitting from here. Answers its exit
+    /// code.
+    ///
+    /// # Errors
+    ///
+    /// Why `ssh` could not be started.
+    fn ssh(&self, host: &str, argv: &[String]) -> Result<i32, String> {
+        let _ = (host, argv);
+        Err("this host runs no ssh".to_string())
+    }
+
+    /// Whether this command runs over SSH (`SSH_CONNECTION` set): the
+    /// browser is on the machine the owner is at, so nothing is opened here
+    /// and Claude Code's own paste-code flow is the one used
+    /// ([`RenewBrowser::Remote`]).
+    fn under_ssh(&self) -> bool {
+        false
+    }
+
+    /// This program's own executable, for the opener's argv0 link
+    /// ([`open_url::OPENER`](super::open_url::OPENER)). `None`: no profile
+    /// can be opened, and the system's default browser opens the page.
+    fn current_exe(&self) -> Option<PathBuf> {
+        None
+    }
+}
+
+/// What opens a renewal's sign-in page ([`AccountsHost::renew_flow`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenewBrowser {
+    /// Claude Code's own opener: the system's default browser.
+    Default,
+    /// The account's own browser profile, through aterm's argv0 opener
+    /// (`BROWSER=<opener>`, the profile's name in
+    /// [`super::open_url::PROFILE_ENV`]).
+    Profile {
+        /// The opener's link ([`super::open_url::OPENER`]).
+        opener: PathBuf,
+        /// The profile's display name.
+        profile: String,
+    },
+    /// Over SSH: NOTHING OPENS ON THIS MACHINE. `BROWSER` is aterm's opener
+    /// with no profile named, which opens nothing and exits 1 (`None`, no
+    /// opener: `BROWSER` removed). MEASURED on 2.1.300 in the lab
+    /// (2026-10-15): `auth login --claudeai --email` prints its paste-code
+    /// URL (`code=true`, the `platform.claude.com/oauth/code/callback`
+    /// redirect, the `login_hint`) and `Paste code here if prompted >`
+    /// whatever `BROWSER` says, and calls its opener under
+    /// `SSH_CONNECTION` too — with `BROWSER` unset that is `open <url>`, a
+    /// browser on THIS machine's screen. The owner opens the printed URL on
+    /// the machine they are at and pastes the code at Claude Code's prompt.
+    Remote {
+        /// The opener's link ([`super::open_url::OPENER`]), where one could
+        /// be made.
+        opener: Option<PathBuf>,
+    },
 }
 
 /// The shipped [`AccountsHost`]: `claude` as PATH resolves it.
@@ -3798,6 +4662,119 @@ impl AccountsHost for LiveAccounts {
     fn now(&self) -> i64 {
         crate::supervise::limit::unix_now()
     }
+
+    fn renew_flow(&self, home: &str, email: &str, browser: &RenewBrowser) -> Result<i32, String> {
+        renew_flow_of(std::ffi::OsStr::new("claude"), home, email, browser)
+    }
+
+    fn status_in_home(&self, home: &str) -> Result<Captured, String> {
+        status_in_home_within(
+            std::ffi::OsStr::new("claude"),
+            home,
+            &|name| std::env::var_os(name),
+            AUTH_CHECK_BUDGET,
+        )
+    }
+
+    fn ssh(&self, host: &str, argv: &[String]) -> Result<i32, String> {
+        let mut cmd = aterm_uds::spawnfd::command("ssh");
+        cmd.arg("-t").arg(host).args(argv);
+        terminal_flow(|| cmd.spawn(), |mut child| child.wait(), || {})
+            .map(exit_code)
+            .map_err(|e| e.to_string())
+    }
+
+    fn under_ssh(&self) -> bool {
+        std::env::var_os("SSH_CONNECTION").is_some_and(|v| !v.is_empty())
+    }
+
+    fn current_exe(&self) -> Option<PathBuf> {
+        std::env::current_exe().ok()
+    }
+}
+
+/// `<program> auth login --claudeai --email <email>` as a RENEWAL runs it
+/// ([`AccountsHost::renew_flow`]): the login made under the staging home
+/// ALONE ([`accounts::HOME_ENV`] = `home`), [`accounts::LOGIN_ENV`] removed
+/// — set, it would name the keychain item instead, and the new login would
+/// land in a live session's — and the page opened as `browser` says: the
+/// account's profile through the argv0 opener, Claude Code's default, or,
+/// over SSH, nothing at all (the opener with no profile, which opens
+/// nothing: the paste-code flow).
+fn renew_command(
+    program: &std::ffi::OsStr,
+    home: &str,
+    email: &str,
+    browser: &RenewBrowser,
+) -> aterm_uds::spawnfd::Command {
+    let mut cmd = aterm_uds::spawnfd::Command::new(program);
+    cmd.args(["auth", "login", "--claudeai", "--email", email])
+        .env_remove(accounts::LOGIN_ENV)
+        .env(accounts::HOME_ENV, home)
+        .env_remove(super::open_url::PROFILE_ENV);
+    match browser {
+        RenewBrowser::Default => {}
+        RenewBrowser::Profile { opener, profile } => {
+            cmd.env("BROWSER", opener)
+                .env(super::open_url::PROFILE_ENV, profile);
+        }
+        RenewBrowser::Remote {
+            opener: Some(opener),
+        } => {
+            cmd.env("BROWSER", opener);
+        }
+        RenewBrowser::Remote { opener: None } => {
+            cmd.env_remove("BROWSER");
+        }
+    }
+    cmd
+}
+
+/// ONE RUN OF A RENEWAL'S SIGN-IN ([`renew_command`]) on this terminal,
+/// WAITED FOR, as [`login_flow_of`] runs the plain one: a child with this
+/// process's stdio, this process standing aside from the terminal's Ctrl-C
+/// ([`ignoring_interrupts`]) while the flow decides what the key means.
+///
+/// # Errors
+///
+/// Why the program could not be started.
+fn renew_flow_of(
+    program: &std::ffi::OsStr,
+    home: &str,
+    email: &str,
+    browser: &RenewBrowser,
+) -> Result<i32, String> {
+    terminal_flow(
+        || renew_command(program, home, email, browser).spawn(),
+        |mut child| child.wait(),
+        || {},
+    )
+    .map(exit_code)
+    .map_err(|e| e.to_string())
+}
+
+/// `<program> auth status --json` IN THE STAGING HOME `home`
+/// ([`AccountsHost::status_in_home`]), bounded by `budget`: the bounded
+/// runner's environment (PATH, HOME, TMPDIR), [`accounts::HOME_ENV`] set to
+/// `home`, and the variables [`auth_check_env`] hands through.
+/// [`accounts::LOGIN_ENV`] is not among them: the login is the home's own
+/// item.
+///
+/// # Errors
+///
+/// As [`auth_status_of`].
+fn status_in_home_within(
+    program: &std::ffi::OsStr,
+    home: &str,
+    var: &dyn Fn(&str) -> Option<OsString>,
+    budget: std::time::Duration,
+) -> Result<Captured, String> {
+    let pass = auth_check_env(var)?;
+    let mut cmd = aterm_uds::spawnfd::Command::new(program);
+    cmd.args(["auth", "status", "--json"])
+        .env(accounts::HOME_ENV, home);
+    cmd.envs(pass);
+    super::align::capture_bounded(cmd, budget, MAX_AUTH_STDOUT)
 }
 
 /// `<program> auth login` as [`login_flow_of`] runs it: the workspace's own
@@ -3821,33 +4798,76 @@ fn login_command(program: &std::ffi::OsStr, dir: Option<&str>) -> aterm_uds::spa
 }
 
 /// ONE RUN OF `<program> auth login` ([`login_command`]) on this terminal,
-/// WAITED FOR. It is a child and not a replacement of this process, so what
-/// the login then answers can be asked and recorded; its stdio is this
-/// process's, so the flow reads the keyboard. A Ctrl-C the terminal delivers
-/// as a signal reaches the whole foreground group, and this process STANDS
-/// ASIDE from it while it waits ([`ignoring_interrupts`]): the flow decides
-/// what the key means, and an end it caused (130) is answered like any other
-/// exit, so the login is still asked afterwards.
+/// WAITED FOR. It is a child and not a replacement of this process, so its
+/// end can be recorded; its stdio is this process's, so the flow reads the
+/// keyboard. A Ctrl-C the terminal delivers as a signal reaches the whole
+/// foreground group, and this process STANDS ASIDE from it while it waits
+/// ([`ignoring_interrupts`]): the flow decides what the key means, and an end
+/// it caused (130) is answered like any other failed exit.
 ///
 /// # Errors
 ///
 /// Why the program could not be started.
 fn login_flow_of(program: &std::ffi::OsStr, dir: Option<&str>) -> Result<i32, String> {
-    let mut child = login_command(program, dir)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    ignoring_interrupts(|| child.wait())
+    terminal_flow(
+        || login_command(program, dir).spawn(),
+        |mut child| child.wait(),
+        || {},
+    )
+    .map(exit_code)
+    .map_err(|e| e.to_string())
+}
+
+/// ONE RUN OF `cmd` ON THIS TERMINAL, waited for exactly as [`login_flow_of`] waits:
+/// the AI CLIs' sign-in flows (`crate::ai::login`). Answers [`exit_code`].
+///
+/// # Errors
+///
+/// Why the program could not be started.
+pub(crate) fn terminal_run(mut cmd: aterm_uds::spawnfd::Command) -> Result<i32, String> {
+    terminal_flow(|| cmd.spawn(), |mut child| child.wait(), || {})
         .map(exit_code)
         .map_err(|e| e.to_string())
+}
+
+/// Process-wide dispositions admit one foreground flow at a time. Admission
+/// starts before spawn: another flow's SIG_IGN must not reach a new child.
+#[cfg(unix)]
+static TERMINAL_FLOWS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// One foreground flow: admit its spawn, then stand aside while it waits.
+/// `contended` observes admission contention without changing the operation.
+fn terminal_flow<T, R, E>(
+    spawn: impl FnOnce() -> Result<T, E>,
+    wait: impl FnOnce(T) -> Result<R, E>,
+    contended: impl FnOnce(),
+) -> Result<R, E> {
+    #[cfg(unix)]
+    let _admission = match TERMINAL_FLOWS.try_lock() {
+        Ok(admission) => admission,
+        Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            contended();
+            TERMINAL_FLOWS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+    };
+    #[cfg(not(unix))]
+    let _ = contended;
+    let child = spawn()?;
+    ignoring_interrupts(|| wait(child))
 }
 
 /// Run `wait` with this process IGNORING SIGINT AND SIGQUIT — the rule
 /// `system(3)` keeps, and `atpkg::platform::wait_standing_aside`'s for a
 /// `std` child. Called AFTER the spawn: an ignored signal is inherited
 /// across `exec`, and the child must meet the key with its own disposition.
-/// Each disposition is put back whole before this returns. The dispositions
-/// are the whole process's: its one caller is `aterm harness accounts
-/// login`'s wait ([`login_flow_of`]).
+/// Each disposition is put back whole before this returns or unwinds. The dispositions
+/// are the whole process's: its callers are the waits of `aterm harness
+/// accounts login` and `renew` ([`login_flow_of`], [`renew_flow_of`], and a
+/// renewal's `ssh` to another machine) and of `aterm ai`'s sign-ins
+/// ([`terminal_run`]).
 #[cfg(unix)]
 fn ignoring_interrupts<T>(wait: impl FnOnce() -> T) -> T {
     // SAFETY: `sigaction` is plain data for which all-zero is a valid value
@@ -3862,14 +4882,19 @@ fn ignoring_interrupts<T>(wait: impl FnOnce() -> T) -> T {
         let set = unsafe { libc::sigaction(sig, &ignore, &mut was) } == 0;
         (sig, set.then_some(was))
     });
-    let value = wait();
-    for (sig, was) in replaced {
-        if let Some(was) = was {
-            // SAFETY: puts back the disposition this function replaced.
-            unsafe { libc::sigaction(sig, &was, std::ptr::null_mut()) };
+    struct Restore([(libc::c_int, Option<libc::sigaction>); 2]);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for (sig, was) in &self.0 {
+                if let Some(was) = was {
+                    // SAFETY: puts back the whole action this scope replaced.
+                    unsafe { libc::sigaction(*sig, was, std::ptr::null_mut()) };
+                }
+            }
         }
     }
-    value
+    let _restore = Restore(replaced);
+    wait()
 }
 
 /// Elsewhere the wait is plain: the console's Ctrl-C reaches this process as
@@ -3899,12 +4924,18 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
 /// ONE RUN OF `<program> auth status --json` UNDER `login`
 /// ([`accounts::LOGIN_ENV`] set to it: a row's `dir` verbatim, or the empty
 /// string for this machine's own login), bounded by [`AUTH_CHECK_BUDGET`],
-/// its stdout capped at [`MAX_AUTH_STDOUT`]. The one runner of that command:
-/// `accounts check` runs the `claude` PATH resolves ([`LiveAccounts`]), and a
-/// window's supervisor runs THE SESSION'S OWN PROGRAM, by its path, before it
-/// moves a session to an account nobody has seen serve (aterm-gui's
-/// `harness_host`, the accounts design §6). `var` reads the caller's
+/// its stdout capped at [`MAX_AUTH_STDOUT`]. `var` reads the caller's
 /// environment.
+///
+/// ITS ONE CALLER IS THE CHECK AFTER AN `accounts login` FLOW THAT EXITED 0
+/// ([`run_accounts_login`], through [`LiveAccounts`]: the `claude` PATH
+/// resolves). In 2.1.300 the command starts a token refresh and exits before
+/// it saves the result, which spends the login's single-use refresh token
+/// (anthropics/claude-code#95822; `docs/DESIGN-claude-accounts-v2-2026-10-15.md`
+/// §1), so it is never run under an idle login. A token minted seconds ago
+/// has nothing to refresh, so this run cannot spend it — and it is the only
+/// proof that the new login is filed where sessions under that directory
+/// look (that design's §5.3 step 4).
 ///
 /// THE STDOUT IS NOT TO BE SHOWN OR LOGGED: it names an email and an
 /// organization. Its one reader is [`login_check`], which takes the exit
@@ -3957,16 +4988,17 @@ fn auth_status_within(
     cmd.args(["auth", "status", "--json"])
         .env(accounts::LOGIN_ENV, login);
     cmd.envs(pass);
-    super::align::capture_bounded(cmd, budget, None, MAX_AUTH_STDOUT)
+    super::align::capture_bounded(cmd, budget, MAX_AUTH_STDOUT)
 }
 
 /// Why `claude auth status --json` is not run with neither USER nor LOGNAME
 /// in the environment: [`LoginCheck::CouldNotRun`]'s reason, word for word.
 pub const AUTH_CHECK_NO_USER: &str = "USER is not set";
 
-/// The variables `accounts check` hands through to the `claude` it runs, as
-/// `var` reads this process's environment: USER and LOGNAME, and the markers
-/// the agents' reroute stub decides by — each as it is, unread.
+/// The variables the check after a sign-in ([`auth_status_of`]) hands
+/// through to the `claude` it runs, as `var` reads this process's
+/// environment: USER and LOGNAME, and the markers the agents' reroute stub
+/// decides by — each as it is, unread.
 ///
 /// # Errors
 ///
@@ -3990,7 +5022,8 @@ fn auth_check_env(
         .collect())
 }
 
-/// What one login answered to `accounts check`.
+/// What one login answered to the check after an `accounts login` flow that
+/// exited 0 ([`login_check`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginCheck {
     /// `loggedIn: true`, exit 0.
@@ -4066,6 +5099,59 @@ pub fn login_check(ran: Result<Captured, String>) -> LoginCheck {
     }
 }
 
+/// What a RENEWAL'S CHECK read of `claude auth status --json` in the staging
+/// home ([`status_facts`]): four facts and nothing else. The address itself
+/// is not among them: it was compared in memory and dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusFacts {
+    /// `loggedIn: true` with exit 0.
+    pub signed_in: bool,
+    /// `authMethod` is `claude.ai`: a subscription's login, not a key's.
+    pub claude_ai: bool,
+    /// The `email` it answers is the row's ([`accounts::email_matches`]).
+    pub email_matches: bool,
+    /// `subscriptionType`, where it names one (one bounded word).
+    pub subscription: Option<String>,
+}
+
+impl StatusFacts {
+    /// The renewal's check passes: signed in to claude.ai as the row's
+    /// account.
+    #[must_use]
+    pub fn renews(&self) -> bool {
+        self.signed_in && self.claude_ai && self.email_matches
+    }
+}
+
+/// THE FOUR FACTS of one `claude auth status --json` run in a staging home
+/// (READ in the 2.1.300 bundle: `loggedIn`, `authMethod`, the home's
+/// `oauthAccount` address as `email`, the token's `subscriptionType`;
+/// exit 0 only when logged in), `want` the row's address. The document is
+/// parsed, those keys are taken and EVERYTHING ELSE — the organization's id
+/// and name among it — is dropped unread; the address answered is compared
+/// with `want` here and goes no further. `None` for an answer that cannot be
+/// read: not UTF-8, not a JSON object, no `loggedIn`.
+#[must_use]
+pub fn status_facts(got: &Captured, want: &str) -> Option<StatusFacts> {
+    let text = std::str::from_utf8(&got.stdout).ok()?;
+    let doc: Value = aterm_json::from_str(text).ok()?;
+    let doc = doc.as_object()?;
+    let logged_in = doc.get("loggedIn")?.as_bool()?;
+    Some(StatusFacts {
+        signed_in: logged_in && got.code == Some(0),
+        claude_ai: doc.get("authMethod").and_then(Value::as_str) == Some("claude.ai"),
+        email_matches: doc
+            .get("email")
+            .and_then(Value::as_str)
+            .is_some_and(|answered| accounts::email_matches(want, answered)),
+        subscription: doc
+            .get("subscriptionType")
+            .and_then(Value::as_str)
+            .map(|s| super::one_line(s, 32))
+            .filter(|s| !s.is_empty()),
+    })
+}
+
 /// The roster `accounts` works on — its path and its rows — or `None` with
 /// the reason already on `err` (the caller's exit 1): no config directory is
 /// known, or the file does not admit. A missing file is the empty roster.
@@ -4109,6 +5195,29 @@ fn accounts_none_listed(path: &Path) -> String {
         } else {
             " (no such file)"
         }
+    )
+}
+
+/// The line `accounts` adds under [`accounts_none_listed`] for this
+/// machine's own login, where the usage tap recorded it: each window's
+/// figure and reset, and when it was read.
+fn accounts_own_reading(state: &accounts::State, now: i64) -> String {
+    let Some(sample) = state
+        .accounts
+        .get(ACCOUNTS_OWN_LABEL)
+        .and_then(|account| account.sample.as_ref())
+    else {
+        return String::new();
+    };
+    let window = |name: &str, figure: Option<(u32, i64)>| match figure {
+        Some((pct, until)) => format!("{name} {pct}% until {}", rfc3339_utc(until)),
+        None => format!("{name} ?"),
+    };
+    format!(
+        "this login ({ACCOUNTS_OWN_LABEL}), read by the usage tap at {}: {} \u{b7} {}",
+        rfc3339_utc(sample.at),
+        window("session", sample.session(now)),
+        window("week", sample.week(now)),
     )
 }
 
@@ -4213,19 +5322,79 @@ fn account_mark(state: &accounts::State, label: &str) -> Option<&'static str> {
     }
 }
 
+/// What the record says of an account's usage (accounts v2 S5), as the
+/// report's row words it, each item followed by two blanks; empty where it
+/// says nothing: `credits: in use since <time>` while usage credits carry its
+/// sessions, else `credits: off (<the vendor's reason>)[ until <time>]` where
+/// the newest word on them is a limit row's `off`; then `warned: <weekly|session>
+/// <n>% (resets <time>)` of Claude Code's warnings that a window fills: the
+/// week's figure while it holds, else the session's.
+fn usage_words(account: &accounts::Account, now: i64) -> String {
+    let mut words = String::new();
+    match &account.credits {
+        Some(accounts::Credits::InUse(c)) if c.stands(now) => {
+            words.push_str(&format!("credits: in use since {}  ", rfc3339_utc(c.since)));
+        }
+        Some(accounts::Credits::Off(off)) => {
+            let why = if off.reason.is_empty() {
+                "named no reason"
+            } else {
+                off.reason.as_str()
+            };
+            words.push_str(&format!("credits: off ({why})"));
+            if let Some(until) = off.until.filter(|&until| now < until) {
+                words.push_str(&format!(" until {}", rfc3339_utc(until)));
+            }
+            words.push_str("  ");
+        }
+        _ => {}
+    }
+    let shown = |window: &str, said: &Option<accounts::WindowSaid>, window_s: i64| {
+        let said = said.as_ref()?;
+        let (pct, _) = said.figure(window_s, now)?;
+        Some(match said.reset {
+            Some(at) => format!("warned: {window} {pct}% (resets {})  ", rfc3339_utc(at)),
+            None => format!("warned: {window} {pct}%  "),
+        })
+    };
+    if let Some(said) =
+        shown("weekly", &account.warned_week, accounts::WEEK_WINDOW_S).or_else(|| {
+            shown(
+                "session",
+                &account.warned_session,
+                accounts::SESSION_WINDOW_S,
+            )
+        })
+    {
+        words.push_str(&said);
+    }
+    words
+}
+
 /// The `accounts` report as text (design §8): the header, one row per
 /// account, `next:` with every non-candidate's reason, and
 /// [`ACCOUNTS_ROTATION`]. No usage figure is shown (the JSON keeps them). A
-/// limit-reset offer on record shows as `offer: N left[, use by <time>]`.
+/// limit-reset offer on record shows as `offer: N left[, use by <time>]`,
+/// and what the record says of the account's usage as [`usage_words`]. With
+/// no account listed, the machine's own row is shown where the record holds
+/// its usage (`[harness] usage_notes`).
 fn accounts_text(
     path: &Path,
     roster: &Roster,
-    state: &accounts::State,
+    (state, logins): (&accounts::State, &accounts::Logins),
     enrolled: &BTreeSet<String>,
     now: i64,
 ) -> String {
     if roster.rows.is_empty() {
-        return accounts_none_listed(path);
+        let mut text = accounts_none_listed(path);
+        let own = usage_words(&state.account(ACCOUNTS_OWN_LABEL), now);
+        if !own.is_empty() {
+            text.push_str(&format!(
+                "this machine's own account ({ACCOUNTS_OWN_LABEL}): {}\n",
+                own.trim_end()
+            ));
+        }
+        return text;
     }
     let mut text = match state.active.as_deref() {
         Some(active) => format!(
@@ -4268,8 +5437,9 @@ fn accounts_text(
                 Some(by) => format!("offer: {} left, use by {}  ", offer.left, rfc3339_utc(by)),
                 None => format!("offer: {} left  ", offer.left),
             });
+        let usage = usage_words(&state.account(&row.label), now);
         text.push_str(&format!(
-            "{:width$}  {:9}  {condition}  {}  {offer}on: {}\n",
+            "{:width$}  {:9}  {condition}  {}  {offer}{usage}on: {}{}\n",
             row.label,
             row.class.as_str(),
             account_mark(state, &row.label).unwrap_or("-"),
@@ -4278,6 +5448,7 @@ fn accounts_text(
             } else {
                 on.join(" ")
             },
+            login_words(row, state, logins, now),
         ));
     }
     let next = accounts_next(roster, state, enrolled, now);
@@ -4298,8 +5469,9 @@ fn accounts_text(
                 // The one reason a command of this verb's ends: named with it.
                 // (Only a row that names a directory is ever not enrolled.)
                 accounts::WhyNot::NotEnrolled => format!(
-                    "{label}: {} (no login made yet: run `aterm harness accounts login {label}`)",
-                    why.as_str()
+                    "{label}: {} (no login made yet: run `aterm harness accounts {} {label}`)",
+                    why.as_str(),
+                    roster.row(label).map_or("login", sign_in_verb)
                 ),
                 _ => format!("{label}: {}", why_not_words(*why)),
             })
@@ -4312,6 +5484,37 @@ fn accounts_text(
     text.push_str(ACCOUNTS_ROTATION);
     text.push('\n');
     text
+}
+
+/// A RENEWABLE ROW'S LOGIN as the report says it (design v2 §5.2): `
+/// login: <state>`, its renew-by date where a forecast has one (five days
+/// before the forecast end), and `last renewal: wrong account` where the
+/// last one answered another account. Empty for a row with no email: its
+/// line is as it was before renewal existed.
+fn login_words(
+    row: &accounts::Row,
+    state: &accounts::State,
+    logins: &accounts::Logins,
+    now: i64,
+) -> String {
+    if row.email.is_none() {
+        return String::new();
+    }
+    let binding = logins.get(&row.label);
+    let mut words = format!(
+        "  login: {}",
+        accounts::login_state(row, logins, state, now).as_str()
+    );
+    if let Some(by) = binding.and_then(accounts::forecast) {
+        words.push_str(&format!(
+            ", renew by {}",
+            rfc3339_utc(by.saturating_sub(accounts::DUE_S))
+        ));
+    }
+    if binding.is_some_and(|b| b.wrong_at.is_some()) {
+        words.push_str(", last renewal: wrong account");
+    }
+    words
 }
 
 /// `key` as Unix seconds and `key_rfc3339` as the same instant in UTC, both
@@ -4362,7 +5565,7 @@ fn accounts_refused_json(path: &Path, why: &str, now: i64) -> String {
 fn accounts_json(
     path: &Path,
     roster: &Roster,
-    state: &accounts::State,
+    (state, logins): (&accounts::State, &accounts::Logins),
     enrolled: &BTreeSet<String>,
     now: i64,
 ) -> String {
@@ -4427,6 +5630,33 @@ fn accounts_json(
             );
             m.insert("auth".to_owned(), Value::from(account.auth.as_str()));
             put_time(&mut m, "auth_at", account.auth_at);
+            // The login's lifecycle: what is on record, never the address.
+            let binding = logins.get(&row.label);
+            m.insert("renews".to_owned(), Value::from(row.email.is_some()));
+            m.insert(
+                "login".to_owned(),
+                Value::from(accounts::login_state(row, logins, state, now).as_str()),
+            );
+            let by = binding.and_then(accounts::forecast);
+            put_time(&mut m, "login_ends", by);
+            put_time(
+                &mut m,
+                "renew_by",
+                by.map(|by| by.saturating_sub(accounts::DUE_S)),
+            );
+            put_time(&mut m, "renewed_at", binding.and_then(|b| b.renewed_at));
+            m.insert(
+                "subscription".to_owned(),
+                Value::from(binding.and_then(|b| b.subscription.clone())),
+            );
+            m.insert(
+                "last_renewal".to_owned(),
+                Value::from(
+                    binding
+                        .and_then(|b| b.wrong_at)
+                        .map(|_| "wrong-account".to_string()),
+                ),
+            );
             let mark = account_mark(state, &row.label);
             m.insert("active".to_owned(), Value::from(mark.is_some()));
             m.insert("pinned".to_owned(), Value::from(mark == Some("pinned")));
@@ -4541,18 +5771,48 @@ fn run_accounts_report(
     if let Some(note) = note {
         let _ = writeln!(err, "aterm harness accounts: {note}");
     }
+    // The roster as this machine's logins bind it: a renewed login is the
+    // row's, and the one it replaced is no row's.
+    let (logins, note) = match store.load_logins(env.now) {
+        Ok(read) => read,
+        Err(why) => {
+            let _ = writeln!(
+                err,
+                "aterm harness accounts: {why}; account identities are unknown"
+            );
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(note) = note {
+        let _ = writeln!(err, "aterm harness accounts: {note}");
+    }
+    // No account listed, and the usage tap recorded this machine's own login
+    // (`super::tap`; `[harness] usage_tap`): that login's row is shown, its
+    // figures with it — the roster's own row, as a reset is judged by.
+    let own = roster.rows.is_empty()
+        && state
+            .accounts
+            .get(ACCOUNTS_OWN_LABEL)
+            .is_some_and(|account| account.sample.is_some());
+    if own && !json {
+        let _ = write!(out, "{}", accounts_none_listed(&path));
+        let _ = writeln!(out, "{}", accounts_own_reading(&state, env.now));
+        return ExitCode::SUCCESS;
+    }
+    let roster = accounts::bound(&if own { Roster::own() } else { roster }, &logins);
     let enrolled = accounts::enrolled(&roster);
+    let read = (&state, &logins);
     let _ = if json {
         writeln!(
             out,
             "{}",
-            accounts_json(&path, &roster, &state, &enrolled, env.now)
+            accounts_json(&path, &roster, read, &enrolled, env.now)
         )
     } else {
         write!(
             out,
             "{}",
-            accounts_text(&path, &roster, &state, &enrolled, env.now)
+            accounts_text(&path, &roster, read, &enrolled, env.now)
         )
     };
     ExitCode::SUCCESS
@@ -4577,12 +5837,12 @@ fn run_accounts_report(
 /// carries the rows to add by hand), a state directory that is not absolute.
 fn run_accounts_add(
     env: &Env,
-    label: &str,
-    class: Class,
+    asked: &accounts::Row,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    match accounts_add(env, label, class) {
+    let (label, class) = (asked.label.as_str(), asked.class);
+    match accounts_add(env, asked) {
         Ok(added) => {
             if added.listed_own {
                 let _ = writeln!(
@@ -4605,13 +5865,26 @@ fn run_accounts_add(
                      as it is: a login made under this name before is this account's again"
                 );
             }
-            let _ = writeln!(out, "run: aterm harness accounts login {label}");
+            let verb = sign_in_verb(asked);
+            let _ = writeln!(out, "run: aterm harness accounts {verb} {label}");
             ExitCode::SUCCESS
         }
         Err(why) => {
             let _ = writeln!(err, "aterm harness accounts add: {why}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// THE VERB THAT SIGNS `row` IN: `renew` for a row with an email — it signs
+/// in to a staging directory, checked before anything uses it, and `login`
+/// refuses it — else `login`. Every line this command prints that tells the
+/// owner to sign a row in names it so.
+fn sign_in_verb(row: &accounts::Row) -> &'static str {
+    if row.email.is_some() {
+        "renew"
+    } else {
+        "login"
     }
 }
 
@@ -4643,8 +5916,39 @@ fn file_mode(path: &Path) -> Option<u32> {
     }
 }
 
-/// [`run_accounts_add`]'s work, or the refusal.
-fn accounts_add(env: &Env, label: &str, class: Class) -> Result<Added, String> {
+/// WHERE A NEW ROSTER TEXT IS WRITTEN, and the mode it keeps: the file at
+/// `path`, or — where it is a SYMLINK (a dotfiles checkout) — the file it
+/// points at, written THROUGH the link: the replacement goes beside that
+/// file, so the link survives and the file gets the row. Renamed over the
+/// link itself the roster would become a regular file the checkout knows
+/// nothing of. The file a link points at is its owner's to keep as they made
+/// it, so the replacement carries that file's mode; a roster this command
+/// makes, or one in the config directory itself, is 0600 (`None`).
+///
+/// # Errors
+///
+/// A symlink whose target cannot be resolved.
+fn roster_target(path: &Path) -> Result<(PathBuf, Option<u32>), String> {
+    let through_link = path.symlink_metadata().is_ok_and(|m| m.is_symlink());
+    let write_to = if through_link {
+        std::fs::canonicalize(path).map_err(|e| {
+            format!(
+                "the roster at {} is a symlink whose target cannot be resolved ({e}); nothing \
+                 was written",
+                path.display()
+            )
+        })?
+    } else {
+        path.to_path_buf()
+    };
+    let keep_mode = through_link.then(|| file_mode(&write_to)).flatten();
+    Ok((write_to, keep_mode))
+}
+
+/// [`run_accounts_add`]'s work, or the refusal. `asked` is the row asked for,
+/// its `dir` none: it is the login directory made here.
+fn accounts_add(env: &Env, asked: &accounts::Row) -> Result<Added, String> {
+    let label = asked.label.as_str();
     if let Some(why) = accounts::label_refusal(label) {
         return Err(format!(
             "`{}` is not a label: it {why}",
@@ -4681,18 +5985,21 @@ fn accounts_add(env: &Env, label: &str, class: Class) -> Result<Added, String> {
     let _held = store
         .acquire()
         .map_err(|e| format!("{}: {e}", store.dir.display()))?;
-    let existing = accounts::roster_text(&path)?.unwrap_or_default();
+    // Resolve a dotfiles link before the strict read so a dangling link keeps
+    // its actionable refusal, and read the same target this transaction writes.
+    let (write_to, keep_mode) = roster_target(&path)?;
+    let existing = accounts::roster_text(&write_to)?.unwrap_or_default();
     let roster = Roster::parse(&existing).map_err(|why| {
         format!(
             "the roster at {} is REFUSED: {why}; nothing was written",
             path.display()
         )
     })?;
-    if roster.row(label).is_some() {
+    if let Some(row) = roster.row(label) {
         return Err(format!(
-            "`{label}` is already listed in {}; `aterm harness accounts login {label}` signs it \
-             in",
-            path.display()
+            "`{label}` is already listed in {}; `aterm harness accounts {} {label}` signs it in",
+            path.display(),
+            sign_in_verb(row)
         ));
     }
     // A roster with no rows gets this machine's own login first.
@@ -4703,8 +6010,14 @@ fn accounts_add(env: &Env, label: &str, class: Class) -> Result<Added, String> {
              (the row with no dir); pick another label for the new account"
         ));
     }
-    let own = (ACCOUNTS_OWN_LABEL, Class::Dedicated, None);
-    let asked = (label, class, Some(dir_text));
+    let own = accounts::Row {
+        label: ACCOUNTS_OWN_LABEL.to_owned(),
+        ..accounts::Row::default()
+    };
+    let asked = accounts::Row {
+        dir: Some(dir_text.to_owned()),
+        ..asked.clone()
+    };
     let rows = if listed_own {
         vec![own, asked]
     } else {
@@ -4724,26 +6037,6 @@ fn accounts_add(env: &Env, label: &str, class: Class) -> Result<Added, String> {
             why
         }
     })?;
-    // A roster that is a SYMLINK (a dotfiles checkout) is written through
-    // the link: the replacement goes beside the file it points at, so the
-    // link survives and that file gets the row. Renamed over the link itself
-    // the roster would become a regular file the checkout knows nothing of.
-    // The file it points at is its owner's to keep as they made it, so the
-    // replacement carries that file's mode; a roster this command makes, or
-    // one in the config directory itself, is 0600.
-    let through_link = path.symlink_metadata().is_ok_and(|m| m.is_symlink());
-    let write_to = if through_link {
-        std::fs::canonicalize(&path).map_err(|e| {
-            format!(
-                "the roster at {} is a symlink whose target cannot be resolved ({e}); nothing \
-                 was written",
-                path.display()
-            )
-        })?
-    } else {
-        path.clone()
-    };
-    let keep_mode = through_link.then(|| file_mode(&write_to)).flatten();
     let dir_held_files = accounts::login_made(&dir);
     aterm_types::fs_restricted::ensure_private_dir(&store.logins_dir())
         .and_then(|()| aterm_types::fs_restricted::ensure_private_dir(&dir))
@@ -4763,36 +6056,31 @@ fn accounts_add(env: &Env, label: &str, class: Class) -> Result<Added, String> {
     })
 }
 
-/// What the login of `row` answers now ([`AccountsHost::auth_status`],
-/// [`login_check`]): asked under the row's `dir` verbatim, or the empty
-/// string for the row with none. A row whose login directory holds no login
-/// (`enrolled` does not name it) is not asked at all.
-fn ask_login(
-    host: &dyn AccountsHost,
-    row: &accounts::Row,
-    enrolled: &BTreeSet<String>,
-) -> LoginCheck {
-    match row.dir.as_deref() {
-        Some(_) if !enrolled.contains(&row.label) => LoginCheck::NotEnrolled,
-        dir => login_check(host.auth_status(dir.unwrap_or(""))),
+/// What the login a flow that exited 0 left in its row's directory answers
+/// now ([`AccountsHost::auth_status`], [`login_check`]): asked under the
+/// row's `dir` verbatim, or the empty string for the row with none. `made` is
+/// whether the directory holds a login after the flow
+/// ([`accounts::login_made`]; the row with no `dir` always does): one that
+/// holds nothing is not asked at all.
+fn ask_login(host: &dyn AccountsHost, dir: Option<&str>, made: bool) -> LoginCheck {
+    if !made {
+        return LoginCheck::NotEnrolled;
     }
+    login_check(host.auth_status(dir.unwrap_or("")))
 }
 
-/// Record what logins answered at `now`, in one transaction
-/// ([`accounts_transact`]): [`accounts::note_auth`] for each, a ledger `auth`
-/// row for each word that changed, and the wake marker replaced when one of
-/// them now works.
-fn record_answers(
+/// Record `auth` of `label`'s login at `now`, in one transaction
+/// ([`accounts_transact`]): [`accounts::note_auth`], a ledger `auth` row when
+/// the word changed, and the wake marker replaced when the login now works.
+fn record_auth(
     env: &Env,
     now: i64,
-    seen: &[(&str, Auth)],
+    label: &str,
+    auth: Auth,
     err: &mut dyn Write,
 ) -> Result<Vec<accounts::Event>, String> {
     accounts_transact(&env.accounts_store(), now, err, |state| {
-        Ok(seen
-            .iter()
-            .flat_map(|(label, auth)| accounts::note_auth(state, label, *auth, now))
-            .collect())
+        Ok(accounts::note_auth(state, label, auth, now))
     })
 }
 
@@ -4803,27 +6091,40 @@ fn record_answers(
 /// the row with no `dir`, this machine's own login, `claude auth login` — and,
 /// with stdin a terminal, run it and wait for it ([`AccountsHost::login`]).
 ///
-/// A FLOW THAT EXITS 0 IS NOT YET A LOGIN THAT WORKS: that one login is then
-/// asked ([`ask_login`], as `accounts check` asks it), its line printed and
-/// its answer recorded ([`record_answers`]). Exit 0 only for `signed in`
-/// after a flow that exited 0. A `claude` that cannot be started is said with
-/// nothing asked and nothing recorded, exit 1.
+/// A FLOW THAT EXITS 0 IS NOT YET A LOGIN THAT WORKS: that one new login is
+/// then checked ([`ask_login`]), its line printed and its answer recorded
+/// ([`record_auth`]). Exit 0 only for `signed in`. That check is the one
+/// `claude auth status` this verb runs, and it runs on a token minted seconds
+/// ago, which has nothing to refresh ([`auth_status_of`] says why nothing
+/// else may). A `claude` that cannot be started is said with nothing run and
+/// nothing recorded, exit 1.
 ///
-/// A FLOW THAT FAILS CAN STILL LEAVE FILES IN THE DIRECTORY, and files are
-/// what enrol a row ([`accounts::login_made`]). MEASURED on 2.1.287: `claude
-/// auth status --json` in an empty home ([`accounts::HOME_ENV`]) exited 1
-/// and left `.claude.json` (start-up keys only), its lock and `backups/`;
-/// `auth login` starts the same way. So a flow that exits non-zero (denied,
-/// timed out, Ctrl-C) is said, exit 1, and when its row's directory now holds
-/// an entry that login is asked and recorded anyway, so the row reads
-/// `signed-out` rather than `unseen`. A failed flow on the row with no `dir`
-/// asks nothing: that row is enrolled whatever a flow did. An answer that
-/// records nothing is said on stderr with what to run.
+/// A FLOW THAT FAILS (denied, timed out, Ctrl-C) RUNS NOTHING MORE UNDER
+/// ANY LOGIN, exit 1: whatever login the directory holds is not brand new,
+/// and the check would spend its refresh token. What it records rests on
+/// whether the row's directory held ANY entry BEFORE the flow
+/// ([`accounts::login_made`], read before the directory is made) and after
+/// it:
+///
+/// * It held any, or the row has no `dir`: nothing is recorded. A flow that
+///   failed is no evidence about a login made before it, one made by hand
+///   with nothing on record included; a directory an earlier, unrecorded
+///   flow left its start-up files in stays as it was.
+/// * It was EMPTY, and now holds the vendor's start-up files (MEASURED on
+///   2.1.287: `claude auth status --json` in an empty home
+///   ([`accounts::HOME_ENV`]) exited 1 and left `.claude.json`, start-up keys
+///   only, its lock and `backups/`; `auth login` starts the same way). Those
+///   files enrol the row, and with nothing on record it would read `unseen` —
+///   fresh, `next:`, pinnable — with no login behind it, so it is recorded
+///   [`Auth::SignedOut`] as it stands, fail-closed, with nothing asked;
+///   stderr then says what the record came to.
+/// * It was empty and still is: nothing is recorded; the row stays
+///   `not-enrolled`.
 ///
 /// With stdin not a terminal the line is printed, nothing is run and the
-/// exit is 0. Where no login can be asked at all ([`AccountsHost::unaskable`])
-/// the flow is not started, exit 1. A label the roster does not list is
-/// exit 1.
+/// exit is 0. Where no login could be checked after the flow
+/// ([`AccountsHost::unaskable`]) the flow is not started, exit 1. A label the
+/// roster does not list is exit 1.
 fn run_accounts_login(
     env: &Env,
     host: &dyn AccountsHost,
@@ -4844,6 +6145,20 @@ fn run_accounts_login(
         );
         return ExitCode::from(1);
     };
+    // A row with an email signs in only the way it renews: to a staging
+    // directory whose login is checked before anything uses it. Run here,
+    // the flow would write the live login's own keychain item, which every
+    // session on it adopts within seconds — another account's, if the
+    // browser was signed in to one.
+    if row.email.is_some() {
+        let _ = writeln!(
+            err,
+            "aterm harness accounts login: `{label}` has an email, so it signs in through `aterm \
+             harness accounts renew {label}`: a staging directory, checked against that address \
+             before any session uses it; nothing was run"
+        );
+        return ExitCode::from(1);
+    }
     let dir = row.dir.as_deref();
     let _ = match dir {
         Some(dir) => writeln!(
@@ -4869,6 +6184,9 @@ fn run_accounts_login(
         );
         return ExitCode::from(1);
     }
+    // Read before the directory is made and before the flow: what a failed
+    // flow may record rests on it.
+    let had_login = dir.is_some_and(|d| accounts::login_made(Path::new(d)));
     // A row written by hand, or one this machine has not enrolled yet: the
     // flow gets a private directory to write its home into.
     if let Some(dir) = dir
@@ -4880,8 +6198,8 @@ fn run_accounts_login(
     }
     let _ = writeln!(
         err,
-        "aterm harness accounts login: running; `{label}`'s sign-in is checked and recorded when \
-         it ends"
+        "aterm harness accounts login: running; when it exits 0 `{label}`'s new login is checked \
+         and recorded"
     );
     let _ = out.flush();
     let _ = err.flush();
@@ -4896,112 +6214,82 @@ fn run_accounts_login(
             return ExitCode::from(1);
         }
     };
+    // Whether a login was made is read now: the flow is what makes it.
+    let made = dir.is_none_or(|d| accounts::login_made(Path::new(d)));
+    // What is recorded is as new as the flow's end, however long the flow
+    // waited for a person: the state is read against the clock of that
+    // moment, since one read against the command's start would save the
+    // stamps other writers made meanwhile moved back to it. Never behind the
+    // command's own clock, should the machine's have been set back.
+    let now = host.now().max(env.now);
     if exited != 0 {
-        let _ = writeln!(
-            err,
-            "aterm harness accounts login: `claude auth login` exited {exited}"
+        let failed = format!(
+            "aterm harness accounts login: `claude auth login` exited {exited}; nothing else was \
+             run under `{label}`'s login"
         );
-        // A failed flow still started `claude` under the home, which writes
-        // its start-up files there: the row may now read enrolled
-        // ([`accounts::login_made`]), and unasked it would read `unseen` —
-        // fresh, `next:`, pinnable — with no login behind it. The row with no
-        // `dir` is enrolled whatever a flow did.
-        if !dir.is_some_and(|d| accounts::login_made(Path::new(d))) {
+        if dir.is_none() || had_login || !made {
+            let left = if dir.is_some() && !made {
+                " (its login directory holds nothing: the row stays not-enrolled)"
+            } else {
+                ""
+            };
+            let _ = writeln!(err, "{failed} and nothing was recorded{left}");
             return ExitCode::from(1);
         }
+        // A FIRST LOGIN THAT FAILED: the flow's start-up files enrol the row.
+        // Recorded first, so stderr says only what the record came to.
+        let _ = writeln!(out, "{label}: signed out");
+        let _ = out.flush();
+        let left = "It left Claude Code's start-up files in a login directory that was empty \
+                    before it";
+        let _ = match record_auth(env, now, label, Auth::SignedOut, err) {
+            Ok(_) => writeln!(
+                err,
+                "{failed}. {left}, so `{label}` is recorded signed out (not unseen) until \
+                 `aterm harness accounts login {label}` signs it in"
+            ),
+            Err(why) => writeln!(
+                err,
+                "{failed}. {left}, but `{label}` was NOT recorded signed out: {why}"
+            ),
+        };
+        return ExitCode::from(1);
     }
-    // Whether a login was made is read now: the flow is what makes it.
-    let answer = ask_login(host, row, &accounts::enrolled(&roster));
+    let answer = ask_login(host, dir, made);
     let _ = writeln!(out, "{label}: {}", answer.words());
     let _ = out.flush();
     match &answer {
         LoginCheck::CouldNotRun(_) => {
             let _ = writeln!(
                 err,
-                "aterm harness accounts login: `claude auth login` exited {exited}, but `{label}` \
-                 could not be asked whether it is signed in, so nothing was recorded; `aterm \
-                 harness accounts check` asks it again, with no browser"
+                "aterm harness accounts login: `claude auth login` exited 0, but `{label}` could \
+                 not be asked whether it is signed in, so nothing was recorded; `aterm harness \
+                 accounts login {label}` signs it in and asks again"
             );
         }
         LoginCheck::NotEnrolled => {
             let _ = writeln!(
                 err,
-                "aterm harness accounts login: `claude auth login` exited {exited} and left no \
-                 login in `{label}`'s directory, so nothing was asked or recorded"
+                "aterm harness accounts login: `claude auth login` exited 0 and left no login in \
+                 `{label}`'s directory, so nothing was asked or recorded"
             );
         }
         LoginCheck::SignedIn | LoginCheck::SignedOut => {}
     }
-    if let Some(auth) = answer.auth() {
-        // The answer is as new as the flow's end, however long the flow
-        // waited for a person: the state is read against the clock of that
-        // moment, since one read against the command's start would save the
-        // stamps other writers made meanwhile moved back to it. Never behind
-        // the command's own clock, should the machine's have been set back.
-        let now = host.now().max(env.now);
-        if let Err(why) = record_answers(env, now, &[(label, auth)], err) {
-            let _ = writeln!(
-                err,
-                "aterm harness accounts login: the answer above was NOT recorded: {why}"
-            );
-            return ExitCode::from(1);
-        }
+    if let Some(auth) = answer.auth()
+        && let Err(why) = record_auth(env, now, label, auth, err)
+    {
+        let _ = writeln!(
+            err,
+            "aterm harness accounts login: the answer above was NOT recorded: {why}"
+        );
+        return ExitCode::from(1);
     }
-    if exited == 0 && answer == LoginCheck::SignedIn {
+    if answer == LoginCheck::SignedIn {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
     }
-}
-
-/// `aterm harness accounts check` (design §8), on the owner's word only: ask
-/// each enrolled login whether it is signed in ([`ask_login`]), print one
-/// line per account, and record each answer ([`record_answers`]).
-///
-/// THE COMMAND'S OUTPUT GOES NOWHERE. It names an email and an organization;
-/// this reads its exit status and the one key `loggedIn`, and no byte of it
-/// is printed, logged, journalled or kept.
-///
-/// The runs happen with NO lock held (each may take [`AUTH_CHECK_BUDGET`]);
-/// the answers are recorded afterwards in one transaction. Exit 1 when a
-/// login could not be asked, or the answers could not be recorded.
-fn run_accounts_check(
-    env: &Env,
-    host: &dyn AccountsHost,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> ExitCode {
-    let Some((path, roster)) = accounts_read_roster(env, err) else {
-        return ExitCode::from(1);
-    };
-    if roster.rows.is_empty() {
-        let _ = write!(out, "{}", accounts_none_listed(&path));
-        return ExitCode::SUCCESS;
-    }
-    let enrolled = accounts::enrolled(&roster);
-    let mut code = ExitCode::SUCCESS;
-    let mut seen: Vec<(&str, Auth)> = Vec::new();
-    for row in &roster.rows {
-        let answer = ask_login(host, row, &enrolled);
-        let _ = writeln!(out, "{}: {}", row.label, answer.words());
-        let _ = out.flush();
-        match answer.auth() {
-            Some(auth) => seen.push((&row.label, auth)),
-            None if matches!(answer, LoginCheck::CouldNotRun(_)) => code = ExitCode::from(1),
-            None => {}
-        }
-    }
-    if seen.is_empty() {
-        return code;
-    }
-    if let Err(why) = record_answers(env, env.now, &seen, err) {
-        let _ = writeln!(
-            err,
-            "aterm harness accounts check: the answers above were NOT recorded: {why}"
-        );
-        return ExitCode::from(1);
-    }
-    code
 }
 
 /// `aterm harness accounts use <label>` and `use --auto` (design §6, "The
@@ -5034,9 +6322,10 @@ fn run_accounts_use(
             let enrolled = accounts::enrolled(&roster);
             let remedy = match roster.row(label) {
                 None => "`aterm harness accounts add <label>` lists an account".to_string(),
-                Some(_) => {
-                    format!("sign it in with `aterm harness accounts login {label}`, in a terminal")
-                }
+                Some(row) => format!(
+                    "sign it in with `aterm harness accounts {} {label}`, in a terminal",
+                    sign_in_verb(row)
+                ),
             };
             accounts_transact(&store, now, err, |state| {
                 accounts::pin(state, &roster, &enrolled, label, now)
@@ -5069,8 +6358,682 @@ fn run_accounts_use(
     }
 }
 
+/// `aterm harness accounts adopt-default <label> --email <e> [--browser <b>]`
+/// (design v2 §4.5): THIS MACHINE'S OWN LOGIN as one renewable row — the
+/// row with no `dir`, its email and its browser profile — appended to the
+/// roster under the store's lock, written as [`run_accounts_add`] writes
+/// (through a symlink, re-read before it is written). Nothing is run and no
+/// login is touched: the login is the one this machine's sessions run on
+/// already, and `accounts renew <label>` is what renews it.
+///
+/// Refused by name, exit 1, with the roster untouched: a bad label, email
+/// or browser (the email never quoted), a label already listed, and a roster
+/// that lists this machine's own login already (the row with no `dir`).
+fn run_accounts_adopt(
+    env: &Env,
+    row: &accounts::Row,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let done = (|| -> Result<PathBuf, String> {
+        let path = env.accounts_roster().ok_or_else(|| {
+            format!(
+                "no config directory is known, so there is no {} to write; name one with \
+                 `--config <dir>/aterm.toml`",
+                accounts::ACCOUNTS_FILE
+            )
+        })?;
+        let store = env.accounts_store();
+        let _held = store
+            .acquire()
+            .map_err(|e| format!("{}: {e}", store.dir.display()))?;
+        let existing = accounts::roster_text(&path)?.unwrap_or_default();
+        let roster = Roster::parse(&existing).map_err(|why| {
+            format!(
+                "the roster at {} is REFUSED: {why}; nothing was written",
+                path.display()
+            )
+        })?;
+        if roster.row(&row.label).is_some() {
+            return Err(format!(
+                "`{}` is already listed in {}",
+                row.label,
+                path.display()
+            ));
+        }
+        if let Some(own) = roster.row_for_login(None) {
+            return Err(format!(
+                "this machine's own login is listed already, as `{}` (the row with no dir); add \
+                 its email to that row by hand",
+                own.label
+            ));
+        }
+        let text = accounts::append_rows(&existing, std::slice::from_ref(row))?;
+        let (write_to, keep_mode) = roster_target(&path)?;
+        super::upgrade_models::write_atomic_mode(&write_to, &text, keep_mode)
+            .map_err(|e| format!("{}: {e}; the roster is unchanged", write_to.display()))?;
+        Ok(path)
+    })();
+    match done {
+        Ok(path) => {
+            let _ = writeln!(
+                out,
+                "listed `{}` (dedicated): this machine's own login, in {}",
+                row.label,
+                path.display()
+            );
+            let _ = writeln!(
+                out,
+                "renew it with: aterm harness accounts renew {}",
+                row.label
+            );
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            let _ = writeln!(err, "aterm harness accounts adopt-default: {why}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// THE MACHINES `renew` RENEWS ON NEXT ([`run_accounts_renew`]): `--on`'s,
+/// else under `--due` `[harness] hosts` (read from aterm.toml), else
+/// none. Each is `host` or `host:/abs/path/to/aterm`; anything that is not —
+/// a host that could be read as an option of `ssh`, a word with a space or a
+/// shell character in it, a relative path — refuses the whole run before
+/// anything is run. Answers `(host, the aterm to run there)`.
+///
+/// # Errors
+///
+/// The first entry that is not a machine, by its words.
+fn machines_to_renew(
+    env: &Env,
+    due: bool,
+    on: Option<&[String]>,
+) -> Result<Vec<(String, String)>, String> {
+    let hosts: Vec<String> = match on {
+        Some(on) => on.to_vec(),
+        None if due => SupervisorConfig::from_path(env.config.as_deref()).0.hosts,
+        None => Vec::new(),
+    };
+    machine_entries(&hosts)
+}
+
+/// `[harness] hosts` entries (`host` or `host:/abs/path/to/aterm`) as `(host, aterm)`,
+/// each refused by name unless both halves are plain words: no leading `-` (an `ssh`
+/// option), no whitespace, control character or shell metacharacter, and an absolute path
+/// for the aterm. The accounts renewal's fan-out and `aterm ai doctor --on` read it.
+///
+/// # Errors
+///
+/// The first entry that is not a machine, by name.
+pub(crate) fn machine_entries(hosts: &[String]) -> Result<Vec<(String, String)>, String> {
+    let word = |w: &str| {
+        !w.is_empty()
+            && w.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@' | '/'))
+    };
+    hosts
+        .iter()
+        .map(|entry| {
+            let (host, aterm) = entry.split_once(':').unwrap_or((entry.as_str(), "aterm"));
+            let host_ok = word(host) && !host.starts_with('-') && !host.contains('/');
+            let aterm_ok = aterm == "aterm" || (aterm.starts_with('/') && word(aterm));
+            if host_ok && aterm_ok {
+                Ok((host.to_string(), aterm.to_string()))
+            } else {
+                Err(format!(
+                    "`{}` is not a machine (`host` or `host:/abs/path/to/aterm`)",
+                    super::one_line(entry, 80)
+                ))
+            }
+        })
+        .collect()
+}
+
+/// How one login's renewal ended ([`renew_one`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Renewal {
+    /// Its check answered the row's account, and the row is bound to it.
+    Renewed,
+    /// Its check answered ANOTHER account: refused, nothing live changed.
+    WrongAccount,
+    /// The flow failed, its login could not be checked, or recording did
+    /// not finish. After recording was attempted its home is retained:
+    /// publication may already have changed the live binding.
+    Failed,
+}
+
+/// THE OPENER'S LINK, `<accounts store>/bin/aterm-open-url` → this program
+/// ([`AccountsHost::current_exe`]), made again on every renewal that opens
+/// a profile or runs over SSH (a temp link, then a rename), so a moved or
+/// updated binary is what it names. `None` with no executable known or a
+/// link that cannot be made: the system's default browser opens the page
+/// (over SSH: `BROWSER` removed).
+fn opener_link(store: &accounts::Store, host: &dyn AccountsHost) -> Option<PathBuf> {
+    let exe = host.current_exe()?;
+    let bin = store.dir.join("bin");
+    aterm_types::fs_restricted::ensure_private_dir(&store.dir).ok()?;
+    aterm_types::fs_restricted::ensure_private_dir(&bin).ok()?;
+    let link = bin.join(super::open_url::OPENER);
+    #[cfg(unix)]
+    {
+        let temp = bin.join(format!(
+            ".{}.{}",
+            super::open_url::OPENER,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&temp);
+        std::os::unix::fs::symlink(&exe, &temp).ok()?;
+        if std::fs::rename(&temp, &link).is_err() {
+            let _ = std::fs::remove_file(&temp);
+            return None;
+        }
+        Some(link)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (exe, link);
+        None
+    }
+}
+
+/// A staging directory a renewal is not keeping, removed: the flow failed,
+/// or its login answered another account or could not be checked. Its
+/// keychain item stays (aterm deletes none, D5): nothing reads it, and the
+/// next renewal of the row signs in to this very name again.
+fn drop_staging(staging: &Path, err: &mut dyn Write) {
+    if let Err(e) = std::fs::remove_dir_all(staging)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        let _ = writeln!(
+            err,
+            "aterm harness accounts renew: {} could not be removed ({e}); nothing reads it",
+            staging.display()
+        );
+    }
+}
+
+/// WHAT A RENEWAL DOES TO THE SESSIONS ON THE LOGIN IT REPLACED, as `cfg`
+/// (this machine's aterm.toml) has the window's supervisor: with `[harness]
+/// enabled`, Claude Code's own `[harness.claude] enabled`, `logins`,
+/// `relaunch` and `resume_limits` on, each is relaunched onto the new login
+/// at its next idle turn end; with any of them off nothing moves one, and the
+/// switch is named — the master switch first, which holds every other off,
+/// then Claude Code's own, whose sessions the logins are (the window's host
+/// turns the accounts and logins off with it).
+fn renewed_sessions(cfg: &SupervisorConfig) -> String {
+    if cfg.enabled && !cfg.on_for(aterm_phase::Program::Claude) {
+        return "`[harness.claude] enabled` is off, so nothing moves a session onto the new login"
+            .to_string();
+    }
+    let off = if !cfg.enabled {
+        "enabled"
+    } else if !cfg.logins {
+        "logins"
+    } else if !cfg.relaunch {
+        "relaunch"
+    } else if !cfg.resume_limits {
+        "resume_limits"
+    } else {
+        return "its sessions move onto the new login at their next idle turn end".to_string();
+    };
+    format!("`[harness] {off}` is off, so nothing moves a session onto the new login")
+}
+
+/// ONE LOGIN'S RENEWAL (design v2 §5.3), `row` read through this machine's
+/// bindings and `own_dir` the roster file's own `dir` for it:
+///
+/// 1. A NEW STAGING DIRECTORY ([`accounts::Store::claim_staging_dir`]) and the
+///    vendor's own sign-in into it ([`AccountsHost::renew_flow`]): `--email`
+///    the row's address, the page opened by `browser`.
+/// 2. A flow that exits non-zero (Ctrl-C included) RUNS NOTHING MORE and
+///    records nothing; the staging directory goes.
+/// 3. A flow that exits 0: ONE `auth status --json` in that staging home
+///    ([`AccountsHost::status_in_home`]), its address compared in memory
+///    ([`status_facts`]).
+/// 4. The row's account: the row is bound to the staging directory and the
+///    login recorded `ok` in one transaction ([`accounts::note_renewed`],
+///    the `renewed` row, the wake marker): every session on the old login
+///    moves onto the new one at its next idle turn end, where the window's
+///    supervisor relaunches ([`renewed_sessions`] says which), and the line
+///    that starts Claude Code under it by hand is printed (what a tab
+///    nothing relaunches is told to run). Another account: refused,
+///    the staging directory goes, `wrong-account` recorded (labels only);
+///    nothing live changes. No answer that can be read: the same, unrecorded.
+///    If recording the checked login fails, its home stays: the binding may
+///    already have been published before a later state, ledger or wake write
+///    failed. That error is not a rollback.
+///
+/// The address is never printed: not by this, not by the flow's argv
+/// echoed, not in any refusal.
+#[allow(clippy::too_many_arguments)]
+fn renew_one(
+    env: &Env,
+    host: &dyn AccountsHost,
+    store: &accounts::Store,
+    row: &accounts::Row,
+    own_dir: Option<&str>,
+    browser: &RenewBrowser,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Renewal {
+    let label = row.label.as_str();
+    let Some(email) = row.email.as_deref() else {
+        return Renewal::Failed;
+    };
+    let say = |err: &mut dyn Write, what: &str| {
+        let _ = writeln!(err, "aterm harness accounts renew: {label}: {what}");
+    };
+    let staging = match store.claim_staging_dir(label) {
+        Ok(staging) => staging,
+        Err(e) => {
+            say(
+                err,
+                &format!(
+                    "no staging directory could be made under {}: {e}",
+                    store.logins_dir().display()
+                ),
+            );
+            return Renewal::Failed;
+        }
+    };
+    let Some(staging_text) = staging.to_str().map(str::to_owned) else {
+        drop_staging(&staging, err);
+        say(err, "the staging directory's name is not UTF-8");
+        return Renewal::Failed;
+    };
+    let how = match browser {
+        RenewBrowser::Default => "it opens in your default browser".to_string(),
+        RenewBrowser::Profile { profile, .. } => {
+            format!(
+                "it opens in browser profile '{}'",
+                super::one_line(profile, 64)
+            )
+        }
+        RenewBrowser::Remote { .. } => match row.browser.as_deref() {
+            Some(profile) => format!(
+                "open the URL it prints in Chrome profile '{}' on the machine you are at, and \
+                 paste the code it shows here",
+                super::one_line(profile, 64)
+            ),
+            None => "open the URL it prints on the machine you are at, and paste the code it \
+                     shows here"
+                .to_string(),
+        },
+    };
+    let _ = writeln!(out, "renewing `{label}`: Claude Code's own sign-in; {how}");
+    let _ = out.flush();
+    let _ = err.flush();
+    let exited = host.renew_flow(&staging_text, email, browser);
+    let now = host.now().max(env.now);
+    let exited = match exited {
+        Ok(code) => code,
+        Err(why) => {
+            drop_staging(&staging, err);
+            say(
+                err,
+                &format!("`claude` could not be run: {}", super::one_line(&why, 160)),
+            );
+            return Renewal::Failed;
+        }
+    };
+    if exited != 0 {
+        drop_staging(&staging, err);
+        say(
+            err,
+            &format!(
+                "`claude auth login` exited {exited}; nothing was recorded, nothing else was run, \
+                 and nothing live changed"
+            ),
+        );
+        return Renewal::Failed;
+    }
+    if !accounts::login_made(&staging) {
+        drop_staging(&staging, err);
+        say(
+            err,
+            "the sign-in exited 0 and left no login; nothing was recorded",
+        );
+        return Renewal::Failed;
+    }
+    let facts = match host.status_in_home(&staging_text) {
+        Ok(got) => status_facts(&got, email).ok_or_else(|| {
+            let exit = got
+                .code
+                .map_or_else(|| "ended by a signal".to_string(), |c| format!("exit {c}"));
+            format!("{exit}, with no answer that can be read")
+        }),
+        Err(why) => Err(super::one_line(&why, 160)),
+    };
+    let facts = match facts {
+        Ok(facts) => facts,
+        Err(why) => {
+            drop_staging(&staging, err);
+            say(
+                err,
+                &format!("the new login could not be checked ({why}); nothing was recorded"),
+            );
+            return Renewal::Failed;
+        }
+    };
+    if facts.signed_in && facts.claude_ai && !facts.email_matches {
+        drop_staging(&staging, err);
+        let _ = writeln!(out, "{label}: REFUSED: wrong account");
+        let recorded = accounts_transact_logins(store, now, err, |_, logins| {
+            Ok(accounts::note_wrong_account(logins, label, now))
+        });
+        say(
+            err,
+            &format!(
+                "the browser signed in ANOTHER account than this row's, so nothing live changed{}; \
+                 sign in as the row's account (its own browser profile) and run `aterm harness \
+                 accounts renew {label}` again",
+                if recorded.is_ok() {
+                    ""
+                } else {
+                    " (and the attempt was not recorded)"
+                }
+            ),
+        );
+        return Renewal::WrongAccount;
+    }
+    if !facts.renews() {
+        drop_staging(&staging, err);
+        let what = if facts.signed_in {
+            "a login that is not a Claude subscription's"
+        } else {
+            "signed out"
+        };
+        say(
+            err,
+            &format!("the new login answers {what}; nothing was recorded"),
+        );
+        return Renewal::Failed;
+    }
+    let done = accounts_transact_logins(store, now, err, |state, logins| {
+        Ok(accounts::note_renewed(
+            state,
+            logins,
+            label,
+            own_dir,
+            &staging_text,
+            facts.subscription.as_deref(),
+            now,
+        ))
+    });
+    match done {
+        Ok(_) => {
+            let by = store
+                .load_logins(now)
+                .ok()
+                .and_then(|(logins, _)| logins.get(label).and_then(accounts::forecast));
+            let _ = writeln!(
+                out,
+                "{label}: renewed; {}{}",
+                renewed_sessions(&SupervisorConfig::from_path(env.config.as_deref()).0),
+                by.map_or_else(String::new, |by| format!(
+                    "; renew by {}",
+                    rfc3339_utc(by.saturating_sub(accounts::DUE_S))
+                ))
+            );
+            let _ = writeln!(
+                out,
+                "start Claude Code under it by hand with: {}={} claude --resume",
+                accounts::LOGIN_ENV,
+                super::upgrade::quote(super::upgrade::Dialect::Zsh, &staging_text)
+            );
+            Renewal::Renewed
+        }
+        Err(why) => {
+            // The transaction publishes logins before state, ledger and
+            // wake writes. Any later error can leave this home live; even
+            // a failed read cannot prove that cleanup is safe.
+            say(
+                err,
+                &format!(
+                    "the new login checked out, but recording did not finish: {why}; its home \
+                     is kept at {} because the binding or state may already have changed. Run \
+                     `aterm harness accounts` to inspect before trying again",
+                    staging.display()
+                ),
+            );
+            Renewal::Failed
+        }
+    }
+}
+
+/// [`accounts_transact`] over the state and the logins together
+/// ([`accounts::Store::transact_logins`]).
+fn accounts_transact_logins(
+    store: &accounts::Store,
+    now: i64,
+    err: &mut dyn Write,
+    edit: impl FnOnce(
+        &mut accounts::State,
+        &mut accounts::Logins,
+    ) -> Result<Vec<accounts::Event>, String>,
+) -> Result<Vec<accounts::Event>, String> {
+    let mut note = None;
+    let done = store.transact_logins(now, &mut note, edit);
+    if let Some(note) = note {
+        let _ = writeln!(err, "aterm harness accounts: {note}");
+    }
+    done
+}
+
+/// `aterm harness accounts renew [<label>…] [--due] [--on <host>,… |
+/// --here]` (design v2 §5.3, ruling R-7: batched, ahead of time, every due
+/// login on every machine in one sitting): each login named, and under
+/// `--due` every login of this machine that is due or expired
+/// ([`accounts::renew_due`]), renewed in turn ([`renew_one`]); then, for each
+/// machine `--on` names (under `--due`, `[harness] hosts` where `--on`
+/// names none; `--here`, none), `ssh -t <host> aterm harness accounts renew
+/// --due --here`, its stdio this terminal's — Claude Code's own paste-code
+/// flow runs there (over SSH it prints its URL and waits for the code), and
+/// aterm reads and relays nothing of it. That run renews its machine's own
+/// logins and goes on to no other: one sitting is one machine deep, however
+/// the machines' configs name each other (or themselves).
+///
+/// Every label named must be listed with an email (a row without one renews
+/// nothing: `accounts login` signs it in), and every machine must be one
+/// ([`machines_to_renew`]): otherwise nothing runs, exit 1. With stdin not a
+/// terminal the logins are named and nothing runs, exit 0, as `login` does.
+/// Where no login could be asked afterwards whether it is signed in
+/// ([`AccountsHost::unaskable`]), no flow starts, exit 1. Nothing due and no
+/// machine named: said, exit 0. Otherwise exit 0 only when every renewal
+/// and every machine's run succeeded.
+fn run_accounts_renew(
+    env: &Env,
+    host: &dyn AccountsHost,
+    (labels, due, on): (&[String], bool, Option<&[String]>),
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let Some((path, file_roster)) = accounts_read_roster(env, err) else {
+        return ExitCode::from(1);
+    };
+    let machines = match machines_to_renew(env, due, on) {
+        Ok(machines) => machines,
+        Err(why) => {
+            let _ = writeln!(err, "aterm harness accounts renew: {why}; nothing was run");
+            return ExitCode::from(1);
+        }
+    };
+    let store = env.accounts_store();
+    let now = env.now;
+    let (logins, logins_note) = match store.load_logins(now) {
+        Ok(read) => read,
+        Err(why) => {
+            let _ = writeln!(
+                err,
+                "aterm harness accounts renew: {why}: {} is left as it is and nothing was run",
+                store.logins_file().display()
+            );
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(note) = logins_note {
+        let _ = writeln!(err, "aterm harness accounts: {note}");
+    }
+    let roster = accounts::bound(&file_roster, &logins);
+    let mut chosen: Vec<String> = Vec::new();
+    for label in labels {
+        match roster.row(label) {
+            None => {
+                let _ = writeln!(
+                    err,
+                    "aterm harness accounts renew: `{}` is not in the roster ({}); nothing was run",
+                    super::one_line(label, 80),
+                    path.display()
+                );
+                return ExitCode::from(1);
+            }
+            Some(row) if row.email.is_none() => {
+                let _ = writeln!(
+                    err,
+                    "aterm harness accounts renew: `{label}` has no email, so its renewal could not \
+                     be checked; add `email = \"…\"` to its row (or sign it in with `aterm harness \
+                     accounts login {label}`); nothing was run"
+                );
+                return ExitCode::from(1);
+            }
+            Some(_) if !chosen.contains(label) => chosen.push(label.clone()),
+            Some(_) => {}
+        }
+    }
+    if due {
+        let (state, _) = match store.load(now) {
+            Ok(read) => read,
+            Err(why) => {
+                let _ = writeln!(
+                    err,
+                    "aterm harness accounts renew: {why}; due logins could not be determined, \
+                     so nothing was run"
+                );
+                return ExitCode::from(1);
+            }
+        };
+        let enrolled = accounts::enrolled(&roster);
+        for label in accounts::renew_due(&roster, &logins, &state, &enrolled, now) {
+            if !chosen.contains(&label) {
+                chosen.push(label);
+            }
+        }
+    }
+    if chosen.is_empty() && machines.is_empty() {
+        let _ = writeln!(out, "nothing is due on this machine");
+        return ExitCode::SUCCESS;
+    }
+    if !chosen.is_empty() && !host.stdin_is_terminal() {
+        let _ = writeln!(out, "due here: {}", chosen.join(", "));
+        let _ = writeln!(
+            err,
+            "aterm harness accounts renew: not run: stdin is not a terminal (each renewal opens a \
+             browser and waits). Run it in a terminal"
+        );
+        return ExitCode::SUCCESS;
+    }
+    if !chosen.is_empty()
+        && let Some(why) = host.unaskable()
+    {
+        let _ = writeln!(
+            err,
+            "aterm harness accounts renew: not run: {why}, so no renewed login could be checked \
+             afterwards"
+        );
+        return ExitCode::from(1);
+    }
+    let mut ok = true;
+    let mut opener: Option<Option<PathBuf>> = None;
+    for label in &chosen {
+        let Some(row) = roster.row(label) else {
+            continue;
+        };
+        let own_dir = file_roster.row(label).and_then(|r| r.dir.as_deref());
+        let browser = if host.under_ssh() {
+            RenewBrowser::Remote {
+                opener: opener
+                    .get_or_insert_with(|| opener_link(&store, host))
+                    .clone(),
+            }
+        } else {
+            match row.browser.as_deref() {
+                None => RenewBrowser::Default,
+                Some(profile) => match opener.get_or_insert_with(|| opener_link(&store, host)) {
+                    Some(link) => RenewBrowser::Profile {
+                        opener: link.clone(),
+                        profile: profile.to_string(),
+                    },
+                    None => RenewBrowser::Default,
+                },
+            }
+        };
+        let renewal = renew_one(env, host, &store, row, own_dir, &browser, out, err);
+        ok &= renewal == Renewal::Renewed;
+    }
+    for (machine, aterm) in &machines {
+        let _ = writeln!(out, "renewing on {machine}:");
+        let _ = out.flush();
+        // `--here`: that machine renews its own logins and goes on to none —
+        // its own `hosts` would name this one, or itself.
+        let argv = [
+            aterm.as_str(),
+            "harness",
+            "accounts",
+            "renew",
+            "--due",
+            "--here",
+        ]
+        .map(str::to_string);
+        match host.ssh(machine, &argv) {
+            Ok(0) => {}
+            Ok(code) => {
+                ok = false;
+                let _ = writeln!(
+                    err,
+                    "aterm harness accounts renew: on {machine}: exited {code}"
+                );
+            }
+            Err(why) => {
+                ok = false;
+                let _ = writeln!(
+                    err,
+                    "aterm harness accounts renew: on {machine}: `ssh` could not be run: {}",
+                    super::one_line(&why, 160)
+                );
+            }
+        }
+    }
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+/// THE PROFILE CLAUDE CODE KEEPS FOR THE HOME a raw `CLAUDE_CONFIG_DIR`
+/// (`config`, `None` unset) names, for a user whose home is `home`, its
+/// directory `dir` where this command could resolve it
+/// ([`footer::claude_dir_of`]): [`profile::path_in`]. Where it could not —
+/// an empty or relative one, with no `CLAUDE_PID` to read the working
+/// directory of — by the raw value alone ([`profile::path_of`], no working
+/// directory): an EMPTY one's is `$HOME`'s wherever its records are
+/// (`CLAUDE_CONFIG_DIR || homedir()`), a relative one's is not known.
+fn claude_profile_of(
+    home: Option<&Path>,
+    config: Option<&str>,
+    dir: Option<&Path>,
+) -> Option<PathBuf> {
+    let user = home?;
+    match dir {
+        Some(dir) => Some(profile::path_in(user, config, dir)),
+        None => profile::path_of(user, config, None, || None),
+    }
+}
+
 /// Route one `accounts` form, the machine injected ([`AccountsHost`]) so the
-/// tests drive `check` and `login` without spawning anything.
+/// tests drive `login` without spawning anything.
 pub fn run_accounts(
     form: &AccountsCmd,
     env: &Env,
@@ -5080,12 +7043,219 @@ pub fn run_accounts(
 ) -> ExitCode {
     match form {
         AccountsCmd::Report { json } => run_accounts_report(env, *json, out, err),
-        AccountsCmd::Add { label, class } => run_accounts_add(env, label, *class, out, err),
+        AccountsCmd::Add {
+            label,
+            class,
+            email,
+            browser,
+        } => {
+            let row = accounts::Row {
+                label: label.clone(),
+                class: *class,
+                email: email.clone(),
+                browser: browser.clone(),
+                ..accounts::Row::default()
+            };
+            run_accounts_add(env, &row, out, err)
+        }
+        AccountsCmd::AdoptDefault {
+            label,
+            email,
+            browser,
+        } => {
+            let row = accounts::Row {
+                label: label.clone(),
+                email: Some(email.clone()),
+                browser: browser.clone(),
+                ..accounts::Row::default()
+            };
+            run_accounts_adopt(env, &row, out, err)
+        }
+        AccountsCmd::Renew { labels, due, on } => {
+            run_accounts_renew(env, host, (labels, *due, on.as_deref()), out, err)
+        }
         AccountsCmd::Login { label } => run_accounts_login(env, host, label, out, err),
-        AccountsCmd::Check => run_accounts_check(env, host, out, err),
         AccountsCmd::Use { label } => run_accounts_use(env, Some(label), out, err),
         AccountsCmd::Auto => run_accounts_use(env, None, out, err),
+        AccountsCmd::Stats { json } => run_accounts_stats(env, *json, out),
     }
+}
+
+/// `aterm harness accounts stats [--json]` (design
+/// `docs/DESIGN-account-stats-2026-10-15.md` §7): what the Claude Code
+/// profile of the home this command's environment names says of its
+/// account — the plan and its tier, the usage-credits word, and how the plan
+/// bills Fable (a hint) — read on demand from the file Claude Code reads
+/// for it ([`profile::effective`]; where the home's records directory is
+/// unknown — an empty `CLAUDE_CONFIG_DIR` with no `CLAUDE_PID` — no
+/// `.config.json` is looked for) through the allowlist reader
+/// ([`profile::read`]), which keeps no field off its list, and labelled by
+/// [`stats_label`]. A home that could not be resolved reads nothing
+/// ([`profile::NoProfile::NoHome`]). Labels and keys only: no email, id,
+/// path or vendor flag name is printed. Writes nothing and takes no lock;
+/// exit 0, a figure that could not be read naming why.
+fn run_accounts_stats(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
+    let read = env
+        .claude_profile
+        .as_deref()
+        .map(|own| profile::effective(own, env.claude_dir().as_deref(), env.claude_custom_oauth))
+        .map_or(Err(profile::NoProfile::NoHome), |file| profile::read(&file));
+    let label = stats_label(env, read.as_ref().ok().and_then(|p| p.key));
+    let _ = if json {
+        writeln!(out, "{}", stats_json(&label, &read, env.now))
+    } else {
+        write!(out, "{}", stats_text(&label, &read, env.now))
+    };
+    ExitCode::SUCCESS
+}
+
+/// THE LABEL `accounts stats` NAMES THE HOME'S LOGIN BY (design §3.1), the
+/// first that applies: the roster row's label where the home is enrolled —
+/// for the default home the row with no `dir`, for any other the row whose
+/// `dir` names the directory `CLAUDE_CONFIG_DIR` resolved to, once a login
+/// was made there ([`accounts::enrolled`]); else `main` for the default
+/// home; else `home-<key6>` from the profile's `key` (`home` with none). A
+/// roster that is missing or refused lists no row.
+fn stats_label(env: &Env, key: Option<profile::AccountKey>) -> String {
+    let roster = env
+        .accounts_roster()
+        .and_then(|path| Roster::load(&path).ok())
+        .unwrap_or_default();
+    // The default home is the one whose profile is `$HOME/.claude.json`. An
+    // EMPTY `CLAUDE_CONFIG_DIR` is that home too (the profile's
+    // `CLAUDE_CONFIG_DIR || homedir()` and the keychain item's
+    // `!CLAUDE_CONFIG_DIR` read it as unset: READ in the 2.1.301 bundle); a
+    // set one, `~/.claude` itself included, is a home of its own.
+    let default_profile = env.home.as_ref().map(|home| home.join(".claude.json"));
+    if env.claude_profile.is_some() && env.claude_profile == default_profile {
+        return roster
+            .row_for_login(None)
+            .map_or(ACCOUNTS_OWN_LABEL, |row| row.label.as_str())
+            .to_owned();
+    }
+    let row = env.claude_dir.as_deref().and_then(|dir| {
+        roster
+            .rows
+            .iter()
+            .find(|row| row.dir.as_deref().is_some_and(|d| Path::new(d) == dir))
+    });
+    match (row, key) {
+        (Some(row), _) if accounts::enrolled(&roster).contains(&row.label) => row.label.clone(),
+        (_, Some(key)) => format!("home-{}", key.short()),
+        (_, None) => "home".to_owned(),
+    }
+}
+
+/// `accounts stats --json`: schema 1 of design §7.2, the fields this
+/// machine's profile fills, each `null` where it says nothing.
+fn stats_json(
+    label: &str,
+    read: &Result<profile::Profile, profile::NoProfile>,
+    now: i64,
+) -> String {
+    let word = |w: &Option<profile::Word>| Value::from(w.as_ref().map(|w| w.as_str().to_owned()));
+    let mut o = Map::new();
+    o.insert("schema".to_owned(), Value::from(1u64));
+    o.insert("kind".to_owned(), Value::from("account-stats".to_owned()));
+    put_time(&mut o, "as_of", Some(now));
+    o.insert("complete".to_owned(), Value::from(true));
+    let mut account = Map::new();
+    account.insert("agent".to_owned(), Value::from("claude".to_owned()));
+    account.insert("label".to_owned(), Value::from(label.to_owned()));
+    let mut missing = Vec::new();
+    match read {
+        Ok(p) => {
+            account.insert("key".to_owned(), Value::from(p.key.map(|k| k.to_string())));
+            let mut plan = Map::new();
+            plan.insert(
+                "word".to_owned(),
+                Value::from(p.plan.word.map(|w| w.word().to_owned())),
+            );
+            plan.insert("tier".to_owned(), word(&p.plan.tier));
+            plan.insert("seat".to_owned(), word(&p.plan.seat));
+            plan.insert("billing".to_owned(), word(&p.plan.billing));
+            plan.insert("display".to_owned(), word(&p.plan.display));
+            put_time(&mut plan, "as_of", p.plan.fetched_at);
+            plan.insert("source".to_owned(), Value::from("profile".to_owned()));
+            account.insert("plan".to_owned(), Value::Object(plan));
+            let mut fable = Map::new();
+            fable.insert("plan".to_owned(), Value::from(p.fable.word().to_owned()));
+            put_time(&mut fable, "ends_at", p.fable.ends_at());
+            fable.insert("hint".to_owned(), Value::from(true));
+            account.insert("fable".to_owned(), Value::Object(fable));
+            let mut credits = Map::new();
+            credits.insert(
+                "state".to_owned(),
+                Value::from(p.credits.state().map(str::to_owned)),
+            );
+            credits.insert("reason".to_owned(), word(&p.credits.reason().cloned()));
+            credits.insert("source".to_owned(), Value::from("profile".to_owned()));
+            account.insert("credits".to_owned(), Value::Object(credits));
+        }
+        Err(why) => {
+            account.insert("key".to_owned(), Value::Null);
+            for figure in ["plan", "fable", "credits"] {
+                account.insert(figure.to_owned(), Value::Null);
+            }
+            let mut reason = Map::new();
+            reason.insert("reason".to_owned(), Value::from(why.word().to_owned()));
+            account.insert("missing".to_owned(), Value::Object(reason));
+            let mut what = Map::new();
+            what.insert("what".to_owned(), Value::from("profile".to_owned()));
+            what.insert("reason".to_owned(), Value::from(why.word().to_owned()));
+            missing.push(Value::Object(what));
+        }
+    }
+    o.insert("missing".to_owned(), Value::Array(missing));
+    o.insert(
+        "accounts".to_owned(),
+        Value::Array(vec![Value::Object(account)]),
+    );
+    aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
+}
+
+/// `accounts stats`: the account's line — label, agent, plan, credits —
+/// then its Fable line.
+fn stats_text(
+    label: &str,
+    read: &Result<profile::Profile, profile::NoProfile>,
+    now: i64,
+) -> String {
+    let mut text = format!(
+        "accounts at {} \u{b7} this machine only \u{b7} from Claude Code's profile\n",
+        rfc3339_utc(now)
+    );
+    let p = match read {
+        Ok(p) => p,
+        Err(why) => {
+            text.push_str(&format!(
+                "{label} \u{b7} claude \u{b7} plan \u{2014} ({})\n",
+                why.word()
+            ));
+            return text;
+        }
+    };
+    let plan = p.plan.title().unwrap_or_else(|| "plan \u{2014}".to_owned());
+    let credits = match (&p.credits, p.credits.reason()) {
+        (profile::Credits::Off(_), Some(reason)) => format!("credits off ({})", reason.as_str()),
+        (credits, _) => format!("credits {}", credits.state().unwrap_or("\u{2014}")),
+    };
+    let fable = match &p.fable {
+        profile::FablePlan::Included => "Fable included".to_owned(),
+        profile::FablePlan::CreditsOnly => "credits only".to_owned(),
+        profile::FablePlan::LimitsEnd(Some(at)) => {
+            format!(
+                "limits end {}",
+                rfc3339_utc(*at).get(..10).unwrap_or_default()
+            )
+        }
+        profile::FablePlan::LimitsEnd(None) => "limits end (date unread)".to_owned(),
+        profile::FablePlan::Unknown => "unknown".to_owned(),
+    };
+    text.push_str(&format!(
+        "{label} \u{b7} claude \u{b7} {plan} \u{b7} {credits}\n  Fable  plan: {fable}\n"
+    ));
+    text
 }
 
 // ---------------------------------------------------------------------------
@@ -5140,6 +7310,7 @@ pub fn run(cmd: &Cmd, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Ex
             ExitCode::SUCCESS
         }
         Cmd::Retired { verb } => run_retired(verb, err),
+        Cmd::Tap => run_tap(out),
         Cmd::Usage { json } => run_usage(env, &LiveClaude, *json, out),
         Cmd::Limits { sid, json } => run_limits(env, sid.as_deref(), *json, out, err),
         Cmd::Disk {
@@ -5155,19 +7326,42 @@ pub fn run(cmd: &Cmd, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Ex
     }
 }
 
+/// `aterm harness tap` on this process's stdin and environment
+/// ([`super::tap::run`], [`super::tap::TapVars::from_process`]), into the
+/// readings' directory under this process's state root
+/// ([`super::tap::rl_dir`]). Always exit 0.
+fn run_tap(out: &mut dyn Write) -> ExitCode {
+    use std::io::IsTerminal as _;
+    let stdin = io::stdin();
+    let tty = stdin.is_terminal();
+    super::tap::run(
+        &mut stdin.lock(),
+        tty,
+        &super::tap::TapVars::from_process(),
+        super::tap::rl_dir().as_deref(),
+        limit::unix_now(),
+        out,
+    )
+}
+
 /// The front door's entry point (`aterm harness …`).
 ///
 /// The retired verbs answer first, before any parsing and before the
 /// environment is read, so no argv or environment an old install runs them
 /// with can turn their answer into an error: `hook` and `statusline` drain
 /// stdin to its end and exit 0 printing nothing; `install` and `uninstall`
-/// refuse with [`RETIRED`], exit 2. See [`answer_retired`].
+/// refuse with [`RETIRED`], exit 2. See [`answer_retired`]. A bare `tap`
+/// answers there too ([`run_tap`]): Claude Code runs it after every reply,
+/// and nothing the environment says may turn its line into an error.
 pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
     use std::io::IsTerminal as _;
     let args: Vec<String> = argv
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
+    if args == ["tap"] {
+        return run_tap(&mut io::stdout().lock());
+    }
     if let Some(verb) = args.first().map(String::as_str)
         && matches!(verb, "hook" | "statusline" | "install" | "uninstall")
     {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE IME DRIVER: `vendor/winit`'s ported `WinitView` composing for real,
+//! THE IME DRIVER: `crates/aterm-window`'s ported `WinitView` composing for real,
 //! through the `NSTextInputClient` IMPs `aterm_objc::declare_class!` registered.
 //!
 //! # Why this exists beside the auditor
@@ -54,10 +54,10 @@
 //! Stage 7 synthesises a real `NSEvent` and sends `keyDown:`, which is the path
 //! `interpretKeyEvents:` takes into the system input method. Whether the
 //! installed input source produces marked text for it is NOT under this file's
-//! control — it depends on the keyboard layout of the machine running the gate
-//! — so that stage REPORTS what happened and only fails on an outcome that is
-//! wrong under every layout (an abort, or preedit arriving while IME is
-//! disabled). See the note on [`macos::Driver::stage_dead_key`].
+//! control — it depends on the keyboard layout of the machine running
+//! `verify appkit` — so that stage REPORTS what happened and only fails on an
+//! outcome that is wrong under every layout (an abort, or preedit arriving
+//! while IME is disabled). See the note on [`macos::Driver::stage_dead_key`].
 //!
 //! # Exit codes — the ladder gates on these, not on the prose
 //!
@@ -79,7 +79,7 @@ const NOT_RUN: i32 = 2;
 fn main() -> std::process::ExitCode {
     eprintln!(
         "objc-ime-drive: NOT RUN — this drives \
-         vendor/winit/src/platform_impl/macos/view.rs, which does not exist off macOS."
+         crates/aterm-window/src/platform_impl/macos/view.rs, which does not exist off macOS."
     );
     std::process::ExitCode::from(NOT_RUN as u8)
 }
@@ -98,7 +98,6 @@ mod macos {
     use winit::event::{Ime, WindowEvent};
     use winit::event_loop::ActiveEventLoop;
     use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::{Window, WindowId};
 
     use super::{FAIL, NOT_RUN, PASS};
@@ -300,11 +299,8 @@ mod macos {
     impl Driver {
         /// The `WinitView` AppKit is holding, or `None` if there is no window.
         fn view(&self) -> Option<Id> {
-            let handle = self.window.as_ref()?.window_handle().ok()?;
-            let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-                return None;
-            };
-            Some(Id::from_ptr(h.ns_view.as_ptr()))
+            let view = aterm_objc::HasNsView::ns_view(self.window.as_ref()?);
+            (!view.is_null()).then_some(view)
         }
 
         /// Everything winit has queued, in order, cleared.
@@ -1053,8 +1049,8 @@ mod macos {
 
     /// Drive the loop until every stage has run, then report.
     pub fn run() -> i32 {
-        // The quiet builder (Accessory, no launch activation): the gate runs this
-        // drive beside a developer who is typing somewhere else.
+        // The quiet builder (Accessory, no launch activation): `verify appkit` runs
+        // this drive beside a developer who is typing somewhere else.
         let mut el = match aterm_gui::quiet_driver_event_loop_builder::<()>().build() {
             Ok(el) => el,
             Err(e) => {

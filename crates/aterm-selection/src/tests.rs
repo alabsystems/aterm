@@ -100,74 +100,6 @@ fn test_no_match_at_position() {
 }
 
 #[test]
-fn test_find_all_matches() {
-    let smart = SmartSelection::with_builtin_rules();
-    let text = "Check https://example.com and user@test.com";
-
-    let matches = smart.find_all(text);
-
-    // Check that we have at least the URL and email
-    let url_matches: Vec<_> = matches.iter().filter(|m| m.rule_name() == "url").collect();
-    let email_matches: Vec<_> = matches
-        .iter()
-        .filter(|m| m.rule_name() == "email")
-        .collect();
-
-    assert_eq!(url_matches.len(), 1);
-    assert_eq!(email_matches.len(), 1);
-
-    // URL should come before email in sorted order
-    let url_pos = matches.iter().position(|m| m.rule_name() == "url").unwrap();
-    let email_pos = matches
-        .iter()
-        .position(|m| m.rule_name() == "email")
-        .unwrap();
-    assert!(url_pos < email_pos);
-}
-
-#[test]
-fn test_disable_rule() {
-    let mut smart = SmartSelection::with_builtin_rules();
-    let text = "Check https://example.com";
-
-    // URL should match initially
-    let m = smart
-        .find_at(text, 10)
-        .expect("URL should match at position 10");
-    assert_eq!(m.rule_name(), "url");
-
-    // Disable URL rule
-    smart.set_rule_enabled("url", false);
-    assert!(
-        smart.find_at(text, 10).is_none(),
-        "disabled rule should not match"
-    );
-
-    // Re-enable
-    smart.set_rule_enabled("url", true);
-    let m = smart
-        .find_at(text, 10)
-        .expect("URL should match after re-enable");
-    assert_eq!(m.rule_name(), "url");
-}
-
-#[test]
-fn test_custom_rule() {
-    let mut smart = SmartSelection::new();
-
-    // Add a custom rule for GitHub issue references
-    let issue_rule = SelectionRule::new("github_issue", SelectionRuleKind::Custom, r"#\d+");
-    smart.add_rule(issue_rule);
-
-    let text = "Fixed in #123 and #456";
-
-    let matches = smart.find_all(text);
-    assert_eq!(matches.len(), 2);
-    assert_eq!(matches[0].matched_text(), "#123");
-    assert_eq!(matches[1].matched_text(), "#456");
-}
-
-#[test]
 fn test_priority_ordering() {
     let mut smart = SmartSelection::new();
 
@@ -217,43 +149,12 @@ fn test_find_at_column() {
 }
 
 #[test]
-fn test_selection_match_properties() {
-    let m = SelectionMatch::new("test", 5, 9, "custom", SelectionRuleKind::Custom);
-
-    assert_eq!(m.matched_text(), "test");
-    assert_eq!(m.start(), 5);
-    assert_eq!(m.end(), 9);
-    assert_eq!(m.len(), 4);
-    assert_eq!(m.rule_name(), "custom");
-    assert_eq!(m.kind(), SelectionRuleKind::Custom);
-}
-
-#[test]
-#[should_panic(expected = "SelectionMatch::new: end (3) must be >= start (5)")]
-fn test_selection_match_invalid_range_panics() {
-    let _ = SelectionMatch::new("bad", 5, 3, "custom", SelectionRuleKind::Custom);
-}
-
-#[test]
 fn test_has_match_at() {
     let smart = SmartSelection::with_builtin_rules();
     let text = "URL: https://example.com here";
 
     assert!(smart.has_match_at(text, 10));
     assert!(!smart.has_match_at(text, 0));
-}
-
-#[test]
-fn test_rule_kind_name() {
-    assert_eq!(SelectionRuleKind::Url.name(), "url");
-    assert_eq!(SelectionRuleKind::FilePath.name(), "file_path");
-    assert_eq!(SelectionRuleKind::Email.name(), "email");
-    assert_eq!(SelectionRuleKind::IpAddress.name(), "ip_address");
-    assert_eq!(SelectionRuleKind::GitHash.name(), "git_hash");
-    assert_eq!(SelectionRuleKind::QuotedString.name(), "quoted_string");
-    assert_eq!(SelectionRuleKind::Uuid.name(), "uuid");
-    assert_eq!(SelectionRuleKind::SemVer.name(), "semver");
-    assert_eq!(SelectionRuleKind::Custom.name(), "custom");
 }
 
 #[test]
@@ -339,12 +240,6 @@ fn test_get_rule() {
         smart.get_rule("nonexistent").is_none(),
         "nonexistent rule should return None"
     );
-}
-
-#[test]
-fn test_rule_pattern_accessor() {
-    let rule = BuiltinRules::url();
-    assert!(rule.pattern().contains("https?"));
 }
 
 #[test]

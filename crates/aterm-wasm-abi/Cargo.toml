@@ -1,0 +1,37 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 AND (MIT OR Apache-2.0)
+#
+# src/panic_hook.rs is derived from the upstream `console_error_panic_hook`
+# crate, version 0.1.7 (https://github.com/rustwasm/console_error_panic_hook,
+# by Nick Fitzgerald, dual-licensed MIT OR Apache-2.0), and names the file it
+# came from. See `LICENSE-MIT` and `LICENSE-APACHE` in this directory for the
+# upstream licenses. The rest of the crate is aterm's own.
+
+[package]
+name = "aterm-wasm-abi"
+description = "The host boundary of aterm's wasm modules, with no third-party dependency: the export layer that replaces wasm-bindgen (marshalling, handles, the descriptor `verify glue` reads) and the panic hook that reports to the host console (derived from console_error_panic_hook 0.1.7, MIT OR Apache-2.0 upstream)."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "Apache-2.0 AND (MIT OR Apache-2.0)"
+
+[dependencies]
+# `#[export]`, re-exported as `aterm_wasm_abi::export`. Its expansion names
+# this crate's `__rt` module. Nothing third-party, on any target. A proc
+# macro, so behind `export`: a crate that only reads `descriptor::*`
+# (aterm-verify) or the panic hook (aterm-gpu-web) keeps it out of its normal
+# closure, which Trust's loader refuses (PM-1,
+# docs/PLAN-pm1-proc-macro-reach-2026-10-16.md).
+aterm-wasm-abi-macros = { workspace = true, optional = true }
+
+[features]
+# `#[export]` and the hidden `__export_method` it expands to.
+export = ["dep:aterm-wasm-abi-macros"]
+
+[dev-dependencies]
+# tests/export.rs exports a toy surface.
+aterm-wasm-abi = { path = ".", features = ["export"] }
+
+[lints]
+workspace = true

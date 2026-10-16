@@ -13,8 +13,9 @@
 //! DEFAULT OFF, exactly like the embedded operator (`[operator] enabled`,
 //! `operator_host::enabled`). The config key is the one spelling in a shipped
 //! aterm: `ATERM_FABRIC_COMMAND`, which used to override it, is a DEVELOPMENT
-//! seam since 2026-09-24 ([`aterm_types::dev_seam!`]) — the aterm-link e2e
-//! harness launches its debug instances with it, and a release build reads none.
+//! seam ([`aterm_types::dev_seam!`]) — the fabric world tests
+//! (`crates/aterm/tests/fabric_world`) launch their debug instances with it,
+//! and a release build reads none.
 //!
 //! ## What the child gets, and what it does not
 //!
@@ -27,16 +28,20 @@
 //! no `AUTH` line is read and no token exists. **The authority is the
 //! descriptor.** A second process cannot present it and there is no file to
 //! steal — the only way to be the bridge is to be the process this function
-//! spawned. WHICH process that is, is chosen by whoever ARMS the supervisor:
-//! the `[fabric] command` the instance was launched with, or, on a running
-//! instance, an `Owner`-scope `fabric attach [<argv>]` (`aterm fabric on`
-//! uses it), and a client in a session holds `Owner` too. So the guarantee
-//! is that `Owner` arms the bridge, ONCE per process (the latch), and never
-//! acts as it — not that no agent can arm one: on an instance with no
-//! supervisor armed, an agent in a session can (control_verbs' `fabric` row,
-//! Owner exactly because arming chooses the process that holds
-//! `Scope::Bridge`; ruling 2026-10-08, the review that found this line
-//! overstated it).
+//! spawned. WHICH process that is, is chosen by the instance's CONFIGURATION
+//! and nothing else: the `[fabric] command` it was launched with, or the one
+//! its aterm.toml names when a running instance is armed with `fabric attach`
+//! ([`command_on_disk`], read again at the attach — `aterm fabric on` writes
+//! the file and then attaches). The verb is `Owner`-scope, and a client in a
+//! session holds `Owner` too, so the verb may only arm, ONCE per process (the
+//! latch), what the config already names: an argv of the caller's choosing
+//! that the config does not name is refused (`ERR fabric not configured`). So
+//! no token chooses the process that holds `Scope::Bridge`; whoever can write
+//! aterm.toml can, which is aterm's same-uid boundary, as for the node cap.
+//! (The 2026-10-08 ruling had let the Owner token choose it, on the ground that
+//! Owner already reaches every local session; the 2026-10-15 audit, r4-17, held
+//! that it left `deliver`'s attested `trust=human` rows and the fleet halt to
+//! whichever process an injected agent named, and closed it.)
 //!
 //! The child gets NO token and NO socket path, and its environment is aterm's own
 //! with [`aterm_types::domain::is_ai_env_key`] applied — the SAME deny list the
@@ -69,13 +74,17 @@
 //!
 //! ## Why it is supervised, and why that is not a way around the halt
 //!
-//! §11.2: "the instance relaunches the child with back-off". When either
-//! descriptor closes, [`crate::fabric::bridge_lost`] holds every session the
-//! bridge ever governed — that lands BEFORE any relaunch, from the
-//! `BridgeLostGuard` on the serving thread, and a relaunched bridge lifts what it
-//! wants lifted with `hold off`. So killing the bridge is strictly worse for an
-//! agent than leaving it alone, supervision or not: the halt does not wait for
-//! the supervisor's opinion.
+//! §11.2: "the instance relaunches the child with back-off". Killing the bridge
+//! lifts nothing: a hold already standing stays where the instance keeps it,
+//! and a relaunched bridge lifts only what its first `Last` read of the fleet's
+//! halt rows shows withdrawn. When either descriptor closes,
+//! [`crate::fabric::bridge_lost`] runs BEFORE any relaunch, from the
+//! `BridgeLostGuard` on the serving thread. By default (the owner's direction of
+//! 2026-09-29) it leaves every session the bridge governed running, each with
+//! `hold_advisory=fabric-lost`, so a halt published while no bridge is attached
+//! lands at the relaunch's `Last` read. Under `[fabric] hold_on_bridge_lost =
+//! true` it holds them `reason=fabric-lost origin=fleet` instead, and then the
+//! halt does not wait for the supervisor's opinion.
 
 use aterm_uds::spawnfd::{ChildStdio, LaneChild, LaneCommand};
 use std::sync::Mutex;
@@ -153,20 +162,16 @@ pub(crate) fn hold_on_bridge_lost(config: &crate::app_config::Config) -> bool {
 ///
 /// [`supervise`] loops forever with no stop handle, so a second supervisor would
 /// be a second relaunch loop over the same instance: two bridge children racing
-/// to be served against one `BRIDGE_CONTEXT`, each one's exit halting every
-/// session the other governed, and no way to take either back. [`arm`] therefore
-/// checks and sets under ONE lock, and `fabric attach` on an armed instance is
-/// refused rather than stacked.
+/// to be served against one `BRIDGE_CONTEXT`, each one's exit sweeping every
+/// session the other governed as lost, and no way to take either back. [`arm`]
+/// therefore checks and sets under ONE lock, and `fabric attach` on an armed
+/// instance is refused rather than stacked.
 ///
 /// `configured` is what the instance was LAUNCHED with — `[fabric] command` (or a
 /// development build's `$ATERM_FABRIC_COMMAND` seam) as [`spawn_supervisor`] read
-/// it at startup —
-/// recorded so a bare `fabric attach` and `fabric status` can name it without
-/// the control thread re-reading the config file (the process-wide config
-/// service owns that read; see the note on `control::spawn`'s `network_config`).
-/// A command added to the config AFTER launch is therefore not seen here: the
-/// verb takes it as `fabric attach <argv...>`, which is the case the verb exists
-/// for.
+/// it at startup — recorded so `fabric status` can name it. A command added to
+/// the config AFTER launch is not seen here; `fabric attach` reads the file
+/// again for it ([`command_on_disk`]), which is the case the verb exists for.
 struct Supervisor {
     /// The argv the supervisor thread was armed with — `Some` exactly once per
     /// process, and never `None` again.
@@ -274,14 +279,14 @@ pub(crate) fn spawn_supervisor(config: &crate::app_config::Config) -> bool {
         // running, which is what the `bool` answers.
         Err(ArmError::AlreadySupervised(_)) => true,
         // The configured command cannot run. It stays RECORDED (`fabric status`
-        // names it; a bare `fabric attach` re-tries it), it is NOT armed — the
-        // supervisor used to retry a typo for ever from here — and the latch
-        // stays open, so `fabric attach <corrected...>` is the remedy, not a
-        // relaunch.
+        // names it), it is NOT armed — the supervisor used to retry a typo for
+        // ever from here — and the latch stays open, so correcting `[fabric]
+        // command` and a bare `fabric attach` (which reads the file again) is
+        // the remedy, not a relaunch.
         Err(ArmError::NotExecutable { program, reason }) => {
             aterm_log::warn!(
-                "fabric bridge supervisor not started: `{program}` is {reason}; \
-                 `aterm ctl fabric attach <command...>` arms it once the command is fixed"
+                "fabric bridge supervisor not started: `{program}` is {reason}; fix [fabric] \
+                 command in aterm.toml, then `aterm ctl fabric attach` arms it"
             );
             false
         }
@@ -290,6 +295,48 @@ pub(crate) fn spawn_supervisor(config: &crate::app_config::Config) -> bool {
             false
         }
     }
+}
+
+/// The bridge command this instance's configuration names NOW: a development
+/// build's `$ATERM_FABRIC_COMMAND` seam, else `[fabric] command` in aterm.toml,
+/// READ AGAIN — so the command `aterm fabric on` wrote after this instance
+/// launched is the instance's own. `None` when neither names one; an aterm.toml
+/// that cannot be read or parsed names none (fail closed: a command no config
+/// can be shown to name is not the instance's). What `fabric attach` may arm,
+/// beside the launch-time `configured`.
+///
+/// A direct read of one file on an Owner-only verb a person or `fabric on`
+/// runs once, not the config service's watch: the question is what the file
+/// says at the moment the latch closes.
+#[cfg(not(test))]
+pub(crate) fn command_on_disk() -> Option<Vec<String>> {
+    let config = crate::app_config::config_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| crate::app_config::Config::parse(&text).ok())
+        .unwrap_or_default();
+    configured_command(&config)
+}
+
+/// [`command_on_disk`] in a test process: what the test said the file names
+/// ([`set_command_on_disk_for_tests`]), never the developer's own aterm.toml.
+#[cfg(test)]
+pub(crate) fn command_on_disk() -> Option<Vec<String>> {
+    COMMAND_ON_DISK_FOR_TESTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+#[cfg(test)]
+static COMMAND_ON_DISK_FOR_TESTS: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+/// Say what aterm.toml's `[fabric] command` names for [`command_on_disk`], in a
+/// test section ([`crate::fabric::with_link_reset`] clears it).
+#[cfg(test)]
+pub(crate) fn set_command_on_disk_for_tests(argv: Option<Vec<String>>) {
+    *COMMAND_ON_DISK_FOR_TESTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = argv;
 }
 
 /// Arm the supervisor with `argv` — the ONE seam that starts a `supervise`
@@ -403,6 +450,8 @@ pub(crate) fn reset_for_tests() {
     g.armed = None;
     g.configured = None;
     g.carried = None;
+    drop(g);
+    set_command_on_disk_for_tests(None);
 }
 
 /// What a seamless update's manifest carries of the supervisor
@@ -443,9 +492,15 @@ fn supervise(argv: &[String]) {
                     Ok(s) => s.to_string(),
                     Err(e) => e.to_string(),
                 };
+                // What `bridge_lost` did to the sessions it governed, which
+                // `[fabric] hold_on_bridge_lost` decides.
+                let loss = if crate::fabric::holds_on_bridge_lost() {
+                    "every session it governed is held reason=fabric-lost"
+                } else {
+                    "the loss holds no session it governed (hold_advisory=fabric-lost)"
+                };
                 aterm_log::warn!(
-                    "fabric bridge stopped ({how}) after {:.1}s; the sessions it governed are \
-                     held — restarting in {:.1}s",
+                    "fabric bridge stopped ({how}) after {:.1}s; {loss} — restarting in {:.1}s",
                     ran.as_secs_f64(),
                     backoff.as_secs_f64()
                 );
@@ -945,7 +1000,7 @@ mod tests {
             pair("PATH", "/usr/bin"),
             pair("HOME", "/home/a"),
             pair("XDG_STATE_HOME", "/home/a/.local/state"),
-            pair("ATERM_LINK_FAULT", "kill-after-deliver"),
+            pair("ATERM_LINK_FAULT", "kill-after-publish"),
             pair("ATERM_EDGE_READ", "0011"),
             pair("ATERM_EDGE_WRITE", "2233"),
             pair("ATERM_EDGE_SIGNAL", "4455"),
@@ -980,7 +1035,7 @@ mod tests {
         // A DENY LIST, NOT AN ALLOW LIST. `aterm-link serve` needs `HOME` and
         // `XDG_STATE_HOME` for its state directory and `PATH` to be executable at
         // all, and the e2e harness arms `ATERM_LINK_FAULT` on `aterm-gui` and
-        // relies on the CHILD inheriting it (`aterm-link/tests/harness/mod.rs`).
+        // relies on the CHILD inheriting it (`crates/aterm/tests/fabric_world/harness.rs`).
         // An allow list would have broken every one of those silently.
         for keeper in ["PATH", "HOME", "XDG_STATE_HOME", "ATERM_LINK_FAULT"] {
             assert!(has(keeper), "the bridge child still needs {keeper}");

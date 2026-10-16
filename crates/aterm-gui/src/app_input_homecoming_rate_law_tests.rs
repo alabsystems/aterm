@@ -53,8 +53,7 @@ fn tick_pet_on_glass(app: &mut App, wid: WindowId, t: Instant) {
     panic!("fixture: the pet never reached the glass in 10 s of fed frames");
 }
 
-/// The prompt's own byte stream (OSC 133;A/B) — every trace starts at a
-/// real prompt block, exactly like the locked companion suite.
+/// The prompt's byte stream (OSC 133;A/B); every trace starts at a real prompt.
 fn at_prompt(app: &mut App) {
     let term = app.pool.get(0).expect("session 0").term.clone();
     let mut t = crate::term_lock(&term);
@@ -110,13 +109,10 @@ fn perform_on_glass(app: &mut App, wid: WindowId, look: KittyLook, t: Instant) -
         .expect("the performance dresses the pet")
 }
 
-/// §2.0.2's canonical trace (vim 30 s, claude 30 s, back to vim) on the
-/// live seams: landings 1 and 2 are strangers and COMMIT their hellos at
-/// the performance; landing 3 is a RETURN inside `HOMECOMING` and maps
-/// to Quiet — the amnesia defect, closed. The gate alone was proven in
-/// `companion_look::alternating_two_programs_greets_each_once`; this drives
-/// the same trace through real OSC bytes, the verdict seam and the
-/// render-side commit.
+/// vim 30 s, claude 30 s, back to vim, through real OSC bytes, the verdict
+/// seam and the render-side commit: landings 1 and 2 are strangers and commit
+/// their hellos at the performance; landing 3 is a return inside `HOMECOMING`
+/// and is Quiet. (The gate alone: `alternating_two_programs_greets_each_once`.)
 #[test]
 fn a_return_to_a_recent_program_is_quiet() {
     let t0 = Instant::now();

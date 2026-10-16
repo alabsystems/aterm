@@ -1,77 +1,49 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A KEY PER GATED LIBRARY, RECORDED AND NEVER JUDGED (the
-//! Trust-lane efficiency plan's W4, the 0.96–0.100 release retro's commitment
-//! 16 and its §2.12).
+//! A closure key per gated library, recorded beside each facts record and never judged.
 //!
-//! A facts record is filed under ONE key over the whole tree less its floors
-//! (`trust_facts::facts_key`), so a comment edit anywhere re-runs every library.
-//! A key that covers only what one library's check reads would let a later run
-//! reuse the rest — but before anything may be reused on such a key, the lane
-//! must show the key predicts what it measures. This module only RECORDS one per
-//! gated library ([`ClosureKey`], the `closure` lines beside a facts record), so the
-//! records themselves measure the reuse a per-library key would have had, and
-//! catch every "same key, different Summary" case (aterm-codec moved with no
-//! source changed). The judge reads none of it: the keys are filed in a file of
-//! their own, `<store>/trust-closure/<facts key>` ([`file_closures`]), beside
-//! the record and never inside it, so no reader of records — this build's or an
-//! older one's — sees them, and no verdict, floor or receipt depends on them
-//! (`trust_facts`'s `closure_keys_never_reach_the_judge`).
+//! A facts record is filed under one key over the whole tree less its floors
+//! (`trust_facts::facts_key`), so any edit re-runs every library. Before a per-library key
+//! may let a run reuse results, it must be shown to predict what it measures; these records
+//! measure the reuse such a key would have had and catch every "same key, different
+//! Summary" case. They are filed apart, in `<store>/trust-closure/<facts key>`
+//! ([`file_closures`]), so no reader of records sees them and no verdict, floor or receipt
+//! depends on them (`trust_facts`'s `closure_keys_never_reach_the_judge`).
 //!
-//! THE KEY is a SHA-256 over [`CLOSURE_SCHEMA`] and one digest per component,
-//! each recorded beside it so a later diff names WHICH input moved
-//! ([`ClosureKey::moved`]):
+//! The key is a SHA-256 over [`CLOSURE_SCHEMA`] and one digest per component, each recorded
+//! so a diff names which input moved ([`ClosureKey::moved`]):
 //!
-//! * `prover` — the prover identity the run filed under (atpkg's `tree_root` of
-//!   the whole toolchain directory);
-//! * `pins` — the seal (`trustc -vV`'s commit-hash and the driver's `--version`)
-//!   and the lane's pinned environment (`lane-pin NAME=VALUE`, sorted);
-//! * `root-config` — the commit's `.cargo/config.toml`, `.cargo/config`,
-//!   `Cargo.toml` and `rust-toolchain.toml`, each parsed and written back as
-//!   canonical TOML (comments, order and layout drop out), or `absent`;
-//! * `profile` — the library's argv for `targo trust check` as the lane ran it:
-//!   the `trust-lane` profile and its `--config` rows, the package selection,
-//!   the features, `--allow-l0-gaps`. targo trust sets its own rustflags; the
-//!   lane passes none;
-//! * `packages` — the git tree id, at the run's commit, of every workspace
-//!   (path) package in the library's dependency closure (normal and build edges
-//!   of `targo metadata`'s resolve, every platform: a superset), a package in a
-//!   submodule by the submodule's gitlink and its path inside it;
-//! * `dep-info` — every input file the `.d` files of the library and of the
-//!   path packages in its closure list, by path and content digest (paths under
-//!   the slots, the checkout and the cargo home written relative to them, and a
-//!   slot's per-check `-<hash>` directory suffix dropped, so a rerun on the same
-//!   inputs reads the same);
-//! * `env-deps` — every `# env-dep:` line of every `.d` the check wrote
-//!   (registry packages too: objc2 reads `MACOSX_DEPLOYMENT_TARGET`), value
-//!   normalized as a path;
-//! * `lock` — the `Cargo.lock` entry of every package in the closure.
+//! * `prover`: the prover identity the run filed under (atpkg's `tree_root` of the
+//!   toolchain directory);
+//! * `pins`: `trustc -vV`'s commit-hash, the driver's `--version` and the lane's pinned
+//!   environment (`lane-pin NAME=VALUE`, sorted);
+//! * `root-config`: the commit's `.cargo/config.toml`, `.cargo/config`, `Cargo.toml` and
+//!   `rust-toolchain.toml`, each as canonical TOML (comments and layout drop out), or
+//!   `absent`;
+//! * `profile`: the library's `targo trust check` argv as the lane ran it;
+//! * `packages`: the git tree id at the commit of every path package in the library's
+//!   dependency closure (normal and build edges, every platform: a superset); a package in
+//!   a submodule by its gitlink and its path inside it;
+//! * `dep-info`: every input the `.d` files of the library and its closure's path packages
+//!   list, by normalized path ([`Normal`]) and content digest;
+//! * `env-deps`: every `# env-dep:` line of every `.d` the check wrote, registry packages
+//!   included, its value normalized as a path;
+//! * `lock`: the `Cargo.lock` entry of every package in the closure.
 //!
-//! THE CHECK'S OWN DEP-INFO, AND NO OTHER'S. A slot runs one check after
-//! another, and a path package compiled for another library's check — with
-//! other features — leaves a `.d` of its own there. So the lane lists, beside
-//! each check's log, the `.d` files that check wrote (`<log>.depinfo`: those
-//! in its slot newer than the check's start; every check's units are fresh
-//! names, `trust-gate-all.sh`'s "THE SLOTS ARE SCRATCH"), and only those are
-//! read: a key depends on what its library's check compiled, not on which
-//! other libraries the run gated.
+//! Only the `.d` files the check itself wrote are read: a slot runs one check after another,
+//! and a path package compiled for another library's check, with other features, leaves its
+//! own `.d` there. The lane lists them beside the check's log (`<log>.depinfo`, those at least
+//! as new as the check's start: [`crate::trust_lane::record`]).
 //!
-//! A FORK RESOLVES ON ITS OWN. A vendored fork is checked by its own manifest
-//! (`--manifest-path`), its own workspace: the root `Cargo.lock` and `[patch]`
-//! do not apply, and cargo resolves it afresh. Its `packages` and `lock` are
-//! read from the `Cargo.lock` that check used, which the lane keeps beside its
-//! log (`<log>.lock`) before it removes the one it created; without it they
-//! are unknown.
+//! A vendored fork is checked by its own manifest, so the root `Cargo.lock` and `[patch]` do
+//! not apply; its `packages` and `lock` come from the lock its check used, which the lane
+//! keeps as `<log>.lock`.
 //!
-//! UNKNOWN IS SAID, NEVER GUESSED. An input the lane cannot read — no graph, a
-//! package git cannot name, a lock entry missing, no `.d` for the library, a
-//! file a `.d` lists that cannot be read — makes that component
-//! `unknown:<why>`, and a key with any unknown component is the literal
-//! [`UNKNOWN`], never a digest over what was readable: a partial key could
-//! later read as a match. A closure package without a `.d` of its own is not
-//! unknown (the graph is every platform's; a Windows-only dependency compiles
-//! nothing here); the library's own `.d` missing from its check's list is.
+//! An input the lane cannot read makes its component `unknown:<why>` and the key the literal
+//! [`UNKNOWN`], never a digest over what was readable: a partial key could later read as a
+//! match. A closure package with no `.d` of its own is not unknown (the graph spans every
+//! platform), but the library's own `.d` missing from its check's list is.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -132,8 +104,8 @@ pub struct ClosureKey {
 }
 
 impl ClosureKey {
-    /// The key over each component's MATERIAL (the text it digests), `Err(why)`
-    /// for one the lane could not read. `material` is in [`COMPONENTS`] order.
+    /// The key over each component's material (the text it digests), `Err(why)` for one the
+    /// lane could not read. `material` is in [`COMPONENTS`] order.
     #[must_use]
     pub fn of(material: [std::result::Result<String, String>; 8]) -> ClosureKey {
         let parts = COMPONENTS
@@ -366,9 +338,11 @@ impl Graph {
         Ok(Graph { root, pkgs, deps })
     }
 
-    /// The package the lane selected by `spec` (`name@version`, or a name).
+    /// The package the lane selected by `spec` (`name@version`, or a name; a
+    /// fork-feature row's `name+feature@version` is that package's).
     fn find(&self, spec: &str) -> std::result::Result<&str, String> {
         let (name, version) = spec.split_once('@').unwrap_or((spec, ""));
+        let name = crate::trust_lane::package_identity(name);
         let hits: Vec<&str> = self
             .pkgs
             .iter()
@@ -652,8 +626,8 @@ struct Shared {
     digests: HashMap<PathBuf, std::result::Result<String, String>>,
 }
 
-/// THE KEYS of every subject, read from `src` ([`ClosureKey`]). Never fails: an
-/// input that cannot be read is an unknown component of the keys that need it.
+/// The keys of every subject, read from `src` ([`ClosureKey`]). Never fails: an input that
+/// cannot be read is an unknown component of the keys that need it.
 #[must_use]
 pub fn closure_keys(src: &Sources<'_>, subjects: &[Subject<'_>]) -> BTreeMap<String, ClosureKey> {
     let graph = Graph::read(src.metadata);
@@ -1003,9 +977,9 @@ pub fn read_closures(store: &Path, facts_key: &str) -> BTreeMap<String, ClosureK
         .unwrap_or_default()
 }
 
-/// FILE THE KEYS beside the record under `facts_key`, replacing any there, and
-/// drop each closure file whose record the store no longer holds (the receipts
-/// store keeps only its newest files), so the directory follows the records.
+/// File the keys beside the record under `facts_key`, replacing any there, and drop each
+/// closure file whose record the store no longer holds (the receipts store keeps only its
+/// newest files), so the directory follows the records.
 ///
 /// # Errors
 /// The file could not be written.
@@ -1088,6 +1062,29 @@ mod tests {
         assert_eq!(ClosureKey::from_fields(&s), None, "a component misnamed");
     }
 
+    /// A fork-feature row (`alpha+sealed@1.0.0`) keys the package it checks.
+    #[test]
+    fn a_fork_feature_row_finds_its_package() {
+        let pkg = |name: &str, version: &str| Pkg {
+            name: name.into(),
+            version: version.into(),
+            source: None,
+            dir: PathBuf::new(),
+            lib: None,
+        };
+        let g = Graph {
+            root: PathBuf::new(),
+            pkgs: BTreeMap::from([
+                ("alpha-id".to_string(), pkg("alpha", "1.0.0")),
+                ("beta-id".to_string(), pkg("beta", "1.0.0")),
+            ]),
+            deps: BTreeMap::new(),
+        };
+        assert_eq!(g.find("alpha+sealed@1.0.0"), Ok("alpha-id"));
+        assert_eq!(g.find("alpha@1.0.0"), Ok("alpha-id"));
+        assert!(g.find("alpha+sealed@2.0.0").is_err());
+    }
+
     static SEQ: AtomicUsize = AtomicUsize::new(0);
 
     /// A checkout with a workspace (alpha -> beta, a path package, and `reg`,
@@ -1096,10 +1093,7 @@ mod tests {
     struct World {
         root: PathBuf,
         pins: BTreeMap<String, String>,
-        /// HEAD as [`World::commit`] last left it, the one way these tests move
-        /// it: a key read it with `rev-parse HEAD` each time (2026-10-05: 35
-        /// of `each_input_the_check_read_moves_its_own_component`'s 305 git
-        /// processes).
+        /// HEAD as [`World::commit`] last left it, so a key spawns no `rev-parse HEAD`.
         head: std::cell::RefCell<String>,
     }
 
@@ -1326,9 +1320,8 @@ mod tests {
         }
     }
 
-    /// THE KEYS ARE READ FROM WHAT THE CHECK READ: the same inputs read the same
-    /// key on a rerun — another slot, another session nonce in every unit's
-    /// name — and each input, moved alone, moves the key and is named.
+    /// The same inputs read the same key in another slot under another nonce; each input
+    /// moved alone moves its own component.
     #[test]
     fn each_input_the_check_read_moves_its_own_component() {
         let w = World::new();
@@ -1407,8 +1400,7 @@ mod tests {
         assert_eq!(before.moved(&w3.key()), ["env-deps"]);
     }
 
-    /// UNKNOWN IS SAID: each input the lane cannot read makes its component —
-    /// and so the key — unknown, never a key over what was readable.
+    /// Each input the lane cannot read makes its component, and so the key, unknown.
     #[test]
     fn an_input_that_cannot_be_read_makes_the_key_unknown() {
         let unknown = |k: ClosureKey, want: &[&str]| {
@@ -1457,10 +1449,8 @@ mod tests {
         unknown(w.key(), &["root-config"]);
     }
 
-    /// THE CHECK'S OWN DEP-INFO, AND NO OTHER'S: a `.d` another library's check
-    /// left in a slot — a path package compiled with other features, or this
-    /// library compiled as that check's dependency — moves nothing, and
-    /// stands in for nothing this check did not write.
+    /// A `.d` another library's check left in a slot moves nothing and stands in for nothing
+    /// this check did not write.
     #[test]
     fn a_key_reads_only_the_dep_info_its_own_check_wrote() {
         let w = World::new();
@@ -1496,10 +1486,8 @@ mod tests {
         );
     }
 
-    /// A FORK RESOLVES ON ITS OWN: its `packages` and `lock` are read from the
-    /// lock its own check used, kept beside its log — unknown without it — and
-    /// a registry version only that lock names moves its key, where the root
-    /// lock moves it not at all.
+    /// A fork's `packages` and `lock` come from the lock its own check used, kept beside its
+    /// log (unknown without it); the root lock and the root graph's closure move nothing.
     #[test]
     fn a_fork_keys_the_lock_its_own_check_resolved() {
         let fork = Some("--manifest-path crates/alpha/Cargo.toml --lib");
@@ -1581,9 +1569,8 @@ mod tests {
         assert_eq!(git.rev_parses.load(Ordering::Relaxed), 2, "{keys:?}");
     }
 
-    /// THE CLOSURE FILE: beside the record, read back whole, leniently (a line
-    /// that does not read is skipped, another schema reads as none), and
-    /// dropped once the store no longer holds its record.
+    /// A closure file reads back whole and leniently (a bad line is skipped, another schema
+    /// reads as none) and is dropped once the store no longer holds its record.
     #[test]
     fn closure_files_round_trip_and_follow_their_records() {
         let w = World::new();

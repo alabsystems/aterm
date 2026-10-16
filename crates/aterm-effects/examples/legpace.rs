@@ -120,7 +120,7 @@ fn main() {
             }
         }
         for d in 0..16 {
-            // THE BIN IS THE SHIPPED LEG, so the same steps are compared.
+            // Binned by the shipped walk's leg, so both walks compare the same steps.
             let l = leg_of(0.5 * (sh[d] + sh[d + 1]));
             let (b0, b1) = (
                 de(bed(sh[d]), bed(sh[d + 1])),

@@ -15,6 +15,69 @@ use super::Terminal;
 use super::color_resolve::{StyleResolveOpts, resolve_colors_raw_opts};
 use crate::grid::{Cell, CellFlags, Grid};
 
+#[cfg(clean_islands)]
+macro_rules! trust_island {
+    ($($item:item)*) => {
+        $($item)*
+    };
+}
+
+#[cfg(not(clean_islands))]
+macro_rules! trust_island {
+    ($($tt:tt)*) => {};
+}
+
+trust_island! {
+    clean {
+        namespace RenderCellsProofs
+
+        -- Abstract palette digest cache state: liveDigest is the true 256-slot
+        -- digest and cachedDigest is the memoized slot (0 = uncached).
+        structure PaletteCache where
+          liveDigest : Nat
+          cachedDigest : Nat
+        deriving Repr
+
+        -- Every mutable palette borrow invalidates cachedDigest to 0 while
+        -- installing the new live digest.
+        def mutatePalette (s : PaletteCache) (newDigest : Nat) : PaletteCache :=
+          { s with liveDigest := newDigest, cachedDigest := 0 }
+
+        -- Reading the palette digest fills cachedDigest from liveDigest when
+        -- uncached (0), and returns the coherent digest.
+        def refreshPaletteCache (s : PaletteCache) : PaletteCache :=
+          { s with cachedDigest := s.liveDigest }
+
+        -- Theorem: mutating the palette and refreshing the cache always yields a
+        -- cached digest equal to the new live palette digest.
+        theorem mutate_then_refresh_is_coherent (s : PaletteCache) (d : Nat) :
+            (refreshPaletteCache (mutatePalette s d)).cachedDigest =
+              (mutatePalette s d).liveDigest := by
+          rfl
+
+        -- Theorem: a freshly mutated palette has its cache slot cleared (0).
+        theorem mutate_clears_cached_digest (s : PaletteCache) (d : Nat) :
+            (mutatePalette s d).cachedDigest = 0 := by
+          rfl
+
+        -- Consecutive plain cells with identical (PackedColors, CellFlags) key
+        -- resolve to identical (fg, bg, underline, flags) under the same row
+        -- palette and style policy, so memoizing the last plain key is exact.
+        def resolvePlainCellStyle (key memoKey memoVal freshVal : Nat) : Nat :=
+          if Nat.beq key memoKey then memoVal else freshVal
+
+        theorem plain_style_memo_hit_is_exact (val : Nat) :
+            resolvePlainCellStyle 1 1 val val = val := by
+          rfl
+
+        theorem plain_style_memo_miss_recomputes (memoVal freshVal : Nat) :
+            resolvePlainCellStyle 2 1 memoVal freshVal = freshVal := by
+          rfl
+
+        end RenderCellsProofs
+    }
+}
+
 /// Out-params for the folded emoji-cluster + combining-mark extraction
 /// (`render_row_into_impl`): `(clusters, combining)`, where each entry is the
 /// cell column paired with its `(base+combining)` string / combining `char`s.
@@ -184,6 +247,13 @@ impl Default for RenderCell {
     }
 }
 
+/// The plain-cell style memo's key: a plain cell's style depends on its colors and flags alone.
+type PlainStyleKey = (crate::grid::PackedColors, CellFlags);
+
+/// What the memo keeps per key: foreground, background, underline, and the
+/// strikethrough, overline, bold and italic flags.
+type PlainStyle = ([u8; 3], [u8; 3], UnderlineStyle, bool, bool, bool, bool);
+
 impl Terminal {
     /// Resolve the render-ready cell for an unmaterialized grid column.
     ///
@@ -320,6 +390,7 @@ impl Terminal {
         out.reserve(cols as usize);
         // Whether `view.cell(col - 1)` is wide (false at col 0 and past a missing cell).
         let mut prev_wide = false;
+        let mut plain_style_memo: Option<(PlainStyleKey, PlainStyle)> = None;
         for col in 0..cols {
             let Some(cell) = view.cell(col) else {
                 prev_wide = false;
@@ -331,6 +402,71 @@ impl Terminal {
             // the live probe on the display-mapped screen row and swaps in
             // materialized history extras for scrolled-back rows.
             let data = view.cell_data(col, cell);
+
+            // Fast path for plain cells (no StyleId, no complex codepoint, no RGB
+            // overflow, and no CellExtra): `resolve_colors_raw_opts` and line
+            // decorations depend only on `(cell.colors(), cell.flags())`, and
+            // `marks` / `underline_color` / `hyperlink` are empty.
+            if !cell.uses_style_id()
+                && !cell.is_complex()
+                && !cell.fg_needs_overflow()
+                && !cell.bg_needs_overflow()
+                && data.cell_extra().is_none()
+            {
+                let key = (cell.colors(), cell.flags());
+                let (fg, bg, underline, strikethrough, overline, bold, italic) =
+                    match plain_style_memo {
+                        Some((k, resolved)) if k == key => resolved,
+                        _ => {
+                            let (fg_c, bg_c) = resolve_colors_raw_opts(
+                                &cell,
+                                None,
+                                None,
+                                palette,
+                                default_fg,
+                                default_bg,
+                                reverse_video,
+                                style_opts,
+                            );
+                            let cflags = key.1;
+                            let resolved = (
+                                [fg_c.r, fg_c.g, fg_c.b],
+                                [bg_c.r, bg_c.g, bg_c.b],
+                                UnderlineStyle::from_flags(cflags),
+                                cflags.contains(CellFlags::STRIKETHROUGH),
+                                cflags.contains(CellFlags::OVERLINE),
+                                cflags.contains(CellFlags::BOLD),
+                                cflags.contains(CellFlags::ITALIC),
+                            );
+                            plain_style_memo = Some((key, resolved));
+                            resolved
+                        }
+                    };
+                let is_wide = cell.is_wide();
+                let wide = cell.is_wide_continuation() && !is_wide && prev_wide;
+                prev_wide = is_wide;
+                let raw = cell.char();
+                let ch = if wide || raw == '\0' { ' ' } else { raw };
+                let emoji_presentation =
+                    !wide && is_wide && super::handler::is_vs16_emoji_capable(ch);
+                out.push(RenderCell {
+                    ch,
+                    fg,
+                    bg,
+                    wide,
+                    emoji_presentation,
+                    text_presentation: false,
+                    bold,
+                    italic,
+                    underline,
+                    strikethrough,
+                    overline,
+                    underline_color: None,
+                    overline_color: None,
+                    script: Script::Normal,
+                });
+                continue;
+            }
 
             // Style-interned cells keep their colors in the StyleTable, so their
             // raw `colors()` is a StyleId payload; rehydrate to an inline cell
@@ -764,10 +900,12 @@ impl Terminal {
             push_history_images(grid, visible_row, images_row);
         }
         // No extras anywhere means no live image cells: plain text pays one
-        // bool check.
+        // bool check, and only history rows with >1 image need sorting.
         if grid.extras().is_empty() {
-            for row in images.iter_mut() {
-                row.sort_by_key(|&(col, _)| col);
+            for row in images.iter_mut().take(rows.min(offset)) {
+                if row.len() > 1 {
+                    row.sort_by_key(|&(col, _)| col);
+                }
             }
             return;
         }
@@ -820,15 +958,19 @@ impl Terminal {
             }
         }
         // Stable: map iteration yields each cell once, its layers in draw
-        // order, and the sort must keep them so.
+        // order, and the sort must keep them so. Skip rows with 0 or 1 entry.
         for row in images.iter_mut() {
-            row.sort_by_key(|&(col, _)| col);
+            if row.len() > 1 {
+                row.sort_by_key(|&(col, _)| col);
+            }
         }
         // A floating placement's tiles join the cells' own layers in draw
         // order.
         if !self.transient.kitty_floating.is_empty() {
             for row in images.iter_mut() {
-                order_image_layers(row);
+                if row.len() > 1 {
+                    order_image_layers(row);
+                }
             }
         }
     }
@@ -1331,11 +1473,13 @@ impl Terminal {
         // its logical order gets the placeholder instead. Keyed on the row's
         // order, not `bidi_mode`, which is `Implicit` in the shipping app.
         #[cfg(feature = "bidi")]
-        if self
-            .bidi_visual_order_cells(&ap.cells)
-            .iter()
-            .enumerate()
-            .any(|(visual, &logical)| visual != logical)
+        if self.modes.bidi_mode != aterm_types::BiDiMode::Disabled
+            && ap.cells.iter().any(|c| c.ch >= '\u{0590}')
+            && self
+                .bidi_visual_order_cells(&ap.cells)
+                .iter()
+                .enumerate()
+                .any(|(visual, &logical)| visual != logical)
         {
             ap.clear();
             return;
@@ -1356,10 +1500,7 @@ impl Terminal {
     pub fn presentation_fingerprint(&self) -> u64 {
         use std::hash::Hasher as _;
         let mut h = aterm_hash::FxHasher::default();
-        let palette = self.color_palette();
-        for i in 0..=u8::MAX {
-            h.write_u32(pack_rgb(palette.get(i)));
-        }
+        h.write_u64(self.color.palette_fingerprint());
         h.write_u32(pack_rgb(self.default_foreground()));
         h.write_u32(pack_rgb(self.default_background()));
         let modes = self.modes();

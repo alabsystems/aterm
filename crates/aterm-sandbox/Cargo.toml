@@ -31,8 +31,7 @@ libc = { workspace = true }
 aterm-spec = { workspace = true }
 # Test-only: sandbox tests mint a root `Authority`; `launcher-mint` makes the sealed
 # mint nameable for this crate's own test build. The production `apply`/`restore`
-# seam receives a `Cap<Sandbox>` by argument and never mints. See aterm-cap's
-# tests/mint_reachability.rs gate.
+# seam receives a `Cap<Sandbox>` by argument and never mints.
 aterm-cap = { workspace = true, features = ["launcher-mint"] }
 
 [lints]

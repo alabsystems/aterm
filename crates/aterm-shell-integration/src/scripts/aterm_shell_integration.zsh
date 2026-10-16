@@ -404,13 +404,14 @@ autoload -Uz add-zsh-hook
 # variable is unset, or the directory (Windows lays none) does not exist.
 #
 # $ATPKG_AGENTS — exported by the atpkg shell.d hook sourced just above — names
-# <prefix>/agents, which holds ONLY the claude and codex shims aterm keeps current
-# (owner decision 2026-09-10). It fails the same way, for the same reasons: measured
-# 2026-09-10 on m27 at PATH position 14, behind /opt/homebrew/bin (path_helper) and
-# ~/.local/bin (~/.zshrc), so `codex` ran a brew cask that could run no command and
-# `claude` an older native install. It is moved to the front first, then the reroute
-# directory, so PATH reads reroute, agents, … — the spawn seam's own order; the two
-# hold disjoint names, so what matters is that both precede everything else.
+# <prefix>/agents, which holds ONLY the agent shims aterm keeps current (claude,
+# codex, agy, muse; owner decisions 2026-09-10 and 2026-10-15). It fails the same
+# way, for the same reasons: measured 2026-09-10 on m27 at PATH position 14, behind
+# /opt/homebrew/bin (path_helper) and ~/.local/bin (~/.zshrc), so `codex` ran a brew
+# cask that could run no command and `claude` an older native install. It is moved
+# to the front first, then the reroute directory, so PATH reads reroute, agents, … —
+# the spawn seam's own order; the two hold disjoint names, so what matters is that
+# both precede everything else.
 #
 # `${(@)path:#…}`: `:#` matches the expanded value LITERALLY (no GLOB_SUBST), so a
 # directory named with `[` or `*` is still removed by equality; `(@)` in quotes
@@ -546,12 +547,20 @@ __aterm_reroute_path_front
 # Gated on BEING INSIDE AN ATERM SESSION ($ATERM_CHILD=1, which the spawn seam sets
 # for every child, or $ATERM_SESSION_ID) — NOT on $ATERM_REROUTE_DIR, which is
 # precisely what the adopted shell lacks. Inert everywhere else.
+#
+# zsh/stat is loaded at the first stamp of a hook that EXISTS, not at load: an
+# absent hook's stamp is the empty string with the module or without it, and
+# loading it cost a fresh session shell 0.36 ms before its first prompt (measured
+# 2026-10-16, zsh 5.9) — every first tab of a fresh machine, which opens before
+# atpkg lays the hook. $__aterm_have_zstat says the stamp is zstat's (loaded, or
+# to be loaded); a zsh whose module will not load drops to the `-f` fallback.
 typeset -g __aterm_atpkg_hook="$HOME/.aterm/shell.d/00-atpkg.zsh"
 typeset -gi __aterm_managed_live=0
 typeset -gi __aterm_have_zstat=0
+typeset -gi __aterm_zstat_loaded="${__aterm_zstat_loaded:-0}"
 if [[ -n "${ATERM_CHILD:-}" || -n "${ATERM_SESSION_ID:-}" ]]; then
     __aterm_managed_live=1
-    zmodload -F zsh/stat b:zstat 2>/dev/null && __aterm_have_zstat=1
+    __aterm_have_zstat=1
 fi
 
 # Leaves "<mtime>:<inode>" of the hook on disk in $__aterm_atpkg_hook_now, or the
@@ -563,6 +572,14 @@ __aterm_atpkg_hook_stamp() {
     emulate -L zsh
     __aterm_atpkg_hook_now=""
     (( __aterm_have_zstat )) || return 0
+    if (( ! __aterm_zstat_loaded )); then
+        [[ -e "$__aterm_atpkg_hook" ]] || return 0
+        if ! zmodload -F zsh/stat b:zstat 2>/dev/null; then
+            __aterm_have_zstat=0
+            return 0
+        fi
+        __aterm_zstat_loaded=1
+    fi
     local -A __aterm_st
     zstat -H __aterm_st -- "$__aterm_atpkg_hook" 2>/dev/null || return 0
     __aterm_atpkg_hook_now="$__aterm_st[mtime]:$__aterm_st[inode]"
@@ -603,8 +620,13 @@ __aterm_managed_path_live() {
     emulate -L zsh
     (( __aterm_managed_live )) || return 0
     # 1. The hook: sourced when the copy on disk is not the copy last sourced.
+    # Stamped first, and the stamp's verdict on zsh/stat read after: a module that
+    # will not load at the first hook's stamp sends that same call to the `-f`
+    # fallback, not the next prompt's.
     if (( __aterm_have_zstat )); then
         __aterm_atpkg_hook_stamp
+    fi
+    if (( __aterm_have_zstat )); then
         if [[ -n "$__aterm_atpkg_hook_now" && "$__aterm_atpkg_hook_now" != "$__aterm_atpkg_hook_seen" ]]; then
             __aterm_atpkg_hook_seen="$__aterm_atpkg_hook_now"
             . "$__aterm_atpkg_hook"
@@ -714,7 +736,7 @@ __aterm_id_suffix() {
     fi
 }
 
-# Percent-encode a string for use in file:// URIs (RFC 3986).
+# Percent-encode a string for use in file:// URIs (RFC 3986), into REPLY.
 # Unreserved chars (A-Z a-z 0-9 - _ . ~ /) pass through; all others
 # are encoded byte-by-byte as %XX. LC_ALL=C ensures multi-byte UTF-8
 # characters are split into individual bytes for correct encoding.
@@ -722,9 +744,13 @@ __aterm_id_suffix() {
 # Runs once per prompt (via __aterm_report_cwd), so it is fork-free by
 # construction: `printf -v` writes into a variable instead of spawning a
 # `$(printf ...)` subshell per encoded byte. A path with a single space used
-# to cost a fork; a 4-byte emoji cost four. No `& 0xFF` mask is needed (or
-# present, historically): unlike bash, zsh's `printf '%d' "'<byte>"` returns
-# the UNSIGNED byte value (195 for 0xC3), so `%02X` is already correct.
+# to cost a fork; a 4-byte emoji cost four. The answer is REPLY, not output:
+# a caller's `$(...)` around it was itself a fork at every prompt (0.6 ms,
+# measured on zsh 5.9). The caller declares `local REPLY`, so a user's REPLY
+# — set by `read` at one prompt, used at the next — is never touched. No
+# `& 0xFF` mask is needed (or present, historically): unlike bash, zsh's
+# `printf '%d' "'<byte>"` returns the UNSIGNED byte value (195 for 0xC3), so
+# `%02X` is already correct.
 #
 # Under `emulate -L zsh`, like `__aterm_encode_cmd`: the loop reads
 # `${string[$i]}` from 1, and a user's KSH_ARRAYS (subscripts from 0) dropped the
@@ -738,7 +764,7 @@ __aterm_urlencode() {
     # verbatim. Skip it. (The class is exactly the loop's pass-through class,
     # so this is the same decision the loop would make for every byte.)
     if [[ "$1" != *[^a-zA-Z0-9_.~/-]* ]]; then
-        print -rn -- "$1"
+        REPLY="$1"
         return
     fi
     local string="$1" i char encoded="" hex
@@ -749,14 +775,14 @@ __aterm_urlencode() {
             *) printf -v hex '%%%02X' "'$char"; encoded+="$hex" ;;
         esac
     done
-    print -rn -- "$encoded"
+    REPLY="$encoded"
 }
 
 # Report current working directory (OSC 7)
 __aterm_report_cwd() {
-    local cwd
-    cwd=$(__aterm_urlencode "$PWD")
-    __aterm_osc "7;file://${__aterm_report_host}${cwd}"
+    local REPLY
+    __aterm_urlencode "$PWD"
+    __aterm_osc "7;file://${__aterm_report_host}${REPLY}"
 }
 
 # Mark prompt start (OSC 133;A)
@@ -854,21 +880,67 @@ __aterm_mark_integration_rev() {
 # is there. What that fallback cannot catch is a raw program that exits 0 without
 # restoring; the freeze catches that too.
 #
+# A FRESH SHELL'S FIRST PROMPT does not wait for the read (2026-10-15): the
+# `stty -a` fork and exec cost that prompt 1.4 ms (measured on zsh 5.9), on the
+# path of every new tab. There the read starts in the background (a process
+# substitution: the prompt pays the fork alone), the freeze and the wrappers
+# are armed at once, and the repair waits for the read until the first
+# command's preexec — or the next prompt, when the line was empty. What it
+# read is what the shell kept: the line editor leaves ISIG, the flag the repair
+# reads, as it found it. Found broken — an rc ran a raw program that died — the
+# tty is repaired THROUGH the thaw (`__aterm_tty_thaw_run`), so the shell keeps
+# the repair and freezes that, before the first command runs. An upgrade in
+# place (`__aterm_fresh_load` 0) reads at once, as before: that shell may be
+# broken right now. A body taken through the pointer finds the shell armed by
+# the body before it, except in a shell whose earlier body had no arm (builds
+# of 2026-09-26 between the loader and the tty fix): its loader's
+# `__aterm_fresh_load` is still 1, so it defers like a fresh shell, and its
+# next command still runs repaired.
+#
 # Kept across a live re-source: a newer body arriving through the pointer finds
 # the shell already armed and changes nothing about it.
 typeset -gi __aterm_tty_armed="${__aterm_tty_armed:-0}"
 typeset -gi __aterm_tty_frozen="${__aterm_tty_frozen:-0}"
+# The descriptor of the read a fresh shell's first prompt left running, or 0.
+typeset -gi __aterm_tty_probe_fd="${__aterm_tty_probe_fd:-0}"
 
-# The repair (part 1 above). One fork to read the tty, a second only when it is
-# in a dead raw program's state. Silent when stdin is not a terminal.
-__aterm_tty_repair() {
+# Whether the tty is in a dead raw program's state (part 1 above): `raw` in
+# REPLY when it is, else nothing. One fork to read it; silent when stdin is
+# not a terminal.
+__aterm_tty_read() {
     emulate -L zsh
+    REPLY=""
     local __aterm_tty_state=""
     __aterm_tty_state="$(command stty -a 2>/dev/null)" || return 0
     local -a __aterm_tty_words
     __aterm_tty_words=(${=__aterm_tty_state})
-    (( ${__aterm_tty_words[(Ie)-isig]} )) || return 0
-    command stty isig icanon iexten echo icrnl opost 2>/dev/null
+    (( ! ${__aterm_tty_words[(Ie)-isig]} )) || REPLY=raw
+    return 0
+}
+
+# The repair (part 1 above): the tty read now — or what the read a fresh
+# shell's first prompt started answered, taken now — and a second fork only
+# when it is in a dead raw program's state; through the thaw when the tty is
+# frozen, so the shell keeps what it set.
+__aterm_tty_repair() {
+    emulate -L zsh
+    local REPLY=""
+    if (( __aterm_tty_probe_fd )); then
+        # Up to its end — the probe has long exited by now — where `read`
+        # answers 1: the first command of an `||` list, so no user's ZERR trap
+        # hears it.
+        read -r -u $__aterm_tty_probe_fd REPLY || true
+        exec {__aterm_tty_probe_fd}<&-
+        __aterm_tty_probe_fd=0
+    else
+        __aterm_tty_read
+    fi
+    [[ "$REPLY" == raw ]] || return 0
+    if (( __aterm_tty_frozen )); then
+        __aterm_tty_thaw_run stty isig icanon iexten echo icrnl opost 2>/dev/null
+    else
+        command stty isig icanon iexten echo icrnl opost 2>/dev/null
+    fi
     return 0
 }
 
@@ -904,15 +976,21 @@ __aterm_tty_thaw_run() {
     return $__aterm_tty_rc
 }
 
-# Once per shell, at the first prompt this body runs. The wrappers are spelled
-# with the `function` keyword: a user's alias for the name would otherwise be
-# expanded when a live body is parsed and define something else entirely. They
-# open with THE TRACE's line: under `set -x`, bare zsh traces the `stty` line and
-# nothing for it, where the wrapper traced its own call too.
+# Once per shell, at the first prompt this body runs; a fresh shell's repair
+# follows at its first command (see "A FRESH SHELL'S FIRST PROMPT" above). The
+# wrappers are spelled with the `function` keyword: a user's alias for the name
+# would otherwise be expanded when a live body is parsed and define something
+# else entirely. They open with THE TRACE's line: under `set -x`, bare zsh
+# traces the `stty` line and nothing for it, where the wrapper traced its own
+# call too.
 __aterm_tty_arm() {
     emulate -L zsh
     __aterm_tty_armed=1
-    __aterm_tty_repair
+    if (( __aterm_fresh_load )); then
+        # The probe answers in a word, so taking it is one short read.
+        exec {__aterm_tty_probe_fd}< <(__aterm_tty_read; print -rn -- "$REPLY")
+    fi
+    (( __aterm_tty_probe_fd )) || __aterm_tty_repair
     local __aterm_tty_name
     for __aterm_tty_name in stty reset tset; do
         (( ${+aliases[$__aterm_tty_name]} )) && return 0
@@ -949,9 +1027,11 @@ __aterm_body_precmd() {
     # A waiting re-key first, so every mark this prompt emits carries it.
     __aterm_rekey_check
 
-    # The tty settings (see "The tty settings the shell keeps" above): armed once;
+    # The tty settings (see "The tty settings the shell keeps" above): a fresh
+    # shell's first-prompt read taken (an empty line ran no preexec), armed once;
     # after that, fork-free while frozen, and one probe after a failed command
     # where the user's own definitions ruled the freeze out.
+    (( ! __aterm_tty_probe_fd )) || __aterm_tty_repair
     (( __aterm_tty_armed )) || __aterm_tty_arm
     (( __aterm_tty_frozen || last_status == 0 )) || __aterm_tty_repair
 
@@ -1002,7 +1082,8 @@ __aterm_body_precmd() {
     return 0
 }
 
-# Encode a string for OSC 633;E (VS Code convention).
+# Encode a string for OSC 633;E (VS Code convention), into REPLY (see
+# `__aterm_urlencode`: the caller's `local REPLY` keeps the user's).
 # Backslash-hex encodes semicolons, backslashes, and bytes <= 0x20.
 #
 # Runs once per user command, between Enter and the command actually
@@ -1027,7 +1108,7 @@ __aterm_encode_cmd() {
             *) encoded+="$char" ;;
         esac
     done
-    print -rn -- "$encoded"
+    REPLY="$encoded"
 }
 
 # preexec - runs before command execution. XTRACE off first (see THE TRACE), then
@@ -1037,12 +1118,18 @@ __aterm_preexec() {
     emulate -L zsh
     typeset -g __aterm_in_command=1
 
+    # A fresh shell's tty, repaired before its first command runs (see "A FRESH
+    # SHELL'S FIRST PROMPT").
+    (( ! __aterm_tty_probe_fd )) || __aterm_tty_repair
+
     # The managed dirs, live — BEFORE this command resolves: a `claude` typed at a
     # prompt that was drawn before atpkg laid agents/ must already run the twin.
     __aterm_managed_path_live
 
     # Report command text for session memory (OSC 633;E)
-    __aterm_osc "633;E;$(__aterm_encode_cmd "$1")${__aterm_id_suffix_str}"
+    local REPLY
+    __aterm_encode_cmd "$1"
+    __aterm_osc "633;E;${REPLY}${__aterm_id_suffix_str}"
 
     # Set tab title to running command (OSC 0).
     # Truncate to first 64 chars and strip control characters.

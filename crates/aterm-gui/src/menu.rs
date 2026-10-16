@@ -253,7 +253,7 @@ pub(crate) enum MenuAction {
     Quit,
     // File menu
     /// New Window — a new in-process window of this App, sharing its sessions
-    /// (`App::create_window_internal`); no second process is spawned.
+    /// (`App::open_window_off_loop`); no second process is spawned.
     NewWindow,
     /// New Tab — a new in-window session (`App::open_tab`).
     NewTab,
@@ -377,6 +377,16 @@ pub(crate) enum MenuAction {
     /// Toggle the own-rendered, cross-platform command PALETTE overlay
     /// (`App::toggle_palette`).
     OpenPalette,
+    /// View ▸ Choose Theme… — open the command palette scoped to its Theme
+    /// section (`App::open_theme_palette`): the arrow keys preview each theme
+    /// live, Enter writes `theme` to aterm.toml, Esc puts the configured theme
+    /// back. Bindable as `choose_theme`.
+    ChooseTheme,
+    /// View ▸ Browse & Customize Themes… and the palette Theme section's last
+    /// row: the one Settings tab, at Settings ▸ Themes — the Theme Showcase,
+    /// where every theme can be tried on a live stage and its fonts and
+    /// colors tuned. Instance-level: no session needed.
+    BrowseThemes,
     // Tab-strip CONTEXT menu (session-metadata stage 2). These two live ONLY in
     // the per-tab right-click menu the native strip pops (`toolbar.rs` /
     // `session_chrome::compose_tab_menu`) — NOT in the menu bar, so they are
@@ -477,6 +487,12 @@ pub(crate) enum MenuAction {
     /// handback cannot reach (modes armed before it existed, a missed
     /// foreground change, a shifted charset). Terminal-only.
     ResetTerminal,
+    /// View ▸ Coding Agent Harness… (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+    /// §1): the one Settings tab, at Settings ▸ Harness — the harness's
+    /// switches, the default Autopilot, each session's Autopilot and what the
+    /// harness did. The menu and palette twin of the footer's `⚙` chip
+    /// (`App::open_harness_settings`). Instance-level: no session needed.
+    HarnessSettings,
     /// Minimise the window.
     Minimize,
     /// Zoom (toggle maximised) the window.
@@ -575,6 +591,12 @@ impl MenuAction {
             MenuAction::NewTabWithIdentity => 72,
             // The manual reset (2026-09-26).
             MenuAction::ResetTerminal => 73,
+            // Settings ▸ Harness (the Autopilot design, 2026-10-15).
+            MenuAction::HarnessSettings => 74,
+            // The palette's Theme section (the theme overhaul, 2026-10-15).
+            MenuAction::ChooseTheme => 75,
+            // Settings ▸ Themes, the Theme Showcase (the theme overhaul).
+            MenuAction::BrowseThemes => 76,
         }
     }
 
@@ -654,6 +676,9 @@ impl MenuAction {
             71 => MenuAction::NewWindowWithIdentity,
             72 => MenuAction::NewTabWithIdentity,
             73 => MenuAction::ResetTerminal,
+            74 => MenuAction::HarnessSettings,
+            75 => MenuAction::ChooseTheme,
+            76 => MenuAction::BrowseThemes,
             _ => return None,
         })
     }
@@ -1007,7 +1032,8 @@ pub(crate) static MENU_STATICS: std::sync::Mutex<()> = std::sync::Mutex::new(())
 #[cfg(test)]
 mod headless_os_ui_tests {
     /// Every function in this file that parks the watchdog for a modal
-    /// (`park_modal`) or asks `NSWorkspace` to open something (`openURL:`)
+    /// (`park_modal`), asks `NSWorkspace` to open something (`openURL:`) or
+    /// puts a window in front of other apps' (`orderFrontRegardless`)
     /// consults [`super::os_ui_refused`] before it — a SOURCE pin, because the
     /// refusal only bites in a real headless process on the main thread, which
     /// a unit test cannot be. A new modal or open helper added without the
@@ -1023,12 +1049,13 @@ mod headless_os_ui_tests {
         let mut sites = 0;
         for (i, line) in lines.iter().enumerate() {
             let code = line.split("//").next().unwrap_or("");
-            // Spelled in pieces so this scan never matches its own needles — and
-            // split before `!(`, so the crate's selector census
-            // (aterm-objc tests/gui_sent_prototypes.rs) never reads one either.
+            // Spelled in pieces so this scan never matches its own needles.
             let parks = code.contains(concat!("park_", "modal()"));
             let opens = code.contains(concat!("sel", "!(openURL:)"));
-            if !(parks || opens) {
+            // A window put in front of other apps' without activating aterm
+            // (the Developer Tools helper panel) is OS UI too.
+            let fronts = code.contains(concat!("sel", "!(orderFrontRegardless)"));
+            if !(parks || opens || fronts) {
                 continue;
             }
             sites += 1;
@@ -1052,8 +1079,9 @@ mod headless_os_ui_tests {
             );
         }
         // choose_local_file, confirm, notify park; open_in_workspace and its
-        // delayed twin open. Fewer means the scan went blind.
-        assert!(sites >= 5, "found only {sites} modal/open sites");
+        // delayed twin open; order_front_regardless fronts the helper panel.
+        // Fewer means the scan went blind.
+        assert!(sites >= 6, "found only {sites} modal/open sites");
     }
 
     /// The refusal is off until `main_entry` marks the process headless — a
@@ -1166,11 +1194,14 @@ impl MenuAction {
             | MenuAction::CopySessionId
             | MenuAction::CopyCwd => ClipboardWrite,
             // Durable `aterm.toml` writes / the security-knob config surface.
-            // `Packages` and `Messages` raise the SAME durable-config Settings
-            // tab as `ToggleSettings`, just at their routes — same fence.
+            // `Packages`, `HarnessSettings` and `Messages` raise the SAME
+            // durable-config Settings tab as `ToggleSettings`, just at their
+            // routes — same fence.
             MenuAction::Preferences
             | MenuAction::ToggleSettings
             | MenuAction::Packages
+            | MenuAction::HarnessSettings
+            | MenuAction::BrowseThemes
             | MenuAction::Messages
             | MenuAction::ToggleSeriousMode => ConfigWrite,
             // Gateway to every action + the staged-update re-exec twins.
@@ -1221,6 +1252,11 @@ impl MenuAction {
             // durable config, the `ConfigWrite` fine op, exactly as Serious
             // Mode is classified.
             MenuAction::TogglePresenceBand | MenuAction::TogglePresenceRim => ConfigWrite,
+            // The theme palette writes `theme` to aterm.toml on Enter, and a
+            // caller that may open it may also press that Enter: the
+            // `settings set theme` class, not the palette gateway's Owner-only
+            // one (its rows reach no other action).
+            MenuAction::ChooseTheme => ConfigWrite,
             // Benign runtime/view/window/tab state. Font zoom is runtime-only
             // (`set_font_px` pins `font_px`; it does NOT persist to `aterm.toml`), so it
             // stays `WriteInput`. `Quit` is a denial of service, not a capability escalation, so it
@@ -1327,8 +1363,11 @@ impl MenuAction {
             | MenuAction::TogglePresenceBand
             | MenuAction::TogglePresenceRim
             | MenuAction::Packages
+            | MenuAction::HarnessSettings
             | MenuAction::Messages
             | MenuAction::OpenPalette
+            | MenuAction::ChooseTheme
+            | MenuAction::BrowseThemes
             | MenuAction::CopySessionId
             | MenuAction::CopyCwd
             | MenuAction::ConnectToSession
@@ -1422,7 +1461,18 @@ impl MenuAction {
             MenuAction::ToggleSettings => "Open Settings.",
             MenuAction::Packages => "Open Settings at Packages: the ALab toolchain.",
             MenuAction::Messages => "Open Settings at Messages: everything aterm told you.",
+            MenuAction::HarnessSettings => {
+                "Open Settings at Harness: the coding agent harness and its Autopilot."
+            }
             MenuAction::OpenPalette => "Open the command palette: every command, by name.",
+            MenuAction::ChooseTheme => {
+                "Choose a theme from a list: arrow keys preview it, Enter keeps it, Esc puts \
+                 the current one back."
+            }
+            MenuAction::BrowseThemes => {
+                "Open Settings at Themes: try every theme on a live preview and tune its fonts \
+                 and colors."
+            }
             MenuAction::CopySessionId => {
                 "Copy this session's id, which scripts and other sessions use to reach it."
             }
@@ -1546,8 +1596,11 @@ impl MenuAction {
             "ToggleSettings" => Some(MenuAction::ToggleSettings),
             "Packages" => Some(MenuAction::Packages),
             "Messages" => Some(MenuAction::Messages),
+            "HarnessSettings" => Some(MenuAction::HarnessSettings),
             "RenameSession" => Some(MenuAction::RenameSession),
             "OpenPalette" => Some(MenuAction::OpenPalette),
+            "ChooseTheme" => Some(MenuAction::ChooseTheme),
+            "BrowseThemes" => Some(MenuAction::BrowseThemes),
             "Minimize" => Some(MenuAction::Minimize),
             "Zoom" => Some(MenuAction::Zoom),
             "NextTab" => Some(MenuAction::NextTab),
@@ -2049,6 +2102,32 @@ const VIEW_MENU: &[MenuEntry] = &[
         mods: MenuMods::None,
     },
     Separator,
+    // Settings at the /harness route (the Autopilot design, §1): the coding
+    // agent harness's switches (Claude Code's, Codex's), Autopilot and what
+    // it did — the bar twin of the footer's `⚙` chip, named as the page is.
+    Item {
+        label: "Coding Agent Harness…",
+        action: MenuAction::HarnessSettings,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Separator,
+    // The palette scoped to its Theme section: live preview on the arrow
+    // keys, Enter keeps. No key equivalent; `choose_theme` binds one.
+    Item {
+        label: "Choose Theme…",
+        action: MenuAction::ChooseTheme,
+        key: "",
+        mods: MenuMods::None,
+    },
+    // Settings at the /themes route: the Theme Showcase, every theme on a
+    // live stage with its fonts and colors to tune.
+    Item {
+        label: "Browse & Customize Themes…",
+        action: MenuAction::BrowseThemes,
+        key: "",
+        mods: MenuMods::None,
+    },
     Item {
         label: "Command Palette…",
         action: MenuAction::OpenPalette,
@@ -2557,9 +2636,9 @@ fn chrome_lines_for(
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
-    MenuHandle, choose_local_file, confirm, confirm_owner, defer_quit_for_terminate, install,
-    notify, open_file_in_workspace, open_help_url, show_handoff_target_version,
-    update_version_menu,
+    MenuHandle, choose_local_file, choose_local_image, confirm, confirm_owner,
+    defer_quit_for_terminate, install, notify, open_file_in_workspace, open_help_url,
+    order_front_regardless, show_handoff_target_version, update_version_menu,
 };
 
 /// Whether this process was launched `--headless`, published ONCE by
@@ -2647,6 +2726,12 @@ pub(crate) fn choose_local_file(title: &str, prompt: &str) -> Option<std::path::
     crate::file_picker_win::choose(title, prompt)
 }
 
+/// Windows: [`choose_local_file`] offering only image files.
+#[cfg(windows)]
+pub(crate) fn choose_local_image(title: &str, prompt: &str) -> Option<std::path::PathBuf> {
+    crate::file_picker_win::choose_image(title, prompt)
+}
+
 /// No portable native picker is linked on the REMAINING targets (Linux). The
 /// global action remains visible in the cross-platform command palette, but
 /// acquires no filesystem authority there — and every surface that would spend
@@ -2654,6 +2739,12 @@ pub(crate) fn choose_local_file(title: &str, prompt: &str) -> Option<std::path::
 /// of accepting a dead click.
 #[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn choose_local_file(_title: &str, _prompt: &str) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// No picker here either; see [`choose_local_file`].
+#[cfg(not(any(target_os = "macos", windows)))]
+pub(crate) fn choose_local_image(_title: &str, _prompt: &str) -> Option<std::path::PathBuf> {
     None
 }
 
@@ -2720,8 +2811,7 @@ pub(crate) fn open_help_url() {
 /// (every non-macOS target, and macOS outside the `.app`). One function so the
 /// two arms cannot drift, and `is_safe_url`-clean because `open_url_external`
 /// trusts its input. It is the PUBLIC channel the updater reads
-/// (`[workspace.metadata.aterm] update_channel`, stamped into
-/// [`aterm_update_core::DEFAULT_OWNER`] / [`aterm_update_core::DEFAULT_REPO`]),
+/// ([`aterm_update_core::DEFAULT_OWNER`] / [`aterm_update_core::DEFAULT_REPO`]),
 /// not `[workspace.package] repository`: that is the private staging repo, a
 /// 404 for anyone without its token.
 fn help_url() -> String {
@@ -2902,7 +2992,10 @@ impl SettingsOpen {
 }
 
 /// Open System Settings at `pane` — the owner-gesture entry point the Security
-/// page presses (design §3.4's FDA button, §3.7's repair link).
+/// page presses (design §3.4's FDA button, §3.7's repair link), and the
+/// Developer Tools hand-over's opener (`devtools_helper::Reach::live`), which
+/// the window's own lane and `aterm ctl devtools hand-over` reach at a quiet
+/// moment.
 ///
 /// macOS does the work in [`macos::open_privacy_settings`], which documents why
 /// a Settings URL may be opened from here and never from a hyperlink. Off macOS
@@ -3473,6 +3566,18 @@ mod macos {
     /// still canonicalizes, bounds, UTF-8-validates, and mints the process-local
     /// document grant before reading the file.
     pub(crate) fn choose_local_file(title: &str, prompt: &str) -> Option<std::path::PathBuf> {
+        open_panel(title, prompt, &[])
+    }
+
+    /// [`choose_local_file`] offering only images: the panel greys out every
+    /// file whose type does not conform to `public.image`.
+    pub(crate) fn choose_local_image(title: &str, prompt: &str) -> Option<std::path::PathBuf> {
+        open_panel(title, prompt, &["public.image"])
+    }
+
+    /// The open panel, limited to `types` (type identifiers or extensions;
+    /// empty offers every file).
+    fn open_panel(title: &str, prompt: &str, types: &[&str]) -> Option<std::path::PathBuf> {
         if super::os_ui_refused(title) {
             return None;
         }
@@ -3482,6 +3587,11 @@ mod macos {
         let _park = crate::watchdog::park_modal();
         let title = appkit::nsstring(title)?;
         let prompt = appkit::nsstring(prompt)?;
+        let types = types
+            .iter()
+            .map(|kind| appkit::nsstring(kind))
+            .collect::<Option<Vec<Obj>>>()?;
+        let type_ids = types.iter().map(Obj::id).collect::<Vec<Id>>();
         // SAFETY: NSOpenPanel is created and run on AppKit's main thread
         // (`_main_thread` is the witness). `+openPanel` is `-(id)` and returns an
         // AUTORELEASED panel — borrowed for the length of this pool, which is
@@ -3501,6 +3611,22 @@ mod macos {
             appkit::send_v_bool(panel, sel!(setResolvesAliases:), true);
             appkit::send_v_id(panel, sel!(setTitle:), title.id());
             appkit::send_v_id(panel, sel!(setPrompt:), prompt.id());
+            if !type_ids.is_empty() {
+                // `+arrayWithObjects:count:` copies the pointers and retains
+                // the strings `types` keeps alive; the array is autoreleased
+                // into this pool, and `-setAllowedFileTypes:` (`-(void)(NSArray
+                // *)`, type identifiers or extensions) copies it.
+                let allowed = appkit::send_id_idptr_usize(
+                    class(c"NSArray").as_id(),
+                    sel!(arrayWithObjects:count:),
+                    type_ids.as_ptr(),
+                    type_ids.len(),
+                );
+                if allowed.is_null() {
+                    return None;
+                }
+                appkit::send_v_id(panel, sel!(setAllowedFileTypes:), allowed);
+            }
             if appkit::send_isize(panel, sel!(runModal)) != NS_MODAL_RESPONSE_OK {
                 return None;
             }
@@ -3880,10 +4006,19 @@ mod macos {
     /// allowlist, and it must not be widened to accommodate this path.**
     ///
     /// This URL is a different kind of thing: a `&'static str` compiled into
-    /// aterm, reached only from a button on aterm's own Security page — an owner
-    /// gesture, at a moment the owner chose, with no untrusted bytes anywhere in
-    /// it. It goes to `NSWorkspace` directly rather than through the link path,
-    /// so the two never share a gate and the allowlist stays closed.
+    /// aterm, with no untrusted bytes anywhere in it, reached from the owner's
+    /// own presses (a button on aterm's own Security page, a digest line's
+    /// capsule) and from one lane of aterm's own: the Developer Tools hand-over
+    /// (`App::hand_devtools_to_owner`), which opens that one page — once per
+    /// aterm version on its own, and when `aterm ctl devtools hand-over` asks —
+    /// only at a quiet moment it judges itself (`devtools_helper::quiet`). A
+    /// program's ask chooses neither the page nor the moment: the verb names no
+    /// URL, and the lane holds it to the same gates as its own (the owner's Not
+    /// now, a build whose grant would not last, ten minutes since the page last
+    /// opened, a lapse after 30 minutes); its `now` form opens nothing here at
+    /// all, showing only aterm's panel while its asker (`aterm doctor`) opens
+    /// the page. It goes to `NSWorkspace` directly rather than through the link
+    /// path, so the two never share a gate and the allowlist stays closed.
     ///
     /// # Twice, without blocking
     ///
@@ -3919,6 +4054,27 @@ mod macos {
             return SettingsOpen::PaneRoot;
         }
         SettingsOpen::Refused
+    }
+
+    /// Put `window` — a panel aterm itself built, never another app's — in front
+    /// of every app's windows WITHOUT activating aterm (`-orderFrontRegardless`):
+    /// the Developer Tools helper panel beside System Settings
+    /// (`devtools_helper`), which must show while System Settings stays the
+    /// active app. `false`, and nothing shown, on a headless process or off the
+    /// main thread.
+    ///
+    /// Here and not in the panel's own module so the headless refusal this
+    /// module's pin holds every OS-UI site to covers it: a headless instance has
+    /// no glass to put a panel on, and a panel it could raise would float over
+    /// the owner's desktop with nothing behind it.
+    pub(crate) fn order_front_regardless(window: Id, what: &str) -> bool {
+        if super::os_ui_refused(what) || MainThread::new().is_none() || window.is_null() {
+            return false;
+        }
+        // SAFETY: `-orderFrontRegardless` is `-(void)` on the live `NSWindow` the
+        // caller owns, on the main thread (checked above).
+        unsafe { appkit::send_v(window, sel!(orderFrontRegardless)) };
+        true
     }
 
     /// Issue `s` through `NSWorkspace openURL:` again after `secs`.
@@ -4035,19 +4191,6 @@ mod tests {
         MENU_MODEL, MenuAction, MenuEntry, menu_chrome_lines, native_menu_action_enabled,
         set_active_tab_is_terminal, staged_apply_label, version_menu_bar_title,
     };
-
-    /// Both document runtimes already worked on Windows — the socket can drive
-    /// them today — so the rows greying out there was the picker's absence
-    /// leaking into a capability claim. With a real `IFileOpenDialog` linked, the
-    /// two platforms that HAVE a picker must both report one.
-    #[cfg(any(target_os = "macos", windows))]
-    #[test]
-    fn a_platform_with_a_picker_says_so() {
-        assert!(
-            super::local_file_picker_available(),
-            "macOS has NSOpenPanel and Windows has IFileOpenDialog"
-        );
-    }
 
     /// REGRESSION: the menu bar badged "v0.14.0 ⬆️" over a row reading "Update to
     /// v0.14.0 — apply now" (today "Install aterm v0.14.0 now"), which reads as an
@@ -4249,6 +4392,12 @@ mod tests {
         MenuAction::NewWindowWithIdentity,
         MenuAction::NewTabWithIdentity,
         MenuAction::ResetTerminal,
+        // Settings ▸ Harness (the Autopilot design, 2026-10-15).
+        MenuAction::HarnessSettings,
+        // View ▸ Choose Theme… (the theme overhaul, 2026-10-15).
+        MenuAction::ChooseTheme,
+        // View ▸ Browse & Customize Themes… (the theme overhaul).
+        MenuAction::BrowseThemes,
     ];
 
     /// Every `invoke` name that resolved BEFORE round 19's menu rework, verbatim
@@ -4997,6 +5146,17 @@ mod tests {
     /// 2026-09-26: Edit gains Reset Terminal, after a separator below the find
     /// rows — the manual reset (`crate::manual_reset`), the escape hatch for a
     /// terminal the automatic foreground handback cannot reach.
+    ///
+    /// 2026-10-15: View gains Claude Code Harness…, after a separator below the
+    /// kitties — Settings ▸ Harness, the bar twin of the footer's `⚙` chip
+    /// (the Autopilot design). 2026-10-16: named Coding Agent Harness…, as
+    /// the page it opens is (it holds Codex's switch too).
+    ///
+    /// 2026-10-16: View gains Choose Theme… above Command Palette… — the
+    /// palette scoped to its Theme section (live preview, Enter keeps).
+    ///
+    /// 2026-10-16: View gains Browse & Customize Themes… after it — Settings
+    /// ▸ Themes, the Theme Showcase.
     #[test]
     fn chrome_lines_render_titled_sections() {
         let lines = menu_chrome_lines(None, false);
@@ -5027,7 +5187,8 @@ mod tests {
              Reset Terminal",
             "menu \"View\": Increase Font Size, Decrease Font Size, Actual Size, Split Right, \
              Split Down, Enter Full Screen, Presence Band, Presence Rim, Serious Mode, \
-             Matrix Rain, Favourite This Kitty, Next Kitty, Command Palette…",
+             Matrix Rain, Favourite This Kitty, Next Kitty, Coding Agent Harness…, \
+             Choose Theme…, Browse & Customize Themes…, Command Palette…",
             "menu \"Fabric\": Inbox, Ledger for This Session, Hold This Session, \
              Lift Hold (This Session), Connect to Session…, Configure Connection…, \
              Disconnect Session…, Show Connection Map, Fabric Status, Turn Fabric On…, \
@@ -5613,24 +5774,17 @@ mod tests {
 
     /// Help opens the PUBLIC channel's page, never the private staging repo
     /// (`[workspace.package] repository`), which a person without its token
-    /// sees as a 404. It named that repo until 2026-09-28.
+    /// sees as a 404.
     #[test]
     fn the_help_destination_is_the_public_channel() {
-        let url = super::help_url();
         assert_eq!(
-            url,
+            super::help_url(),
             format!(
                 "https://github.com/{}/{}",
                 aterm_update_core::DEFAULT_OWNER,
                 aterm_update_core::DEFAULT_REPO
             )
         );
-        if aterm_update_core::PUBLISH_OWNER != aterm_update_core::DEFAULT_OWNER {
-            assert!(
-                !url.contains(&format!("/{}/", aterm_update_core::PUBLISH_OWNER)),
-                "{url} names the private staging owner"
-            );
-        }
     }
 
     // ---- the System Settings deep link (design §3.4, §3.7, Appendix A.2) --------

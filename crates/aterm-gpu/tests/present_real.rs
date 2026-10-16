@@ -12,11 +12,6 @@
 // copyable swapchain (`RENDER_ATTACHMENT | COPY_SRC`, the
 // `pick_surface_format` SDR default); only the pixel-free `present()` is absent.
 //
-// Variants cover the swapchain-only layers: glow quads, radial halos, the
-// under-glyph flame body and charred cores, the comet trail, half-res bloom,
-// the SDR glow-boost crown, the settings tray, bell invert, and the
-// scissored second present.
-//
 // No GPU or no system font: no-op.
 
 use aterm_core::terminal::Terminal;
@@ -29,7 +24,7 @@ use aterm_render::{
 // The wgpu present-theorem harness (its stand-in textures and taps are
 // wgpu-typed). The Metal twin is the armed differentials
 // (`metal_present_bytes_for_test` and the tap-ring differential).
-use crate::common::wgpu_oracle_or_skip as gpu_or_skip;
+use crate::common::wgpu_oracle as gpu;
 
 fn opts(half_res: bool) -> CaptureOpts {
     CaptureOpts {
@@ -126,7 +121,7 @@ fn add_fire_stack(input: &mut RenderInput, cw: usize, ch: usize) {
             w: cw as u16,
             h: ch as u16,
             color: premul_rgb(fire, *a),
-            // ADDITIVE light (see `GlowQuad::alpha`).
+            // Additive light (see `GlowQuad::alpha`).
             alpha: 0,
             color2: premul_rgb(fire, *a),
             alpha2: 0,
@@ -154,7 +149,7 @@ fn add_fire_stack(input: &mut RenderInput, cw: usize, ch: usize) {
         w: (2 * cw) as u16,
         h: ch as u16,
         color: premul_rgb(fire, 150),
-        // ADDITIVE light (see `GlowQuad::alpha`).
+        // Additive light (see `GlowQuad::alpha`).
         alpha: 0,
         color2: premul_rgb(fire, 150),
         alpha2: 0,
@@ -201,9 +196,7 @@ fn add_fire_stack(input: &mut RenderInput, cw: usize, ch: usize) {
 /// base compose, letterbox blit and dirty-row repaint agree between arms.
 #[test]
 fn present_real_theorem_text_and_scissored_present() {
-    let Some(mut gpu) = gpu_or_skip(16.0, Theme::default()) else {
-        return;
-    };
+    let mut gpu = gpu(16.0, Theme::default());
     gpu.set_bloom(false);
     let (rows, cols) = (6usize, 28usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -220,8 +213,7 @@ fn present_real_theorem_text_and_scissored_present() {
         fh as u32,
         false,
     );
-    // Non-vacuity: the two swapchain frames submitted through the WSI present
-    // path really differ (the scissored second present repainted the changed rows).
+    // Non-vacuity: the scissored second present repainted the changed rows.
     let (f1, f2) = (&take_a.frames[0], &take_a.frames[1]);
     assert!(
         f1.rgba != f2.rgba,
@@ -237,9 +229,7 @@ fn present_real_theorem_text_and_scissored_present() {
 #[test]
 fn production_present_resolves_odd_bands_and_trailing_content() {
     let theme = Theme::default();
-    let Some(mut gpu) = gpu_or_skip(16.0, theme) else {
-        return;
-    };
+    let mut gpu = gpu(16.0, theme);
     gpu.set_bloom(false);
     gpu.set_sdr_glow_boost(0.0);
     gpu.set_pad(0);
@@ -289,8 +279,8 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
         0..0,
     );
 
-    // Exercise the REAL swapchain present seam, not the dedicated blit helper:
-    // this includes the production viewport/scissor and video-introspection copy.
+    // The real swapchain present seam, not the dedicated blit helper: it includes
+    // the production viewport/scissor and video-introspection copy.
     let mut present_win = aterm_gpu::WindowGpu::new();
     gpu.video_begin_standin_for_test(&mut present_win, dw as u32, dh as u32, opts(false))
         .expect("standin tap");
@@ -381,9 +371,7 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
 /// the same encoder and harvest identical bytes.
 #[test]
 fn one_shot_presented_snapshot_is_independent_from_video() {
-    let Some(mut gpu) = gpu_or_skip(16.0, Theme::default()) else {
-        return;
-    };
+    let mut gpu = gpu(16.0, Theme::default());
     gpu.set_bloom(true);
     gpu.set_sdr_glow_boost(0.25);
     let (rows, cols) = (5usize, 24usize);
@@ -426,9 +414,7 @@ fn one_shot_presented_snapshot_is_independent_from_video() {
 /// on: every swapchain-only pass agrees byte-for-byte between the arms.
 #[test]
 fn present_real_theorem_fire_glow_bloom_halo_crown() {
-    let Some(mut gpu) = gpu_or_skip(16.0, Theme::default()) else {
-        return;
-    };
+    let mut gpu = gpu(16.0, Theme::default());
     gpu.set_bloom(true);
     // Heat shimmer stays on with its wall-clock phase pinned, so both arms
     // compose the same refraction.
@@ -464,8 +450,8 @@ fn present_real_theorem_fire_glow_bloom_halo_crown() {
         bare_take.frames[0].rgba != fire_take.frames[0].rgba,
         "the fire stack must actually land in the captured bytes (non-vacuous)"
     );
-    // And the fire really reads WARM somewhere: a pixel visibly hotter in red
-    // than blue (the ember ramp), so the parity claim covers lit pixels.
+    // The fire reads warm somewhere (a pixel hotter in red than blue, the ember
+    // ramp), so the parity claim covers lit pixels.
     let warm = fire_take.frames[0]
         .rgba
         .as_chunks::<4>()
@@ -479,15 +465,13 @@ fn present_real_theorem_fire_glow_bloom_halo_crown() {
     );
 }
 
-/// The theorem under the HALF-RES harvest (the multi-second recording
-/// default): the 2x2 box downscale runs identically on both arms.
+/// The theorem under the half-res harvest (the multi-second recording default):
+/// the 2x2 box downscale runs identically on both arms.
 #[test]
 fn present_real_theorem_half_res_harvest() {
-    let Some(mut gpu) = gpu_or_skip(16.0, Theme::default()) else {
-        return;
-    };
+    let mut gpu = gpu(16.0, Theme::default());
     gpu.set_bloom(true);
-    // Shimmer ON with a pinned phase, as in the fire-stack theorem above.
+    // Shimmer on with a pinned phase, as in the fire-stack theorem above.
     gpu.set_shimmer_phase_for_test(Some(0.40));
     let (rows, cols) = (6usize, 28usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -509,9 +493,7 @@ fn present_real_theorem_half_res_harvest() {
 /// The bell-invert chrome (a blit-uniform arm) agrees between the arms.
 #[test]
 fn present_real_theorem_bell_invert() {
-    let Some(mut gpu) = gpu_or_skip(16.0, Theme::default()) else {
-        return;
-    };
+    let mut gpu = gpu(16.0, Theme::default());
     gpu.set_bloom(false);
     let (rows, cols) = (5usize, 20usize);
     let mut term = Terminal::new(rows as u16, cols as u16);

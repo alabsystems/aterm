@@ -1,29 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Claude Code's composer, the second wrap and after: a long prompt's band must
-//! follow each wrapped line up and continue the spectrum, and a Space typed at
-//! the end of a full line must go up with it (owner, 2026-09-24).
+//! Claude Code's composer, the second wrap and after: a long prompt's band follows each wrapped
+//! line up and continues the spectrum, and a Space typed at the end of a full line goes up with
+//! it.
 //!
-//! `tests/composer_box_growth_wrap.rs` pins the first wrap. At the second the
-//! line wraps under the first line of prose, and Ink's diff writes that repaint
-//! sparsely: every cell where the second line's glyph equals the first line's
-//! at the same column is skipped. The follow pass (`Witness::follow_runs`) must
-//! not read those coincidences as holes, or it refuses the run, the band melts
-//! on the caret's new row in `RETIRE_MELT_S`, and the next keys join a stale
+//! `tests/composer_box_growth_wrap.rs` pins the first wrap. At the second the line wraps under
+//! the first line of prose, and Ink's diff writes that repaint sparsely: every cell where the
+//! second line's glyph equals the first line's at the same column is skipped. The follow pass
+//! (`Witness::follow_runs`) must not read those coincidences as holes, or it refuses the run,
+//! the band melts on the caret's new row in `RETIRE_MELT_S`, and the next keys join a stale
 //! cohort and restart the colours.
 //!
-//! The bytes are Claude Code 2.1.282's at 91×53, captured in an isolated aterm
-//! and under a Python pty (run `run1`): its two wrap chunks are quoted below
-//! verbatim, and the first law proves this file's writers reproduce them byte
-//! for byte. The DEC 2026 bracket is the window's own.
+//! The bytes are Claude Code 2.1.282's at 91×53, captured in an isolated aterm and under a
+//! Python pty (run `run1`): its two wrap chunks are quoted below verbatim, and the first law
+//! proves this file's writers reproduce them byte for byte. The DEC 2026 bracket is the
+//! window's own.
 //!
-//! Every law runs at the host seam (`trail_host::Core`, the frame hold), as
-//! `tests/composer_box_growth_wrap.rs` does: a real
-//! `aterm_core::terminal::Terminal` driven byte for byte, rows sampled as
-//! `app_render.rs`'s frame hold does, fed through `CursorGlow::observe_row` /
-//! `observe_ribbon_row` / `ribbon_rows` and ticked through `CursorGlow::tick` at
-//! 16.7 ms, keys at the capture's 80 ms.
+//! Every law runs at the host seam (`trail_host::Core`, the frame hold) on a 16.7 ms train,
+//! keys at the capture's 80 ms.
 
 use crate::trail_host::{Core, LOCK_A, Theme};
 use aterm_effects::rainbow_kitty::TypedClass;
@@ -75,8 +70,8 @@ const LINE2: &str =
 /// The keys typed on the third row.
 const AFTER: &str = "and then";
 
-/// `run1` key 87, the `k` that wraps the first line, VERBATIM from the
-/// on-glass byte log (458 bytes; the rule is 91 × U+2500).
+/// `run1` key 87, the `k` that wraps the first line, verbatim from the on-glass byte log
+/// (458 bytes; the rule is 91 × U+2500).
 fn captured_first_wrap() -> String {
     format!(
         "\x1b[?2026h\x1b[?25l\x1b[H\r\x1b[48B\x1b[38;2;136;136;136m{}\r\x1b[1B\x1b[39m\u{276f}\u{a0}the quick brown fox jumps over the lazy dog while the rainbow kitty trail follows each\x1b[K\r\x1b[1B  k\x1b[K\x1b[53;1H\x1b[51;4H\x1b[?25h\x1b[?2026l",
@@ -657,22 +652,19 @@ fn a_second_wrap_that_writes_other_text_a_row_up_follows_nothing() {
     );
 }
 
-/// The limit, stated as a law: a line identical to the one above it, or one
-/// glyph off (`step 1:` then `step 2:`), melts instead of following. At the
-/// second wrap it moves a row up onto a row that already held it, glyph for
-/// glyph but at most one, which is too little evidence for a move and is
-/// exactly the screen of a line erased under an identical line
-/// (`tests/erased_under_its_twin.rs`). The follow pass refuses both, so the
-/// band goes out on the caret's row in `RETIRE_MELT_S`. If a future witness can
-/// tell them apart, flip this law; do not loosen the erase laws to pass it.
+/// The limit, stated as a law: a line identical to the one above it, or one glyph off
+/// (`step 1:` then `step 2:`), melts instead of following. At the second wrap it moves a row up
+/// onto a row that already held it, glyph for glyph but at most one: too little evidence for a
+/// move, and exactly the screen of a line erased under an identical line
+/// (`tests/erased_under_its_twin.rs`). If a future witness can tell them apart, flip this law;
+/// do not loosen the erase laws to pass it.
 ///
-/// It also pins what the limit must not become: the first line re-laid a row
-/// higher is identical text arriving two rows up, and a twin one row away does
-/// not stop the search two rows away (`a_twin_testifies_only_about_its_own_row`).
-/// The band stays off the first line because nothing samples its row at that
-/// wrap (`no_row_two_away_is_named`); stopping the search at a whole text one
-/// row away would instead melt a line under an identical command pushed down
-/// two rows (`tests/moves_are_followed.rs`).
+/// What the limit must not become: the first line re-laid a row higher is identical text
+/// arriving two rows up, and a twin one row away does not stop the search two rows away
+/// (`a_twin_testifies_only_about_its_own_row`). The band stays off the first line because
+/// nothing samples its row at that wrap (`no_row_two_away_is_named`); stopping the search at a
+/// whole text one row away would melt a line under an identical command pushed down two rows
+/// (`tests/moves_are_followed.rs`).
 #[test]
 fn the_limit_a_line_identical_to_the_one_above_it_or_one_column_off_melts_instead_of_following() {
     let step1 =

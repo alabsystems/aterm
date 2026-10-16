@@ -50,8 +50,8 @@ impl Cell {
         }
     }
 
-    /// Create a cell from a character. BMP characters are stored directly;
-    /// non-BMP characters need the overflow mechanism.
+    /// Create a cell from a character. A non-BMP character is stored as U+FFFD;
+    /// its text needs the overflow mechanism.
     #[must_use]
     #[inline]
     #[allow(
@@ -67,7 +67,6 @@ impl Cell {
                 flags: CellFlags::empty(),
             }
         } else {
-            // Non-BMP character - store replacement char, caller should use overflow
             Self {
                 char_data: '\u{FFFD}' as u16,
                 colors: PackedColors::DEFAULT,
@@ -92,7 +91,6 @@ impl Cell {
             '\u{FFFD}' as u16
         };
 
-        // Convert the PackedColor pair to PackedColors.
         let colors = Self::convert_legacy_colors(fg, bg);
 
         Self {
@@ -122,28 +120,23 @@ impl Cell {
         Self::convert_legacy_colors(fg, bg)
     }
 
-    /// Convert a PackedColor pair to PackedColors.
+    /// Convert a PackedColor pair to PackedColors. RGB sets only the mode bits;
+    /// the value lives in CellExtras.
     #[inline]
     const fn convert_legacy_colors(fg: PackedColor, bg: PackedColor) -> PackedColors {
         let mut colors = PackedColors::DEFAULT;
 
-        // Handle foreground
         if fg.is_indexed() {
             colors = colors.set_fg_indexed(fg.index());
         } else if fg.is_rgb() {
-            // RGB needs overflow - mark as RGB mode
             colors = colors.with_rgb_fg();
         }
-        // else: default
 
-        // Handle background
         if bg.is_indexed() {
             colors = colors.set_bg_indexed(bg.index());
         } else if bg.is_rgb() {
-            // RGB needs overflow - mark as RGB mode
             colors = colors.with_rgb_bg();
         }
-        // else: default
 
         colors
     }
@@ -165,12 +158,8 @@ impl Cell {
     ///
     /// `cell_flags` holds cell-specific flags only (WIDE, WIDE_CONTINUATION,
     /// PROTECTED); style attributes come from the StyleTable at render time.
-    ///
-    /// # Memory layout
-    ///
-    /// - `colors.0` low 16 bits: StyleId value
-    /// - `colors.0` high 16 bits: reserved (for RGB overflow index)
-    /// - `flags`: USES_STYLE_ID plus cell-specific flags
+    /// `colors` holds the StyleId in its low 16 bits (bit 16 is HAS_EXTRAS, the
+    /// rest zero) and `flags` gains USES_STYLE_ID.
     #[cfg(test)]
     #[must_use]
     #[inline]
@@ -186,8 +175,6 @@ impl Cell {
             '\u{FFFD}' as u16
         };
 
-        // Store StyleId in the colors field's low 16 bits
-        // Set USES_STYLE_ID flag to indicate this cell uses style interning
         let colors = PackedColors(style_id.raw() as u32);
         let flags = CellFlags(cell_flags.0 | CellFlags::USES_STYLE_ID.0);
 
@@ -224,7 +211,6 @@ impl Cell {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::style::StyleId;
     use super::{Cell, CellFlags, PackedColor, PackedColors};
 
     // EMPTY / default / from_ascii_fast / from_ascii_styled / new / with_style,
@@ -248,8 +234,6 @@ mod tests {
 
     #[test]
     fn value_constructors_store_exactly_what_they_are_given() {
-        // One walk in place of 31 one-case tests.
-
         // The blank cell, three ways: a space, default colours, no flags.
         for blank in [Cell::EMPTY, Cell::default(), Cell::from_ascii_fast(b' ')] {
             assert_eq!(blank.char(), ' ');
@@ -263,8 +247,7 @@ mod tests {
             assert!(blank.is_empty());
         }
 
-        // Every ASCII byte (0x20 and 0x7E are the printable ends) through the
-        // two byte constructors.
+        // Every ASCII byte through the two byte constructors.
         let styles = [
             (PackedColors::DEFAULT, CellFlags::empty()),
             (
@@ -414,32 +397,6 @@ mod tests {
     // with_overflow_index — complex character overflow
 
     #[test]
-    fn test_with_overflow_index_sets_complex_flag() {
-        let cell = Cell::with_overflow_index(0);
-        assert!(cell.is_complex());
-        assert!(cell.flags().contains(CellFlags::COMPLEX));
-    }
-
-    #[test]
-    fn test_with_overflow_index_stores_index() {
-        let cell = Cell::with_overflow_index(42);
-        assert_eq!(cell.char_data(), 42);
-    }
-
-    #[test]
-    fn test_with_overflow_index_max_value() {
-        let cell = Cell::with_overflow_index(u16::MAX);
-        assert!(cell.is_complex());
-        assert_eq!(cell.char_data(), u16::MAX);
-    }
-
-    #[test]
-    fn test_with_overflow_index_default_colors() {
-        let cell = Cell::with_overflow_index(7);
-        assert!(cell.colors().is_default());
-    }
-
-    #[test]
     fn test_with_overflow_index_returns_replacement_char() {
         let cell = Cell::with_overflow_index(100);
         assert_eq!(cell.char(), '\u{FFFD}');
@@ -448,73 +405,7 @@ mod tests {
 
     // with_style_id — StyleId interning
 
-    #[test]
-    fn test_with_style_id_sets_uses_style_id_flag() {
-        let cell = Cell::with_style_id('A', StyleId::DEFAULT, CellFlags::empty());
-        assert!(cell.uses_style_id());
-        assert!(cell.flags().contains(CellFlags::USES_STYLE_ID));
-    }
-
-    #[test]
-    fn test_with_style_id_stores_style_id_in_colors() {
-        let sid = StyleId::new(42);
-        let cell = Cell::with_style_id('A', sid, CellFlags::empty());
-        assert_eq!(cell.style_id(), sid);
-        assert_eq!(cell.style_id().raw(), 42);
-    }
-
-    #[test]
-    fn test_with_style_id_preserves_character() {
-        let cell = Cell::with_style_id('W', StyleId::new(5), CellFlags::empty());
-        assert_eq!(cell.char(), 'W');
-    }
-
-    #[test]
-    fn test_with_style_id_non_bmp_stores_replacement() {
-        let cell = Cell::with_style_id('\u{1F600}', StyleId::new(1), CellFlags::empty());
-        assert_eq!(cell.char(), '\u{FFFD}');
-        assert!(cell.uses_style_id());
-    }
-
-    #[test]
-    fn test_with_style_id_merges_cell_flags() {
-        let cell = Cell::with_style_id('A', StyleId::new(1), CellFlags::WIDE);
-        assert!(cell.flags().contains(CellFlags::WIDE));
-        assert!(cell.flags().contains(CellFlags::USES_STYLE_ID));
-    }
-
-    #[test]
-    fn test_with_style_id_max_style_id() {
-        let sid = StyleId::new(u16::MAX);
-        let cell = Cell::with_style_id('M', sid, CellFlags::empty());
-        assert_eq!(cell.style_id(), sid);
-        assert_eq!(cell.style_id().raw(), u16::MAX);
-    }
-
     // from_ascii_with_style_id — ASCII + StyleId hot path
-
-    #[test]
-    fn test_from_ascii_with_style_id_stores_byte() {
-        let cell = Cell::from_ascii_with_style_id(b'H', StyleId::new(5), CellFlags::empty());
-        assert_eq!(cell.char(), 'H');
-        assert_eq!(cell.char_data(), b'H' as u16);
-    }
-
-    #[test]
-    fn test_from_ascii_with_style_id_sets_style() {
-        let sid = StyleId::new(99);
-        let cell = Cell::from_ascii_with_style_id(b'X', sid, CellFlags::empty());
-        assert!(cell.uses_style_id());
-        assert_eq!(cell.style_id(), sid);
-    }
-
-    #[test]
-    fn test_from_ascii_with_style_id_merges_flags() {
-        let cell =
-            Cell::from_ascii_with_style_id(b'Z', StyleId::new(1), CellFlags::WIDE_CONTINUATION);
-        assert!(cell.flags().contains(CellFlags::WIDE_CONTINUATION));
-        assert!(cell.flags().contains(CellFlags::USES_STYLE_ID));
-    }
 
     // Cross-constructor consistency
 

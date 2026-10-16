@@ -49,7 +49,6 @@ fn write_cell_run_fills_exact_line() {
     for col in 0..5 {
         assert_eq!(grid.cell(0, col).unwrap().char(), 'X');
     }
-    // Cursor should be at last column with pending wrap.
     assert_eq!(grid.cursor_col(), 4);
     assert!(grid.pending_wrap());
     assert_eq!(last_byte, Some(b'X'));
@@ -68,21 +67,16 @@ fn write_cell_run_wraps_across_lines() {
     );
     assert_eq!(written, 12);
 
-    // Row 0: 5x '-'
     for col in 0..5 {
         assert_eq!(grid.cell(0, col).unwrap().char(), '-');
     }
-    // Row 1: 5x '-'
     for col in 0..5 {
         assert_eq!(grid.cell(1, col).unwrap().char(), '-');
     }
-    // Row 2: 2x '-'
     assert_eq!(grid.cell(2, 0).unwrap().char(), '-');
     assert_eq!(grid.cell(2, 1).unwrap().char(), '-');
-    // Rest of row 2 empty
     assert_eq!(grid.cell(2, 2).unwrap().char(), ' ');
 
-    // Cursor on row 2, col 2 (next write position).
     assert_eq!(grid.cursor_row(), 2);
     assert_eq!(grid.cursor_col(), 2);
 }
@@ -122,7 +116,6 @@ fn write_cell_run_applies_style() {
 #[test]
 fn write_cell_run_scrolls_at_screen_bottom() {
     let mut grid = Grid::new(3, 5);
-    // Position cursor at the last row.
     grid.set_cursor(2, 0);
 
     let mut last_byte = None;
@@ -135,15 +128,13 @@ fn write_cell_run_scrolls_at_screen_bottom() {
         &mut last_byte,
     );
 
-    // After writing 5 chars on row 2, it wraps. The grid scrolls up by 1
-    // so original rows 1, 2 become rows 0, 1, and the 6th char goes to row 2.
+    // The wrap scrolls the grid up by 1; the 6th char lands on row 2.
     assert_eq!(grid.cell(2, 0).unwrap().char(), 'S');
     assert_eq!(grid.cursor_row(), 2);
 }
 
 #[test]
 fn write_cell_run_cursor_consistency_with_write_char_wrap() {
-    // Verify cursor ends up in the same place as per-char writes.
     for count in [1, 5, 10, 11, 20] {
         let mut grid_bulk = Grid::new(4, 10);
         let mut grid_char = Grid::new(4, 10);

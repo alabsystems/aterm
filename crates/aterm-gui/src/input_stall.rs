@@ -511,15 +511,15 @@ pub(crate) fn is_restart_signal(sig: libc::c_int) -> bool {
 }
 
 /// Whether the PTY `master`'s foreground job is STOPPED (`SIGSTOP`/`SIGTSTP`):
-/// its group leader's `pbi_status` is `SSTOP`. `false` when unknown, and
-/// always off macOS.
+/// its group leader's `pbi_status` is `SSTOP` (macOS) or `/proc/<pid>/stat`
+/// state is `'T'`/`'t'` (Linux). `false` when unknown.
 pub(crate) fn fg_stopped(master: i32) -> bool {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let pgrp = crate::quit_safety::foreground_pgrp(master);
         pgrp > 0 && pid_stopped(pgrp) == Some(true)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = master;
         false
@@ -527,11 +527,11 @@ pub(crate) fn fg_stopped(master: i32) -> bool {
 }
 
 /// The PTY `master`'s foreground group leader's resident set, in MiB, or
-/// `None` when unknown (and always off macOS). For the stall's publication:
+/// `None` when unknown. For the stall's publication:
 /// the incident's program was 38.8 GiB resident when it was found, and an
 /// owner deciding whether to restart it wants that number beside the stall.
 pub(crate) fn fg_rss_mb(master: i32) -> Option<u64> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let pgrp = crate::quit_safety::foreground_pgrp(master);
         if pgrp <= 0 {
@@ -539,7 +539,7 @@ pub(crate) fn fg_rss_mb(master: i32) -> Option<u64> {
         }
         pid_rss_mb(pgrp)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = master;
         None
@@ -547,11 +547,11 @@ pub(crate) fn fg_rss_mb(master: i32) -> Option<u64> {
 }
 
 /// The PTY `master`'s foreground group leader and its total CPU time in
-/// nanoseconds ([`pid_cpu_ns`]), or `None` when unknown (and always off
-/// macOS). The LEADER only: zsh's completion child runs in zsh's group and
-/// may burn CPU while zsh, which holds the unread key, sleeps.
+/// nanoseconds ([`pid_cpu_ns`]), or `None` when unknown. The LEADER only:
+/// zsh's completion child runs in zsh's group and may burn CPU while zsh,
+/// which holds the unread key, sleeps.
 pub(crate) fn fg_cpu(master: i32) -> Option<(i32, u64)> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let pgrp = crate::quit_safety::foreground_pgrp(master);
         if pgrp <= 0 {
@@ -559,7 +559,7 @@ pub(crate) fn fg_cpu(master: i32) -> Option<(i32, u64)> {
         }
         pid_cpu_ns(pgrp).map(|ns| (pgrp, ns))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = master;
         None
@@ -638,16 +638,17 @@ pub(crate) fn pid_rss_mb(pid: libc::pid_t) -> Option<u64> {
 /// the timebase cannot be read.
 #[cfg(target_os = "macos")]
 pub(crate) fn pid_cpu_ns(pid: libc::pid_t) -> Option<u64> {
+    static TIMEBASE: std::sync::OnceLock<Option<(u128, u128)>> = std::sync::OnceLock::new();
+    let (numer, denom) = (*TIMEBASE.get_or_init(|| {
+        let mut base = MachTimebaseInfo { numer: 0, denom: 0 };
+        // SAFETY: `base` is a live, writable `mach_timebase_info` record; the
+        // call only fills it.
+        let rc = unsafe { mach_timebase_info(&raw mut base) };
+        (rc == 0 && base.denom != 0).then_some((u128::from(base.numer), u128::from(base.denom)))
+    }))?;
     let info = pid_task_info(pid)?;
-    let mut base = MachTimebaseInfo { numer: 0, denom: 0 };
-    // SAFETY: `base` is a live, writable `mach_timebase_info` record; the
-    // call only fills it.
-    let rc = unsafe { mach_timebase_info(&raw mut base) };
-    if rc != 0 || base.denom == 0 {
-        return None;
-    }
     let ticks = u128::from(info.total_user) + u128::from(info.total_system);
-    u64::try_from(ticks * u128::from(base.numer) / u128::from(base.denom)).ok()
+    u64::try_from(ticks * numer / denom).ok()
 }
 
 /// `proc_pidinfo(pid, PROC_PIDTASKINFO)`, read only when the kernel wrote
@@ -672,6 +673,64 @@ fn pid_task_info(pid: libc::pid_t) -> Option<ProcTaskInfo> {
     // SAFETY: the exact-size success above initialized the whole record, and
     // every field is a plain integer, valid for any bit pattern.
     Some(unsafe { info.assume_init() })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_stat_after_comm(pid: libc::pid_t) -> Option<String> {
+    use std::os::unix::fs::MetadataExt as _;
+    if pid <= 1 {
+        return None;
+    }
+    let path = format!("/proc/{pid}/stat");
+    let meta = std::fs::metadata(&path).ok()?;
+    // SAFETY: `geteuid` is a side-effect-free libc getter.
+    let ours = unsafe { libc::geteuid() };
+    if meta.uid() != ours {
+        return None;
+    }
+    let stat = std::fs::read_to_string(path).ok()?;
+    let close_paren = stat.rfind(')')?;
+    Some(stat.get(close_paren + 1..)?.trim_start().to_string())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn pid_stopped(pid: libc::pid_t) -> Option<bool> {
+    let tail = linux_proc_stat_after_comm(pid)?;
+    let state = tail.split_whitespace().next()?;
+    Some(matches!(state, "T" | "t"))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn pid_rss_mb(pid: libc::pid_t) -> Option<u64> {
+    let tail = linux_proc_stat_after_comm(pid)?;
+    // Field 24 in `/proc/[pid]/stat` is `rss` (in pages), which is index 21
+    // in the space-separated tokens after `(comm)`.
+    let rss_pages: u64 = tail.split_whitespace().nth(21)?.parse().ok()?;
+    static PAGE_SIZE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let page_size = (*PAGE_SIZE.get_or_init(|| {
+        // SAFETY: `sysconf(_SC_PAGESIZE)` is a thread-safe POSIX query.
+        let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        u64::try_from(v).ok().filter(|&b| b > 0)
+    }))?;
+    Some(rss_pages.saturating_mul(page_size) / (1024 * 1024))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn pid_cpu_ns(pid: libc::pid_t) -> Option<u64> {
+    static CLK_TCK: std::sync::OnceLock<Option<u128>> = std::sync::OnceLock::new();
+    let hz = (*CLK_TCK.get_or_init(|| {
+        // SAFETY: `sysconf(_SC_CLK_TCK)` is a thread-safe POSIX query.
+        let v = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        (v > 0).then(|| v as u128)
+    }))?;
+    let tail = linux_proc_stat_after_comm(pid)?;
+    let mut fields = tail.split_whitespace();
+    // Fields 14 (`utime`) and 15 (`stime`) in `/proc/[pid]/stat` are indices
+    // 11 and 12 after `(comm)`.
+    let utime: u64 = fields.nth(11)?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    let ticks = u128::from(utime) + u128::from(stime);
+    u64::try_from(ticks.saturating_mul(1_000_000_000) / hz).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1557,7 +1616,7 @@ pub(crate) fn since_hhmm(
 /// WHY (robustness backlog item 2, 2026-09-26): this line used to end `then
 /// claude --continue` for every Claude Code. `--continue` resumes the
 /// directory's NEWEST conversation, and that day four live Claude Code
-/// processes shared `/Users//example/aterm`, each with its own conversation: a
+/// processes shared one checkout, each with its own conversation: a
 /// person following the remedy in one tab would have resumed a sibling's.
 ///
 /// The command is never cut: the stored attention keeps
@@ -1696,14 +1755,19 @@ fn act_of(ctx: &SessionCtx, fact: &InputStallFact) -> Option<StallAct> {
 /// (`crate::status_item::SessionRow::restarts`) read alike. Three leaf
 /// locks, each released before the next (`ctx.meta`, the fabric state,
 /// `ctx.turn_lease`).
+///
+/// A PROVEN SELF-CLAIM is the host's hand too, for the remedies it keeps
+/// there (the codex-alab self-claim contract, §4): its watch-only worker's
+/// stall remedy and memory ceiling act from outside an agent that cannot
+/// restart itself out of a freeze.
 pub(crate) fn host_hand_refusal(ctx: &crate::SessionCtx, now_us: u64) -> Option<&'static str> {
     let own = crate::harness_host::holder();
     let claimed = ctx
         .meta
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .live_supervisor(now_us)
-        == Some(own.as_str());
+        .live_claim(now_us)
+        .is_some_and(|claim| claim.holder == own || claim.proven.is_some());
     if !claimed {
         return Some("not-supervised");
     }
@@ -1930,7 +1994,7 @@ impl crate::App {
         if let Some(fact) = &fact {
             self.session_status.inputs.set_act(id, fact.act.clone());
         }
-        let (agent_moved, text) = {
+        let (agent_moved, text, wake) = {
             let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let text = fact.as_ref().map(|fact| {
                 attention_now(
@@ -1941,8 +2005,16 @@ impl crate::App {
                     now,
                 )
             });
-            (tl.set_input(fact), text)
+            let moved = tl.set_input(fact);
+            (moved, text, tl.slog_wake())
         };
+        // A stall that lifts hands the word back to the screen's, which may
+        // be a resting one: the session log's settle wake is owed from here.
+        self.session_status.slog_wakes.note(id, wake);
+        if agent_moved {
+            // The A/B clock (Settings ▸ Harness): a stall moves the word too.
+            self.note_harness_phase(id);
+        }
         let attention_moved =
             crate::session_timeline::write_server_attention(ctx, SERVER_ATTENTION_OWNER, text);
         if (agent_moved || attention_moved) && self.subscribers.any() {
@@ -2124,7 +2196,9 @@ pub(crate) mod tests {
         assert_eq!(
             exempt,
             [
-                "close", "confirm", "pane", "reset", "resize", "restart", "signal", "tab"
+                // `askpass` reaches a PTY only by way of root, not by writing input,
+                // so the input-stall gate never refuses it; the halt still does.
+                "askpass", "close", "confirm", "pane", "reset", "resize", "restart", "signal", "tab"
             ]
         );
         // `invoke` is input-writing only for an action that writes input.
@@ -4027,6 +4101,7 @@ pub(crate) mod tests {
     /// one whose exit its relaunch brings back on its conversation.
     fn hosted_claude(sid: &str) -> aterm_agent::harness::relaunch::Snapshot {
         let snap = aterm_agent::harness::relaunch::Snapshot {
+            stored_login: false,
             tab: sid.to_string(),
             pid: 7,
             start: "Sat Sep 27 01:02:03 2026".to_string(),
@@ -4131,7 +4206,7 @@ pub(crate) mod tests {
                 let store = app.store.read().unwrap();
                 crate::App::status_session_row(
                     store.by_local(0).expect("session 0"),
-                    true,
+                    |_| true,
                     &Default::default(),
                 )
                 .input_stall
@@ -4287,6 +4362,7 @@ pub(crate) mod tests {
                 dialect: Some(aterm_agent::harness::upgrade::Dialect::Zsh),
                 codex: Some(aterm_agent::harness::relaunch::CodexRun {
                     home: std::path::PathBuf::from("/h/.codex"),
+                    home_env: None,
                     embedded: false,
                     started_ms: 0,
                     ambiguous,
@@ -4479,7 +4555,7 @@ pub(crate) mod tests {
             let store = app.store.read().unwrap();
             let row = crate::App::status_session_row(
                 store.by_local(0).expect("session 0"),
-                true,
+                |_| true,
                 relaunching,
             );
             assert!(row.supervised, "the host supervises it: {row:?}");

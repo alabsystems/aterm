@@ -78,10 +78,10 @@ fn posted_lines(c: &MessageCenter) -> usize {
     c.log().records().filter(|r| r.later).count()
 }
 
-/// A reporter states the WHOLE of its family each look. A new fact posts, the
-/// same fact is quiet, and a fact that stops being named ends only once it has
-/// gone unnamed for `RESOLVE_AFTER`: a look of silence is a flicker, not an
-/// end; a look that names it again clears the clock and writes no line.
+/// A reporter states the whole of its family each look. A new fact posts, the same fact
+/// is quiet, and a fact that stops being named ends only once it has gone unnamed for
+/// `RESOLVE_AFTER`: a look of silence is a flicker, not an end; a look that names it
+/// again clears the clock and writes no line.
 #[test]
 fn a_family_pass_ends_an_entry_only_after_ten_minutes_unnamed() {
     assert_eq!(RESOLVE_AFTER, ms(600_000));
@@ -125,12 +125,10 @@ fn a_family_pass_ends_an_entry_only_after_ten_minutes_unnamed() {
     assert_eq!(posted_lines(&c), 1);
 }
 
-/// THE CASE THAT MADE "TWO LOOKS" WRONG: the upgrade's
-/// looks are sent only when its rows CHANGE. The row leaves in one change (the
-/// owner restarts Claude by hand, or closes the tab): ONE look, then silence.
-/// The entry must still end — by the digest's own clock, which the host arms
-/// (`digest_deadline`) and settles (`settle_digest`) — and the log must say
-/// when it really ended.
+/// The upgrade's looks are sent only when its rows change, so a row that leaves in one
+/// change (the owner quits Claude by hand, or closes the tab) gets one look, then
+/// silence. The entry still ends, by the digest's own clock the host arms
+/// (`digest_deadline`) and settles (`settle_digest`), and the log says when.
 #[test]
 fn an_entry_whose_row_left_in_one_change_ends_at_the_digests_own_clock() {
     let now = t0();
@@ -178,10 +176,9 @@ fn a_resolved_entry_that_returns_is_news() {
     assert_eq!((s.posted, s.suppressed), (1, 0));
 }
 
-/// One producer, one mode: the upgrade ROWS'
-/// pass sweeps everything under `harness.upgrade.`, so a fact the HOST raises
-/// by event (the state folder it cannot use) has a prefix of its own and
-/// survives any number of the rows' passes.
+/// One producer, one mode: the upgrade rows' pass sweeps everything under
+/// `harness.upgrade.`, so a fact the host raises by event (the state folder it cannot
+/// use) has a prefix of its own and survives any number of the rows' passes.
 #[test]
 fn an_event_raised_sibling_survives_the_rows_family_pass() {
     let now = t0();
@@ -212,8 +209,8 @@ fn an_event_raised_sibling_survives_the_rows_family_pass() {
     assert_eq!(keys.len(), 2);
 }
 
-/// The roster: every family has ONE producer and ONE mode, and no family's
-/// prefix starts another's (a pass over one must never sweep the other).
+/// The roster: every family has one producer and one mode, and no family's prefix
+/// starts another's (a pass over one must never sweep the other).
 #[test]
 fn every_family_has_one_mode_and_no_prefix_shadows_another() {
     let all = Family::ALL;
@@ -229,13 +226,17 @@ fn every_family_has_one_mode_and_no_prefix_shadows_another() {
             }
         }
     }
-    // The level families are the two whose reporters look on a cadence of
-    // their own; everything else raises by event and is never swept.
+    // The level families are the three whose reporters look on a cadence of
+    // their own (the AI CLIs' look among them: each look states every CLI
+    // that needs a person); everything else raises by event and is never
+    // swept.
     let level: Vec<Family> = all
         .into_iter()
         .filter(|f| f.mode() == Mode::Level)
         .collect();
-    assert_eq!(level, vec![Family::Upgrade, Family::Resume]);
+    assert_eq!(level, vec![Family::Upgrade, Family::Resume, Family::Ai]);
+    assert_eq!(Family::Ai.stem(), "ai");
+    assert_eq!(Family::Ai.tag(), tags::HARNESS);
     // The accounts' facts are the machine's, raised by the host's own look: a
     // prefix beside the supervisor's, never under it, whose adopted-line sweep
     // would end them.
@@ -339,11 +340,10 @@ fn an_explicit_clear_ends_the_entry_at_once() {
     assert_eq!(s.posted, 1);
 }
 
-/// THE NORMAL ORDER OF THE FULL DISK ACCESS CARD: the owner presses the entry's
-/// button (filed `Answered`, quiet for its span), and only THEN does the probe
-/// read the grant. The verified grant ends the fact, so the next regression is
-/// news, not a repeat of what the owner put away — in this process and after a
-/// restart.
+/// The Full Disk Access card's normal order: the owner presses the entry's button
+/// (filed `Answered`, quiet for its span), and only then does the probe read the grant.
+/// The verified grant ends the fact, so the next regression is news, in this process
+/// and after a restart.
 #[test]
 fn a_grant_after_the_owners_answer_makes_the_next_regression_news() {
     use crate::model::ActionIndex;
@@ -401,12 +401,11 @@ fn on_disk(c: &mut MessageCenter) -> Vec<LogLine> {
         .collect()
 }
 
-/// The successor loads the file at its launch and waits for Commit; the owner
-/// presses `Dismiss all` in the PARENT meanwhile. At Commit the successor reads
-/// the file's tail again: the dismissed fact stays filed. Two negative controls
-/// pin the law: a successor that trusts its launch snapshot (`StaleSuccessor`)
-/// and a parent whose dismissal never reached the file (`NoFlush`) both show
-/// the fact the owner had just dismissed.
+/// The successor loads the file at its launch and waits for Commit; the owner presses
+/// `Dismiss all` in the parent meanwhile. At Commit the successor reads the file's tail
+/// again, so the dismissed fact stays filed. Negative controls: a successor that trusts
+/// its launch snapshot (`StaleSuccessor`) and a parent whose dismissal never reached the
+/// file (`NoFlush`) both show the fact again.
 #[test]
 fn the_successor_honours_a_dismissal_the_parent_made_while_they_overlapped() {
     let now = t0();
@@ -415,7 +414,7 @@ fn the_successor_honours_a_dismissal_the_parent_made_while_they_overlapped() {
     let mut parent = fresh(now);
     let _ = parent.sync_digest(UPGRADE, vec![own_work("s-1", 16)], wall, now);
     let file: Vec<LogLine> = on_disk(&mut parent);
-    // The successor launches: it loads the file AS IT IS NOW, and adopts.
+    // The successor launches: it loads the file as it is now, and adopts.
     let load = |file: &[LogLine], at: Instant| {
         let mut log = MessageLog::empty();
         log.replay_all(file.iter().cloned());

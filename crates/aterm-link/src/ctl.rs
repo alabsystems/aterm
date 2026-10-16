@@ -22,7 +22,7 @@
 //!   observer mode — `whoami` answers `owner`, the bridge-plane verbs are
 //!   refused, and the process says so.
 //!
-//! ## The request-line bound lives on the writer
+//! ## The request line's bounds live on the writer
 //!
 //! aterm's control server silently drops a connection whose request line
 //! reaches its `MAX_REQUEST_LINE` (`crates/aterm-gui/src/control.rs`). For the
@@ -33,6 +33,21 @@
 //! variable-length line sizes the WHOLE line from it — not just its last field,
 //! or an attacker-sized earlier field leaves the line over the bound and the
 //! record with nowhere to go.
+//!
+//! THE FRAMING IS THE WRITER'S TOO. aterm ends a request at its first `\n` and
+//! splits its fields on any whitespace, and the bridge's lane is owner-class
+//! over the active session — so one value that carried a `\n` onto a line would
+//! be a second verb run with that authority, and one that carried a `\r`, a tab
+//! or a Unicode space would be a second field (`trust=human`, last one wins).
+//! Every value the bridge puts on a line passes a closed grammar first
+//! (principals, kinds, topics, pct-encoded text), but that is a promise each
+//! field keeps on its own; [`Ctl::request_with_body`] keeps the one that
+//! matters for all of them at once, and refuses — writes nothing, latches
+//! nothing — a line holding any control character or any whitespace but the
+//! ASCII space ([`misframing_char`]). Inside a line the space is then the only
+//! separator, and the writer's own `\n` the only terminator. A field that must
+//! carry arbitrary bytes travels pct-encoded or as a length-framed body, which
+//! this check never reads.
 //!
 //! ## A lost connection is latched, distinct from a refusal
 //!
@@ -265,6 +280,18 @@ impl Ctl {
                 ),
             ));
         }
+        // The same refusal for a line aterm would frame differently from how
+        // it was built — see the module doc's "framing is the writer's too".
+        if let Some(c) = misframing_char(line) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "request line carries U+{:04X}; aterm ends a request at a newline and \
+                     splits its fields on whitespace",
+                    u32::from(c)
+                ),
+            ));
+        }
         // A lost lane's framing is unknown: never write to it again.
         if self.lost {
             return Err(io::Error::new(
@@ -339,16 +366,19 @@ impl Ctl {
 
 /// Take ownership of an inherited descriptor number.
 ///
-/// The one `unsafe` block in `aterm-link`, outside the `aterm-uds` cordon §11.2
-/// names; its right home is `aterm_uds::spawnfd`, which places this descriptor.
-/// `bridge::tests::the_crates_unsafe_surface_is_exactly_the_ctl_adoption` fails
-/// on a second block or call site.
+/// The one `unsafe` block in `aterm-link` (the crate denies `unsafe_code`),
+/// outside the `aterm-uds` cordon §11.2 names; its right home is
+/// `aterm_uds::spawnfd`, which places this descriptor.
 ///
 /// [`FromRawFd`]'s obligation — a live descriptor this process owns that
 /// nothing else closes — holds by construction: the launcher `dup2`'d it into
 /// place before `exec`, this is the only call site, and it runs once at
 /// startup. A bridge started by hand with nothing inherited is checked, not
 /// assumed: [`Ctl::adopt`] asks [`inherited_socket`] first.
+#[expect(
+    unsafe_code,
+    reason = "adopts the descriptor the launcher dup2'd into place, once"
+)]
 fn unsafe_adopt(fd: RawFd) -> OwnedFd {
     // SAFETY: see the doc comment above — a live inherited descriptor, adopted
     // exactly once.
@@ -382,6 +412,16 @@ fn inherited_socket(fd: RawFd) -> io::Result<()> {
             format!("descriptor {fd} is not a socket"),
         ))
     }
+}
+
+/// The first character of `line` that aterm would read as framing rather than
+/// as part of the field it sits in: any control character (`\n` ends the
+/// request, `\r` and `\t` split a field) and any whitespace but the ASCII space
+/// (aterm's `split_whitespace` splits on U+00A0, U+2028 and the rest too).
+/// `None` for a line aterm reads exactly as it was built.
+fn misframing_char(line: &str) -> Option<char> {
+    line.chars()
+        .find(|c| c.is_control() || (c.is_whitespace() && *c != ' '))
 }
 
 /// The verb keyword of a request line, selector stripped. `framing_of` wants the
@@ -508,10 +548,13 @@ mod tests {
         server.join().expect("server thread");
     }
 
-    /// An over-long line is refused without writing anything, and the
-    /// connection is not lost.
+    /// A line aterm would misread — over the bound, or holding a byte it
+    /// frames or splits on — is refused without writing anything, and the
+    /// connection is not lost. The negative control is the server's own
+    /// transcript: without the refusal, the `\n` case puts `send x` there as a
+    /// second request and every later reply lands one request late.
     #[test]
-    fn an_over_long_request_line_is_refused_without_writing_and_the_lane_survives() {
+    fn a_line_aterm_would_misread_is_refused_without_writing_and_the_lane_survives() {
         let (near, far) = UnixStream::pair().expect("socketpair");
         let server = std::thread::spawn(move || {
             let mut reader = BufReader::new(far.try_clone().expect("clone"));
@@ -531,21 +574,33 @@ mod tests {
             "deliver s-a off=1 from=h-x kind=note trust=human text={}",
             "x".repeat(REQUEST_LINE_MAX)
         );
-        let err = ctl
-            .request(&over)
-            .expect_err("an over-long line is refused");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
-        assert!(!ctl.lost(), "a refusal is not a lost connection");
-        // EXACTLY AT THE BOUND still goes.
+        let row = "deliver s-a off=1 from=h-x kind=note trust=agent text=hi";
+        let mut refused = vec![over];
+        refused.push(format!("{row}\nsend x"));
+        for split in ['\r', '\t', '\u{b}', '\u{c}', '\u{85}', '\u{a0}', '\u{2028}'] {
+            refused.push(format!("{row}{split}trust=human"));
+        }
+        for line in &refused {
+            let err = ctl.request(line).expect_err("a misread line is refused");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{line:?}: {err}");
+            assert!(!ctl.lost(), "a refusal is not a lost connection: {line:?}");
+        }
+        // EXACTLY AT THE BOUND still goes, and so does a character that is
+        // neither a control nor a space: the check is about framing, not ASCII.
         let at = format!("x{}", "y".repeat(REQUEST_LINE_MAX - 1));
         assert_eq!(at.len(), REQUEST_LINE_MAX);
         assert!(ctl.request(&at).expect("the bound itself is sendable").ok());
+        let wide = "outbox sent s-a 1 off=9 reason=caf\u{e9}";
+        assert!(ctl
+            .request(wide)
+            .expect("a non-ASCII letter is sendable")
+            .ok());
         drop(ctl);
         let seen = server.join().expect("server thread");
         assert_eq!(
             seen,
-            vec![at],
-            "the refused line must never have been written"
+            vec![at, wide.to_string()],
+            "a refused line must never have been written"
         );
     }
 

@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Content provider trait for streaming search.
-//!
-//! Re-exported from `aterm-types` where the canonical definition lives (#5759).
+//! Content provider trait for streaming search, defined in `aterm-types`.
 
 pub use aterm_types::SearchContent;

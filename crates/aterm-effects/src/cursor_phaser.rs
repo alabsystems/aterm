@@ -16,12 +16,10 @@
 //!   (trailing spectrum left, leading right), unlike the rainbow kitty's banded
 //!   ring.
 //!
-//! Text-safe as [`crate::cursor_rainbow`] is: the fill goes through the
-//! renderer's `floor_cursor_fill` contrast floor, and the wings are additive
-//! [`GlowQuad`] light with capped coverage; only the dim outer tint reaches over
-//! neighbouring glyphs. Clockless (pure in the injected `now`), it settles to
-//! inactive when the charge dies (then rides the blink cadence), and emits
-//! identical premultiplied quads on CPU and Metal.
+//! Text-safe as [`crate::cursor_rainbow`] is: the fill goes through the renderer's
+//! `floor_cursor_fill` contrast floor, and the wings are additive [`GlowQuad`] light with capped
+//! coverage; only the dim outer tint reaches over neighbouring glyphs. Pure in the injected
+//! `now`, it settles to inactive when the charge dies (then rides the blink cadence).
 
 use aterm_time::Instant;
 
@@ -79,11 +77,10 @@ const COV_IDLE: f32 = 46.0;
 const COV_MAX: f32 = 132.0;
 const COV_CAP: f32 = 96.0;
 
-/// Stack budget for the strip where all four [`WING_LAYERS`] overlap (hugging the
-/// cursor's cell edges, where the newest typed glyphs sit). The per-layer
-/// [`COV_CAP`] alone lets the sum reach ~250 at full charge and saturate those
-/// glyphs, so the shared core is capped so `Σ(layer × core) ≤ budget`, at the
-/// rainbow ribbon's text-safety ceiling, leaving the lens shape unchanged.
+/// Stack budget for the strip where all four [`WING_LAYERS`] overlap (hugging the cursor's cell
+/// edges, where the newest typed glyphs sit). The per-layer [`COV_CAP`] alone lets the sum reach
+/// ~280 at full charge and saturate those glyphs, so the shared core is capped so
+/// `Σ(layer × core) ≤ budget`, the rainbow ribbon's text-safety ceiling.
 const WING_STACK_BUDGET: f32 = 150.0;
 /// Σ of the [`WING_LAYERS`] coverage multipliers (the worst-case overlap).
 const WING_STACK_OVERLAP: f32 = 2.24;
@@ -95,30 +92,22 @@ const SETTLED_ENERGY: f32 = 0.02;
 /// Resolved per-frame inputs (Copy so the host reads it out before borrowing state).
 #[derive(Clone, Copy, Debug)]
 pub struct PhaserConfig {
-    /// Master on/off (the `phaser` style opted in AND the cursor is a focused,
-    /// visible block).
+    /// Master on/off (the `phaser` style opted in and the cursor is a focused, visible block).
     pub enabled: bool,
     /// Overall scale `0..1` — the reduced-motion / load-shed amplitude, folded in
     /// by the host exactly like the aurora. 0 ⇒ fully inert (plain themed cursor).
     pub intensity: f32,
-    /// The block's colour at rest, `0x00RRGGBB`: the terminal's resolved cursor
-    /// colour (OSC 12, else the configured theme cursor, else the live OSC 10
-    /// foreground). The beam hue is a tint over it, so a settled caret is the
-    /// user's cursor colour and charging blooms it toward the sweep.
-    ///
-    /// The fill leaves the tick as
-    /// [`aterm_render::RenderInput::cursor_fill_override`], which the renderer
-    /// applies instead of the frame cursor colour, so it must carry the host's
-    /// colour, as the comet and beam rod do (`CometConfig::color` /
-    /// `BeamRodConfig::color`).
-    ///
-    /// `None` uses the theme-polar base ([`BASE_DARK_THEME`] /
-    /// [`BASE_LIGHT_THEME`]) for callers with no cursor colour.
+    /// The block's colour at rest, `0x00RRGGBB`: the terminal's resolved cursor colour (OSC 12,
+    /// else the configured theme cursor, else the live OSC 10 foreground). The beam hue is a
+    /// tint over it, so a settled caret is the user's cursor colour. The fill leaves the tick as
+    /// [`aterm_render::RenderInput::cursor_fill_override`], which replaces the frame cursor
+    /// colour, so it must carry the host's colour, as the comet and beam rod do. `None` uses the
+    /// theme-polar base ([`BASE_DARK_THEME`] / [`BASE_LIGHT_THEME`]).
     pub base: Option<u32>,
 }
 
-/// What a tick produced: the beam-hued block FILL to hand the renderer (it floors
-/// it for contrast) and a fingerprint that changes on every visible step (0 when off).
+/// What a tick produced: the beam-hued block fill to hand the renderer (it floors it for
+/// contrast) and a fingerprint that changes on every visible step (0 when off).
 #[derive(Clone, Copy, Debug)]
 pub struct PhaserFrame {
     /// The beam-hued block-fill colour `0x00RRGGBB`, or `None` when the emitter
@@ -135,7 +124,7 @@ pub struct CursorPhaser {
     /// Idle-breath phase in turns `0..1`.
     pulse: f32,
     last: Option<Instant>,
-    /// Latched charge at the last tick (so [`is_active`] answers without a clock).
+    /// Latched charge at the last tick (so [`Self::is_active`] answers without a clock).
     energy: f32,
 }
 
@@ -197,11 +186,8 @@ impl CursorPhaser {
         }
         let breath = 0.5 + 0.5 * (self.pulse * std::f32::consts::TAU).sin(); // 0..1
 
-        // The block fill: the cursor's own colour tinted toward the beam's hue
-        // with charge. The renderer floors it against the cell bg (the cut-out
-        // glyph colour), so the glyph stays sharp. The base is OSC 12 or the
-        // theme `cursor_color` when the host resolved one, else the theme-polar
-        // constants.
+        // The block fill: the cursor's own colour tinted toward the beam's hue with charge. The
+        // renderer floors it against the cell bg, so the glyph stays sharp.
         let beam = hsv2rgb(hue, lerp(SAT_IDLE, SAT_MAX, e), lerp(VAL_IDLE, VAL_MAX, e));
         let base = cfg.base.unwrap_or(if dark_theme {
             BASE_DARK_THEME
@@ -239,8 +225,8 @@ impl CursorPhaser {
         }
     }
 
-    /// Emit the two lens-shaped wings as premultiplied additive quads. Bounded by
-    /// construction: ≤ 3 layers × (cell_h / slab) slabs × 2 sides.
+    /// Emit the two lens-shaped wings as premultiplied additive quads. Bounded by construction:
+    /// ≤ 4 layers × (cell_h / slab) slabs × 2 sides.
     #[allow(
         clippy::too_many_arguments,
         reason = "cursor cell + charge/hue + geometry/config; one internal call site"
@@ -280,8 +266,8 @@ impl CursorPhaser {
             if cov == 0 {
                 continue;
             }
-            // Prism fringe: the LEFT lobe trails the sweep, the RIGHT leads it.
-            // The core layer (fringe 0) is the pure beam hue on both sides.
+            // Prism fringe: the left lobe trails the sweep, the right leads it. The core layer
+            // (fringe 0) is the pure beam hue on both sides.
             let left_premul = premul_rgb(hsv2rgb(hue - fringe, 0.95, 1.0), cov);
             let right_premul = premul_rgb(hsv2rgb(hue + fringe, 0.95, 1.0), cov);
             let half_h = (ch * 0.5 * hx).max(1.0);
@@ -327,8 +313,7 @@ mod tests {
         PhaserConfig {
             enabled: true,
             intensity: 1.0,
-            // No host base: these fixtures pin the historical theme-polar
-            // bloom, so they stay byte-identical to the pre-`base` tick.
+            // No host base: these fixtures pin the theme-polar bloom.
             base: None,
         }
     }
@@ -489,8 +474,8 @@ mod tests {
         let g = geom();
         let mut out = Vec::new();
         let t = Instant::now();
-        // A SETTLED emitter (energy 0) with a FIXED beam hue: the only thing
-        // that can move this fill between two ticks is the base.
+        // A settled emitter (energy 0) with a fixed beam hue: only the base can move this fill
+        // between two ticks.
         let settled = |base: u32, dark: bool, out: &mut Vec<GlowQuad>| {
             let c = PhaserConfig {
                 base: Some(base),
@@ -520,8 +505,8 @@ mod tests {
                 "two cursor colours must not paint one identical block (dark={dark})"
             );
         }
-        // …and charge still blooms the BEAM hue over that base rather than
-        // replacing the base's job: the charged fill differs markedly.
+        // …and charge still blooms the beam hue over that base: the charged fill differs
+        // markedly.
         let c = PhaserConfig {
             base: Some(0x00FF_0000),
             ..cfg()
@@ -534,8 +519,7 @@ mod tests {
         assert_ne!(hot, settled(0x00FF_0000, true, &mut out));
     }
 
-    /// Full charge reaches further sideways and burns far brighter than the idle
-    /// port glow — the capacitor-charging read.
+    /// Full charge reaches further sideways and burns far brighter than the idle port glow.
     #[test]
     fn charge_widens_and_brightens_the_wings() {
         let g = geom();
@@ -597,9 +581,8 @@ mod tests {
         }
     }
 
-    /// Every emitted quad is single-row, grid-interior, with capped coverage
-    /// (row gate, parity and legibility invariants), including at a grid-edge
-    /// cell where clamping applies.
+    /// Every emitted quad is single-row, inside the grid, with capped coverage, including at a
+    /// grid-edge cell where clamping applies.
     #[test]
     fn quads_respect_grid_and_cap() {
         let g = geom();
@@ -701,8 +684,8 @@ mod tests {
         assert!(!cp.is_active());
     }
 
-    /// The per-frame quad budget is bounded by construction (3 layers × slabs ×
-    /// 2 sides), far under the aurora's MAX_QUADS defence.
+    /// The per-frame quad budget is bounded by construction (4 layers × slabs × 2 sides), far
+    /// under the aurora's MAX_QUADS defence.
     #[test]
     fn quad_count_is_bounded() {
         let g = Geom {

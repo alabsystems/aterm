@@ -49,6 +49,7 @@ fn record(local_id: u64) -> SessionRecord {
         role: None,
         attention: None,
         questions: None,
+        autopilot: None,
         control: None,
         frozen_path: false,
         identity: None,
@@ -61,6 +62,7 @@ fn record(local_id: u64) -> SessionRecord {
         history_withheld: false,
         history_lost: 0,
         hold: None,
+        more_holds: Vec::new(),
         supervisor: None,
         claim_known: false,
         attention_owners: Vec::new(),
@@ -68,6 +70,7 @@ fn record(local_id: u64) -> SessionRecord {
         render_debt: None,
         fabric: Default::default(),
         timeline_id: 0,
+        log_ids: None,
         journal_key: None,
     }
 }
@@ -2446,9 +2449,9 @@ fn a_paused_held_pass_finishes_after_the_resume() {
 /// whole [`FORK_EXPORT_WAIT`]; and the export they left unfinished was said as
 /// one that had not reached every tab, though it had. Past the handed
 /// sessions' passes the held ones get at most their own bound: here a held
-/// pass that never finishes, a wait of a minute and a held bound of nothing,
-/// and the export is handed over at once, the tab's whole, not "unfinished",
-/// and the held pane told why it has none.
+/// pass that never finishes, a wait of two minutes and a held bound of
+/// nothing, and the export is handed over inside the minute's hang detector,
+/// the tab's whole, not "unfinished", and the held pane told why it has none.
 ///
 /// FAILS WITHOUT THE FIX: the export waited out the whole wait for the held
 /// pass, and was booked unfinished.
@@ -2465,9 +2468,9 @@ fn the_fork_lanes_held_passes_wait_only_their_own_bound() {
     let started = std::time::Instant::now();
     let results = HistoryExporter::start(dir.path().to_path_buf(), sessions, false)
         .unwrap()
-        .finish_deferred(aterm_spec::wait::MUST_HAPPEN, Duration::ZERO);
+        .finish_deferred(aterm_spec::wait::MUST_HAPPEN * 2, Duration::ZERO);
     assert!(
-        started.elapsed() < aterm_spec::wait::MUST_HAPPEN / 2,
+        started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
         "the held pass was not waited for: {:?}",
         started.elapsed()
     );

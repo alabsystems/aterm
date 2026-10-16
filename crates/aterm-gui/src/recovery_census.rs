@@ -1,49 +1,48 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE RECOVERY CENSUS: at each windowed launch of the installed app, one row in the
-//! recovery ledger saying how the run before it ended (`aterm_update::recovery_ledger`,
-//! the PTY keeper's P0, `docs/DESIGN-pty-keeper-2026-09-26.md` §7).
+//! The recovery census: at each windowed launch of the installed app, one row in the
+//! recovery ledger saying how the run before it ended
+//! (`aterm_update::recovery_ledger`, `docs/DESIGN-pty-keeper-2026-09-26.md` §7).
 //!
-//! IT READS WHAT IS ALREADY THERE, off the main thread, after the crash scans:
+//! It reads what is already there, off the main thread, after the crash scans:
 //!
-//! * THE CRASH MARKER ([`crate::crash_signal::markers`]) — one per run, named for its
+//! * the crash marker ([`crate::crash_signal::markers`]): one per run, named for its
 //!   pid and birth, removed by every clean exit. Non-empty: a fatal signal, whose
 //!   number the handler wrote and whose mtime is the moment of death. Empty and
 //!   dead: a kill. Gone: a clean exit.
-//! * THE PANIC REPORT (`crash-<pid>.log`, [`crate::logging`]) — its first line
-//!   carries the moment it was filed.
-//! * `aterm.log` — every line carries its time and its writer's pid. The watchdog's
-//!   `MAIN-THREAD STALL` lines and the `STALL ENDED` line say whether the run's last
-//!   word was an unended stall ([`crate::watchdog`]); the pressure source's lines say
-//!   which level the OS last reported ([`crate::memory_pressure`]); the final exit's
-//!   one line dates a quit; the run's last line bounds a kill.
-//! * THE BOOT SENTINEL (`aterm_update::trial_launch_count`) — whether the previous
-//!   build was still inside its boot trial (§2 F17).
+//! * the panic report (`crash-<pid>.log`, [`crate::logging`]), whose first line
+//!   dates it.
+//! * `aterm.log`, every line stamped with its time and writer's pid: the watchdog's
+//!   stall lines say whether the run's last word was an unended stall
+//!   ([`crate::watchdog`]), the pressure source's lines the level the OS last
+//!   reported ([`crate::memory_pressure`]), the final exit's line dates a quit, and
+//!   the run's last line bounds a kill.
+//! * the boot sentinel (`aterm_update::trial_launch_count`): whether the previous
+//!   build was still inside its boot trial.
 //!
-//! The crash scans (`logging::take_crash_evidence` / `take_kill_evidence`) consume
-//! their artifacts by renaming them `.seen`, so the census reads both names. Every
-//! artifact is tied to its run by pid AND by time — pids are recycled — so a report
-//! older than the run's birth is never that run's.
+//! The crash scans (`logging::take_crash_evidence` / `take_kill_evidence`) rename
+//! their artifacts `.seen`, so the census reads both names. Every artifact is tied to
+//! its run by pid and by time (pids are recycled), so a report older than the run's
+//! birth is never that run's.
 //!
-//! WHICH LAUNCHES WRITE: the ones whose crash marker is the daily driver's
-//! ([`crate::crash_signal::MarkerOwner::App`]) — a cold windowed start of the
+//! Only launches whose crash marker is the daily driver's
+//! ([`crate::crash_signal::MarkerOwner::App`]) write: a cold windowed start of the
 //! installed app, and an update successor once its Commit lands. An update's cold
-//! lane (no session open) exec's the new build IN PLACE: that image keeps the pid
-//! and the birth and boots as a cold start, and its row records the image it
-//! replaced as handed off — never the run before the process a second time. Test,
-//! dev, headless and translocated starts share the log directory and are SIGKILLed
-//! by harnesses routinely; they write nothing, exactly as they report nothing.
+//! lane exec's the new build in place, keeping the pid and birth; its row records the
+//! image it replaced as handed off, never the run before a second time. Test, dev,
+//! headless and translocated starts share the log directory and are SIGKILLed by
+//! harnesses routinely; they write nothing.
 //!
-//! WHAT IT CANNOT TELL: a run whose marker was never created (no private log dir)
-//! reads as clean, and so does a killed run whose consumed marker the crash scans
-//! pruned before an installed launch read it (they keep the newest `.seen` artifacts
-//! by mtime, and an empty marker's mtime is its run's birth); a run that filed a panic report on a background thread and then
-//! quit reads as a panic, as the crash banner does; a second instance still alive at
-//! the next launch is recorded as running and its own end is never classified, since
-//! each row looks one run back. And the pid-and-time tie excludes only an EARLIER
-//! owner of the pid: a process that reuses a dead run's pid before the next launch
-//! and writes `aterm.log` lines or a panic report lends them to the run.
+//! Blind spots: a run whose marker was never created (no private log dir) reads as
+//! clean, as does a killed run whose consumed marker the crash scans pruned before an
+//! installed launch read it (they keep the newest `.seen` artifacts by mtime, and an
+//! empty marker's mtime is its run's birth); a run that filed a panic report on a
+//! background thread and then quit reads as a panic; a second instance still alive
+//! at the next launch is recorded as running and its own end is never classified.
+//! The pid-and-time tie excludes only an earlier owner of the pid: a process that
+//! reuses a dead run's pid before the next launch lends its `aterm.log` lines or
+//! panic report to the run.
 
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -128,7 +127,7 @@ fn now_secs() -> u64 {
 }
 
 /// Record this launch in the ledger, on a thread of its own: the log scan reads up
-/// to [`MAX_LOG_BYTES`], and nothing on the launch path waits for it. Call AFTER the
+/// to [`MAX_LOG_BYTES`], and nothing on the launch path waits for it. Call after the
 /// crash scans, whose renames it reads. A no-op without a private log directory.
 pub(crate) fn record(launch: LaunchKind) {
     let spawned = std::thread::Builder::new()
@@ -173,11 +172,10 @@ pub(crate) fn census_row(
     let own_image = rows.last().filter(|row| is_me(row)).cloned();
     let last = rows.into_iter().rev().find(|row| !is_me(row));
     let prev = match (launch, own_image, last) {
-        // The newest row is THIS process's own: an update's cold lane exec'd a new
-        // image in place (same pid, same kernel birth), and that image is booting
-        // now. Its previous run is the image it replaced, which handed off to an
-        // update; the run before THAT was classified by the old image's own row, and
-        // is never counted twice.
+        // The newest row is this process's own: an update's cold lane exec'd a new
+        // image in place (same pid, same kernel birth). Its previous run is the image
+        // it replaced; the run before that is the old image's own row's, never
+        // counted twice.
         (LaunchKind::Cold, Some(own), _) => handoff_prev(dir, Some(&own), now, probe),
         (LaunchKind::Successor, _, last) => handoff_prev(dir, last.as_ref(), now, probe),
         (LaunchKind::Cold, None, Some(last)) => cold_prev(dir, &last, probe),
@@ -284,8 +282,8 @@ fn classify(evidence: &Evidence, facts: &LogFacts) -> (EndClass, Option<(u64, bo
         return (EndClass::Clean, Some((at, false)));
     }
     // A run always logs at its start (the watchdog arms), so a run with no marker
-    // AND no line of its own left no evidence at all — its lines rotated away, or
-    // the log directory was cleared — and "clean" would be a guess.
+    // and no line of its own left no evidence (its lines rotated away, or the log
+    // directory was cleared), and "clean" would be a guess.
     if facts.lines == 0 {
         return (EndClass::Unknown, None);
     }
@@ -839,7 +837,7 @@ mod tests {
     fn another_runs_artifacts_and_lines_under_a_recycled_pid_are_not_this_runs() {
         let s = Scratch::new("recycled");
         with_previous(&s);
-        // An EARLIER owner of pid 4242: its marker is named with an older birth, and
+        // An earlier owner of pid 4242: its marker is named with an older birth, and
         // its lines predate this run's birth.
         s.file(&format!("{}.seen", marker(4242, BORN - 86_400)), "");
         s.log(&[(BORN - 86_000, 4242, "MAIN-THREAD STALL: an old one")]);
@@ -912,11 +910,10 @@ mod tests {
         assert_eq!(row.prev.uptime.map(|u| u.secs), Some(700));
     }
 
-    /// The first row's artifact is never one whose marker names ANOTHER kind of
-    /// launch (`MarkerOwner::Other`: a test, dev or headless start, or a candidate
-    /// its parent could still reject). Those share the log directory, and one's crash
-    /// is not the run before an installed launch: read as it, it would be the
-    /// ledger's "last unexpected end" in `aterm doctor` until a real one replaced it.
+    /// The first row's artifact is never one whose marker names another kind of launch
+    /// (`MarkerOwner::Other`: a test, dev or headless start, or a candidate its parent
+    /// could still reject): those share the log directory, and one's crash is not the
+    /// run before an installed launch.
     #[test]
     fn the_first_row_never_takes_a_marker_owned_by_another_kind_of_launch() {
         let s = Scratch::new("first-other");
@@ -977,13 +974,10 @@ mod tests {
         assert_eq!(row.prev.build, None);
     }
 
-    /// THE COLD-LANE UPDATE EXEC. An update applied with no session open replaces
-    /// the process image IN PLACE (`app_update_handoff`'s `ApplyLane::Cold`,
-    /// `command.exec()`): the new image keeps the pid and the kernel birth, boots as
-    /// a cold windowed start and runs the census again. Its previous run is the
-    /// image it replaced, handed off to an update — never the run the old image's
-    /// own row already classified: counting that one twice would double every end
-    /// the ledger exists to count.
+    /// An update applied with no session open exec's the new image in place
+    /// (`ApplyLane::Cold`), keeping the pid and kernel birth: its previous run is the
+    /// image it replaced, handed off, never the run the old image's own row already
+    /// classified (which would count that end twice).
     #[test]
     fn a_cold_lane_update_exec_is_a_handoff_from_the_image_it_replaced() {
         let s = Scratch::new("self");

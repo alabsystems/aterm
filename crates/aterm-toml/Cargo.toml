@@ -18,8 +18,14 @@ description = "First-party TOML 1.0 for aterm: a serde Deserializer/Serializer (
 test = false
 [dependencies]
 # serde is the only dependency, on purpose: the tree's `#[derive(Deserialize)]`
-# models need a `serde::Deserializer`, and serde is already in the graph.
+# models need a `serde::Deserializer`. The workspace `serde` row is first-party
+# crates/aterm-serde since docs/AUDIT-third-party-2026-10-15.md SP.6.
 serde = { workspace = true }
+
+[dev-dependencies]
+# The tests and doctests derive their models, as a dependent would. The normal
+# row stays derive-free so the lib's closure holds no proc macro (Trust PM-1).
+serde = { workspace = true, features = ["derive"] }
 
 [lints]
 workspace = true

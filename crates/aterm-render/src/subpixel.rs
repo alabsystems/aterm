@@ -8,10 +8,12 @@
 //! `rgba=rgb`) encodes 3× horizontal resolution into the R/G/B subpixels of an
 //! LCD: each output pixel carries THREE coverage samples, one per channel, and
 //! the panel's physical subpixel geometry turns the chroma fringes back into
-//! sharpness. This module produces exactly that coverage: the same skrifa
+//! sharpness. This module produces exactly that coverage: the same hinted
 //! outline the [`crate::hinted`] seam draws (LCD hint target, FreeType's
-//! `FT_LOAD_TARGET_LCD` twin), rasterized at 3× horizontal resolution by the
-//! same [`crate::raster`] coverage fill, then run through FreeType's default FIR5
+//! `FT_LOAD_TARGET_LCD` twin) — or, with hinting off or on a face the LCD
+//! hinter declines, the unhinted outline the sfnt reader hands every unhinted
+//! raster in this crate — rasterized at 3× horizontal resolution by the same
+//! [`crate::raster`] coverage fill, then run through FreeType's default FIR5
 //! LCD filter and folded into 3-bytes-per-texel per-channel coverage.
 //!
 //! STAGE-1 SCOPE (the RFC's §4 step 1, deliberately narrow so every state
@@ -23,15 +25,12 @@
 //! shared [`crate::GlyphImage`] store, the goldens, and macOS/Windows are
 //! byte-identical whether the flag is on or off.
 //!
-//! Gated to `cfg(all(unix, not(target_os = "macos")))` at the module
+//! Production builds gate this to `cfg(all(unix, not(target_os = "macos")))` at the module
 //! declaration, exactly like [`crate::hinted`]: subpixel is the LINUX gap
 //! (macOS removed subpixel OS-wide; Windows has no aterm LCD story yet).
+//! macOS unit tests also compile this pure raster with embedded fonts.
 
-use skrifa::{
-    FontRef, MetadataProvider,
-    instance::{LocationRef, Size},
-    outline::{DrawSettings, Engine, HintingInstance, HintingOptions, SmoothMode, Target},
-};
+use aterm_font::autohint::{HintingInstance, Target};
 
 use crate::hinted::PathPen;
 
@@ -83,7 +82,7 @@ impl SubpixelMode {
     }
 }
 
-/// The skrifa hinting options for the subpixel raster: the autohinter with the
+/// The hinter target for the subpixel raster: the autohinter with the
 /// LCD smooth target — FreeType's `FT_LOAD_TARGET_LCD` pairing, which keeps
 /// vertical grid fit while leaving horizontal stem phases for the 3× subpixel
 /// resolution to resolve (snapping them, as the grayscale `full` mode does, is
@@ -91,17 +90,8 @@ impl SubpixelMode {
 /// purpose: the desktop reference pairs `rgba=rgb` with one hint discipline,
 /// not a matrix. `font_hinting = "off"` disables hinting for the subpixel
 /// raster too (the caller passes no instance).
-pub(crate) fn lcd_hint_options() -> HintingOptions {
-    HintingOptions {
-        engine: Engine::Auto(None),
-        target: Target::Smooth {
-            mode: SmoothMode::Lcd,
-            // Same rationale as the grayscale seam: no vertical supersampling
-            // in this analytic rasterizer. Interpreter paths only.
-            symmetric_rendering: false,
-            preserve_linear_metrics: false,
-        },
-    }
+pub(crate) fn lcd_hint_options() -> Target {
+    Target::Lcd
 }
 
 /// FreeType's default FIR5 LCD filter (`FT_LCD_FILTER_DEFAULT`), fixed-point
@@ -109,6 +99,37 @@ pub(crate) fn lcd_hint_options() -> HintingOptions {
 /// fringes stay below the visibility threshold while the luminance keeps the
 /// 3× resolution. Sums to 256, so solid ink stays solid (255 → 255).
 const FIR5: [u32; 5] = [8, 77, 86, 77, 8];
+
+/// An aterm-font outline (design units, y up) recorded into a [`PathPen`] in
+/// pixels (y up): every coordinate times `scale` (`px / units_per_em`), the
+/// scale the grayscale unhinted raster draws with.
+struct Scaled<'a> {
+    pen: &'a mut PathPen,
+    scale: f32,
+}
+
+impl aterm_font::OutlineSink for Scaled<'_> {
+    fn move_to(&mut self, x: f32, y: f32) {
+        let s = self.scale;
+        self.pen.move_to(x * s, y * s);
+    }
+    fn line_to(&mut self, x: f32, y: f32) {
+        let s = self.scale;
+        self.pen.line_to(x * s, y * s);
+    }
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        let s = self.scale;
+        self.pen.quad_to(x1 * s, y1 * s, x * s, y * s);
+    }
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        let s = self.scale;
+        self.pen
+            .curve_to(x1 * s, y1 * s, x2 * s, y2 * s, x * s, y * s);
+    }
+    fn close(&mut self) {
+        self.pen.close();
+    }
+}
 
 /// Rasterize glyph `gid` of the face at `px` as PER-CHANNEL (subpixel)
 /// coverage: `(width, height, xmin, ymin, bytes)` with **3 bytes per texel**
@@ -121,10 +142,13 @@ const FIR5: [u32; 5] = [8, 77, 86, 77, 8];
 /// than the grayscale raster's).
 ///
 /// `hint`, when present, must be an LCD-target instance built from
-/// [`lcd_hint_options`]; `None` draws the unhinted outline at `px` (the
-/// `font_hinting = "off"` pairing). `None` return = no outline (space) or a
-/// parse/draw failure — the caller falls back to the grayscale blit, so this
-/// is always a safe enhancement, exactly the hint seam's contract.
+/// [`lcd_hint_options`]; `None` draws the unhinted outline at `px` (with
+/// `font_hinting = "off"`, and for a face the LCD instance builder declines),
+/// read through aterm-font at the face's default instance like the grayscale
+/// unhinted raster, not through the hinter (TF.2 of
+/// docs/AUDIT-third-party-2026-10-15.md). `None` return = no outline (space)
+/// or a parse/draw failure — the caller falls back to the grayscale blit, so
+/// this is always a safe enhancement, exactly the hint seam's contract.
 pub(crate) fn subpixel_glyph_raster(
     bytes: &[u8],
     index: u32,
@@ -136,23 +160,25 @@ pub(crate) fn subpixel_glyph_raster(
     if !px.is_finite() || px <= 0.0 {
         return None;
     }
-    let font = FontRef::from_index(bytes, index).ok()?;
-    let glyph_id = skrifa::GlyphId::from(gid);
-    let outline = font.outline_glyphs().get(glyph_id)?;
     let mut pen = PathPen::default();
-    // Pedantic OFF on the hinted path (a bytecode error degrades to the
-    // unhinted outline, same as the grayscale seam).
     match hint {
-        Some(h) => outline
-            .draw(DrawSettings::hinted(h, false), &mut pen)
-            .ok()?,
-        None => outline
-            .draw(
-                DrawSettings::unhinted(Size::new(px), LocationRef::default()),
-                &mut pen,
-            )
-            .ok()?,
-    };
+        Some(h) => {
+            h.draw(bytes, index, gid, &mut pen)?;
+        }
+        None => {
+            let face = aterm_font::Face::parse(bytes, index).ok()?;
+            let scale = px / f32::from(face.units_per_em());
+            // `None` = no outline at all (space and friends) or a glyph id
+            // past the face: nothing to blit either way.
+            face.outline_glyph(
+                aterm_font::GlyphId(gid),
+                &mut Scaled {
+                    pen: &mut pen,
+                    scale,
+                },
+            )?;
+        }
+    }
     if pen.is_blank() {
         // No outline (space and friends): nothing to blit — the grayscale
         // path draws nothing for these either, so `None` is exact.
@@ -335,6 +361,29 @@ mod tests {
     fn unhinted_subpixel_rasterizes() {
         let gid = unicode_gid(dejavu(), 0, 'x').unwrap();
         assert!(subpixel_glyph_raster(dejavu(), 0, gid, 12.0, None, false).is_some());
+    }
+
+    /// The unhinted LCD raster fills the outline the grayscale unhinted raster
+    /// fills, at the same scale: the 3× fill and FIR5 both conserve ink, so a
+    /// glyph's LCD ink (channel sum over 3·255) is its grayscale ink to within
+    /// edge rounding (measured on these glyphs: 0.17% at worst). A scale slip
+    /// (design units left unscaled, or `px` applied twice) misses by a factor.
+    #[test]
+    fn unhinted_subpixel_ink_is_the_unhinted_outline() {
+        for px in [12.0f32, 24.0] {
+            for ch in ['x', 'M', '0', 'g', '@', 'i', '.', '_'] {
+                let gid = unicode_gid(dejavu(), 0, ch).unwrap();
+                let (.., lcd) = subpixel_glyph_raster(dejavu(), 0, gid, px, None, false).unwrap();
+                let (.., gray) =
+                    crate::variation::varied_glyph_raster(dejavu(), 0, &[], gid, px).unwrap();
+                let lcd_ink = lcd.iter().map(|&v| f32::from(v)).sum::<f32>() / (3.0 * 255.0);
+                let gray_ink = gray.iter().map(|&v| f32::from(v)).sum::<f32>() / 255.0;
+                assert!(
+                    (lcd_ink - gray_ink).abs() <= 0.01 * gray_ink + 0.05,
+                    "{ch:?} @{px}px: unhinted LCD ink {lcd_ink} vs grayscale {gray_ink}"
+                );
+            }
+        }
     }
 
     /// Spelling table: env/config parse and the canonical round-trip.

@@ -1,24 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Offline trainer for the tone-of-typing classifier (`aterm_effects::tone`).
-//! Run manually when the corpus or architecture changes; never part of a
-//! build:
+//! Offline trainer for the tone-of-typing classifier (`aterm_effects::tone`). Run by
+//! hand when the corpus or architecture changes:
 //!
 //! ```sh
-//! cargo run -p aterm-effects --example tone_train --release
+//! targo --unverified run -p aterm-effects --example tone_train --release
 //! ```
 //!
-//! Reads `data/tone_corpus.tsv`, trains the fastText-style bag model with plain
-//! SGD (deterministic seed), quantizes through the same `encode_model` /
-//! `from_bytes` pair the runtime uses, audits the quantized model against the
-//! held-out expectations file, and only then overwrites `data/tone_model.atn`.
-//! Floors here are stricter than the conformance tests' (train ≥ 0.95, holdout
-//! ≥ 0.78 overall, ≥ 0.70 per focus language vs the tests' 0.70 / 0.60), so the
-//! committed asset carries margin over the pins.
-//!
-//! Featurization is `tone::for_each_ngram_bucket`, the runtime function, so
-//! trained weights match the runtime's view of the text.
+//! Reads `data/tone_corpus.tsv`, trains the fastText-style bag model with plain SGD
+//! (deterministic seed), quantizes through the runtime's `encode_model` /
+//! `from_bytes` pair, audits the quantized model against `data/tone_holdout.tsv`,
+//! and only then overwrites `data/tone_model.atn`. Its floors (train ≥ 0.95,
+//! holdout ≥ 0.78 overall, ≥ 0.70 per focus language) are stricter than the
+//! conformance tests' 0.70 / 0.60, so the committed asset carries margin. Features
+//! come from the runtime's own `tone::for_each_ngram_bucket`.
 
 use aterm_effects::tone::{self, BUCKETS, EMBED, HIDDEN, TONE_COUNT, Tone, ToneModel, ToneScratch};
 
@@ -174,7 +170,7 @@ impl Net {
         for (c, &gc) in g.iter().enumerate() {
             self.b2[c] -= lr * gc;
         }
-        // Pooled-embedding gradient through w1 (compute BEFORE updating w1).
+        // Pooled-embedding gradient through w1, computed before w1 is updated.
         let mut de = [0.0f32; EMBED];
         for (i, dei) in de.iter_mut().enumerate() {
             let mut acc = 0.0;

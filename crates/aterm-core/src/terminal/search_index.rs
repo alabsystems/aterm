@@ -4,40 +4,26 @@
 
 //! Cached full-content search index.
 //!
-//! The index over all retained scrollback plus visible rows is a pure function
-//! of which grid is active and that grid's content, while the query pattern is
-//! independent, so one index serves every query until the content changes.
-//! [`Terminal::indexed_search`] caches it keyed by
-//! `(modes.alternate_screen, content_seq())`: history lines keyed from
-//! `oldest_absolute_row()`, then visible rows at `oldest + scrollback`.
-//!
-//! The key cannot go stale:
-//!
-//! - Line text and membership change only on writes, scroll into scrollback,
-//!   erases, reflow or resize; all bump the active grid's `content_gen`
-//!   ([`Terminal::content_seq`]).
-//! - Absolute-row keys derive from `oldest_absolute_row()`, which advances only
-//!   when content scrolls off (bumping `content_gen`); resize reflows bump it
-//!   too.
-//! - The active grid is part of the key (the two grids have independent
-//!   counters).
-//!
-//! A pure viewport scroll does not change the retained set or `content_seq()`,
-//! so the cache is reused.
+//! The index over all retained scrollback plus visible rows depends only on which grid is
+//! active and its content, so one index serves every query until the content changes.
+//! [`Terminal::indexed_search`] caches it keyed by `(alternate_screen, content_seq())` plus
+//! the renumber epoch and the ambiguous-width policy. The key cannot go stale: line text,
+//! membership and `oldest_absolute_row()` change only by writes, scrolls, erases, reflows
+//! and resizes, all of which bump the active grid's `content_gen`. A pure viewport scroll
+//! reuses the cache.
 //!
 //! A miss refreshes in O(churn) rather than rebuilding in O(total):
 //!
 //! - Append: rows at or above the previous `indexed_end` are new; feed them.
-//! - Replace: rows at or above the previous visible base may have been edited
-//!   in place; re-feed them (unchanged rows are cheap).
-//! - EvictBelow: `drop_history_below` removes evicted rows with fresh-build
-//!   semantics (complete results, zero watermark).
-//! - Reflow, alt-screen switch, protected-footer splice (`absolute_row_revision`)
-//!   or Kitty-unscroll renumbering (`history_renumber_epoch`): full rebuild.
+//! - Replace: rows at or above the previous visible base may have been edited in place;
+//!   re-feed them (unchanged rows are cheap).
+//! - EvictBelow: `drop_history_below` removes evicted rows with fresh-build semantics.
+//! - Reflow, alt-screen switch, protected-footer splice (`absolute_row_revision`) or Kitty
+//!   unscroll (`history_renumber_epoch`): full rebuild.
 //!
-//! The refresh is used only when it provably equals the full rebuild (guards in
-//! `try_refresh_search_index`); the differential tests compare against
-//! `legacy_results`, a from-scratch oracle.
+//! The refresh runs only when it provably equals the full rebuild (guards in
+//! `try_refresh_search_index`); the tests compare it with `legacy_results`, a from-scratch
+//! oracle.
 
 use aterm_types::text_shaping::AmbiguousWidth;
 
@@ -45,66 +31,47 @@ use super::Terminal;
 use super::search_rows::history_row_for_search;
 use crate::search::{DEFAULT_MAX_CACHED_LINES, TerminalSearch};
 
-/// A cached search index plus the cache key it was built for (see
-/// [`Terminal::indexed_search`]).
+/// A cached search index and the key it was built for, stamped at (re)build time.
 pub(crate) struct CachedSearchIndex {
-    /// Whether the alternate screen was active when this index was built; the
-    /// grids keep independent `content_gen` counters, so a swap landing on the
-    /// same sequence value must still invalidate.
+    /// The alternate screen was active: the grids keep independent `content_gen` counters,
+    /// so a swap landing on the same value must still invalidate.
     alt_screen: bool,
-    /// The active grid's `content_seq()` at build time. Bumps on every content
-    /// mutation, so a mismatch means the indexed text/keys may have changed.
+    /// The active grid's `content_seq()`, bumped by every content mutation.
     content_gen: u64,
-    /// Protected-footer splice revision at (re)build time. A splice renumbers
-    /// absolute rows piecewise, so a mismatch forces the full rebuild.
+    /// Protected-footer splice revision: a splice renumbers rows piecewise (full rebuild).
     absolute_row_revision: u64,
-    /// `Grid::history_renumber_epoch()` at (re)build time. Kitty CSI +T unscroll
-    /// removes the newest scrollback lines, shifting older rows' absolute keys
-    /// without changing the other stamps; a mismatch forces the full rebuild
-    /// and is part of the hit key.
+    /// `Grid::history_renumber_epoch()`: a Kitty CSI +T unscroll shifts older rows' keys
+    /// without moving the other stamps. Part of the hit key.
     history_renumber_epoch: u64,
-    /// Grid width at (re)build time. A width change rewraps history wholesale,
-    /// forcing the full rebuild; height-only changes move rows between history
-    /// and visible without moving keys, so they stay refreshable.
+    /// Grid width. A width change rewraps history (full rebuild); height-only changes move
+    /// rows between history and visible without moving keys.
     cols: u16,
-    /// The `ambiguous_width` policy the index measures columns under. A live
-    /// switch moves no `content_gen` (it reflows nothing), so it is part of the
-    /// hit key: the next search re-measures every row under the new policy.
+    /// The `ambiguous_width` policy the index measures under; a live switch moves no
+    /// `content_gen`, so it is part of the hit key.
     ambiguous_width: AmbiguousWidth,
-    /// Absolute row of the oldest retained line at (re)build time. Retention only
-    /// advances it; a decrease means renumbering (full rebuild).
+    /// Absolute row of the oldest retained line; a decrease means renumbering.
     hist_base: usize,
-    /// Absolute row of the top visible row at (re)build time. Rows at or above
-    /// it were fed as visible text and may be edited in place; rows below are
-    /// immutable history. The refresh re-feeds from `min(previous, current)` so
-    /// reclassified rows get the text form a fresh build would give them.
+    /// Absolute row of the top visible row. Rows at or above it were fed as visible text
+    /// and may be edited in place; rows below are immutable history.
     visible_base: usize,
-    /// Exclusive end of the indexed absolute-row range at (re)build time. A
-    /// shrink cannot be expressed as a refresh (full rebuild).
+    /// Exclusive end of the indexed absolute-row range; a shrink forces the full rebuild.
     indexed_end: usize,
-    /// The fully built index over scrollback + visible rows (keyed by absolute
-    /// row). Reused verbatim while the key matches.
+    /// The index over scrollback and visible rows, reused verbatim while the key matches.
     index: TerminalSearch,
 }
 
 impl Terminal {
-    /// A full-content search index, reusing the cache while the active grid's
-    /// content is unchanged.
-    ///
-    /// The index covers every retained addressable line keyed by absolute row
-    /// (history `0..scrollback_lines` at `oldest + i`, visible rows at
-    /// `oldest + scrollback + r`), so each
-    /// [`SearchMatch::line`](crate::search::SearchMatch) is an absolute row. Query
-    /// with `indexed_search(...).search_results_opts(pat, case, regex)`.
-    ///
-    /// A hit (key `(alternate_screen, content_seq())` unchanged) returns the
-    /// cached index; a miss refreshes or rebuilds it. The result is immutable so
-    /// callers cannot alter cached coordinates.
+    /// A full-content search index, reused while the active grid's content is unchanged. It
+    /// covers every retained line keyed by absolute row (history at `oldest + i`, visible
+    /// rows at `oldest + scrollback + r`), so each
+    /// [`SearchMatch::line`](crate::search::SearchMatch) is an absolute row. Query with
+    /// `indexed_search(...).search_results_opts(pat, case, regex)`. A miss refreshes or
+    /// rebuilds; the result is immutable so callers cannot alter cached coordinates.
     pub fn indexed_search(&mut self) -> &TerminalSearch {
         let key_alt = self.modes.alternate_screen;
         let key_gen = self.content_seq();
-        // The renumber epoch is part of the hit key: a Kitty unscroll shifts
-        // older rows' keys without necessarily moving `content_seq`.
+        // A Kitty unscroll shifts older rows' keys without necessarily moving
+        // `content_seq`, so the renumber epoch is part of the hit key.
         let key_epoch = self.grid.history_renumber_epoch();
         let key_ambiguous = self.ambiguous_width();
 
@@ -119,8 +86,8 @@ impl Terminal {
         };
 
         if !hit {
-            // Current retained-window geometry, shared by the refresh guards, the
-            // refresh and the cached stamps; mirrors `build_search_index`.
+            // Retained-window geometry for the guards, the refresh and the stamps; mirrors
+            // `build_search_index`.
             let oldest = self.grid.oldest_absolute_row();
             let scrollback = self.grid.scrollback_lines();
             let rows = self.rows();
@@ -143,7 +110,7 @@ impl Terminal {
                     self.search_index_refreshes = self.search_index_refreshes.wrapping_add(1);
                     index
                 }
-                // The full build is the fallback and the refresh's test oracle.
+                // The full build is the fallback and the definition the refresh must equal.
                 None => self.build_search_index(),
             };
             self.search_index = Some(CachedSearchIndex {
@@ -161,8 +128,6 @@ impl Terminal {
             self.search_index_rebuilds = self.search_index_rebuilds.wrapping_add(1);
         }
 
-        // `self.search_index` is `Some` here: it was `Some` on a hit and we just
-        // assigned it on a miss.
         &self
             .search_index
             .as_ref()
@@ -170,28 +135,21 @@ impl Terminal {
             .index
     }
 
-    /// Serve a cache miss by incrementally refreshing the cached index. Returns
-    /// `None` unless the refresh provably equals `build_search_index` over the
-    /// current window; the caller then rebuilds.
+    /// Serve a cache miss by refreshing the cached index; `None` unless the refresh provably
+    /// equals `build_search_index` over the current window. Given the guards:
     ///
-    /// Why it is equal, given the guards:
+    /// - Rows below the previous visible base are immutable history: splices, rewraps and
+    ///   renumberings are fenced to the rebuild, and retention only drops the oldest rows.
+    ///   The refresh re-feeds from `min(previous, current visible base)`, so a reclassified
+    ///   row is read as the build reads it (`written_line_cells` visible,
+    ///   `history_row_for_search` history).
+    /// - `drop_history_below` removes the evicted prefix with fresh-build semantics.
+    /// - No cap eviction fires on either path: the guards require an eviction-free cached
+    ///   index and a window under `DEFAULT_MAX_CACHED_LINES` (`TerminalSearch::new`'s cap).
     ///
-    /// - Rows below the previous visible base are immutable history: splices,
-    ///   rewraps and renumberings are fenced to the rebuild arm, and retention
-    ///   only drops the oldest rows (`hist_base` monotone). Every refresh
-    ///   re-feeds from `min(previous, current visible base)`, so a row that
-    ///   changed classification is re-fed in its new form (visible via
-    ///   `written_line_text`, history via `line_text_bounded`, as the build
-    ///   does).
-    /// - `drop_history_below` removes the evicted prefix with fresh-build
-    ///   semantics.
-    /// - No internal cap eviction fires on either path: the guards require an
-    ///   eviction-free cached index and a window under
-    ///   `DEFAULT_MAX_CACHED_LINES` (the cap `TerminalSearch::new` uses).
-    ///
-    /// Cost: O(appended rows + visible rows) per miss. The bloom filter keeps
-    /// stale bits from replaced rows (false-positive candidates only; saturation
-    /// self-heals via `rebuild_bloom`).
+    /// Cost: O(appended rows + visible rows). The bloom filter keeps stale bits from
+    /// replaced rows (false-positive candidates only; saturation self-heals via
+    /// `rebuild_bloom`).
     #[allow(
         clippy::too_many_arguments,
         reason = "geometry tuple computed once by the caller and shared with the cache stamps"
@@ -214,14 +172,12 @@ impl Terminal {
                 && cached.cols == cols
                 // Every row is re-measured under a new ambiguous-width policy.
                 && cached.ambiguous_width == self.ambiguous_width()
-                // Retention only advances; a retreat means renumbering (a
-                // re-attached offloaded reflow can grow scrollback back; its width
-                // change also fences, but this guard stands on its own).
+                // Retention only advances; a retreat means renumbering (a re-attached
+                // offloaded reflow can grow scrollback back).
                 && cached.hist_base <= hist_base
                 // The index cannot truncate above; a shrinking end falls back.
                 && cached.indexed_end <= indexed_end
-                // Cap guard: both the cached and the refreshed window must be
-                // eviction-free for the fresh-equality argument to hold.
+                // Both windows eviction-free, for the fresh-equality argument.
                 && indexed_end.saturating_sub(hist_base) <= DEFAULT_MAX_CACHED_LINES
                 && !cached.index.results_may_be_incomplete();
             if !reusable {
@@ -231,19 +187,15 @@ impl Terminal {
         let cached = self.search_index.take()?;
         let mut index = cached.index;
 
-        // EvictBelow: rows no longer retained go, with fresh-build semantics.
         index.drop_history_below(hist_base);
 
-        // Replace + Append: re-feed from the older of the two visible bases.
-        // `SearchIndex::index_line` skips unchanged rows cheaply.
+        // Replace + Append: re-feed from the older visible base (unchanged rows are cheap).
         let refresh_start = cached.visible_base.min(visible_base).max(hist_base);
         if refresh_start < visible_base {
             let start_hist = refresh_start.saturating_sub(hist_base);
             let count = visible_base.saturating_sub(refresh_start);
-            // Dense history walk: item `j` is `get_history_line(start_hist + j)`
-            // (`None` becomes empty text), so absolute-row keys are unchanged.
-            // `chain(repeat(None))` pads if the walk were ever shorter than
-            // `count`.
+            // The dense walk keeps absolute-row keys (`None` is empty text); the repeat
+            // pads should it be shorter than `count`.
             let lines = self
                 .grid
                 .history_lines_from(start_hist)
@@ -263,8 +215,8 @@ impl Terminal {
         Some(index)
     }
 
-    /// Build a fresh full-content index over the active grid. The line set,
-    /// order and absolute-row keys here define search results.
+    /// A fresh full-content index over the active grid. Its line set, order and absolute-row
+    /// keys define search results.
     fn build_search_index(&self) -> TerminalSearch {
         let grid = &self.grid;
         let oldest = grid.oldest_absolute_row();
@@ -273,20 +225,12 @@ impl Terminal {
 
         let mut search = TerminalSearch::new().with_ambiguous_width(self.ambiguous_width());
 
-        // History 0..scrollback at absolute oldest + i, via the dense history
-        // walk (`Grid::history_lines_from`, item `i` == `get_history_line(i)`,
-        // unreadable lines as empty placeholders so later lines keep their
-        // rows). It decodes each warm block / cold page once. Text is bounded by
-        // MAX_SCROLLBACK_LINE_SCAN_BYTES: a crafted checkpoint can inject a
-        // multi-MiB `Line`.
-        //
-        // Fed streaming, moving each bounded `String` into the index, so the
-        // whole scrollback text is never resident twice. The walk borrows the
-        // grid immutably, so nothing can change mid-build. The `legacy_results`
-        // oracle keeps the per-line collect form and checks equality.
-        //
-        // Every row comes with the cells its text was read from
-        // (`search_rows`), so a match is reported in the cells that hold it.
+        // History at absolute oldest + i via the dense walk (`Grid::history_lines_from`,
+        // item `i` == `get_history_line(i)`, an unreadable line an empty placeholder so
+        // later lines keep their rows), decoding each warm block / cold page once. Text is
+        // bounded by MAX_SCROLLBACK_LINE_SCAN_BYTES: a crafted checkpoint can inject a
+        // multi-MiB `Line`. Streamed, so the scrollback text is never resident twice. Each
+        // row carries the cells its text was read from, so a match is reported where drawn.
         let hist_base = usize::try_from(oldest).unwrap_or(usize::MAX);
         let history = grid
             .history_lines_from(0)
@@ -297,11 +241,9 @@ impl Terminal {
             (hist_base.saturating_add(i), text, cells)
         }));
 
-        // Visible rows 0..rows at absolute oldest + scrollback + r, via the
-        // combining-aware `written_line_cells` so accents and ZWJ clusters
-        // survive. Read as written, trailing blanks kept, as each history line
-        // stores its row: a row's matches must not change when it scrolls off
-        // (`foo$`, a query ending in spaces). Streamed like the history.
+        // Visible rows at oldest + scrollback + r, combining-aware, read as written with
+        // trailing blanks kept as each history line stores its row: a row's matches must
+        // not change when it scrolls off (`foo$`, a query ending in spaces).
         let vis_base = hist_base.saturating_add(scrollback);
         search.index_numbered_cells_owned((0..rows).map(|r| {
             let (text, cells) = self.written_line_cells(i32::from(r)).unwrap_or_default();
@@ -311,33 +253,26 @@ impl Terminal {
         search
     }
 
-    /// Number of search-index rebuilds (cache misses) so far: advances when
-    /// [`indexed_search`](Self::indexed_search) rebuilds or refreshes, never on
-    /// a reuse. Introspection only.
+    /// Search-index cache misses so far (rebuilds and refreshes), never a reuse.
+    /// Introspection only.
     #[must_use]
     #[inline]
     pub fn search_index_rebuilds(&self) -> u64 {
         self.search_index_rebuilds
     }
 
-    /// Number of incremental refreshes among those misses;
-    /// `search_index_rebuilds() - search_index_refreshes()` is the number of
-    /// full rebuilds. Introspection only.
+    /// Incremental refreshes among those misses; `search_index_rebuilds() -
+    /// search_index_refreshes()` is the number of full rebuilds. Introspection only.
     #[must_use]
     #[inline]
     pub fn search_index_refreshes(&self) -> u64 {
         self.search_index_refreshes
     }
 
-    /// Release the search index's heap: drop the cached full-content index and
-    /// any budgeted search (in flight or completed and retained for
-    /// `search_summary`), returning their allocations to the allocator.
-    ///
-    /// Dropping the whole `CachedSearchIndex` is the correct eviction: an
-    /// in-place [`SearchIndex::release`](aterm_search::SearchIndex::release)
-    /// would leave the cache key matching an emptied index, so the next
-    /// [`indexed_search`](Self::indexed_search) would return a false empty hit.
-    /// The next search rebuilds from the live buffer.
+    /// Release the search index's heap: the cached index and any budgeted search (in flight
+    /// or retained for `search_summary`). The whole `CachedSearchIndex` goes: an in-place
+    /// [`SearchIndex::release`](aterm_search::SearchIndex::release) would leave the key
+    /// matching an emptied index, a false empty hit.
     pub fn release_search_index(&mut self) {
         self.search_index = None;
         self.budgeted_search = None;
@@ -348,9 +283,7 @@ impl Terminal {
 pub(crate) mod tests {
     use super::Terminal;
 
-    /// Build the index the uncached way as a behavior-identity reference, so
-    /// any divergence between the cached path and a per-search rebuild shows as
-    /// a result mismatch.
+    /// The from-scratch oracle: the index built the uncached, per-line way.
     pub(crate) fn legacy_results(t: &Terminal, pat: &str) -> Vec<(usize, usize, usize)> {
         use crate::search::TerminalSearch;
         let grid = t.grid();
@@ -390,16 +323,13 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// A terminal whose history runs through a tiered store holding a corrupt
-    /// warm block between its cold tier and its healthy warm blocks, with a
-    /// needle on both sides: a skipping history reader would shift later lines
-    /// onto their neighbours' rows.
+    /// History through a tiered store with a corrupt warm block between a needle in cold
+    /// and one in hot: a skipping reader would shift later lines onto neighbours' rows.
     pub(crate) fn corrupt_tiered_terminal() -> (Terminal, usize) {
         use aterm_grid::Grid;
         use aterm_scrollback::Scrollback;
-        // Cold holds the oldest lines (needle at 2), hot the newest (needle at
-        // 38); the corrupt block is injected at the warm front, between them,
-        // and nothing afterwards evicts it.
+        // Cold holds the needle at 2, hot the one at 38; the corrupt block sits at the
+        // warm front between them and nothing evicts it.
         let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
         for i in 0..40 {
             match i {
@@ -429,9 +359,8 @@ pub(crate) mod tests {
         (t, corrupt)
     }
 
-    /// Over a corrupt tiered segment the cached index's matches equal the
-    /// per-line oracle's (same lines, same absolute rows), and the needle after
-    /// the corrupt block lands on its own row.
+    /// Over a corrupt tiered segment the cached index equals the oracle, and the needle
+    /// after the corrupt block lands on its own row.
     #[test]
     fn search_over_a_corrupt_tiered_segment_keeps_absolute_rows() {
         let (mut t, corrupt) = corrupt_tiered_terminal();
@@ -439,15 +368,13 @@ pub(crate) mod tests {
         assert_eq!(got, legacy_results(&t, "NEEDLE_"));
         assert_eq!(got.len(), 2, "both needles are found: {got:?}");
         let oldest = usize::try_from(t.grid().oldest_absolute_row()).expect("row");
-        // The corrupt block's placeholder rows sit between the two needles.
+        // The corrupt block's placeholder rows sit between the needles.
         assert_eq!(got[0].0, oldest + 2);
         assert_eq!(got[1].0, oldest + 38 + corrupt);
     }
 
-    /// R15 content-1: absolute rows only grow, and a tab's numbering survives
-    /// live upgrades, so a long-lived tab passes row `u32::MAX`. Find must
-    /// keep answering there — the full build, the incremental refresh after
-    /// more output, regex and literal — at the rows the terminal numbers.
+    /// Absolute rows only grow and survive live upgrades, so a long-lived tab passes row
+    /// `u32::MAX`: find (full build, refresh, regex and literal) keeps answering there.
     #[test]
     fn find_keeps_working_once_absolute_rows_pass_u32_max() {
         for start in [(1u64 << 32) - 30, (1u64 << 32) + 10] {
@@ -502,12 +429,9 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// A line's matches do not change when it scrolls from the screen into
-    /// history: both are read as written, trailing blanks kept, so `foo$` and
-    /// a query ending in the spaces the program printed answer the same in
-    /// either place (absolute rows do not move on a scroll). The same holds for
-    /// every reader: the full build, the refresh that serves a search after
-    /// more output, and the budgeted search.
+    /// A line's matches do not change when it scrolls into history: both are read as
+    /// written, trailing blanks kept, so `foo$` and a query ending in printed spaces answer
+    /// the same in either place, for the full build, the refresh and the budgeted search.
     #[test]
     fn a_rows_matches_do_not_change_when_it_scrolls_into_history() {
         let regex = |t: &mut Terminal, pat: &str| -> Vec<(usize, usize, usize)> {
@@ -558,7 +482,6 @@ pub(crate) mod tests {
             "a match's snippet is the line it came from"
         );
 
-        // More output, still on the screen: the refresh re-reads the rows.
         let refreshes = t.search_index_refreshes();
         t.process(b"\r\nqux");
         let refreshed: Vec<_> = queries.iter().map(|q| regex(&mut t, q)).collect();
@@ -588,15 +511,10 @@ pub(crate) mod tests {
         })
     }
 
-    /// R15 content-5: the grid folds a character into the cell before it
-    /// only when that cell is the one before the cursor as it arrives, so
-    /// cells written out of order, or brought together by a delete-character,
-    /// stay apart where a walk of the row's text joins them. Find reports a
-    /// match in the cells that hold it: on each row `XYZ` is found where the
-    /// grid paints it, by the cached index (full build and the refresh after
-    /// more output), the from-scratch oracle, the budgeted search, literal
-    /// and regex. On origin/main every case but the control reported it 1-2
-    /// cells left of where it is drawn.
+    /// The grid folds a character into the cell before it only when that cell is the one
+    /// before the cursor, so cells written out of order or joined by DCH stay apart where a
+    /// walk of the text joins them. Every reader (cached build and refresh, oracle,
+    /// budgeted, literal and regex) finds `XYZ` where the grid paints it.
     #[test]
     fn find_reports_matches_in_the_cells_the_grid_drew_them_in() {
         let cases: &[(&str, &str)] = &[
@@ -622,9 +540,8 @@ pub(crate) mod tests {
                 "skin tone brought to its base by DCH",
                 "\u{1f44d}q\u{1f3fd}XYZ\x1b[1;3H\x1b[P",
             ),
-            // VS15 narrows a wide glyph and empties its right half, which the
-            // row reads as a blank: a walk of that text counts the glyph's two
-            // columns AND the blank.
+            // VS15 narrows a wide glyph and empties its right half, which reads as a
+            // blank: a walk of the text counts the glyph's two columns and the blank.
             ("a wide glyph narrowed by VS15", "\u{231a}\u{fe0e}XYZ"),
         ];
         let budgeted = |t: &mut Terminal, pat: &str, regex: bool| -> Vec<(usize, usize, usize)> {
@@ -666,7 +583,6 @@ pub(crate) mod tests {
                     ));
                 }
             }
-            // More output on the screen: the refresh re-reads the row.
             let refreshes = t.search_index_refreshes();
             t.process(b"\x1b[3;1Hmore");
             let refreshed = cached_results(&mut t, "xyz");
@@ -687,9 +603,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// The same text with its cells moved under it: a redraw that writes the
-    /// flag halves apart, then in order, leaves the row's text unchanged and
-    /// its cells not, and the refreshed index follows the cells.
+    /// A redraw that moves cells under unchanged text moves the refreshed matches with them.
     #[test]
     fn a_redraw_that_moves_cells_under_the_same_text_moves_the_matches() {
         let mut t = Terminal::new(4, 20);
@@ -708,15 +622,9 @@ pub(crate) mod tests {
         assert_eq!(cached_results(&mut t, "xyz"), vec![(0, 2, 3)]);
     }
 
-    /// R15 search-columns review: printable ASCII after a cell that ends in a
-    /// ZWJ. The live grid draws the `Q` of `❤️‍Qa` in a cell of its own, two
-    /// columns right of the emoji. Scrolled into history, the ring tier draws
-    /// the row from those cells and a row past the ring from its stored
-    /// `Line`: both must draw `Q` there, and find must report it there. The
-    /// lane's first cut read history columns from the `Line` walk, which
-    /// joined ASCII after a ZWJ, so find said column 0 on the ring tier where
-    /// the glass drew column 2; on origin/main a row past the ring drew `Q`
-    /// inside the emoji's cell.
+    /// Printable ASCII after a cell ending in a ZWJ: the grid draws the `Q` of `❤️‍Qa` in a
+    /// cell of its own, two columns right of the emoji, on either history tier, and find
+    /// reports it there.
     #[test]
     fn ascii_after_a_zwj_is_found_where_either_history_tier_draws_it() {
         use aterm_grid::test_counters::take_ring_fast_materialize;
@@ -764,14 +672,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// The shapes `find_reports_matches_in_the_cells_the_grid_drew_them_in`
-    /// writes, scrolled into history: find reports `XYZ` where either history
-    /// tier draws the row, by the cached index, the oracle and the budgeted
-    /// search. The ring tier draws a row from its own cells, which keep the
-    /// shapes apart; a row past the ring is drawn from its stored line, whose
-    /// walk joins them. Reading every history row's cells from that walk put
-    /// the ring tier's matches up to two cells left of where they are drawn
-    /// (r16 selection-stride review; the r15 lead `stored_line_cells` named).
+    /// The shapes of `find_reports_matches_in_the_cells_the_grid_drew_them_in`, scrolled into
+    /// history: `XYZ` is found where either tier draws it. The ring tier draws a row from
+    /// its own cells, which keep the shapes apart; a row past the ring from its stored line,
+    /// whose walk joins them.
     #[test]
     fn find_reports_matches_where_either_history_tier_draws_them() {
         use aterm_grid::test_counters::take_ring_fast_materialize;
@@ -863,10 +767,8 @@ pub(crate) mod tests {
         t
     }
 
-    /// With `ambiguous_width = "wide"` the grid draws an East Asian Ambiguous
-    /// character in two cells, and find reports the cells the match is drawn
-    /// in, one-shot and budgeted: `foo` after two arrows is in cells 4-6, after
-    /// three box-drawing dashes in cells 7-9.
+    /// With `ambiguous_width = "wide"` find reports the cells an East Asian Ambiguous
+    /// character is drawn in (two), one-shot and budgeted.
     #[test]
     fn find_measures_ambiguous_characters_as_the_grid_draws_them() {
         let mut t = wide_terminal(4, 20);
@@ -890,9 +792,8 @@ pub(crate) mod tests {
         assert_eq!(budgeted, vec![(0, 4, 3), (1, 7, 3)]);
     }
 
-    /// A live switch to `"wide"` moves no content generation, so the refresh
-    /// that serves the next search must not keep the narrow index: a line
-    /// written after the switch is measured as the grid drew it.
+    /// A live switch to `"wide"` moves no content generation, so the next search must not
+    /// serve the narrow index for a line written after it.
     #[test]
     fn a_live_switch_to_wide_ambiguous_width_is_not_served_from_the_narrow_index() {
         let mut t = Terminal::new(4, 20);
@@ -906,18 +807,9 @@ pub(crate) mod tests {
         assert_eq!(cached_results(&mut t, "foo"), vec![(0, 6, 3), (1, 4, 3)]);
     }
 
-    /// A live switch with no new output moves no content generation, and no
-    /// cache serves an answer a fresh build would not give: the cached index,
-    /// a resumed budgeted search and the summary each answer as a fresh build
-    /// under the policy now in force.
-    ///
-    /// A row written before the switch keeps the cells it was drawn in
-    /// (`apply_config` reflows nothing), and find reads those cells, so the
-    /// fresh answer is where the grid paints the row: the arrows still take
-    /// one cell each. (Ruling 2026-10-11, r15 content-5: until find read the
-    /// grid's cells it re-measured such a row under the new policy and put
-    /// `foo` two cells right of where it is drawn; this test pinned that as
-    /// its precondition.)
+    /// A live switch with no new output: the cached index, a resumed budgeted search and the
+    /// summary each answer as a fresh build would. A row written before the switch keeps
+    /// the cells it was drawn in (`apply_config` reflows nothing), and find reads them.
     #[test]
     fn a_live_switch_with_no_new_output_is_not_served_from_a_cache() {
         let mut t = Terminal::new(4, 20);
@@ -977,19 +869,15 @@ pub(crate) mod tests {
         assert_eq!(summary, fresh, "the summary");
     }
 
-    /// Two identical searches with no content change return identical results
-    /// and the second reuses the cache; a search after a write rebuilds and
-    /// sees the new content. Cached results always equal the oracle's.
+    /// A repeat search reuses the cache (any pattern); a write invalidates it.
     #[test]
     fn repeat_search_reuses_cache_write_invalidates() {
         let mut t = Terminal::new(6, 40);
-        // Push a needle off-screen into scrollback, plus filler.
         t.process(b"NEEDLE_alpha\r\n");
         for i in 0..20 {
             t.process(format!("filler line {i}\r\n").as_bytes());
         }
 
-        // First search: a cache miss -> exactly one rebuild.
         let before = t.search_index_rebuilds();
         let r1 = cached_results(&mut t, "NEEDLE_alpha");
         assert_eq!(
@@ -1004,8 +892,6 @@ pub(crate) mod tests {
         );
         assert_eq!(r1.len(), 1, "the scrolled-off needle is found exactly once");
 
-        // Second identical search, no content change -> cache hit, no rebuild,
-        // byte-identical results.
         let rebuilds_after_first = t.search_index_rebuilds();
         let r2 = cached_results(&mut t, "NEEDLE_alpha");
         assert_eq!(
@@ -1018,8 +904,6 @@ pub(crate) mod tests {
             "reused-cache results must be identical to the first search"
         );
 
-        // A different pattern still reuses the same index (the per-query pattern
-        // is independent of the indexed content) — still no rebuild.
         let r_filler = cached_results(&mut t, "filler");
         assert_eq!(
             t.search_index_rebuilds(),
@@ -1029,7 +913,6 @@ pub(crate) mod tests {
         assert_eq!(r_filler, legacy_results(&t, "filler"));
         assert!(r_filler.len() >= 2, "many filler rows match");
 
-        // Now write new content: the next search must rebuild and reflect it.
         t.process(b"NEEDLE_beta later\r\n");
         let rebuilds_before_write_search = t.search_index_rebuilds();
         let r_beta = cached_results(&mut t, "NEEDLE_beta");
@@ -1041,13 +924,10 @@ pub(crate) mod tests {
         assert_eq!(r_beta, legacy_results(&t, "NEEDLE_beta"));
         assert_eq!(r_beta.len(), 1, "the freshly written needle is found");
 
-        // And the original needle is still found post-rebuild (content retained).
         assert_eq!(cached_results(&mut t, "NEEDLE_alpha"), r1);
     }
 
-    /// A height-only resize leaves search fresh and complete: the cache
-    /// invalidates and the rebuilt index covers the full retained history with
-    /// unshifted absolute rows.
+    /// A height-only resize keeps all history searchable at unshifted absolute rows.
     #[test]
     fn height_only_resize_keeps_history_searchable_with_stable_rows() {
         let mut t = Terminal::new(10, 40);
@@ -1057,7 +937,6 @@ pub(crate) mod tests {
         let before = cached_results(&mut t, "needle-");
         assert_eq!(before.len(), 30, "every written line matches pre-resize");
 
-        // Height-only shrink (cols unchanged).
         t.resize(5, 40);
         let after = cached_results(&mut t, "needle-");
         assert_eq!(
@@ -1070,20 +949,17 @@ pub(crate) mod tests {
             legacy_results(&t, "needle-"),
             "the post-resize cache equals a from-scratch rebuild (not stale)"
         );
-        // Lines that did not move (deep history) keep their absolute rows.
         let hit = |t: &mut Terminal, pat: &str| cached_results(t, pat)[0].0;
         assert_eq!(hit(&mut t, "needle-0"), 0, "unmoved line keeps its row");
         assert_eq!(hit(&mut t, "needle-20"), 20, "unmoved line keeps its row");
         assert_eq!(t.grid().oldest_absolute_row(), 0, "nothing was evicted");
     }
 
-    /// A retention shrink is a content change: right after
-    /// `set_scrollback_line_limit` evicts lines, search returns no evicted
-    /// absolute rows. Pinned on both retention arms: the tiered store (native
-    /// sessions) and the ring-only grid (the wasm engines' shape).
+    /// After `set_scrollback_line_limit` evicts lines, search returns no evicted rows, on
+    /// the tiered store and on the ring-only grid (the wasm engines' shape).
     #[test]
     fn retention_shrink_invalidates_the_cached_index() {
-        // tiered arm: a small ring so the bulk of history lives in the store.
+        // A small ring, so the bulk of history lives in the store.
         let sb = aterm_scrollback::Scrollback::new(64, 512, 8_000_000);
         let mut tiered = Terminal::with_scrollback(6, 40, 8, sb);
         let check = |t: &mut Terminal, label: &str| {
@@ -1113,30 +989,24 @@ pub(crate) mod tests {
         };
         check(&mut tiered, "tiered");
 
-        // Ring-only arm (`Terminal::new`, no store).
         let mut ring = Terminal::new(6, 40);
         check(&mut ring, "ring-only");
     }
 
-    /// A memory-budget shrink is a content change too: `set_memory_budget`
-    /// evicts cold-tier scrollback, so the search cache must invalidate rather
-    /// than keep returning evicted rows until the next write.
+    /// A memory-budget shrink evicts cold scrollback, so the search cache invalidates.
     #[test]
     fn memory_budget_shrink_invalidates_the_cached_index() {
-        // Small hot/warm tiers so the bulk of history spills to the compressible
-        // cold tier, where a tight budget can evict the oldest lines.
+        // Small hot/warm tiers spill history to the cold tier, which a tight budget evicts.
         let sb = aterm_scrollback::Scrollback::new(8, 16, 64_000_000);
         let mut t = Terminal::with_scrollback(6, 40, 8, sb);
         for i in 0..400 {
             t.process(format!("needle-{i}\r\n").as_bytes());
         }
-        // Prime the cached index over the full retained set.
         let before = cached_results(&mut t, "needle-");
         assert_eq!(before.len(), 400, "all lines retained + found pre-shrink");
         let lines_before = t.grid().scrollback_lines();
 
-        // Shrink the budget hard, evicting the oldest cold lines. An
-        // EnforcementFailed (the hot tier holds active data) is ignored; the cold
+        // An EnforcementFailed (the hot tier holds active data) is ignored: the cold
         // eviction still happened.
         let _ = t.set_memory_budget(4096);
         assert!(
@@ -1147,7 +1017,7 @@ pub(crate) mod tests {
             t.grid().scrollback_lines()
         );
 
-        // No write since the prime: the cache must still rebuild.
+        // No write since the prime: the cache still rebuilds.
         let after = cached_results(&mut t, "needle-");
         assert_eq!(
             after,
@@ -1167,8 +1037,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// `release_search_index` drops the cache so the next search rebuilds, with
-    /// identical results (never a false empty hit).
+    /// `release_search_index` makes the next search rebuild, identically (never a false
+    /// empty hit).
     #[test]
     fn release_drops_cache_then_next_search_rebuilds_identically() {
         let mut t = Terminal::new(6, 40);
@@ -1180,8 +1050,6 @@ pub(crate) mod tests {
         assert_eq!(r1.len(), 1);
         let rebuilds = t.search_index_rebuilds();
 
-        // Release with no content change: the next search must rebuild, not hit
-        // a matching key over an emptied index.
         t.release_search_index();
         let r2 = cached_results(&mut t, "NEEDLE_alpha");
         assert_eq!(
@@ -1195,8 +1063,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// A pure viewport scroll does not bump `content_seq`, so the cache is
-    /// reused with identical results.
+    /// A pure viewport scroll moves no `content_seq`, so the cache is reused.
     #[test]
     fn viewport_scroll_reuses_cache() {
         let mut t = Terminal::new(6, 40);
@@ -1208,7 +1075,6 @@ pub(crate) mod tests {
         let rebuilds = t.search_index_rebuilds();
         let gen_before = t.content_seq();
 
-        // Scroll the viewport up into scrollback (content unchanged).
         t.grid_mut().scroll_display(5);
         assert_eq!(
             t.content_seq(),
@@ -1225,9 +1091,8 @@ pub(crate) mod tests {
         assert_eq!(r1, r2, "results identical across a viewport scroll");
     }
 
-    /// `restore_checkpoint` replaces the grids, so every stamp the cache keyed
-    /// on restarts from fresh values and could collide; the release in
-    /// `restore_checkpoint` forces a rebuild. Pins the results and the rebuild.
+    /// `restore_checkpoint` replaces the grids, whose fresh stamps could collide with the
+    /// cache key, so it releases the index and the next search rebuilds.
     #[test]
     fn restore_checkpoint_drops_the_cached_search_index() {
         let mut source = Terminal::new(6, 40);
@@ -1236,7 +1101,6 @@ pub(crate) mod tests {
         }
         let saved = source.checkpoint();
 
-        // A different terminal, with its own primed cache over other content.
         let mut target = Terminal::new(6, 40);
         for i in 0..30 {
             target.process(format!("beta {i} other\r\n").as_bytes());
@@ -1264,19 +1128,15 @@ pub(crate) mod tests {
         assert!(!after.is_empty(), "the restored content is searchable");
     }
 
-    /// Scripted differential: one terminal driven through a long deterministic
-    /// mix of appends, in-place edits, erases, scrollback clears, height and
-    /// width resizes, alt-screen switches, retention shrinks and Kitty
-    /// unscrolls, searching after every step; the cached path must equal the
-    /// `legacy_results` oracle each time. The script must exercise both the
-    /// refresh and the full-rebuild arms.
+    /// A long deterministic mix of appends, edits, erases, scrollback clears, resizes,
+    /// alt-screen switches, retention shrinks and Kitty unscrolls, searching after every
+    /// step: the cached path equals `legacy_results` each time, over both arms.
     #[test]
     fn scripted_mutation_mixture_keeps_the_refresh_equal_to_a_rebuild() {
         let sb = aterm_scrollback::Scrollback::new(64, 512, 8_000_000);
         let mut t = Terminal::with_scrollback(8, 40, 64, sb);
         t.set_scrollback_line_limit(Some(600));
 
-        // Deterministic xorshift: a fixed script, replayable byte for byte.
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut roll = move || {
             state ^= state << 13;
@@ -1295,8 +1155,7 @@ pub(crate) mod tests {
         for step in 0..140u64 {
             let r = roll();
             match r % 12 {
-                // Ordinary streaming output — the refresh arm's home turf, and
-                // the majority of the script so history really accumulates.
+                // Streaming output, most of the script, so history accumulates.
                 0..=6 => {
                     for _ in 0..=(r >> 8) % 14 {
                         t.process(format!("needle {written} alpha row\r\n").as_bytes());
@@ -1308,7 +1167,6 @@ pub(crate) mod tests {
                     t.process(b"\x1b[H");
                     t.process(format!("beta {step} needle overwrite").as_bytes());
                 }
-                // Erases: the screen, and (rarely) the scrollback itself.
                 8 => {
                     if r % 48 == 8 {
                         t.process(b"\x1b[3J");
@@ -1316,8 +1174,8 @@ pub(crate) mod tests {
                         t.process(b"\x1b[2J");
                     }
                 }
-                // Resizes: height-only reclassifies rows without moving keys;
-                // a width change rewraps history wholesale (rebuild fence).
+                // Height-only reclassifies rows without moving keys; a width change
+                // rewraps history (rebuild fence).
                 9 => {
                     if r % 2 == 0 {
                         let cols = t.cols();
@@ -1336,8 +1194,8 @@ pub(crate) mod tests {
                     }
                     on_alt = !on_alt;
                 }
-                // Kitty CSI +T unscroll (history renumbered, seen only via the
-                // epoch), plus an occasional retention shrink.
+                // Kitty CSI +T unscroll (seen only via the epoch), and sometimes a
+                // retention shrink.
                 _ => {
                     if !on_alt {
                         let n = 1 + usize::try_from(r % 3).unwrap_or(0);
@@ -1377,9 +1235,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// After ordinary streaming output a miss is served by an incremental
-    /// refresh, and every result equals the oracle. Refreshes must advance and
-    /// full rebuilds must not.
+    /// After streaming output every miss is an incremental refresh equal to the oracle.
     #[test]
     fn streaming_output_refreshes_incrementally_and_equals_legacy() {
         let mut t = Terminal::new(6, 40);
@@ -1415,9 +1271,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// Ring-cap eviction during streaming (every capped session's steady
-    /// state): the refresh drops the evicted prefix with fresh-build semantics,
-    /// matching the oracle's matches and completeness.
+    /// Ring-cap eviction while streaming (a capped session's steady state) stays on the
+    /// refresh path and matches the oracle's matches and completeness.
     #[test]
     fn ring_eviction_steady_state_refreshes_and_equals_legacy() {
         let mut t = crate::terminal::TerminalBuilder::new()
@@ -1428,9 +1283,8 @@ pub(crate) mod tests {
             t.process(format!("fill {i} needle\r\n").as_bytes());
         }
         let _ = cached_results(&mut t, "needle");
-        // Single-row advances retain a compressed byte prefix; enough cycles
-        // force several amortized compactions. Include Unicode columns and
-        // overlapping case-folded postings in the fresh-index comparison.
+        // Enough single-row advances to force several amortized compactions, with Unicode
+        // columns and overlapping case-folded postings.
         for batch in 0..160 {
             let oldest_before = t.grid().oldest_absolute_row();
             t.process(format!("more {batch} NEEDLE 日本語 needle\r\n").as_bytes());
@@ -1460,12 +1314,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// A width change (history rewrapped) and a Kitty CSI +T unscroll (history
-    /// renumbered) both fall back to the full rebuild. The epoch assertion
-    /// guards `Grid::history_renumber_epoch` wiring.
+    /// A width change (history rewrapped) and a Kitty CSI +T unscroll (history renumbered)
+    /// both fall back to the full rebuild and advance the renumber epoch.
     #[test]
     fn width_change_and_unscroll_rebuild_instead_of_refreshing() {
-        // Width-change arm.
         let mut t = Terminal::new(6, 40);
         for i in 0..40 {
             t.process(format!("wrapline {i} needle\r\n").as_bytes());
@@ -1474,10 +1326,9 @@ pub(crate) mod tests {
         let refreshes = t.search_index_refreshes();
         let epoch = t.grid().history_renumber_epoch();
         t.resize(6, 33);
-        // Wiring guard: the refresh assertion below also holds via the
-        // `cached.cols == cols` fence, so it alone would pass without the
-        // width-reflow epoch bump (`scrollback_reflow.rs`), and a later width
-        // change restoring `cols` would then refresh over renumbered keys.
+        // The `cols` fence alone would pass the refresh assertion below; without the
+        // width-reflow epoch bump a later width change restoring `cols` would refresh over
+        // renumbered keys.
         assert!(
             t.grid().history_renumber_epoch() > epoch,
             "a width rewrap renumbers history and must advance the epoch"
@@ -1490,8 +1341,8 @@ pub(crate) mod tests {
         );
         assert_eq!(got, legacy_results(&t, "needle"));
 
-        // Unscroll arm: a tiered store so unscroll really removes the newest
-        // history lines (ring-only grids route to a plain region scroll).
+        // Unscroll arm: a tiered store, since a ring-only grid routes unscroll to a plain
+        // region scroll.
         let sb = aterm_scrollback::Scrollback::new(8, 64, 8_000_000);
         let mut t = Terminal::with_scrollback(6, 40, 8, sb);
         for i in 0..80 {

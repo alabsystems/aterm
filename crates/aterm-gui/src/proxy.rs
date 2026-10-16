@@ -1,60 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Cross-process `@<sid>` proxy forward: turns the per-process control socket
-//! into one address space spanning the recursion tree, so an outer aterm can
-//! reach a session inside an inner aterm it spawned, or in a sibling instance.
+//! Cross-process `@<sid>` proxy forward: one control address space across the
+//! recursion tree, so an outer aterm reaches a session in an inner aterm it
+//! spawned or in a sibling instance.
 //!
-//! ## How a child hop works
+//! Child hop: when `handle`/`serve` cannot resolve `@<sid>` locally, it consults
+//! the [`ProxyTable`] of per-op edge tokens this aterm minted for each child it
+//! spawned. The child's socket comes from the graph entry it wrote at bind
+//! ([`read_graph_entry`]); the tokens bind to the launch nonce recorded there, so
+//! a relaunched child fails closed at discovery rather than dialing a stranger.
+//! The forward connects, proves the child is serving (`TOKEN <edge-hex> version`;
+//! the child authorizes the token against the edges it installed from its injected
+//! env, so it grants exactly the op the verb needs), sends the verb with the
+//! child's selector inlined to `@.`, and relays bytes verbatim both ways (no
+//! framing is parsed, so push streams and binary payloads pass). Only direct
+//! children are forwarded and a child is never in its own table, so no cycle forms;
+//! an edge-scoped connection never forwards (it resolves locally), so an edge cannot
+//! be escalated beyond its grant.
 //!
-//! When `handle`/`serve` cannot resolve a `@<sid>` selector in this process's
-//! store, it consults the [`ProxyTable`]: the per-op capability tokens this
-//! aterm minted for each child it spawned (`ChildProvision`). The child's live
-//! socket path comes from the on-disk graph entry the inner aterm wrote at bind
-//! time ([`read_graph_entry`]). The forward then:
-//!
-//! 1. `CtlStream::connect`s the child's socket,
-//! 2. presents `TOKEN <edge-hex> <rewritten-verb>`, which the child authorizes
-//!    against the edges it installed from its injected env, so it grants
-//!    exactly the op the verb needs, and
-//! 3. relays bytes transparently in both directions until either side closes.
-//!
-//! The relay never parses framing, so it carries the styled `screen` JSON, the
-//! `subscribe cells/bytes` push streams, `feed-bin` payloads and every other
-//! verb verbatim.
-//!
-//! ## Scope: one hop per kind
-//!
-//! The edge-authority hop forwards direct children only: the child's selector
-//! is inlined to `@.` so it runs the verb on itself, and a child is never in
-//! its own proxy table, so no cycle can form. An Owner-scope `@<grandchild>`
-//! needs no transitive edge forwarding: every instance publishes a graph entry
-//! for every session it hosts into the shared runtime dir (a nested instance
-//! inherits the parent's), so the grandchild resolves through the sibling hop
-//! below. An edge-scoped connection never forwards (it falls through to local
-//! resolution), so an edge cannot be escalated beyond its grant.
-//!
-//! ## Identity binding
-//!
-//! The tokens bind to the child's launch nonce (recorded in the graph entry): a
-//! child relaunched under a fresh nonce no longer matches the parent's table,
-//! so a stale forward fails closed at discovery rather than dialing a stranger.
-//!
-//! ## Sibling instances
-//!
-//! Two instances the user opened separately are siblings: same uid, same trust
-//! domain, no parent-minted edge. Every instance publishes a graph entry for
-//! every session it hosts, keyed by sid and pointing at its own socket
-//! ([`publish_session`] / [`unpublish_session`], fed by [`set_self_sock`] at
-//! bind). An `@<sid>` that resolves neither locally nor as a spawned child is
-//! forwarded to the hosting sibling's socket, authenticated with that
-//! instance's own per-launch token (`aterm-<pid>.token`, same-uid 0600: the
-//! credential a same-uid `aterm-ctl --pid` client reads directly, so the relay
-//! grants nothing the caller could not take itself). Owner-scope only; the
-//! original selector is kept so the sibling resolves the session among its own
-//! tabs. A stale entry pointing back at the forwarder's own socket is refused
-//! (the self-dial guard), so a removed session degrades to `ERR no such
-//! session`, never a loop.
+//! Sibling hop: every instance publishes a graph entry for every session it hosts
+//! ([`publish_session`] / [`unpublish_session`], fed by [`set_self_sock`]) into
+//! the shared runtime dir, which a nested instance inherits, so a grandchild
+//! resolves this way too. An `@<sid>` that resolves neither locally nor as a child
+//! is forwarded (Owner scope only, selector kept) to the hosting instance's socket,
+//! authenticated with its per-launch token (`aterm-<pid>.token`, same-uid 0600),
+//! which a same-uid `aterm-ctl --pid` could read itself. A stale entry pointing
+//! back at the forwarder's own socket is refused, so a removed session degrades to
+//! `ERR no such session`, never a loop.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Read, Write};
@@ -67,11 +40,10 @@ use aterm_uds::CtlStream;
 #[cfg(unix)]
 use crate::native_document_host::HeldAdvisoryLock;
 
-/// The capability this aterm holds over ONE child it spawned: the child's launch
+/// The capability this aterm holds over one child it spawned: the child's launch
 /// nonce (to validate the graph entry) plus the three per-op edge tokens minted
-/// at spawn (Item 4). The child's socket PATH is not stored here — it is
-/// discovered live from the graph entry, since the child binds it only once it
-/// (an inner aterm) actually starts.
+/// at spawn. The child's socket path is discovered live from its graph entry,
+/// since an inner aterm binds it only once it starts.
 #[derive(Clone)]
 pub(crate) struct ProxyEntry {
     pub nonce: LaunchNonce,
@@ -158,14 +130,13 @@ static SELF_SOCK: RwLock<Option<(std::path::PathBuf, String)>> = RwLock::new(Non
 /// Record this instance's bound control socket so session registration can
 /// publish per-session graph entries ([`publish_session`]) and the sibling
 /// forward can refuse to dial itself. Called once by the control server after a
-/// successful bind (never for a disabled socket).
+/// successful bind.
 ///
 /// The path is stored canonical: the self-dial guard compares it against
-/// `confine_proxy_sock`'s `canonicalize(dir)`-rooted output, and a raw path
-/// under a symlinked ancestor (`$HOME`, `/var` → `/private/var`) would defeat
-/// the guard and let a self-pointing entry relay requests back into this
-/// server without bound. If canonicalization fails, it falls back to a
-/// canonical dir joined with the file name, like `confine_proxy_sock`.
+/// `confine_proxy_sock`'s `canonicalize(dir)`-rooted output, and a raw path under
+/// a symlinked ancestor (`/var` → `/private/var`) would let a self-pointing entry
+/// relay requests back into this server without bound. If canonicalization
+/// fails, it falls back to a canonical dir joined with the file name.
 pub(crate) fn set_self_sock(sock_dir: &Path, sock_path: &str) {
     let canon = std::fs::canonicalize(sock_path)
         .map(|p| p.to_string_lossy().into_owned())
@@ -255,22 +226,13 @@ pub(crate) fn unpublish_session(sid: &SessionId) {
 }
 
 /// Read the per-launch auth token of the sibling instance whose socket is
-/// `sock_path` (`<dir>/aterm-<pid>.sock` → `<dir>/aterm-<pid>.token`; an
-/// explicit socket → `<sock>.token`; 0600, same-uid). This is the credential a
-/// same-uid `aterm-ctl --sock <path>` client reads, through the same function
-/// ([`aterm_ctl::read_token_beside`]), so presenting it grants nothing the
-/// caller could not obtain directly. `None` (fail closed) for an unreadable
-/// token. The forward reads it once its connection to the sibling exists
-/// ([`ForwardToken::BesideSocket`]).
-///
-/// The reader never follows a symlink at the token's name, takes only a
-/// regular file and reads no more than a token's bound, since a
-/// same-uid-writable directory can plant a link or a runaway file. Candidates
-/// follow [`aterm_types::control_socket::token_names_for_sock`] in its order:
-/// the per-socket file first, the shared `aterm.token` only when that one is
-/// absent or unreadable; a per-socket file that exists but is malformed ends
-/// the search. A foreign token grants nothing: the sibling compares `AUTH`
-/// against the token it minted in memory.
+/// `sock_path` (`aterm-<pid>.sock` → `aterm-<pid>.token`; an explicit socket →
+/// `<sock>.token`; 0600, same-uid), through the same function a same-uid
+/// `aterm-ctl --sock <path>` uses ([`aterm_ctl::read_token_beside`]), so
+/// presenting it grants nothing the caller could not take directly, and a planted
+/// foreign token grants nothing (the sibling checks it against the token it holds
+/// in memory). `None` (fail closed) for an unreadable token. The forward reads it
+/// once its connection exists ([`ForwardToken::BesideSocket`]).
 #[must_use]
 pub(crate) fn read_sibling_token(sock_path: &str) -> Option<String> {
     aterm_ctl::read_token_beside(sock_path).ok()
@@ -454,8 +416,8 @@ pub(crate) fn remove_own_graph_entry(sock_dir: &Path, sid: &SessionId, our_sock:
 
 /// Sweep dead discovery entries: remove any `graph/<sid>` whose recorded socket
 /// has no live listener (a crashed session that never ran
-/// `remove_graph_entry`). Mirrors `control_auth::sweep_stale_instances`;
-/// best-effort, keeping the dir bounded. Called at spawn.
+/// `remove_graph_entry`). Runs beside `control_auth::sweep_stale_instances` at
+/// bind and after an update handoff, in the shared default dir; best-effort.
 pub(crate) fn sweep_stale_graph(sock_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(sock_dir.join("graph")) else {
         return;
@@ -472,20 +434,15 @@ pub(crate) fn sweep_stale_graph(sock_dir: &Path) {
 }
 
 /// Write the parent→child edge-token secrets to a 0600 file at
-/// `<sock_dir>/edges/<child-sid>` and return its absolute path, or `None` if
-/// the private dir or file cannot be created. The bearer tokens live only here
-/// (a 0600 file in the 0700 socket dir), never in inheritable env. Three
-/// lines: `read <hex>` / `write <hex>` / `signal <hex>`.
+/// `<sock_dir>/edges/<child-sid>` (lines `read <hex>`, `write <hex>`,
+/// `signal <hex>`) and return it, or `None` if the private dir or file cannot be
+/// created. The bearer tokens live only here, never in inheritable env.
 ///
-/// The file persists for the parent session and is not consumed on read
-/// ([`read_edge_tokens`] is repeatable): the child inherits the path in
-/// `ATERM_EDGE_TOKENS` pinned in its shell env, so a child aterm relaunched in
-/// the same shell must re-read the same secrets to re-install the parent
-/// edges. The trust boundary (same-uid + 0600) matches the per-launch auth
-/// token file. The parent owns the file: the [`ChildProxy`] that records its
-/// path removes it when the child's session ends. `ATERM_EDGE_TOKENS` stays
-/// deny-listed across a new aterm hop, so only a same-shell relaunch re-reads
-/// it.
+/// The child inherits the path in `ATERM_EDGE_TOKENS`, pinned in its shell env,
+/// and the file is not consumed on read, so a child aterm relaunched in the same
+/// shell re-installs the parent edges. `ATERM_EDGE_TOKENS` stays deny-listed
+/// across a new aterm hop. The parent owns the file: the [`ChildProxy`] that
+/// records it removes it when the child's session ends.
 pub(crate) fn write_edge_tokens(
     sock_dir: &Path,
     child_sid: &SessionId,
@@ -497,12 +454,14 @@ pub(crate) fn write_edge_tokens(
     if crate::control_auth::ensure_private_dir(&dir).is_err() {
         return None;
     }
-    #[cfg(unix)]
-    sweep_dead_edge_files(&dir);
+    // No sweep here: this process's own files are live (it holds their
+    // locks), so a sweep per spawn only ever found other processes' leftovers,
+    // at one open+flock per file of every instance sharing the dir, on the
+    // event loop. [`start_edge_sweeper`] does it off the loop.
     let path = dir.join(child_sid.as_str());
     let body = format!("read {read_hex}\nwrite {write_hex}\nsignal {signal_hex}\n");
     let f = open_private(&path).ok()?;
-    // THE OWNER'S LOCK, taken before the secret is written: the parent holds it
+    // The owner's lock, taken before the secret is written: the parent holds it
     // for the child's life ([`EdgeFile`]), so a later sweep can tell a live
     // parent's file from a dead one's ([`sweep_dead_edge_files`]).
     let Some(lock) = take_owner_lock(f) else {
@@ -523,11 +482,11 @@ pub(crate) fn write_edge_tokens(
 }
 
 /// One edge-token file this aterm wrote ([`write_edge_tokens`]) and the open
-/// handle whose `flock` marks its owner alive: held by the [`ChildProxy`] for
-/// the child's life, released when it drops (after the file is removed) — by
-/// `LOCK_UN`, not by the close alone ([`OwnerLock`]): a child any thread
-/// forks while it is held keeps a copy of its description until that child
-/// execs, and the sweep read a parent gone that long as live.
+/// handle whose `flock` marks its owner alive. Held by the [`ChildProxy`] for the
+/// child's life and released when it drops (after the file is removed) by
+/// `LOCK_UN`, not by the close alone ([`OwnerLock`]): a child any thread forks
+/// while it is held keeps a copy of the description until it execs, and a
+/// close-only release would make the sweep read the dead parent as live.
 #[derive(Debug)]
 pub(crate) struct EdgeFile {
     path: PathBuf,
@@ -578,6 +537,7 @@ fn owner_file(lock: &OwnerLock) -> &std::fs::File {
 /// again, since the child's `(sid, nonce)` is never reissued) and is removed.
 /// An empty file is left (its writer may be between create and lock), as is a
 /// file the probe cannot read. A file never locked reads as a dead owner's.
+/// Run by [`start_edge_sweeper`], never on a spawn.
 #[cfg(unix)]
 fn sweep_dead_edge_files(dir: &Path) {
     use crate::crash_signal::markers::{Owner, probe};
@@ -598,13 +558,44 @@ fn sweep_dead_edge_files(dir: &Path) {
     }
 }
 
+/// How long the edge sweeper ([`start_edge_sweeper`]) waits between passes.
+/// A dead parent's file authorizes nothing (its child's `(sid, nonce)` is
+/// never reissued), so only the directory's size waits on it.
+#[cfg(unix)]
+const EDGE_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Sweep `<control dir>/edges` of dead parents' files ([`sweep_dead_edge_files`])
+/// once now and then every [`EDGE_SWEEP_EVERY`], on one detached thread per
+/// process at [`crate::qos::Role::Housekeeping`]: nothing waits on it, it holds
+/// no lock anyone waits on (a probe's lock is let go before its close), and a
+/// late pass only leaves files a while longer. It ran on every spawn, on the
+/// event loop, until 2026-10-15: 14-15 us per file, with one file per tab of
+/// every instance sharing the directory. Later calls do nothing.
+#[cfg(unix)]
+pub(crate) fn start_edge_sweeper() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name("aterm-edge-sweep".into())
+            .spawn(|| {
+                crate::qos::set_self(crate::qos::Role::Housekeeping);
+                loop {
+                    if let Some(dir) = crate::control_auth::socket_dir() {
+                        sweep_dead_edge_files(&dir.join("edges"));
+                    }
+                    std::thread::sleep(EDGE_SWEEP_EVERY);
+                }
+            });
+        if let Err(e) = spawned {
+            aterm_log::warn!("edge-token sweep: could not start its thread: {e}");
+        }
+    });
+}
+
 /// Read the three edge-token hexes `(read, write, signal)` from the 0600 file at
-/// `path` (written by [`write_edge_tokens`]), or `None` if absent / malformed.
-/// Same-uid + 0600 is the access gate (the path is not secret; the file is).
-///
-/// Non-destructive and repeatable for the parent session's lifetime: a child
-/// relaunched in the same shell re-reads the file to re-install the parent
-/// edges. The parent owns the file's removal ([`ChildProxy`]).
+/// `path` (written by [`write_edge_tokens`]), or `None` if absent or malformed.
+/// Same-uid + 0600 is the access gate: the path is not secret, the file is.
+/// Repeatable: the parent owns the file's removal ([`ChildProxy`]).
 pub(crate) fn read_edge_tokens(path: &str) -> Option<(String, String, String)> {
     let body = std::fs::read_to_string(path).ok()?;
     let (mut r, mut w, mut s) = (None, None, None);
@@ -624,19 +615,15 @@ pub(crate) fn read_edge_tokens(path: &str) -> Option<(String, String, String)> {
 /// [`ProxyEntry`] was registered under and the 0600 edge-token file it wrote
 /// ([`write_edge_tokens`]), when it could write one.
 ///
-/// Dropping it retires both. The session that spawned the child holds it, so
-/// a closed tab deregisters its child and [`proxies`] does not grow for the
-/// process lifetime (`aterm_spec::derive::proxy_registry_model`); a spawn that
-/// fails after provisioning drops it on the way out, sharing the same
-/// teardown. The file removed is the exact path written, never one
-/// re-derived from a socket dir that may resolve differently by then.
+/// Dropping it retires both, so a closed tab deregisters its child and
+/// [`proxies`] does not grow for the process lifetime
+/// (`aterm_spec::derive::proxy_registry_model`); a spawn that fails after
+/// provisioning drops it on the way out. The file removed is the exact path
+/// written, never one re-derived from a socket dir that may resolve differently.
 ///
-/// There is no liveness-based sweep of `edges/`: a freshly provisioned child
-/// has no discovery entry until it launches (maybe much later, or never), so
-/// "no live graph entry" cannot tell a still-needed file from an orphan. A
-/// file orphaned by a crashed parent is inert: its tokens authorize only
-/// against the dead child's exact `(sid, nonce)`, both random and never
-/// reissued.
+/// On unix `edges/` is swept by owner lock ([`sweep_dead_edge_files`]), never by
+/// graph liveness: a provisioned child has no discovery entry until it launches
+/// (maybe never).
 pub(crate) struct ChildProxy {
     sid: SessionId,
     edge_file: Option<EdgeFile>,
@@ -686,9 +673,9 @@ pub(crate) fn read_graph_entry(sock_dir: &Path, sid: &SessionId) -> Option<(Stri
     parse_graph_entry(&body)
 }
 
-/// Parse a graph-entry body (`sock <path>\nnonce <hex>\n`). The `sock` line is
-/// the shared on-disk format (`aterm_types::control_socket::graph_entry_sock`,
-/// also read by `aterm-ctl`'s self-location); the nonce line is server-only.
+/// Parse a graph-entry body's `sock` and `nonce` lines. The `sock` line is the
+/// shared on-disk format (`aterm_types::control_socket::graph_entry_sock`, also
+/// read by `aterm-ctl`'s self-location); the nonce line is server-only.
 fn parse_graph_entry(body: &str) -> Option<(String, LaunchNonce)> {
     let sock = aterm_types::control_socket::graph_entry_sock(body)?;
     let nonce = body
@@ -935,38 +922,32 @@ struct ForwardHost {
 const HOST_LOOK: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl ForwardHost {
-    /// What the client is told when the host hung up first: the host-gone
-    /// line ([`aterm_types::control_verbs::host_gone_line`]) when the host no
-    /// longer serves at its socket — nothing answers there, another process
-    /// does (a successor that rebound it), or the same pid does through
-    /// another listener (an `exec` that kept it) — and nothing when it does
-    /// (it ended the exchange on purpose, as a stream whose sessions ended),
-    /// or when its pid could not be read (a bare end of stream, as before).
+    /// What the client is told when the host hung up first: the host-gone line
+    /// ([`aterm_types::control_verbs::host_gone_line`]) when the host no longer
+    /// serves at its socket (nothing answers there, another process does, or the
+    /// same pid does through another listener), and nothing when it does (it ended
+    /// the exchange on purpose) or when its pid could not be read.
     fn gone_line(&self) -> Option<String> {
         let pid = self.pid?;
         (!self.serves(pid)).then(|| aterm_types::control_verbs::host_gone_line(pid, &self.sock))
     }
 
-    /// Whether `pid` still answers at the host's socket through the listener
-    /// the forward went through: a connection there is that process's and
-    /// answers the connect probe with any line — `OK`, or a refusal (busy,
-    /// auth), which only a live listener gives — and the socket file is still
-    /// the one that accepted the forward, read after the answer.
+    /// Whether `pid` still answers at the host's socket through the listener the
+    /// forward went through: a connection there is that process's, answers the
+    /// connect probe with any line (`OK`, or a busy/auth refusal, which only a live
+    /// listener gives), and the socket file still names the listener that accepted
+    /// the forward, read after the answer.
     ///
-    /// A PID ALONE DOES NOT NAME THE HOST ([`aterm_uds::listener`]): the cold
-    /// update lane shuts down every stream it accepted, this forward
-    /// included, and its `exec` keeps the pid and binds the same path — or an
-    /// `exec` that returned reopens it. Judged by pid, that process answering
-    /// was the host ending the exchange on purpose: no line, and the client,
-    /// finding this aterm still answering, read a bare EOF as a deliberate
-    /// end (review of the round-eight fixes).
+    /// A pid alone does not name the host ([`aterm_uds::listener`]): the cold update
+    /// lane shuts down every stream it accepted, and its `exec` keeps the pid and
+    /// binds the same path, so judged by pid that host would seem to have ended the
+    /// exchange on purpose.
     ///
     /// A busy answer often comes with no pid: the listener writes its line and
-    /// closes at once, and Darwin answers `ENOTCONN` to `LOCAL_PEERPID` once
-    /// the peer has closed (aterm-ctl's `version_at`). The recorded listener,
-    /// unchanged after the answer, then names the host, as aterm-ctl's
-    /// `answers_at` judges a successor; without one, an answer with no pid
-    /// proves nothing.
+    /// closes at once, and Darwin answers `ENOTCONN` to `LOCAL_PEERPID` once the
+    /// peer has closed. The recorded listener, unchanged after the answer, then
+    /// names the host, as aterm-ctl's `answers_at` judges a successor; without one,
+    /// an answer with no pid proves nothing.
     fn serves(&self, pid: u32) -> bool {
         let Ok(look) = CtlStream::connect(&self.sock) else {
             return false;
@@ -1008,11 +989,9 @@ fn deliver_then_relay(
     // Prove the child is serving before it is handed the verb, then send the
     // rewritten verb as the next request line.
     prove_child_serving(&child, &token, accept_within)?;
-    // The host's pid is read NOW, while the connection is surely up: Darwin answers
-    // `ENOTCONN` to `LOCAL_PEERPID` once the peer has closed, and the host this
-    // exists for (an update's Commit `_exit`s it) hangs up as soon as it has read
-    // the verb - read after the delivery, a relay that was descheduled between the
-    // two found no pid, and the client a bare EOF instead of `ERR gone`.
+    // The host's pid is read now, while the connection is surely up: Darwin answers
+    // `ENOTCONN` to `LOCAL_PEERPID` once the peer has closed, and an updating host
+    // (its Commit `_exit`s) hangs up as soon as it has read the verb.
     let pid = aterm_uds::fdpass::peer_pid(&child).ok();
     (&child).write_all(first_line.verb.as_bytes())?;
     (&child).write_all(b"\n")?;
@@ -1020,13 +999,10 @@ fn deliver_then_relay(
         (&child).write_all(client_prebuffered)?;
     }
     (&child).flush()?;
-    // Past this point the verb HAS been delivered to the child. A relay-stage
-    // failure (e.g. a `try_clone` under fd exhaustion) tears the connection down
-    // but must NOT be reported as "forward failed" — that would be a false
-    // negative for an op that already reached the child. Only a connect/handshake
-    // error (the `?`s above, before any byte was delivered) surfaces as `Err` so
-    // the caller can honestly answer `ERR forward`. Nor is the host going away
-    // under the delivered verb: the relay says THAT, in its own words
+    // Past this point the verb has been delivered. A relay-stage failure (e.g. a
+    // `try_clone` under fd exhaustion) must not read as a failed forward: only the
+    // connect/handshake errors above surface as `Err` (the caller's `ERR forward`).
+    // A host going away under the delivered verb is the relay's to say
     // ([`ForwardHost::gone_line`]).
     let host = ForwardHost {
         sock: child_sock.to_string(),
@@ -1039,40 +1015,29 @@ fn deliver_then_relay(
 }
 
 /// Pump bytes both ways between two connected streams, preserving graceful
-/// half-close order. EOF after a child response becomes `Shutdown::Write` on
-/// the original client only after every preceding byte was copied and flushed;
-/// client EOF then becomes `Shutdown::Write` on the child. Guarded artifact
-/// replies need this: the client's post-response ACK must travel client →
-/// child after the complete child → client response.
+/// half-close order: the child's EOF becomes `Shutdown::Write` on the client only
+/// after every preceding byte was copied and flushed, and the client's EOF then
+/// becomes `Shutdown::Write` on the child. Guarded artifact replies need this: the
+/// client's ACK must reach the child after the complete response. A real copy
+/// error hangs up both sides to unblock the paired pump.
 ///
-/// A real copy error still shuts both sockets down to unblock the paired pump.
+/// When the child's side ends while the client is still there, the host is looked
+/// at once ([`ForwardHost::gone_line`]): one that no longer serves (an update's
+/// Commit `_exit`ed it, or it crashed or quit) leaves the client the host-gone line
+/// before its EOF, so a `subscribe` does not read the end as deliberate.
 ///
-/// THE HOST HANGING UP FIRST IS SAID (round eight of the update audit, finding
-/// 12): when the child's side ends while the client is still there, the host
-/// is looked at once ([`ForwardHost::gone_line`]), and one that no longer
-/// serves — an update's Commit `_exit`ed it, or it crashed or quit — leaves the
-/// client the host-gone line before its EOF. A bare EOF from this aterm, which
-/// still answers, read to the client as an end on purpose: a `subscribe` exited
-/// 0 ("session over") with the session alive in the host's successor.
+/// Every teardown hangs up each half on its own ([`aterm_uds::hangup::hang_up`]),
+/// never a both-ways `shutdown`: by then one end has usually half-closed toward
+/// the relay, Darwin refuses a both-ways `shutdown` of that end and shuts nothing,
+/// and the peer then reads no EOF while any copy of the descriptor lives (a fork
+/// holds one until it execs).
 ///
-/// Every teardown here is a HANG-UP of each half on its own
-/// ([`aterm_uds::hangup::hang_up`]), never a both-ways `shutdown`: by then one
-/// end has usually half-closed toward the relay (the child that answered, the
-/// client that sent its request), and Darwin refuses a both-ways `shutdown` of
-/// that end, shutting NOTHING — so the peer still waiting on it read no EOF
-/// while any copy of the relay's descriptor lived (any thread's fork holds
-/// one until it execs).
-///
-/// THE WORKER'S EXIT NEVER WAITS ON A WAKE FROM ANOTHER THREAD: every hang-up
-/// of the child is preceded by setting `stop`, and the worker polls the
-/// child's end ([`crate::control::HANGUP_POLL`]) before each read, re-reading
-/// `stop` whenever a poll times out. Under load a read already parked on one
-/// descriptor was not woken by a `shutdown(SHUT_RD)` made through a sibling
-/// descriptor of the same socket, and the relay's join hung for the test's
-/// whole two-minute detector. The same holds in reverse: the worker's one
-/// hang-up of the client (its copy broke) sets `client_stop` first, and this
-/// thread's client read waits the same way, so a silent client that never
-/// half-closes cannot park it past a lost wake either.
+/// No exit waits on a wake from another thread: every hang-up of the child is
+/// preceded by setting `stop`, and the worker polls the child's end
+/// ([`crate::control::HANGUP_POLL`]) before each read, re-reading `stop` whenever a
+/// poll times out, because a read parked on one descriptor is not reliably woken by
+/// a `shutdown(SHUT_RD)` through a sibling descriptor. The worker's hang-up of the
+/// client sets `client_stop` the same way for this thread's client read.
 fn relay_bidirectional(
     client: &CtlStream,
     child: &CtlStream,
@@ -1090,7 +1055,7 @@ fn relay_bidirectional(
     // child's end the worker then reads is that, not the host's.
     let client_gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let torn = Arc::clone(&client_gone);
-    // Set before EVERY hang-up of the child: the worker stops at its next
+    // Set before every hang-up of the child: the worker stops at its next
     // poll timeout even if the hang-up's wake never reaches it.
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stopped = Arc::clone(&stop);
@@ -1280,13 +1245,9 @@ fn copy_until_eof<R: Read, W: Write>(
 
 /// Drain whatever a server-side `BufReader` already buffered past the request
 /// line, so [`connect_and_relay`] can forward it to the child before the raw
-/// relay. A freshly handshaked connection usually has none.
-///
-/// Uses [`BufReader::buffer`], never `fill_buf()`: `fill_buf` blocks on an
-/// empty buffer, the common case for a one-line forward request (the client
-/// sent `TOKEN <hex> @<sid> <verb>\n` and awaits the reply), and would
-/// deadlock before the relay starts. `buffer()` returns pipelined leftovers or
-/// an empty slice, with no syscall.
+/// relay. Uses [`BufReader::buffer`], never `fill_buf()`, which blocks on an
+/// empty buffer (the common case: the client sent one line and awaits the reply)
+/// and would deadlock before the relay starts.
 #[must_use]
 pub(crate) fn drain_buffered<R: Read>(reader: &mut std::io::BufReader<R>) -> Vec<u8> {
     let buffered = reader.buffer().to_vec();
@@ -1305,8 +1266,8 @@ mod tests {
     use crate::test_socket::{hang_up, join_after_hang_up};
     use std::io::BufReader;
 
-    /// A host whose pid was not read: a hang-up from it is relayed as a bare
-    /// end of stream, as before the host-gone line.
+    /// A host whose pid was not read: a hang-up from it is relayed as a bare end of
+    /// stream.
     fn unknown_host() -> ForwardHost {
         ForwardHost {
             sock: String::new(),
@@ -1366,13 +1327,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An instance bound to an explicit `--control-sock` outside the default
-    /// rendezvous dir mirrors its session graph entry into the default dir (the
-    /// only one the flagless `aterm-ctl` client reads), and the client recovers
-    /// the absolute socket path and nonce from that entry, so a flagless
-    /// in-session call reaches the hosting instance. Parsed with the shared
-    /// helper (`control_socket::graph_entry_sock`) the client's self-location
-    /// uses.
+    /// An instance on an explicit `--control-sock` mirrors its graph entry into the
+    /// default rendezvous dir (the only one the flagless `aterm-ctl` reads), and the
+    /// client's own parse (`control_socket::graph_entry_sock`) recovers the absolute
+    /// socket path and nonce from it.
     #[test]
     fn explicit_socket_instance_resolvable_from_default_dir_entry() {
         // `default_dir` stands in for `aterm_uds::control_socket_dir()`.
@@ -1471,11 +1429,10 @@ mod tests {
         assert!(e.token_for(Op::ClipboardWrite).is_none());
     }
 
-    /// A wedged child, whose listener queues connections without accepting
-    /// them, is reported within the connect-probe bound as having accepted
-    /// nothing (an error before any relay, so the caller answers it), and the
-    /// verb never reaches it. The served child in the test above is the
-    /// negative control.
+    /// A wedged child, whose listener queues connections without accepting them, is
+    /// reported within the connect-probe bound as having accepted nothing (an error
+    /// before any relay), and the verb never reaches it. The served child in
+    /// `connect_and_relay_pipes_handshake_and_response` is the negative control.
     #[test]
     fn a_child_that_accepts_nothing_fails_the_forward_fast() {
         let dir = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch");
@@ -1539,12 +1496,10 @@ mod tests {
         assert_eq!(child.join().unwrap(), "", "the verb was never sent");
     }
 
-    /// A SATURATED HOST STILL ANSWERS. A listener with no lane free writes its
-    /// busy line and closes without reading; a probe written after that close
-    /// fails (`EPIPE`), and the line left behind is its answer — the proof
-    /// [`ForwardHost::serves`] takes that the host is alive. FAILS WITHOUT THE
-    /// FIX: the probe is `Err(BrokenPipe)`, and a relay told its client a
-    /// live host went away.
+    /// A saturated host still answers: a listener with no lane free writes its busy
+    /// line and closes without reading, so the probe's write fails (`EPIPE`) and the
+    /// line left behind is the answer [`ForwardHost::serves`] takes as proof the
+    /// host is alive.
     #[test]
     fn a_busy_line_left_behind_answers_a_probe_whose_write_failed() {
         let dir = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch");
@@ -1563,23 +1518,13 @@ mod tests {
         );
     }
 
-    /// A HOST THAT GOES AWAY UNDER A FORWARD LEAVES ITS CLIENT A TYPED LINE
-    /// (round eight of the update audit, finding 12). The aterm a forward
-    /// reached (a sibling, a child) self-updates and `_exit`s at its Commit;
-    /// the relay copied its EOF through and half-closed the client, which then
-    /// found THIS aterm still answering and read the end as deliberate — a
-    /// `subscribe` exited 0, a `turn` exited 1. Now, when the host hangs up
-    /// first and no longer serves where it was reached, the client is told so
-    /// before the EOF: `ERR gone pid=<host> sock=<its socket>`, a line of its
-    /// own (never `ERR forward`: the verb was delivered). `Gone`: its listener
-    /// closed, then the connection. `Reopened`: the cold update lane — the
-    /// SAME pid on a fresh listener renamed over the path (an `exec` that kept
-    /// the pid, or `Endpoint::reopen` after one that returned), then the
-    /// forwarded connection shut (`Endpoint::retire`); judged by pid it read
-    /// as the host serving on (review of the round-eight fixes). NEGATIVE
-    /// CONTROL, `ServesOn`: a host that ends the exchange and goes on serving
-    /// through the same listener leaves a bare EOF, as before. FAILS WITHOUT
-    /// THE FIX: the client reads a bare EOF from `Gone` and from `Reopened`.
+    /// A host that goes away under a forward leaves its client a typed line before
+    /// the EOF, `ERR gone pid=<host> sock=<its socket>` (never `ERR forward`: the
+    /// verb was delivered). `Gone`: its listener closed, then the connection.
+    /// `Reopened`: the same pid on a fresh listener renamed over the path, then the
+    /// forwarded connection shut (the cold update lane). Negative control,
+    /// `ServesOn`: a host that ends the exchange and serves on through the same
+    /// listener leaves a bare EOF.
     #[test]
     fn a_host_that_goes_away_under_a_forward_leaves_a_typed_line() {
         #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1738,10 +1683,9 @@ mod tests {
         assert_eq!(echo, "ping\n");
 
         // Hang the client up for the whole socket ([`hang_up`]) so the relay's
-        // client→child reader hits EOF and the relay thread returns. Closing
-        // its handles is not that while a sibling's fork holds a copy of one,
-        // and the both-ways `shutdown` this made before is refused on Darwin,
-        // shutting nothing, once the relay has half-closed toward the client.
+        // client→child reader hits EOF: closing its handles is not enough while a
+        // sibling's fork holds a copy, and Darwin refuses a both-ways `shutdown`
+        // once the relay has half-closed toward the client.
         drop(app_rdr);
         hang_up(client_app);
         join_after_hang_up(relay, "the relay to end on its client's hang-up");
@@ -1761,7 +1705,7 @@ mod tests {
         let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let (mut original, relay_client) = CtlStream::pair().unwrap();
         let (relay_child, mut child) = CtlStream::pair().unwrap();
-        // The response and the challenge MUST cross the relay: the read bound
+        // The response and the challenge must cross the relay: the read bound
         // is a hang detector, never a latency budget a loaded host outruns.
         original
             .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
@@ -1914,22 +1858,15 @@ mod tests {
     }
 
     /// Tier-1 conformance of the real relay to
-    /// `aterm_spec::derive::relay_teardown_model` (`RelayTeardown`): when the
-    /// relay tears down, both read halves of both local sockets are shut, so a
-    /// pump parked on a clone of either gets EOF and the worker joins, leaving
-    /// no parked thread or held fd.
+    /// `aterm_spec::derive::relay_teardown_model` (`RelayTeardown`): on teardown both
+    /// read halves of both local sockets are shut, so a pump parked on a clone of
+    /// either gets EOF and the worker joins.
     ///
-    /// `relay_bidirectional` has two error arms, one per pump, each driven by
-    /// the fault that exercises it while both peers stay open and silent
-    /// ([`RelayFault`]): a failed write toward the child (the main thread's
-    /// arm) and toward the original client (the worker's arm). For each, the
-    /// projection ([`relay_teardown_under`]) must be the model's `Teardown`
-    /// step, and the relay must have returned.
-    ///
-    /// Negative control: `Buggy = 1` (`shutdown(Write)` only) must reject every
-    /// real step. Turning either arm's hang-ups ([`hang_up`]: the write half,
-    /// then the read half) into `shutdown(Write)` leaves both read halves open,
-    /// the step only the mutant admits.
+    /// Each of `relay_bidirectional`'s two error arms is driven by its own fault
+    /// ([`RelayFault`]), and its projection ([`relay_teardown_under`]) must be the
+    /// model's `Teardown` step with the relay returned. Negative control: `Buggy = 1`
+    /// (`shutdown(Write)` only, which leaves both read halves open) must reject every
+    /// real step.
     #[test]
     #[cfg(unix)]
     fn relay_teardown_conforms_to_readers_unblock_after_teardown() {
@@ -1971,13 +1908,10 @@ mod tests {
         }
     }
 
-    /// THE HOST PUMP ENDS ON THE STOP FLAG ALONE: the lost wake, staged by
-    /// sending none. The pump waits on a silent host whose socket nobody shuts;
-    /// once the pump is about to wait (the handshake), only `stop` is set, and
-    /// the pump must still end, as the host's side ending. `stop` is read only
-    /// after a poll times out, so a flag set before the poll is entered still
-    /// exercises the lost-wake path. Both waits are hang detectors. Negative control: drop the `stop` re-read after a poll
-    /// timeout and the pump parks forever.
+    /// The host pump ends on the stop flag alone: the lost wake, staged by sending
+    /// none. Once the pump waits on a silent host nobody shuts, only `stop` is set,
+    /// and the pump must still end, as the host's side ending. Negative control: drop
+    /// the `stop` re-read after a poll timeout and the pump parks forever.
     #[test]
     #[cfg(unix)]
     fn the_host_pump_ends_on_the_stop_flag_without_a_wake() {
@@ -2006,23 +1940,15 @@ mod tests {
         pump.join().expect("the pump");
     }
 
-    /// A CHILD THAT HALF-CLOSED READS END-OF-FILE WHEN THE RELAY ENDS, though a
-    /// copy of the relay's end of it survives — the copy any thread's fork
-    /// holds until it execs (a `try_clone` here: one more descriptor on the
-    /// same socket, which is all the kernel counts).
+    /// A child that half-closed reads end-of-file when the relay ends, though a copy
+    /// of the relay's end of it survives (a `try_clone` here, as a fork holds one
+    /// until it execs).
     ///
-    /// The child answers and half-closes, still waiting for its client's EOF;
-    /// the relay passes the answer and the half-close on; the client reads both
-    /// and then half-closes in turn. Each read waits on a fact the real relay
-    /// must reach, so its bound is a hang detector. Once the relay has
-    /// returned, every shutdown it will ever make is made, so one non-blocking
-    /// read of the child's end is the verdict.
-    ///
-    /// NEGATIVE CONTROL (run by restoring the both-ways `shutdown` calls): the
-    /// relay's teardown of the child-side socket, whose read half the child's
-    /// half-close had shut, was refused on Darwin (`ENOTCONN`) and shut nothing
-    /// — so the child read `WouldBlock`, not its end-of-file, while the copy
-    /// lived.
+    /// The child answers and half-closes; the relay passes both on; the client reads
+    /// them and half-closes in turn. Once the relay has returned, one non-blocking
+    /// read of the child's end is the verdict. Negative control: restore both-ways
+    /// `shutdown` calls, which Darwin refuses (`ENOTCONN`) on a socket whose read
+    /// half the child's half-close shut, and the child reads `WouldBlock`.
     #[test]
     #[cfg(unix)]
     fn a_child_that_half_closed_reads_eof_when_the_relay_ends_though_a_copy_survives() {
@@ -2063,10 +1989,9 @@ mod tests {
         drop(forked_copy);
     }
 
-    /// F1 (revised): edge-token secrets round-trip through the 0600 file, the file
-    /// is owner-only (0600), and the read is REPEATABLE — it PERSISTS for the
-    /// session so a child re-launched in the same shell can re-read it. The PARENT
-    /// removes it at teardown: the `ChildProxy` holding its path drops.
+    /// Edge-token secrets round-trip through a 0600 file, and the read is repeatable
+    /// (a child relaunched in the same shell re-reads it). The parent removes it when
+    /// the `ChildProxy` holding its path drops.
     #[test]
     fn edge_tokens_file_is_0600_and_read_is_repeatable() {
         let dir = std::env::temp_dir().join(format!("aterm-edges-{}", std::process::id()));
@@ -2110,11 +2035,12 @@ mod tests {
     }
 
     /// A dead parent's edge file is swept, a live one's never. A parent holds
-    /// its file's owner lock for the child's life; at the next provisioning a
-    /// file whose lock is free (here, its handle dropped without the clean
-    /// retire's removal, as a crash leaves it) is removed. Negative controls:
-    /// a live parent's file (its `EdgeFile` held) and an empty file (a writer
-    /// between create and lock) stay.
+    /// its file's owner lock for the child's life; the sweep removes a file
+    /// whose lock is free (here, its handle dropped without the clean retire's
+    /// removal, as a crash leaves it). A provisioning sweeps nothing: that is
+    /// the sweeper thread's work, off the event loop. Negative controls: a live
+    /// parent's file (its `EdgeFile` held) and an empty file (a writer between
+    /// create and lock) stay.
     #[cfg(unix)]
     #[test]
     fn a_dead_parents_edge_file_is_swept_and_a_live_ones_never() {
@@ -2139,21 +2065,15 @@ mod tests {
         )
         .expect("crashed");
         let crashed_path = crashed.path().to_path_buf();
-        // The lock released, the file left: a crashed parent. The drop
-        // releases it by LOCK_UN ([`EdgeFile`]), so a child forked while it
-        // was held — made here for real, and parked short of its exec through
-        // the sweep — holds no copy of a lock the sweep would read the parent
-        // as live by. Released by the close alone, it did, and the dead
-        // parent's file stayed.
+        // The lock released, the file left: a crashed parent. A child forked while
+        // the lock was held, parked short of its exec through the sweep, must not
+        // make the dead parent read as live: the drop releases by LOCK_UN
+        // ([`EdgeFile`]), not by the close alone.
         let forked = crate::parked_fork::ParkedChild::fork();
         drop(crashed);
         let edges = dir.join("edges");
         let empty = edges.join(SessionId::generate().as_str());
         std::fs::write(&empty, b"").unwrap();
-        assert!(
-            crashed_path.exists(),
-            "nothing sweeps before a provisioning"
-        );
         let next = write_edge_tokens(
             &dir,
             &SessionId::generate(),
@@ -2162,6 +2082,8 @@ mod tests {
             &hex("33"),
         )
         .expect("next");
+        assert!(crashed_path.exists(), "a provisioning sweeps nothing");
+        sweep_dead_edge_files(&edges);
         assert!(
             forked.still_parked(),
             "the sweep ran before the fork's exec"
@@ -2186,11 +2108,9 @@ mod tests {
         let _guard = self_sock_test_guard();
         let dir = std::env::temp_dir().join(format!("aterm-pub-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        // Redirect the rendezvous mirror into a scratch dir so publishing never
-        // touches the user's real control dir: `dir` is not the default dir,
-        // so `publish_session` would otherwise mirror into
-        // `aterm_uds::control_socket_dir()`. The override is held under the
-        // self-sock guard and cleared before it drops.
+        // Redirect the rendezvous mirror into a scratch dir: `dir` is not the
+        // default dir, so `publish_session` would otherwise mirror into the user's
+        // real control dir. Cleared before the self-sock guard drops.
         let mirror = std::env::temp_dir().join(format!("aterm-pub-mirror-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&mirror);
         set_mirror_dir_override(Some(mirror.clone()));
@@ -2205,14 +2125,9 @@ mod tests {
         publish_session(&sid, &nonce);
         assert!(read_graph_entry(&dir, &sid).is_none(), "no entry pre-bind");
 
-        // Post-bind: the entry appears, pointing at our socket, with the nonce.
-        // `set_self_sock` stores the canonical path, so the published entry is
-        // canonical even when the raw path went through a symlinked ancestor
-        // (macOS temp: /var → /private/var).
+        // Post-bind: the entry names our socket, canonical (macOS temp: /var →
+        // /private/var) and in its published spelling, with the nonce.
         let sock = dir.join("aterm-88001.sock").to_string_lossy().into_owned();
-        // …in the published spelling: Windows' canonical form is the verbatim
-        // `\\?\C:\…`, which `publish_session` un-verbatims so one socket has
-        // one spelling in the graph (`published_sock_spelling`, identity on Unix).
         let canon_sock = published_sock_spelling(
             &std::fs::canonicalize(&dir)
                 .unwrap()
@@ -2287,9 +2202,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `drain_buffered` must not block when the BufReader has no buffered
-    /// bytes and the peer is silent (the common one-line-forward case). A
-    /// blocking drain makes this test hang.
+    /// `drain_buffered` does not block on an empty buffer and a silent peer (the
+    /// common one-line-forward case).
     #[test]
     fn drain_buffered_never_blocks_on_empty_buffer() {
         let (a, _b) = CtlStream::pair().expect("pair"); // _b stays open + silent

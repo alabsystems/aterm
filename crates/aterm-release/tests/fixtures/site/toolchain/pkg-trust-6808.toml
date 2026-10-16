@@ -1,0 +1,17 @@
+schema = 2
+program = "trust"
+version = "6808"
+build_number = 6808
+exposes = ["trust"]
+
+[[artifact]]
+target = "aarch64-apple-darwin"
+kind = "binary"
+url = "trust-6808-aarch64-apple-darwin.tar.zst"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[artifact]]
+target = "x86_64-apple-darwin"
+kind = "binary"
+url = "trust-6808-x86_64-apple-darwin.tar.zst"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"

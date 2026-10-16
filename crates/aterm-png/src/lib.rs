@@ -41,6 +41,11 @@
 //! rows). The excess is unbounded, so it is treated as a decompression bomb,
 //! with its own error so it is never reported as corruption.
 //!
+//! Encoded input is bounded too: [`Limits`] allows four times its output-byte
+//! budget plus 64 KiB of container/compression overhead. This accepts ordinary
+//! incompressible images, including 16-bit input stripped to 8-bit output, but
+//! refuses arbitrarily large metadata, padding and empty compressed blocks.
+//!
 //! Encoding covers what aterm writes: 8-bit Grayscale/RGB/RGBA/Indexed with
 //! optional `PLTE`/`tRNS`/`sRGB`. See [`deflate`] for the compressor's
 //! deliberate ratio trade.
@@ -214,18 +219,27 @@ impl std::ops::BitOr for Transformations {
     }
 }
 
-/// A budget on what a decode may allocate.
+/// A decoded-output budget, with a separate derived encoded-input ceiling.
 ///
 /// A few hundred bytes of PNG can declare a 4-gigapixel image; the point of this
 /// is that such a file is REFUSED before anything is allocated for it, rather
 /// than aborting the process on a failed allocation. Checked against the output
-/// buffer, computed from the header before it exists: the image data is
-/// inflated a scanline at a time, so nothing else a decode allocates grows with
-/// the image.
+/// buffer, computed from the header before it exists. The image data is
+/// inflated a scanline at a time. Encoded input is buffered before parsing and
+/// is limited to four times this budget plus 64 KiB, with saturation at
+/// `usize::MAX`; a second buffer holds its IDAT payload. The overhead allowance
+/// keeps an exact output-byte budget usable for small images whose container
+/// and zlib framing are larger than their pixels.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
-    /// Maximum bytes the decoder may allocate for one image.
+    /// Maximum bytes in the decoded output buffer.
     pub bytes: usize,
+}
+
+impl Limits {
+    pub(crate) const fn encoded_bytes(self) -> usize {
+        self.bytes.saturating_mul(4).saturating_add(64 * 1024)
+    }
 }
 
 impl Default for Limits {

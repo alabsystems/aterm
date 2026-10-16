@@ -2,20 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Tier-1 bind for `TerminalModes` (`aterm_spec::derive::terminal_modes_model`):
-//! drives every `#[refines(machine = "terminal_modes", …)]` action through real
-//! `Terminal::process_at` bytes, projects the real [`TerminalModes`] with
-//! [`project_modes`], and validates each step against the model (the in-process
-//! interpreter always, `ty trace validate` where installed).
+//! Tier-1 bind for `TerminalModes` (`aterm_spec::derive::terminal_modes_model`): drives
+//! every `#[refines(machine = "terminal_modes", …)]` action through real
+//! `Terminal::process_at` bytes, projects the modes with [`project_modes`], and validates
+//! each step against the model (in-process, plus `ty trace validate` where installed).
+//! It lives in the unit-test build, where the anchors expand: each step runs in a
+//! [`StepEvidence`] window proving it entered its action's anchored sites, and every
+//! action sets its variable to an exact value, so a handler that does nothing is rejected.
 //!
-//! It lives in aterm-core's unit-test build, where the anchors expand, so each
-//! step runs inside a [`StepEvidence`] window proving it entered every anchored
-//! site of its own action. Every action sets its variable to an exact value, so
-//! a handler that does nothing is rejected. The host's default cursor shape is
-//! set to a non-factory style so shape steps and resets are checked against it.
-//!
-//! Negative control: a DECSTR that forgets the synchronized-output hold is
-//! rejected by the committed model and admitted by `Buggy = 1`.
+//! Negative control: a DECSTR that forgets the synchronized-output hold is rejected by
+//! the committed model and admitted by `Buggy = 1`.
 
 use std::collections::BTreeMap;
 
@@ -143,14 +139,13 @@ const STEPS: &[(&str, &[u8])] = &[
     ("SetBracketedPaste", b"\x1b[?2004h"),
 ];
 
-/// A terminal with the host's non-factory default shape installed, and the
-/// fixed batch clock every step runs under (so no mode-2026 timeout can fire
-/// between steps while `ty` validates the previous one).
+/// A terminal with the host's non-factory default shape, and one fixed batch clock for
+/// every step (so no mode-2026 timeout fires while `ty` validates the previous step).
 fn fixture() -> (Terminal, ClockReading) {
     let mut term = Terminal::new(24, 80);
     term.set_default_cursor_style(HOST_STYLE);
     let clock = ClockReading {
-        monotonic: aterm_time::Instant::now(), // CLOCK-EXEMPT: captured once, reused so deltas are zero
+        monotonic: aterm_time::Instant::now(), // captured once, reused so deltas are zero
         wall_ms: Some(0),
     };
     (term, clock)

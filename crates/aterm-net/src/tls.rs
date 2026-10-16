@@ -39,13 +39,21 @@ const EXPORTER_LABEL: &[u8] = b"EXPORTER-aterm-net-capability-v1";
 /// The exporter (and the channel-binding HMAC) length.
 pub const EXPORTER_LEN: usize = 32;
 
-/// Install the `ring` crypto provider as the process default, once. Idempotent —
-/// a second call (or a pre-installed provider) is ignored.
+/// THE crypto provider: the one place this crate names a rustls
+/// `CryptoProvider` implementation. Today it is rustls's `ring` provider, and
+/// ring is the bridge half of the KEEP pair (docs/AUDIT-third-party-2026-10-15.md):
+/// replacing it is a change to this function, not to its callers.
+fn provider() -> rustls::crypto::CryptoProvider {
+    rustls::crypto::ring::default_provider()
+}
+
+/// Install `provider()` as the process default, once. Idempotent — a second call
+/// (or a pre-installed provider) is ignored.
 pub fn init_crypto() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         // Ignore the error: another caller may have already installed a provider.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = provider().install_default();
     });
 }
 
@@ -91,14 +99,14 @@ pub fn server_config(cert_der: Vec<u8>, key_pkcs8_der: Vec<u8>) -> io::Result<Ar
 
 /// A client [`ClientConfig`] that pins the server cert to `fingerprint` (SHA-256
 /// of its DER) and otherwise verifies the TLS 1.3 handshake signature with the
-/// `ring` provider — so the peer must BOTH present the pinned cert AND prove it
-/// holds the matching private key.
+/// algorithms of `provider()` — so the peer must BOTH present the pinned cert AND
+/// prove it holds the matching private key.
 #[must_use]
 pub fn client_config(fingerprint: [u8; 32]) -> Arc<ClientConfig> {
     init_crypto();
     let verifier = PinnedServerVerifier {
         pin: fingerprint,
-        supported: rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        supported: provider().signature_verification_algorithms,
     };
     // TLS 1.3 ONLY (matches `server_config`): no downgrade to a non-EMS 1.2
     // session whose exporter would not be transcript-bound.
@@ -346,6 +354,7 @@ impl<C> RelayState<C> {
     }
 }
 
+#[cfg_attr(trust_verify, trust::paired)]
 struct RelayShared<C> {
     state: Mutex<RelayState<C>>,
     /// Signals every relay condition: plaintext-buffer space freed, TLS output
@@ -1324,11 +1333,11 @@ mod tests {
     /// Upper bound on how long a socket read in these tests may block.
     ///
     /// Not a latency budget — a liveness guard. Its only job is that a stall can
-    /// never be UNBOUNDED, because an unbounded one hangs `cargo test
-    /// --workspace` (and therefore `tools/verify.sh`, the merge contract)
-    /// instead of failing it. Sized to survive worst-case scheduler starvation
-    /// when the whole workspace suite runs concurrently, not to measure a
-    /// loopback round trip, which takes milliseconds.
+    /// never be UNBOUNDED, because an unbounded one hangs `targo --unverified
+    /// test --workspace` (and therefore `verify test`) instead of failing it.
+    /// Sized to survive worst-case scheduler starvation when the whole
+    /// workspace suite runs concurrently, not to measure a loopback round trip,
+    /// which takes milliseconds.
     const NET_TEST_LIVENESS_BOUND: Duration = Duration::from_secs(60);
 
     /// A GRACEFUL local EOF is a half-close of ONE direction, not the end of the

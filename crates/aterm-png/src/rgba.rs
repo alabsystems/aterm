@@ -19,9 +19,8 @@ const DECODE_BYTE_LIMIT: usize = 64 * 1024 * 1024;
 /// dimensions would be: either axis past `max_dimension` is refused after IHDR
 /// is parsed and BEFORE the output buffer is allocated, and the output budget
 /// scales with that dimension budget (never below [`DECODE_BYTE_LIMIT`]). The
-/// decoder's limit IS that budget — it streams the image data, so the output
-/// buffer is all it allocates in proportion to the image — and so every image
-/// within `max_dimension` decodes. Any failure — a corrupt file, an overflowing
+/// decoder's limit IS that budget; encoded input also has the derived ceiling
+/// described by [`Limits`]. Any failure — a corrupt file, an overflowing
 /// pixel count, an unsupported layout — is `None`: never a panic, never an
 /// unbounded allocation.
 #[must_use]

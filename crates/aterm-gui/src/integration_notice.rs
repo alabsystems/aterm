@@ -99,7 +99,7 @@ pub(crate) enum Heal {
     /// relaunch after a crash — types the one line that re-keys the shell.
     /// `agent` is its product name.
     AgentMoved {
-        /// `Claude Code` or `Codex`.
+        /// Its [`aterm_phase::Program::product`]: `Claude Code`, `Codex`.
         agent: &'static str,
     },
     /// Nothing will: a new tab has the integration.
@@ -114,24 +114,34 @@ impl Heal {
 }
 
 /// What heals a degraded tab: its re-key channel when it has one, else the
-/// harness's move of the agent in front of it (`program`, the session's
-/// published program) when the harness will type that move's line
-/// (`harness_moves`: [`crate::harness_host::HostHandle::rekeys_agents`]),
-/// else a new tab.
+/// harness's move of the agent in front of it (`agent`, the session's agent
+/// as the host knows it, [`crate::harness_host::agent_of`]: by its name, or a
+/// Claude Code started as `node` by its screen) when the harness will type
+/// that move's line (`harness_moves`:
+/// [`crate::harness_host::HostHandle::rekeys_agents`]), else a new tab — and
+/// a new tab for agy and Muse Code, whose move no lane types.
 #[must_use]
-pub(crate) fn heal_for(rekey_channel: bool, program: Option<&str>, harness_moves: bool) -> Heal {
+pub(crate) fn heal_for(
+    rekey_channel: bool,
+    agent: Option<aterm_phase::Program>,
+    harness_moves: bool,
+) -> Heal {
     if rekey_channel {
         return Heal::NextPrompt;
     }
     if !harness_moves {
         return Heal::NewTab;
     }
-    match program.and_then(aterm_phase::program_of) {
-        Some(aterm_phase::Program::Claude) => Heal::AgentMoved {
-            agent: "Claude Code",
-        },
-        Some(aterm_phase::Program::Codex) => Heal::AgentMoved { agent: "Codex" },
-        _ => Heal::NewTab,
+    match agent {
+        Some(agent @ (aterm_phase::Program::Claude | aterm_phase::Program::Codex)) => {
+            Heal::AgentMoved {
+                agent: agent.product(),
+            }
+        }
+        Some(
+            aterm_phase::Program::Agy | aterm_phase::Program::Muse | aterm_phase::Program::Generic,
+        )
+        | None => Heal::NewTab,
     }
 }
 
@@ -551,22 +561,61 @@ mod tests {
 
     #[test]
     fn a_channel_heals_at_the_prompt_a_moved_agent_by_its_move_anything_else_in_a_new_tab() {
-        assert_eq!(heal_for(true, Some("claude"), true), Heal::NextPrompt);
-        assert_eq!(heal_for(true, Some("claude"), false), Heal::NextPrompt);
+        use aterm_phase::Program;
         assert_eq!(
-            heal_for(false, Some("claude"), true),
+            heal_for(true, Some(Program::Claude), true),
+            Heal::NextPrompt
+        );
+        assert_eq!(
+            heal_for(true, Some(Program::Claude), false),
+            Heal::NextPrompt
+        );
+        assert_eq!(
+            heal_for(false, Some(Program::Claude), true),
             Heal::AgentMoved {
                 agent: "Claude Code"
             }
         );
         assert_eq!(
-            heal_for(false, Some("codex"), true),
+            heal_for(false, Some(Program::Codex), true),
             Heal::AgentMoved { agent: "Codex" }
         );
         // The harness will not type the line: a new tab.
-        assert_eq!(heal_for(false, Some("claude"), false), Heal::NewTab);
-        assert_eq!(heal_for(false, Some("vim"), true), Heal::NewTab);
+        assert_eq!(heal_for(false, Some(Program::Claude), false), Heal::NewTab);
+        assert_eq!(heal_for(false, Some(Program::Generic), true), Heal::NewTab);
         assert_eq!(heal_for(false, None, true), Heal::NewTab);
+        // No lane types agy's or Muse Code's move: a new tab.
+        assert_eq!(heal_for(false, Some(Program::Agy), true), Heal::NewTab);
+        assert_eq!(heal_for(false, Some(Program::Muse), true), Heal::NewTab);
+    }
+
+    /// A CLAUDE CODE STARTED AS `node` HEALS WITH ITS MOVE: the heal asked the
+    /// published program's NAME, so a `node` the host supervises by its screen
+    /// (`harness_host::agent_of`) was told "a new tab" though the live upgrade
+    /// moves it in the same tab. It now asks the agent as the host knows it.
+    /// NEGATIVE CONTROL: a `node` whose screen named no agent is a new tab.
+    #[test]
+    fn a_node_hosted_agent_the_host_supervises_heals_with_its_move() {
+        use crate::session_timeline::AgentPublication;
+        use aterm_phase::Program;
+        let node = |reader: Option<Program>| {
+            crate::harness_host::agent_of(&AgentPublication {
+                program: Some("node".to_string()),
+                reader,
+                ..AgentPublication::default()
+            })
+        };
+        assert_eq!(
+            heal_for(false, node(Some(Program::Claude)), true),
+            Heal::AgentMoved {
+                agent: "Claude Code"
+            }
+        );
+        assert_eq!(
+            heal_for(false, node(Some(Program::Codex)), true),
+            Heal::AgentMoved { agent: "Codex" }
+        );
+        assert_eq!(heal_for(false, node(None), true), Heal::NewTab);
     }
 
     #[test]

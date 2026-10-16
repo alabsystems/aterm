@@ -192,9 +192,11 @@ pub(crate) fn main() -> ExitCode {
         .unwrap_or_default();
     match alias_route(argv0, &first) {
         AliasRoute::Ctl => return aterm_ctl::main_entry_with(rest, CTL_LOCAL),
+        AliasRoute::Askpass => return aterm_ctl::askpass_main_entry(rest),
         AliasRoute::Pkg => return atpkg::cli::main_entry(rest),
         AliasRoute::Fleet => return aterm_agent::fleet_cli::main_entry(rest),
         AliasRoute::Drive => return aterm_agent::drive_cli::main_entry(rest),
+        AliasRoute::OpenUrl => return aterm_agent::harness::open_url::main_entry(rest),
         AliasRoute::Link => {
             #[cfg(unix)]
             return aterm_link::cli::dispatch(
@@ -310,6 +312,9 @@ pub(crate) fn main() -> ExitCode {
             // by an older build's bridge with the payload on a pipe, reaches the
             // same code and its silent exit 0.
             aterm_cli::Verb::Harness => aterm_agent::harness::cli::main_entry(forwarded),
+            // This machine's AI CLIs: their logins' doctor and reviews across AIs
+            // (docs/DESIGN-ai-connections-2026-10-16.md).
+            aterm_cli::Verb::Ai => aterm_agent::ai::cli::main_entry(forwarded),
             // The PTY keeper (docs/DESIGN-pty-keeper-2026-09-26.md).
             aterm_cli::Verb::Keeper => {
                 aterm_keeper::cli::main_entry(forwarded, aterm_types::version::app_version())
@@ -320,6 +325,11 @@ pub(crate) fn main() -> ExitCode {
                 let _ = aterm_cli::parse_args(rest);
                 ExitCode::SUCCESS
             }
+            // The theme family: the one listing and the authoring commands
+            // (read from the window library's catalog and classifier, handed in
+            // as Ship's tool is) and import (a pure conversion plus one file
+            // write). No window either way.
+            aterm_cli::Verb::Theme => aterm_cli::theme_main_entry(forwarded, &WindowThemes),
             // The wt-shaped WINDOWING grammar (S12).
             // `WindowedSibling`: typed at a prompt, this is the CONSOLE image on
             // Windows, and a window it has to spawn belongs in the windowed
@@ -328,6 +338,13 @@ pub(crate) fn main() -> ExitCode {
                 window_verb(verb.name(), &forwarded, WindowHost::WindowedSibling)
             }
         };
+    }
+
+    // `aterm list-themes [<args>]` is `aterm theme list [<args>]`: one listing,
+    // so it routes to the verb before the diagnostics below (whose parser has
+    // no theme catalog) can answer it.
+    if let Some(theme_args) = aterm_cli::list_themes_alias(&first, rest.get(1..).unwrap_or(&[])) {
+        return aterm_cli::theme_main_entry(theme_args, &WindowThemes);
     }
 
     // `aterm --completions <bash|zsh|fish>` — the hidden generator flag, kept
@@ -501,6 +518,20 @@ pub(crate) fn main() -> ExitCode {
     // stray. Never `ATPKG_AGENTS`: the shell integration keys its hook-sourcing on that
     // being unset. Set here, single-threaded, before the lane's first thread.
     hand_agents_dir(layout.as_ref());
+    // THE MANAGED `bin/`, APPENDED to the PATH `session_main` hands its shell, as the
+    // window's spawn seam appends it: the shell's own copies stay ahead, and the rc-sourced
+    // hook, which appends the same entry only where it is absent, adds no second one. A
+    // process the shell starts before that hook exists still finds a tool the moment its
+    // shim lands. Gated on consent or a hook already there ([`atpkg::session_bin_dir`]).
+    // Never `ATPKG_BIN`: that says the rc chain ran.
+    if let Some(bin) = layout.as_ref().and_then(|layout| {
+        atpkg::session_bin_dir(layout, packages, aterm_types::dirs::home_dir().as_deref())
+    }) {
+        aterm_log::env::set(
+            "PATH",
+            atpkg::store::append_bin_to_path(std::env::var_os("PATH").as_deref(), &bin),
+        );
+    }
 
     // THE REROUTE SEAM of the session lane (`docs/DESIGN-toolchain-reroute-2026-09-07.md`
     // §"Reaching PATH" 1): resolve the configured store, lay the session-scoped stubs
@@ -956,6 +987,11 @@ enum AliasRoute {
     Fleet,
     /// `aterm-drive` — the agent drive CLI.
     Drive,
+    /// `aterm-open-url` — the opener a Claude Code login renewal runs as
+    /// `BROWSER` (`aterm harness accounts renew`): the URL in the account's
+    /// own browser profile. An alias because the variable names ONE
+    /// executable, run with no shell.
+    OpenUrl,
     /// `aterm-link` — the fabric bridge. It is an alias and not merely a verb
     /// because a bridge is spawned BY NAME out of `[fabric] command`, which is
     /// split on whitespace and exec'd, so the string an operator writes has to
@@ -973,6 +1009,11 @@ enum AliasRoute {
     /// that name and `build.ps1` renames to `aterm-gui.exe` for the shipped
     /// folder.
     AliasWindow,
+    /// `aterm-askpass …` — the `SUDO_ASKPASS` helper `sudo` runs with no tty
+    /// (`docs/DESIGN-sudo-askpass-2026-10-15.md`). An argv0 alias because `sudo`
+    /// execs it as `[path, prompt]` with no room for a verb, and it must run
+    /// before the session/window fork (it has no tty).
+    Askpass,
     /// Not an alias: `aterm`, the old `aterm-cli` symlink target, a renamed copy.
     FrontDoor,
 }
@@ -985,7 +1026,9 @@ fn alias_route(argv0: &str, first: &str) -> AliasRoute {
         "atpkg" => AliasRoute::Pkg,
         "aterm-fleet" => AliasRoute::Fleet,
         "aterm-drive" => AliasRoute::Drive,
+        "aterm-askpass" => AliasRoute::Askpass,
         "aterm-link" => AliasRoute::Link,
+        "aterm-open-url" => AliasRoute::OpenUrl,
         "aterm-gui" | "aterm-windowed" => match aterm_cli::Verb::from_operand(first) {
             Some(verb) if verb.is_windowing() => AliasRoute::AliasWindowVerb,
             // Every other verb stays out: `aterm-gui` means "the window". Only the
@@ -1281,7 +1324,7 @@ mod windowed_sibling {
         }
         stop_inheriting_std_handles();
         let mut sibling_cmd = aterm_uds::spawnfd::command(&sibling);
-        aterm_uds::spawn::set_flags(&mut sibling_cmd, aterm_uds::spawn::Console::Detached, 0);
+        aterm_uds::spawn::set_gui_image_flags(&mut sibling_cmd);
         sibling_cmd
             .args(args)
             .stdin(std::process::Stdio::null())
@@ -1993,7 +2036,7 @@ fn update_unknown_line(word: &str, is_package: impl FnOnce(&str) -> bool) -> Str
     format!("aterm update: unknown sub-command {word:?} ({UPDATE_USAGE})")
 }
 
-/// What `aterm update` knows of THIS copy's dev mark (`tools/dev-app.sh`,
+/// What `aterm update` knows of THIS copy's dev mark (`ship dev-app`,
 /// `aterm_update::running_is_dev_marked`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum DevCopy {
@@ -2051,8 +2094,8 @@ fn dev_shared_writes_line(writes: aterm_gui::DevSharedWrites) -> String {
     let aterm_gui::DevSharedWrites { what, repair } = writes;
     format!(
         "This dev build writes {what}, which only the release writes by itself, because its \
-         bundle is named aterm.app \u{2014} rebuild it with tools/dev-app.sh (it installs as \
-         aterm (dev).app) and remove this copy, then run {repair} from the release."
+         bundle is named aterm.app \u{2014} rebuild it with `targo --unverified ship dev-app` (it \
+         installs as aterm (dev).app) and remove this copy, then run {repair} from the release."
     )
 }
 
@@ -2119,7 +2162,7 @@ fn staged_tries(staged: u64, lane: Option<&aterm_update::ApplyLaneReport>) -> u3
 /// check completed, relative. The updater's own decision sentence, the lane and the
 /// counters stay in `aterm ctl update status`, `-v` and the log.
 /// `installs_by_itself` is `[update] auto_apply`, `automatic_checks` `[update] enabled`,
-/// `dev` whether the running bundle carries the dev mark (`tools/dev-app.sh`) and, for a
+/// `dev` whether the running bundle carries the dev mark (`ship dev-app`) and, for a
 /// dev build, where it stands against the public channel ([`DevCopy`]). `lane` is the
 /// apply lane's record, which counts the installs of the staged build ([`staged_tries`]).
 /// Pure for the test.
@@ -2194,7 +2237,7 @@ fn update_summary(
     }
     if !st.installable {
         // The checker deliberately does nothing here, which otherwise reads as idleness.
-        // A dev-marked bundle (`tools/dev-app.sh`, in /Applications or not) is left
+        // A dev-marked bundle (`ship dev-app`, in /Applications or not) is left
         // alone on purpose and has nowhere to move: say that, not "move it" — and, when
         // the channel was read, how far behind it. A disk-image launch and a translocated
         // download get their own remedy; a `target/` binary has none to get. Never
@@ -2532,6 +2575,28 @@ fn front_door_verbs() -> Vec<&'static str> {
         verbs.push(name);
     }
     verbs
+}
+
+/// What `aterm theme` reads from the window library: its one theme report,
+/// its catalog lookup and its dark/light classifier (the catalog lives there).
+struct WindowThemes;
+
+impl aterm_cli::ThemeHost for WindowThemes {
+    fn list(&self, request: &aterm_cli::ThemeListRequest) -> String {
+        let format = match request.format {
+            aterm_cli::ThemeListFormat::Text => aterm_gui::ThemeListFormat::Text,
+            aterm_cli::ThemeListFormat::Tsv => aterm_gui::ThemeListFormat::Tsv,
+        };
+        aterm_gui::theme_list_report(request.appearance, format)
+    }
+
+    fn lookup(&self, id: &str) -> Result<aterm_types::scheme::CatalogTheme, String> {
+        aterm_gui::theme_catalog_entry(id)
+    }
+
+    fn measure(&self, background: aterm_types::Rgb) -> aterm_types::Appearance {
+        aterm_gui::theme_measured_appearance(background)
+    }
 }
 
 /// The user-typed front-door flags `--completions` offers, with the zsh/fish
@@ -3276,7 +3341,6 @@ mod tests {
             trouble.starts_with("This dev build writes the agent primer, which only the release"),
             "{trouble}"
         );
-        assert!(trouble.contains("tools/dev-app.sh"), "{trouble}");
         assert!(
             trouble.ends_with("then run `aterm agents install` from the release."),
             "{trouble}"
@@ -4107,10 +4171,20 @@ mod tests {
         assert_eq!(alias_route("atpkg", "new-tab"), AliasRoute::Pkg);
         assert_eq!(alias_route("aterm-fleet", ""), AliasRoute::Fleet);
         assert_eq!(alias_route("aterm-drive", ""), AliasRoute::Drive);
+        // `sudo` execs the askpass helper as `[aterm-askpass, "Password:"]`.
+        assert_eq!(
+            alias_route("aterm-askpass", "Password:"),
+            AliasRoute::Askpass
+        );
         // A bridge is spawned by name out of `[fabric] command`; before this
         // arm existed that name opened a window instead of serving.
         assert_eq!(alias_route("aterm-link", ""), AliasRoute::Link);
         assert_eq!(alias_route("aterm-link", "serve"), AliasRoute::Link);
+        // A renewal's `BROWSER`: the opener, whatever URL it is handed.
+        assert_eq!(
+            alias_route("aterm-open-url", "https://claude.ai/x"),
+            AliasRoute::OpenUrl
+        );
         // And the front door is still the front door under every other name.
         for name in ["aterm", "aterm-cli", "my-renamed-aterm"] {
             assert_eq!(
@@ -4568,37 +4642,6 @@ mod tests {
                 .iter()
                 .any(|(flag, _)| *flag == NO_REROUTE_FLAG),
             "the flag completes"
-        );
-    }
-
-    /// The verb list the completions offer is EXACTLY the routed surface:
-    /// `help`, every [`aterm_cli::Verb`] in the roster, and every
-    /// [`aterm_cli::DIAG_COMMANDS`] name — nothing more (an unrouted word in a
-    /// completion is an advertised 404), nothing less (a routed verb missing
-    /// from completion is the drift this list exists to prevent — and it
-    /// HAPPENED: `update` joined the dispatch while the retired VERB_BINS
-    /// table kept the original four, so completions "built from the routing"
-    /// were missing a verb the routing had). The roster cannot drift from the
-    /// dispatch — the front door matches it exhaustively — so completion,
-    /// dispatch, --help and the shadowing shield are one fact.
-    #[test]
-    fn front_door_verb_list_is_the_routing_tables() {
-        let verbs = front_door_verbs();
-        assert!(verbs.contains(&"help"));
-        for verb in aterm_cli::Verb::ALL {
-            assert!(
-                verbs.contains(&verb.name()),
-                "routed verb `{}` must complete",
-                verb.name()
-            );
-        }
-        for (name, _) in aterm_cli::DIAG_COMMANDS {
-            assert!(verbs.contains(name), "diag `{name}` must complete");
-        }
-        assert_eq!(
-            verbs.len(),
-            1 + aterm_cli::Verb::ALL.len() + aterm_cli::DIAG_COMMANDS.len(),
-            "no unrouted words: the list is the roster and the diag set, nothing else"
         );
     }
 

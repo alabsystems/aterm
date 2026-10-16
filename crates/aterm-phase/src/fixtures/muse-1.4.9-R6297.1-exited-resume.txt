@@ -1,0 +1,10 @@
+# muse 1.4.9-R6297.1 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 098c216c7), the atpkg-managed muse (Meta latest) launched through its shim with a scratch HOME, `--provider echo --echo-delay-ms 8000` (Meta's offline echo provider: no login, no model), harness off · after the second ctrl+c: muse erases its composer, prints `To continue this session, run muse resume <uuid>` and the shell prompt returns (program=sh); exit status 0 · cursor=8,2 (visible) · account and scratch path redacted at equal length
+
+  Muse Code 1.4.9
+
+❯ hello there
+
+◆ echo: hello there
+
+To continue this session, run muse resume 01a14549-b0f5-7c80-a8da-96e62d068899
+$

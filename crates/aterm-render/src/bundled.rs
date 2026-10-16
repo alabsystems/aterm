@@ -551,7 +551,7 @@ fn deepest_latin_letter(ids: &[&str; 4]) -> Option<f32> {
     for face in ids
         .iter()
         .filter_map(|id| face_for_id(id))
-        .filter_map(|bytes| ttf_parser::Face::parse(bytes, 0).ok())
+        .filter_map(|bytes| aterm_font::Face::parse(bytes, 0).ok())
     {
         let upem = f32::from(face.units_per_em());
         if upem <= 0.0 {
@@ -834,7 +834,7 @@ mod tests {
         assert_eq!(served.len(), expected_count, "{served:?}");
         for id in &served {
             let bytes = face_for_id(id).expect("filtered to served ids");
-            let face = ttf_parser::Face::parse(bytes, 0).unwrap_or_else(|e| panic!("{id}: {e}"));
+            let face = aterm_font::Face::parse(bytes, 0).unwrap_or_else(|e| panic!("{id}: {e}"));
             assert!(face.number_of_glyphs() > 100, "{id}");
         }
         let mut families = Vec::new();
@@ -859,7 +859,7 @@ mod tests {
             let weights: Vec<(u16, bool)> = ids
                 .iter()
                 .map(|id| {
-                    let f = ttf_parser::Face::parse(face_for_id(id).unwrap(), 0).unwrap();
+                    let f = aterm_font::Face::parse(face_for_id(id).unwrap(), 0).unwrap();
                     assert!(f.is_monospaced(), "{id} must be monospaced");
                     assert!(
                         f.variation_axes().into_iter().next().is_none(),
@@ -868,7 +868,7 @@ mod tests {
                     let names = f.names();
                     let name = (0..names.len()).find_map(|i| {
                         let n = names.get(i)?;
-                        (n.name_id == ttf_parser::name_id::FAMILY)
+                        (n.name_id == aterm_font::name_id::FAMILY)
                             .then(|| n.to_string())
                             .flatten()
                     });
@@ -886,22 +886,23 @@ mod tests {
 
     // ---- the stack, bound to the real renderer ------------------------------
 
-    use crate::{FaceId, GlyphClass, Renderer, Theme};
+    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
+    use crate::{FaceId, GlyphClass};
+    #[cfg(feature = "bundled-font-stack")]
+    use crate::{Renderer, Theme};
 
     /// The default renderer a GUI window builds when nothing is configured,
     /// sealed exactly as the backend worker seals it.
-    fn default_sealed() -> Option<Renderer> {
-        if !ACTIVE {
-            eprintln!("SKIP: bundled stack inactive");
-            return None;
-        }
+    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
+    fn default_sealed() -> Renderer {
         let mut r = Renderer::from_system(18.0, Theme::default()).expect("a default face");
         r.seal_admitted_font_sources();
-        Some(r)
+        r
     }
 
     /// Where `ch` resolves in the sealed default chain, as a readable label:
     /// the bundled identity or system path of the face that draws it.
+    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
     fn resolved_face(r: &mut Renderer, ch: char) -> String {
         let key = r.glyph_key(ch);
         match key.source {
@@ -934,11 +935,8 @@ mod tests {
     /// Linux (not the system DejaVu Sans Mono `fc-match monospace` answers,
     /// which is the first system candidate and used to win).
     #[test]
+    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
     fn the_default_primary_is_the_bundled_platform_face() {
-        if !ACTIVE {
-            eprintln!("SKIP: bundled stack inactive");
-            return;
-        }
         let expected = if cfg!(windows) {
             CASCADIA_ID
         } else {
@@ -959,10 +957,8 @@ mod tests {
     /// NAME through every resolver (startup, config admission, the catalogue
     /// worker) — on Windows both Cascadia Mono PL and JetBrains Mono.
     #[test]
+    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
     fn a_configured_font_still_wins_and_the_bundled_families_resolve_by_name() {
-        if !ACTIVE {
-            return;
-        }
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/DejaVuSansMono.ttf");
         let r = Renderer::from_system_with_family(Some(path), 18.0, Theme::default()).unwrap();
         assert_eq!(
@@ -1034,10 +1030,8 @@ mod tests {
     /// own: its Powerline points (U+E0A0..E0A3, U+E0B0..E0B3) stand inside
     /// its line (-285..965 of 1000), so it does not yield them.
     #[test]
+    #[cfg(feature = "bundled-font-stack")]
     fn iosevka_term_is_selectable_by_name_on_every_platform() {
-        if !IOSEVKA_ACTIVE {
-            return;
-        }
         assert!(selectable_families().contains(&IOSEVKA_FAMILY));
         assert!(crate::list_fonts().iter().any(|f| f == IOSEVKA_FAMILY));
         for id in PRIMARY_FAMILIES[2] {
@@ -1087,10 +1081,8 @@ mod tests {
     /// what a window actually draws, measured through the renderer the GUI
     /// builds rather than the `show-face` probe above.
     #[test]
+    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
     fn the_default_face_draws_its_measured_cell_at_16_px() {
-        if !ACTIVE {
-            return;
-        }
         let r = Renderer::from_system(16.0, Theme::default()).expect("a default face");
         let expected = if cfg!(windows) { (9, 21) } else { (10, 21) };
         assert_eq!(r.cell_size(), expected);
@@ -1112,11 +1104,9 @@ mod tests {
     /// rows past the cell (coverage 55 and 54/255), and the caron of an `Š`
     /// inked the row a `j` above it ended on.
     #[test]
+    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
     fn the_default_cell_holds_its_letters_and_keeps_a_clear_row_between_lines() {
         use crate::{GlyphImage, StyleBits};
-        if !ACTIVE {
-            return;
-        }
         const STYLES: [StyleBits; 4] = [
             StyleBits::REGULAR,
             StyleBits::BOLD,
@@ -1187,15 +1177,16 @@ mod tests {
     /// filled from its REAL compiled-in faces — never a sibling FILE lookup,
     /// never the synthetic dilation/shear.
     #[test]
+    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
     fn the_bundled_primary_resolves_real_bold_italic_and_bold_italic_faces() {
-        let Some(r) = default_sealed() else { return };
+        let r = default_sealed();
         assert_eq!(r.debug_styled_face_indices(), [Some(0); 3]);
         let styles: Vec<(u16, bool)> = r
             .styled_faces
             .iter()
             .map(|slot| {
                 let face = slot.as_ref().expect("slot filled");
-                let parsed = ttf_parser::Face::parse(&face.bytes, 0).unwrap();
+                let parsed = aterm_font::Face::parse(&face.bytes, 0).unwrap();
                 (parsed.weight().to_number(), parsed.is_italic())
             })
             .collect();
@@ -1215,9 +1206,11 @@ mod tests {
     /// JetBrains Mono chosen BY NAME on Windows, where it is not the default,
     /// still gets its own real styled faces.
     #[test]
+    #[cfg(all(feature = "bundled-font-stack", windows))]
     fn a_named_jetbrains_mono_on_windows_resolves_its_own_styled_faces() {
-        if !CASCADIA_ACTIVE || crate::resolve_font_family(JETBRAINS_FAMILY).is_some() {
-            return;
+        // An installed JetBrains Mono wins the name, by design.
+        if crate::resolve_font_family(JETBRAINS_FAMILY).is_some() {
+            aterm_spec::host::could_not_run("JetBrains Mono is installed on this host");
         }
         let mut r =
             Renderer::from_system_with_family(Some(JETBRAINS_FAMILY), 18.0, Theme::default())
@@ -1242,10 +1235,9 @@ mod tests {
     /// Windows Cascadia Mono PL → DejaVu Sans Mono → the same two Noto faces →
     /// … — and NOTHING in the set may end as `.notdef`.
     #[test]
+    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
     fn the_test_set_resolves_in_the_declared_order_and_never_to_notdef() {
-        let Some(mut r) = default_sealed() else {
-            return;
-        };
+        let mut r = default_sealed();
         let primary = format!("primary:{PRIMARY_ID}");
         let dejavu = format!("fallback:{DEJAVU_ID}");
         let sym2 = format!("symbol:{NOTO_SYMBOLS2_ID}");
@@ -1354,11 +1346,9 @@ mod tests {
     /// U+F301) to an unrelated glyph (`FOREIGN_PRIVATE_USE_FACES` in the crate
     /// root).
     #[test]
-    #[cfg(all(windows, feature = "embedded-symbols"))]
+    #[cfg(all(windows, feature = "bundled-font-stack", feature = "embedded-symbols"))]
     fn the_windows_prompt_line_resolves_each_icon_to_the_face_that_owns_it() {
-        let Some(mut r) = default_sealed() else {
-            return;
-        };
+        let mut r = default_sealed();
         for ch in [
             '\u{E0B0}', '\u{E0B1}', '\u{E0B2}', '\u{E0B3}', '\u{E0B4}', '\u{E0B6}',
         ] {
@@ -1470,11 +1460,9 @@ mod tests {
     /// every one of them that is not a procedural separator now draws from
     /// the Nerd Font, in every style.
     #[test]
-    #[cfg(all(windows, feature = "embedded-symbols"))]
+    #[cfg(all(windows, feature = "bundled-font-stack", feature = "embedded-symbols"))]
     fn every_private_use_point_the_default_face_maps_draws_from_the_nerd_font() {
-        let Some(mut r) = default_sealed() else {
-            return;
-        };
+        let mut r = default_sealed();
         let mut expected: Vec<char> = ('\u{E0A0}'..='\u{E0A3}')
             .chain('\u{E0B0}'..='\u{E0C8}')
             .chain(['\u{E0CA}'])
@@ -1483,7 +1471,7 @@ mod tests {
             .collect();
         expected.sort_unstable();
         for id in PRIVATE_USE_YIELDING_IDS {
-            let face = ttf_parser::Face::parse(face_for_id(id).unwrap(), 0).unwrap();
+            let face = aterm_font::Face::parse(face_for_id(id).unwrap(), 0).unwrap();
             let mut mapped = Vec::new();
             for sub in face.tables().cmap.unwrap().subtables {
                 if sub.is_unicode() {
@@ -1524,11 +1512,8 @@ mod tests {
     /// runtime tier closed, where nothing yields: its own U+E0D2 still pokes
     /// out of the cell, so the test sees the defect it was written for.
     #[test]
-    #[cfg(all(windows, feature = "embedded-symbols"))]
+    #[cfg(all(windows, feature = "bundled-font-stack", feature = "embedded-symbols"))]
     fn the_yielded_powerline_glyphs_draw_inside_their_cell_at_16_px() {
-        if !CASCADIA_ACTIVE {
-            return;
-        }
         // `(left, top, right, bottom)` of the raster box and of its ink
         // (coverage > 0), cell-relative, half-open.
         fn boxes(r: &mut Renderer, ch: char) -> ([i32; 4], [i32; 4]) {
@@ -1619,12 +1604,9 @@ mod tests {
     /// BOLD or a STYLED face of such a primary yields too: the bold / italic
     /// cell keeps the primary's routing instead of drawing Cascadia's glyph.
     #[test]
-    #[cfg(all(windows, feature = "embedded-symbols"))]
+    #[cfg(all(windows, feature = "bundled-font-stack", feature = "embedded-symbols"))]
     fn a_face_that_is_not_the_bundled_cascadia_keeps_its_own_private_use_glyphs() {
         use crate::{GlyphClass, StyleBits};
-        if !CASCADIA_ACTIVE {
-            return;
-        }
         let branch = '\u{E0A0}';
         let jbm = face_for_id(JETBRAINS_ID).unwrap();
         let cascadia = face_for_id(CASCADIA_ID).unwrap().to_vec();
@@ -1670,12 +1652,9 @@ mod tests {
     /// re-resolves every memo, styled ones included, onto the runtime tier
     /// (`set_runtime_font_discovery` drops the styled memo with the rest).
     #[test]
-    #[cfg(all(windows, feature = "embedded-symbols"))]
+    #[cfg(all(windows, feature = "bundled-font-stack", feature = "embedded-symbols"))]
     fn the_yield_waits_for_the_runtime_tier_and_follows_it_open() {
         use crate::{GlyphClass, StyleBits};
-        if !CASCADIA_ACTIVE {
-            return;
-        }
         let branch = '\u{E0A0}';
         let mut r = Renderer::from_system(16.0, Theme::default()).unwrap();
         r.set_runtime_font_discovery(false);
@@ -1712,22 +1691,20 @@ mod tests {
     /// Cascadia bold beside a JetBrains Mono primary, whose own glyphs do not
     /// yield (the run's face follows its style).
     #[test]
-    #[cfg(all(windows, feature = "embedded-symbols"))]
+    #[cfg(all(windows, feature = "bundled-font-stack", feature = "embedded-symbols"))]
     fn a_yielded_point_breaks_the_shaping_run() {
         use crate::ColumnGlyph;
-        use crate::ligature_shaping::{RowShaper, ShapedRun, build_feature_list};
+        use crate::ligature_shaping::{RowShaper, ShapedRun, build_feature_list, engine_features};
         use aterm_core::terminal::Terminal;
-        if !CASCADIA_ACTIVE {
-            return;
-        }
         let text = "a\u{E0A0}\u{E0A2}b";
         let cols: u16 = 8;
         // CONTROL: on the face itself, a run holding the branch and the lock
         // comes back with both columns changed.
-        let features = build_feature_list(&[], true);
-        let face = rustybuzz::Face::from_slice(face_for_id(CASCADIA_ID).unwrap(), 0).unwrap();
+        let features = engine_features(&build_feature_list(&[], true));
+        let face =
+            aterm_font::shape::ShapeFace::from_slice(face_for_id(CASCADIA_ID).unwrap(), 0).unwrap();
         let chars: Vec<char> = text.chars().collect();
-        let mut buffer = rustybuzz::UnicodeBuffer::new();
+        let mut buffer = aterm_font::shape::UnicodeBuffer::new();
         let shaped = RowShaper::new(face, &features).shape(text, &chars, false, &mut buffer);
         let Some(ShapedRun::PerColumn(gids)) = shaped else {
             panic!("the control: Cascadia Mono PL changes nothing in {text:?} ({shaped:?})");
@@ -1782,14 +1759,13 @@ mod tests {
     /// from a bundled chain face (the colour face and the Symbols Nerd Font
     /// own those).
     #[test]
+    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
     fn a_bundled_chain_face_never_takes_an_emoji_default_or_private_use_point() {
-        let Some(mut r) = default_sealed() else {
-            return;
-        };
+        let mut r = default_sealed();
         let mut checked = 0usize;
         // Every bundled CHAIN face this build places.
         for &id in broad_fallback_ids().iter().chain(symbol_fallback_ids()) {
-            let face = ttf_parser::Face::parse(face_for_id(id).unwrap(), 0).unwrap();
+            let face = aterm_font::Face::parse(face_for_id(id).unwrap(), 0).unwrap();
             let mut incidental = Vec::new();
             for sub in face.tables().cmap.unwrap().subtables {
                 if sub.is_unicode() {
@@ -1828,10 +1804,8 @@ mod tests {
     /// Bold"`) and the Settings preview must never hand the identity to the
     /// filesystem, where it fails with ENOENT.
     #[test]
+    #[cfg(all(feature = "bundled-font-stack", not(target_os = "macos")))]
     fn a_resolved_bundled_identity_reads_as_its_compiled_in_bytes() {
-        if !ACTIVE {
-            return;
-        }
         let mut cases = Vec::new();
         if crate::resolve_font_family(JETBRAINS_FAMILY).is_none() {
             cases.extend([
@@ -1872,7 +1846,11 @@ mod tests {
     /// the six non-private-use points both carry (measured with fontTools:
     /// `⏻ ⏼ ⏽ ⏾ ☰ ⭘`) must not be drawn by a bundled Noto face.
     #[test]
-    #[cfg(feature = "embedded-symbols")]
+    #[cfg(all(
+        feature = "bundled-font-stack",
+        feature = "embedded-symbols",
+        not(target_os = "macos")
+    ))]
     fn the_nerd_font_precedes_the_bundled_noto_faces_where_both_draw() {
         // The measured set, pinned: a Nerd Font update that adds a text point
         // announces itself here.
@@ -1885,13 +1863,11 @@ mod tests {
             "⏻⏼⏽⏾☰♥⚡❬❭❮❯❰❱⭘",
             "the embedded Nerd Font's non-private-use coverage moved"
         );
-        let Some(mut r) = default_sealed() else {
-            return;
-        };
+        let mut r = default_sealed();
         let contested = ['⏻', '⏼', '⏽', '⏾', '☰', '⭘'];
         for ch in contested {
             let noto_has = [NOTO_SYMBOLS2_ID, NOTO_MATH_ID].iter().any(|id| {
-                ttf_parser::Face::parse(face_for_id(id).unwrap(), 0)
+                aterm_font::Face::parse(face_for_id(id).unwrap(), 0)
                     .unwrap()
                     .glyph_index(ch)
                     .is_some_and(|g| g.0 != 0)

@@ -1,26 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Stacked combining marks. A cell's second mark on the same side of its base
-//! is LIFTED clear of the first (above the baseline) or DROPPED under it
-//! (below), as far as the cell has room — the stack never leaves the cell's
-//! band. Before `MarkStack` every mark of a cell painted at the row's one
-//! anchor, so `e` + U+0301 + U+0301 was pixel-equal to `e` + U+0301 up to
-//! double-coverage darkening and every mark past the first was invisible.
+//! Stacked combining marks: a cell's second mark on the same side of its base is lifted
+//! clear of the first (above the baseline) or dropped under it (below), as far as the
+//! cell has room, and never leaves the cell's band.
 //!
-//! Every assertion here is about ROWS of ink, not darkness: a stack that grew
-//! occupies rows the single mark did not. Two rigs: the default line height and
-//! a doubled one, where every lift is whole and the marks form separate bands.
-//! The row numbers below are this machine's FACE as well as its rasterizer —
-//! `Renderer::from_system(18.0, ..)` resolves SF Mono
-//! (`/System/Library/Fonts/SFNSMono.ttf`), whose cell is 11x21 with baseline 17,
-//! which is what leaves two rows of room over an acute and none under a dot
-//! below; CoreText supplies the rasters.
-//!
-//! The placement operand is the mark's INK box, never the box its raster path
-//! reports — see `the_stack_is_placed_by_ink_not_by_the_reported_raster_box`,
-//! which is the end-to-end witness for the seam
-//! `aterm_render::glyph_ink_box` closes.
+//! The assertions are about rows of ink, not darkness: a grown stack occupies rows the
+//! single mark did not. Two rigs: the default line height and a doubled one, where every
+//! lift is whole. On macOS `Renderer::from_system(18.0, ..)` resolves SF Mono (an 11x21
+//! cell, baseline 17: two rows of room over an acute, none under a dot below) through
+//! CoreText. Placement reads the mark's ink box, never the raster path's reported box
+//! (`the_stack_is_placed_by_ink_not_by_the_reported_raster_box`).
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{Frame, Renderer, Theme, glyph_ink_box};
@@ -32,8 +22,7 @@ const COLS: usize = 4;
 fn renderer(line_height: f32) -> Renderer {
     Renderer::from_system(18.0, Theme::default())
         .map(|mut r| {
-            // Deterministic pixels: block on the lazy fallback parses so a parse
-            // landing between two renders cannot recolour a frame.
+            // Block on lazy fallback parses so one cannot land between two renders.
             r.debug_block_on_lazy_fallbacks();
             r.set_line_height(line_height);
             r
@@ -41,16 +30,15 @@ fn renderer(line_height: f32) -> Renderer {
         .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
-/// `text` at row 1, column 0, cursor hidden. Row 0 stays empty: it is the band
-/// a stack that was not bounded would climb into.
+/// `text` at row 1, column 0, cursor hidden. Row 0 stays empty: an unbounded stack
+/// would climb into it.
 fn frame(rend: &mut Renderer, text: &str) -> Frame {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     term.process(format!("\x1b[?25l\x1b[2;1H{text}").as_bytes());
     rend.render_input(&term.cell_frame(ROWS, COLS))
 }
 
-/// Frame rows on which `a` and `b` differ anywhere — with `b` the bare base,
-/// the rows the marks' ink occupies.
+/// Frame rows on which `a` and `b` differ; with `b` the bare base, the marks' rows.
 fn differing_rows(a: &Frame, b: &Frame) -> Vec<usize> {
     assert_eq!((a.width, a.height), (b.width, b.height), "frame dims");
     (0..a.height)
@@ -87,9 +75,8 @@ fn second_above_mark_is_lifted_and_stays_in_the_band() {
             !rows_one.is_empty(),
             "non-vacuity: a single acute draws ink"
         );
-        // The stack grew UPWARD: the pair's ink starts on a higher row than
-        // the single mark's and covers more rows. Overprinting (the old
-        // placement) only darkens the same rows, which fails both.
+        // The stack grew upward: the pair's ink starts higher and covers more rows,
+        // where overprinting would only darken the same rows.
         assert!(
             rows_two[0] < rows_one[0],
             "line height {line_height}: two acutes must start above one: {rows_two:?} vs {rows_one:?}"
@@ -98,7 +85,7 @@ fn second_above_mark_is_lifted_and_stays_in_the_band() {
             rows_two.len() > rows_one.len(),
             "line height {line_height}: two acutes must occupy more rows than one: {rows_two:?} vs {rows_one:?}"
         );
-        // BOUNDED: nothing of the stack reaches the row above.
+        // Bounded: nothing of the stack reaches the row above.
         let (top, _) = band(&rend);
         assert!(
             rows_two.iter().all(|&y| y >= top),
@@ -121,8 +108,7 @@ fn a_whole_lift_leaves_an_ink_free_row_and_the_first_mark_untouched() {
         rows_two.windows(2).any(|w| w[1] > w[0] + 1),
         "the acutes must be separated by an ink-free row: {rows_two:?}"
     );
-    // The first acute is placed exactly as when it was alone (its lift is
-    // zero), so its rows are byte-identical between the two frames.
+    // The first acute's lift is zero, so its rows are byte-identical in both frames.
     for &y in &rows_one {
         assert_eq!(
             one.pixels[y * one.width..(y + 1) * one.width],
@@ -139,8 +125,7 @@ fn acute_over_circumflex_are_two_separate_bands() {
     let rows = differing_rows(&frame(&mut rend, "e\u{0302}\u{0301}"), &bare);
     eprintln!("circumflex + acute rows {rows:?}");
     assert!(rows.len() >= 3, "non-vacuity: two marks draw ink: {rows:?}");
-    // Two marks, two bands: the lifted acute sits one clear row above the
-    // circumflex, so the ink rows are not one contiguous run.
+    // The lifted acute sits one clear row above the circumflex.
     assert!(
         rows.windows(2).any(|w| w[1] > w[0] + 1),
         "acute and circumflex must be separated by an ink-free row: {rows:?}"
@@ -161,9 +146,8 @@ fn second_below_mark_is_dropped_as_far_as_the_descent_allows() {
             !rows_one.is_empty(),
             "non-vacuity: a single dot below draws ink"
         );
-        // A below stack never moves its first mark, never loses ink, and never
-        // leaves the band — under a descent with no room it overprints as it
-        // always did rather than being cut off.
+        // A below stack never moves its first mark, loses ink, or leaves the band;
+        // with no room in the descent it overprints rather than being cut off.
         let (_, bottom) = band(&rend);
         assert!(
             rows_two[0] == rows_one[0] && rows_two.last() >= rows_one.last(),
@@ -182,19 +166,12 @@ fn second_below_mark_is_dropped_as_far_as_the_descent_allows() {
     }
 }
 
-/// WHY the stack is placed by [`glyph_ink_box`] and not by the `(height, ymin)`
-/// a raster path reports: CoreText reports a box that overhangs the ink on the
-/// rows, and for a mark sitting just under the baseline the overhang crosses it
-/// — so a box-fed classifier calls a dot below a baseline-STRADDLING overlay,
-/// which joins no stack, and every dot of a stack stays at the one anchor.
-///
-/// Measured on the CoreText raster of SF Mono at 18px: U+0323 COMBINING DOT
-/// BELOW reports `gh 6, ymin -5` — top edge `+1`, a row ABOVE the baseline it
-/// has no ink on — while its ink is `gh 3, ymin -4`, top edge `-1`. This
-/// asserts the ink is a below-mark (which is what the placement must read) and
-/// RECORDS the reported box, so a path whose box needs no trimming — the
-/// subpixel path pads X only, and the portable one crops its pad off — is
-/// visible in the log rather than silently making the sibling tests vacuous.
+/// The stack is placed by [`glyph_ink_box`], not the `(height, ymin)` a raster path
+/// reports: CoreText's box overhangs the ink, and for a mark just under the baseline the
+/// overhang crosses it, so a box-fed classifier would call a dot below a straddling
+/// overlay that joins no stack. This asserts the ink is a below-mark and logs the
+/// reported box, so a path whose box needs no trimming (subpixel pads X only, portable
+/// crops its pad) shows in the log rather than silently making the sibling tests vacuous.
 #[test]
 fn the_stack_is_placed_by_ink_not_by_the_reported_raster_box() {
     let mut rend = renderer(2.0);
@@ -217,9 +194,8 @@ fn the_stack_is_placed_by_ink_not_by_the_reported_raster_box() {
         "the ink box is inside the reported box"
     );
     if ymin + gh > 0 {
-        // This raster path pads. The box rule would classify this below-mark as
-        // a straddling overlay, so `second_below_mark_is_dropped_as_far_as_the_
-        // descent_allows` above is the live regression for the operand.
+        // This raster path pads: the box rule would call this below-mark a straddling
+        // overlay, so the below-stack test above is the live regression.
         assert!(
             ink_ymin + ink_h as i32 <= 0,
             "the pad, not the glyph, is what crosses the baseline"

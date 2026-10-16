@@ -12,10 +12,10 @@
 //! parent without ever being it on screen: the test binary re-runs ITSELF as a
 //! PARENT started `Console::Detached` (no console at all, exactly the window's
 //! state), and that parent starts <this binary> as a CHILD that reports what it
-//! got — built by the rule's setter on a plain `Command` (`spawn::set_flags`,
-//! `Console::Quiet`: what an allow-listed raw site does) in one test, and by
-//! `spawnfd::command` itself in another, whose parent is also started the way
-//! the windowed sibling is (`spawnfd::command`, then `set_flags` replacing its
+//! got — built by the rule's setter on a plain `Command` (`spawn::set_flags`:
+//! what a reviewed raw site does) in one test, and by `spawnfd::command`
+//! itself in another, whose parent is also started the way the windowed
+//! sibling is (`spawnfd::command`, then `set_gui_image_flags` replacing its
 //! choice with `Console::Detached`). Four distinct states are observed, so a
 //! pass is never vacuous:
 //!
@@ -56,6 +56,10 @@
 //! there; the real constructor passed with no console window.
 
 #![cfg(windows)]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test code: the plain std Command a reviewed raw site builds is what is measured"
+)]
 
 use std::io::Read as _;
 use std::process::{Command, Stdio};
@@ -152,15 +156,18 @@ fn shows_a_console_window(word: u32, has_console: bool) -> bool {
 /// `Command`: what an allow-listed raw site (a transparent pass-through) does.
 fn with_console(exe: &Path, console: Console) -> Command {
     let mut command = Command::new(exe);
-    spawn::set_flags(&mut command, console, 0);
+    match console {
+        Console::Quiet => spawn::set_flags(&mut command, 0),
+        Console::Detached => spawn::set_gui_image_flags(&mut command),
+    };
     command
 }
 
 /// `exe` built as the windowed sibling is: the shipped constructor, then
-/// `set_flags` REPLACING its quiet choice with `Console::Detached`.
+/// `set_gui_image_flags` REPLACING its quiet choice with `Console::Detached`.
 fn like_the_windowed_sibling(exe: &Path) -> Command {
     let mut command = aterm_uds::spawnfd::command(exe);
-    spawn::set_flags(&mut command, Console::Detached, 0);
+    spawn::set_gui_image_flags(&mut command);
     command
 }
 
@@ -316,7 +323,7 @@ fn a_quiet_child_of_a_parent_with_no_console_gets_a_console_with_no_window() {
 }
 
 /// THE FIX, through the shipped constructor: a parent with no console, started
-/// as the windowed sibling is (`spawnfd::command`, then `set_flags` replacing
+/// as the windowed sibling is (`spawnfd::command`, then `set_gui_image_flags` replacing
 /// its choice with `Console::Detached`), starts `spawnfd::command(<this
 /// binary>)` — how every shipped child is built — and the child has a console
 /// with no window. A `spawnfd::command` off Unix that dropped the console rule

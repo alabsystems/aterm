@@ -12,15 +12,10 @@ use super::handler::SgrStyleHandler;
 use super::sgr_color_u8;
 
 impl SgrStyleHandler<'_> {
-    /// Apply an SGR rendition change: refresh the caches the cell writers read
-    /// (`update_cached_colors`, feeding `cached_colors()`, `has_style_extras()`
-    /// and `is_default()`), and re-arm the BCE cursor template from the new
-    /// background so line feeds, autowrap and scrolls before the next explicit
+    /// Apply an SGR rendition change: refresh the writer caches
+    /// (`update_cached_colors`) and re-arm the BCE cursor template from the new
+    /// background, so line feeds, autowrap and scrolls before the next explicit
     /// erase use it.
-    ///
-    /// The production write path stores colours inline as `PackedColors`
-    /// (24-bit overflow in the extras RGB ring), so renditions are not interned
-    /// into a style table.
     #[inline]
     pub(super) fn apply_style_change(&mut self) {
         // Refresh unconditionally: individual codes (`\x1b[39;49m`) can return
@@ -107,38 +102,33 @@ impl SgrStyleHandler<'_> {
             28 => self.style.flags.remove(CellFlags::HIDDEN),
             29 => self.style.flags.remove(CellFlags::STRIKETHROUGH),
             53 => {
-                // Overline — mutually exclusive with superscript/subscript
-                // (OVERLINE is encoded as SUPERSCRIPT | SUBSCRIPT)
+                // OVERLINE is encoded as SUPERSCRIPT | SUBSCRIPT, so overline,
+                // superscript and subscript exclude each other.
                 self.style.flags.remove(CellFlags::SUPERSCRIPT);
                 self.style.flags.remove(CellFlags::SUBSCRIPT);
                 self.style.flags.insert(CellFlags::OVERLINE);
             }
             55 => {
-                // Reset only a real overline (both SUPERSCRIPT and SUBSCRIPT set),
-                // which is how OVERLINE is encoded; a standalone superscript or
-                // subscript stays. Arm-local `if`, not a match guard: a guard would
-                // fall through to the `_ => apply_style_change()` default.
+                // Reset only a real overline (both bits set); a lone superscript
+                // or subscript stays. An arm-local `if`, not a match guard, so a
+                // false test never falls through to a later arm.
                 #[allow(clippy::collapsible_match)]
                 if self.style.flags.contains(CellFlags::OVERLINE) {
                     self.style.flags.remove(CellFlags::OVERLINE);
                 }
             }
             73 => {
-                // Superscript — clear subscript and overline first
                 self.style.flags.remove(CellFlags::SUBSCRIPT);
                 self.style.flags.remove(CellFlags::OVERLINE);
                 self.style.flags.insert(CellFlags::SUPERSCRIPT);
             }
             74 => {
-                // Subscript — clear superscript and overline first
                 self.style.flags.remove(CellFlags::SUPERSCRIPT);
                 self.style.flags.remove(CellFlags::OVERLINE);
                 self.style.flags.insert(CellFlags::SUBSCRIPT);
             }
             75 => {
-                // Reset superscript/subscript but keep overline (encoded as both
-                // bits). Arm-local `if`, not a match guard: a guard would fall
-                // through to the `_ => apply_style_change()` default.
+                // Keep a real overline (both bits). Arm-local `if`, as for 55.
                 #[allow(clippy::collapsible_match)]
                 if !self.style.flags.contains(CellFlags::OVERLINE) {
                     self.style.flags.remove(CellFlags::SUPERSCRIPT);
@@ -163,9 +153,9 @@ impl SgrStyleHandler<'_> {
             49 => self.style.bg = PackedColor::DEFAULT_BG,
             58 => {
                 if let Some(color) = Self::parse_underline_color(&params[i..]) {
-                    // Store the raw parsed value (0x01_RRGGBB or 0x02_0000NN);
-                    // indexed colours resolve at render time from the live palette,
-                    // so OSC 4 changes apply.
+                    // The raw packed value (0x01_RRGGBB or 0x02_0000NN): an index
+                    // resolves at render time from the live palette, so OSC 4
+                    // changes apply.
                     self.transient.current_underline_color = Some(color);
                     self.transient.update_has_transient_extras();
                     return Self::extended_color_skip(&params[i..]);
@@ -224,16 +214,12 @@ impl SgrStyleHandler<'_> {
         // Fast path: single-param basic colours and attributes (ESC[32m, ESC[1m)
         // without the loop.
         if params.len() == 1 {
-            // Capture bg before apply so apply_style_change_bg_maybe can detect a
-            // no-op bg change and skip set_cursor_template.
             let old_bg = self.style.bg;
             self.apply_sgr_param(params, 0);
             match params[0] {
                 30..=37 | 90..=97 | 39 => self.apply_style_change_keep_bce(),
                 40..=47 | 100..=107 | 49 => self.apply_style_change_bg_maybe(old_bg),
-                // Attribute flag changes (bold/dim/italic/underline/blink/reverse/
-                // hidden/strike and resets, super/sub/overline) flip only flag bits,
-                // so the cached colours are reused.
+                // Flag-only codes reuse the cached colours.
                 1..=9 | 21..=25 | 27..=29 | 53 | 55 | 73..=75 => {
                     self.apply_flags_change();
                 }
@@ -305,8 +291,8 @@ impl SgrStyleHandler<'_> {
             }
         }
 
-        // Fast path: 10-param combined truecolor fg+bg (38;2;R;G;B;48;2;R;G;B).
-        // Common in modern terminals (bat, delta) — one CSI for both colors.
+        // Fast path: 10-param truecolor fg+bg (38;2;R;G;B;48;2;R;G;B), one CSI for
+        // both colors (bat, delta).
         if params.len() == 10
             && params[0] == 38
             && params[1] == 2
@@ -340,8 +326,7 @@ impl SgrStyleHandler<'_> {
     /// `subparam_mask` marks which params were preceded by a colon.
     #[inline]
     pub(super) fn handle_sgr_with_subparams(&mut self, params: &[u16], subparam_mask: u32) {
-        // Empty params = CSI m → same as CSI 0 m. Clear underline color too.
-        // Use reset_sgr() (not reset()) to preserve DECSCA protected attribute.
+        // CSI m is SGR 0; reset_sgr() keeps DECSCA protection.
         if params.is_empty() {
             self.style.reset_sgr();
             self.transient.current_underline_color = None;
@@ -358,7 +343,6 @@ impl SgrStyleHandler<'_> {
             let next_is_subparam =
                 i + 1 < params.len() && i + 1 < 32 && (subparam_mask & (1u32 << (i + 1))) != 0;
 
-            // Handle SGR 4 (underline) with subparameters
             if param == 4 && next_is_subparam {
                 let subparam = params.get(i + 1).copied().unwrap_or(0);
                 match subparam {
@@ -392,7 +376,7 @@ impl SgrStyleHandler<'_> {
                 continue;
             }
 
-            // Handle SGR 58 (underline color) with subparameters (ISO 8613-3 format)
+            // SGR 58 (underline color) with colon subparameters.
             if param == 58 && next_is_subparam {
                 // Compute colon-group size first so parse receives only the
                 // colon-linked slice, not trailing semicolon params.
@@ -407,8 +391,7 @@ impl SgrStyleHandler<'_> {
                     &params[i..i + skip],
                     if i < 32 { subparam_mask >> i } else { 0 },
                 ) {
-                    // Store the raw parsed value (0x01_RRGGBB or 0x02_0000NN);
-                    // indexed colours resolve at render time from the live palette.
+                    // The raw packed value, as in the semicolon form.
                     self.transient.current_underline_color = Some(color);
                     self.transient.update_has_transient_extras();
                 }
@@ -419,8 +402,7 @@ impl SgrStyleHandler<'_> {
             // SGR 38/48 with colon subparameters (ISO 8613-3): 38:2:cs:r:g:b or
             // 38:5:n, including the colourspace slot the semicolon path lacks.
             if (param == 38 || param == 48) && next_is_subparam {
-                // Compute colon-group size first so parse receives only the
-                // colon-linked slice, not trailing semicolon params.
+                // Only the colon group, as for 58.
                 let mut skip = 1;
                 while i + skip < params.len()
                     && i + skip < 32
@@ -439,7 +421,6 @@ impl SgrStyleHandler<'_> {
                 continue;
             }
 
-            // For all other parameters, use the shared SGR dispatch
             i += self.apply_sgr_param(params, i);
             i += 1;
         }
@@ -501,7 +482,6 @@ impl SgrStyleHandler<'_> {
         match params.get(1) {
             Some(&2) if params.len() >= 5 => {
                 // True color: 38;2;r;g;b
-                // .min(u8::MAX) clamps to [0, 255]; safe to truncate.
                 let r = params[2].min(u16::from(u8::MAX)) as u8;
                 let g = params[3].min(u16::from(u8::MAX)) as u8;
                 let b = params[4].min(u16::from(u8::MAX)) as u8;
@@ -532,27 +512,24 @@ impl SgrStyleHandler<'_> {
                 let r = u32::from(params[2].min(255));
                 let g = u32::from(params[3].min(255));
                 let b = u32::from(params[4].min(255));
-                // Format: 0x01_RRGGBB (type=RGB)
                 Some(0x01_000000 | (r << 16) | (g << 8) | b)
             }
             Some(&5) if params.len() >= 3 => {
                 // 256-color: 58;5;n
                 let index = u32::from(params[2].min(255));
-                // Format: 0x02_0000NN (type=indexed)
                 Some(0x02_000000 | index)
             }
             _ => None,
         }
     }
 
-    /// Parse underline color with colon subparameters (ISO 8613-3 format).
+    /// Parse underline color with colon subparameters (ISO 8613-3), `params`
+    /// being only the colon group:
+    /// - `58:5:Ps`: indexed
+    /// - `58:2:Pc:Pr:Pg:Pb`: RGB with a colour space
+    /// - `58:2::Pr:Pg:Pb`: RGB with an empty colour space (read as 0)
     ///
-    /// Handles:
-    /// - 58:5:Ps - indexed color (params = [58, 5, index])
-    /// - 58:2:Pc:Pr:Pg:Pb - RGB color (params = [58, 2, colorspace, r, g, b])
-    /// - 58:2::Pr:Pg:Pb - RGB with empty colorspace (params = [58, 2, 0, r, g, b])
-    ///
-    /// The `subparam_mask` argument is shifted so bit `0` corresponds to params\[0\].
+    /// `_subparam_mask` (bit 0 = `params[0]`) is unused.
     fn parse_underline_color_colon(params: &[u16], _subparam_mask: u32) -> Option<u32> {
         if params.len() < 3 {
             return None;
@@ -563,15 +540,11 @@ impl SgrStyleHandler<'_> {
                 // RGB: 58:2:Pc:Pr:Pg:Pb or 58:2::Pr:Pg:Pb. Pc (colour space) is
                 // ignored; 6 params with it, 5 without.
                 if params.len() >= 6 {
-                    // Full format: 58:2:cs:r:g:b
-                    // Skip colorspace at params[2], use r/g/b at params[3..6]
                     let r = u32::from(params[3].min(255));
                     let g = u32::from(params[4].min(255));
                     let b = u32::from(params[5].min(255));
                     Some(0x01_000000 | (r << 16) | (g << 8) | b)
                 } else if params.len() >= 5 {
-                    // Short format without colorspace: 58:2:r:g:b
-                    // (some terminals omit the colorspace entirely)
                     let r = u32::from(params[2].min(255));
                     let g = u32::from(params[3].min(255));
                     let b = u32::from(params[4].min(255));
@@ -581,7 +554,6 @@ impl SgrStyleHandler<'_> {
                 }
             }
             Some(&5) if params.len() >= 3 => {
-                // Indexed color: 58:5:Ps
                 let index = u32::from(params[2].min(255));
                 Some(0x02_000000 | index)
             }
@@ -592,16 +564,12 @@ impl SgrStyleHandler<'_> {
 
 #[cfg(test)]
 mod tests {
-    //! The semicolon-form underline colour (SGR `58;2;r;g;b` / `58;5;n`),
-    //! pinned at the byte level: these feed the byte sequences and read the grid
-    //! back, so a regression in parameter consumption or SGR dispatch fails in
-    //! this crate.
+    //! The semicolon-form underline colour (`58;2;r;g;b` / `58;5;n`), fed as
+    //! bytes and read back from the grid.
     //!
-    //! On Windows, conhost does not forward the semicolon form: its
-    //! `_ApplyGraphicsOption` has no `UnderlineColor` arm, so `58`'s sub-values
-    //! are dispatched as separate SGRs (`58;5;196` becomes BLINK, a trailing `0`
-    //! a reset); only the colon forms `58:2::r:g:b` and `58:5:n` pass through.
-    //! Programs wanting a coloured underline under ConPTY must use those.
+    //! conhost does not forward the semicolon form (its `_ApplyGraphicsOption`
+    //! has no `UnderlineColor` arm, so `58;5;196` arrives as separate SGRs); under
+    //! ConPTY only the colon forms `58:2::r:g:b` and `58:5:n` pass through.
 
     use super::super::Terminal;
     use super::super::render_cells::UnderlineStyle;

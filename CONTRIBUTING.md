@@ -5,19 +5,17 @@
 
 This repository is a public source snapshot of aterm's private development
 line, cut at release time. Focused fixes and well-scoped improvements are
-welcome. The public tree includes the whole Rust workspace;
-[PUBLICATION.md](PUBLICATION.md) lists what the export leaves out — release
-credentials, prebuilt binaries, internal operational notes and proof packets.
+welcome. It carries the whole Rust workspace;
+[PUBLICATION.md](PUBLICATION.md) lists what the export leaves out.
 
 ## Build and test
 
-The snapshot pins the Trust toolchain in `rust-toolchain.toml`, as the
-development line does. Install aterm ([README ▸ Install](README.md#install))
-and atpkg installs Trust (`aterm pkg install trust` by hand; `aterm help rust`
-explains the toolchain). atpkg ships Trust for Apple-silicon macOS only, so the
-snapshot builds and tests there, with the Xcode Command Line Tools installed.
-Every command names its lane — `targo --unverified <verb>` builds with no proof
-claim, `targo trust <verb>` verifies. From the workspace root:
+The snapshot pins the Trust toolchain (`rust-toolchain.toml`), which atpkg
+installs on Apple-silicon macOS
+([README ▸ Build from source](README.md#build-from-source); `aterm help rust`
+explains the toolchain). Every command names its lane: `targo --unverified
+<verb>` builds with no proof claim, `targo trust <verb>` verifies. From the
+workspace root:
 
 ```sh
 targo --unverified check --locked -p aterm
@@ -26,48 +24,45 @@ targo --unverified build --locked -p aterm
 targo --unverified run --quiet --locked -p aterm -- --version
 ```
 
-The last command reports `[workspace.package] version` from the root
-`Cargo.toml`. Build from the workspace: the crates are not published to
-crates.io and their APIs are not stable
-([README ▸ Build from source](README.md#build-from-source) says why
-`cargo install aterm` is the wrong move).
+The last command prints the root `Cargo.toml`'s `[workspace.package] version`.
+Build from the workspace: the crates are not on crates.io (the crates.io
+`aterm` is an unrelated project) and their APIs are not stable.
 
-Every derived-model obligation is discharged in-process, so a clone verifies
-for real. Where `ty` or `ay` adds an analysis the in-process checker cannot
-express, it is skipped on machines without them: the test reports `ok` and
-prints the reason to stderr (`targo --unverified test -- --nocapture`).
+Derived-model obligations run in-process, so a clone verifies for real. An
+analysis only `ty` or `ay` can run is skipped where they are absent: the test
+reports `ok` and prints why on stderr (`-- --nocapture` shows it).
 
-**`'rustc' is not installed for the custom toolchain 'trust'`** means rustup's
-`trust` link no longer reaches the atpkg store; `targo` still works. Run `aterm
-pkg repair`. Never rebuild a toolchain from source for it. **`toolchain 'trust'
-is not installed`** with no `targo` either means Trust is not installed yet: run
-`aterm pkg install trust`. With no aterm installed, install aterm first.
+**`'rustc' is not installed for the custom toolchain 'trust'`**: rustup's
+`trust` link no longer reaches the atpkg store. Run `aterm pkg repair`; never
+rebuild a toolchain from source for it. **`toolchain 'trust' is not
+installed`** with no `targo` either: run `aterm pkg install trust` (install
+aterm first if it is missing).
 
-What you can run on this snapshot, on the pinned toolchain:
+What to run before a pull request:
 
-* `targo --unverified test --locked -p <crate>` for every crate you touched —
-  the one that matters, expected green on a fresh clone.
-* `targo --unverified run -p xtask -- gate lint --fmt-only`, the formatter check.
-* `targo-tippy --workspace --all-targets --keep-going -- -D warnings`, zero
-  warnings.
-* `targo --unverified run -q -p aterm-census -- . [--mainloop|--locks|--wasm|--scope|--lazy-init]`,
-  the in-process source-walk censuses (no flag runs main-loop and lock order;
-  `--help` lists them). Run the ones touching your change.
+* `targo --unverified test --locked -p <crate>` for every crate you touched,
+  expected green on a fresh clone.
+* `targo --unverified run -q -p aterm-verify -- fmt`, the formatter check
+  (`fmt --fix` rewrites what it finds).
+* `targo-tippy --workspace --all-targets --keep-going -- -D warnings`,
+  zero warnings.
+* `targo --unverified run -q -p aterm-census -- --all`, the source-walk
+  censuses and the source guards (`--help` lists them).
 
-The gate that decides whether a change lands is `tools/verify.sh`
-(`crates/aterm-verify`), which a maintainer runs on the development line at
-land time; it drives that line's toolchain and private configuration, which
-this snapshot does not carry, so you are not asked to run it. Other `xtask gate`
-verbs need the development line's machinery; one that cannot run here prints
-NOT RUN or COULD NOT RUN, which says nothing about your change.
+The development line runs these and the rest of the checks as
+`targo --unverified verify` (`crates/aterm-verify`), an alias in the private
+Cargo configuration this snapshot does not carry, and every release runs its
+`release` set before anything is published. A check that needs the
+development line's machinery reports NOT RUN or COULD NOT RUN here; that says
+nothing about your change.
 
 There is no hosted CI: paste the output of the tests you ran into the pull
-request. If a change affects how the window looks or feels, run a real aterm,
-capture the frame with `aterm ctl image`, and include before/after evidence.
+request. For a change to how the window looks or feels, capture the frame with
+`aterm ctl image` on a real aterm and include before and after.
 
 ## Issues and pull requests
 
-Use [GitHub Issues](https://github.com/alabsystems/aterm/issues) for public bug
+Use [GitHub Issues](https://github.com/alabsystems/aterm/issues) for bug
 reports, focused feature discussion and reproducible build problems. Keep pull
 requests small and explain the user-visible behavior they change. A merged
 change lands in the private line first and reaches this repository with the

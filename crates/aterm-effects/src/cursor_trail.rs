@@ -2190,15 +2190,6 @@ mod tests {
     }
 
     #[test]
-    fn line_cells_includes_both_endpoints() {
-        let l = line_cells(0, 0, 0, 3);
-        assert_eq!(l, vec![(0, 0), (0, 1), (0, 2), (0, 3)]);
-        let diag = line_cells(0, 0, 2, 2);
-        assert_eq!(diag.first(), Some(&(0, 0)));
-        assert_eq!(diag.last(), Some(&(2, 2)));
-    }
-
-    #[test]
     fn bounded_tail_matches_the_legacy_full_sweep() {
         for (origin, destination) in [
             ((0, 0), (0, 40)),

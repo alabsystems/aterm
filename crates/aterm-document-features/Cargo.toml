@@ -1,0 +1,35 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+# `[patch.crates-io]` matches on PACKAGE name, so this must be called
+# `document-features`; the directory keeps the `aterm-` prefix so it reads as
+# ours (precedent: crates/aterm-profiling, whose consumers are also wgpu's).
+name = "document-features"
+# A SEMVER CONTRACT with wgpu and wgpu-core (`document-features = "0.2.10"`, so
+# ^0.2.10), not an aterm release number. 0.2.12 is what the lock held and
+# upstream's latest, so no registry 0.2.x in the graph can outrank the shim.
+version = "0.2.12"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party no-op `document_features!` for aterm (replaces the document-features proc macro behind wgpu and wgpu-core)"
+
+[lib]
+name = "document_features"
+path = "src/lib.rs"
+proc-macro = true
+# No unit tests live in src/; tests/ expands the macro in its consumers' form.
+test = false
+
+[dependencies]
+# None: upstream's one dependency, litrs (5,215 lines), leaves with it.
+
+[features]
+# Upstream's feature names, with no effect. `self-test` gates upstream's
+# test-only `self_test_helper!`, which nothing in the graph calls.
+default = []
+self-test = []
+
+[lints]
+workspace = true

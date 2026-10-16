@@ -1977,7 +1977,8 @@ fn a_direction_after_the_ready_ends_it() {
     assert!(!transcript_has_ready(&rows(&[&peer]), marker), "a peer's");
     // Negative controls: the rows Claude Code writes itself, the harness's
     // own line and a subagent's prompt end nothing.
-    let release = aterm_json::to_string(&Value::from(release_prompt(Agent::Claude))).expect("json");
+    let release =
+        aterm_json::to_string(&Value::from(release_prompt(Agent::Claude, false))).expect("json");
     for quiet in [
         user(
             r#","isMeta":true"#,
@@ -2594,6 +2595,23 @@ fn the_request_word_round_trips_and_an_unknown_word_asks_for_nothing() {
     for bad in ["later", "defer-until:soon", "skip:", "skip:2.1.x", "NOW"] {
         assert_eq!(Request::parse(bad), None, "{bad:?}");
     }
+}
+
+/// The agent word round-trips, Claude's own name reads as Claude's, and a word
+/// no lane carries reads as no agent; a lane's program names it back, and a
+/// program no lane moves names none.
+#[test]
+fn the_agent_word_round_trips_and_an_unknown_word_is_no_agent() {
+    use aterm_phase::Program;
+    for agent in [Agent::Claude, Agent::Codex] {
+        assert_eq!(Agent::parse(agent.word()), Some(agent), "{agent:?}");
+        assert_eq!(Agent::of(agent.program()), Some(agent), "{agent:?}");
+    }
+    assert_eq!(Agent::parse("claude"), Some(Agent::Claude));
+    for bad in ["gemini", "opencode", "Codex", " codex", "generic"] {
+        assert_eq!(Agent::parse(bad), None, "{bad:?}");
+    }
+    assert_eq!(Agent::of(Program::Generic), None);
 }
 
 /// A deferral is SHOWN as the time it has left, never its unix second.
@@ -3714,7 +3732,7 @@ fn the_release_is_typed_where_a_notice_could_be_and_never_over_a_ready() {
     };
     assert_eq!(gate_release(&at_break, false), Gate::Go);
 
-    let text = release_prompt(Agent::Claude);
+    let text = release_prompt(Agent::Claude, false);
     assert_eq!(
         text,
         "[aterm harness] Upgrade off: The Claude Code upgrade is off for now: nothing will \
@@ -5183,6 +5201,10 @@ fn the_standing_quota_wall_is_the_limit_row_that_stands_and_only_a_quota_rejecti
             at,
             until: Some(until),
             window: Some(window.to_string()),
+            credits: Some(CreditsWord::Off {
+                reason: Some("org_level_disabled".to_string()),
+                until: None,
+            }),
         })
     };
     let session = quota_row(
@@ -5199,10 +5221,17 @@ fn the_standing_quota_wall_is_the_limit_row_that_stands_and_only_a_quota_rejecti
         transcript_standing_wall(&[answered.clone(), session.clone()].join("\n")),
         wall("five_hour", 1_790_532_000)
     );
-    // The week: the owner's row of 2026-09-27 (2.1.280), as it is.
+    // The week: the owner's row of 2026-09-27 (2.1.280), as it is — its
+    // credits off, with no reason named.
     assert_eq!(
         transcript_standing_wall(&limit_row(ts)),
-        wall("seven_day", 1_791_046_800)
+        wall("seven_day", 1_791_046_800).map(|w| StandingWall {
+            credits: Some(CreditsWord::Off {
+                reason: None,
+                until: None,
+            }),
+            ..w
+        })
     );
     for bucket in [
         "seven_day_opus",
@@ -5334,6 +5363,11 @@ fn a_standing_wall_with_no_limit_type_takes_it_from_its_text_and_hostile_rows_co
     let ts = "2026-09-27T15:04:28.344Z";
     let typed = r#""rateLimitType":"seven_day","#;
     let week = limit_row(ts);
+    // The row says credits are off, and names no reason.
+    let off = Some(CreditsWord::Off {
+        reason: None,
+        until: None,
+    });
     assert!(week.contains(typed), "{week}");
     let read = |row: &str| transcript_standing_wall(row);
     let window = |row: &str| read(row).expect("a wall").window;
@@ -5346,6 +5380,7 @@ fn a_standing_wall_with_no_limit_type_takes_it_from_its_text_and_hostile_rows_co
             at,
             until: Some(1_791_046_800),
             window: Some("seven_day".to_string()),
+            credits: off.clone(),
         })
     );
     let session_text = "You've hit your session limit · resets 7pm (America/Los_Angeles)";
@@ -5362,6 +5397,7 @@ fn a_standing_wall_with_no_limit_type_takes_it_from_its_text_and_hostile_rows_co
             at,
             until: Some(1_791_046_800),
             window: None,
+            credits: off.clone(),
         })
     );
     // NEGATIVE CONTROL: where the row carries a type, the text is not asked
@@ -5411,6 +5447,7 @@ fn a_standing_wall_with_no_limit_type_takes_it_from_its_text_and_hostile_rows_co
                 at,
                 until: None,
                 window: Some("seven_day".to_string()),
+                credits: off.clone(),
             }),
             "{hostile}"
         );
@@ -5467,6 +5504,7 @@ fn a_standing_wall_with_no_limit_type_takes_it_from_its_text_and_hostile_rows_co
                 at,
                 until: Some(1_791_046_800),
                 window: Some("seven_day".to_string()),
+                credits: off.clone(),
             }),
             "{junk:?}"
         );
@@ -5720,4 +5758,149 @@ fn the_dialogs_result_line_is_read_under_its_own_command_and_only_since_the_clai
         Some("two lines")
     );
     assert_eq!(read(&[dialog(after), out(after, "")]).as_deref(), Some(""));
+}
+
+/// WHAT A LIMIT ROW SAYS OF THE ACCOUNT'S USAGE CREDITS (accounts v2 S5),
+/// kept with the wall it stands for ([`StandingWall::credits`]): `rejected`
+/// is off, with the vendor's reason and when they come back (`out_of_credits`
+/// and `overageResetsAt`, the bundle's; `org_level_disabled`, this machine's
+/// own rows), `allowed` and `allowed_warning` are on. NEGATIVE CONTROLS: a
+/// row with no `overageStatus`, or one the reader does not know, says nothing;
+/// a reason that is no word is no reason.
+#[test]
+fn a_limit_rows_word_on_usage_credits_is_read() {
+    let ts = "2026-09-27T15:04:28.344Z";
+    let week = limit_row(ts);
+    let status = r#""overageStatus":"rejected","#;
+    assert!(week.contains(status), "{week}");
+    let read = |row: &str| transcript_standing_wall(row).expect("a wall").credits;
+    let with = |keys: &str| week.replace(status, keys);
+    assert_eq!(
+        read(&with(
+            r#""overageStatus":"rejected","overageDisabledReason":"out_of_credits","overageResetsAt":1793000000,"#
+        )),
+        Some(CreditsWord::Off {
+            reason: Some("out_of_credits".to_string()),
+            until: Some(1_793_000_000),
+        })
+    );
+    for on in ["allowed", "allowed_warning"] {
+        assert_eq!(
+            read(&with(&format!(r#""overageStatus":"{on}","#))),
+            Some(CreditsWord::On),
+            "{on}"
+        );
+    }
+    for silent in [
+        "",
+        r#""overageStatus":"sometimes","#,
+        r#""overageStatus":7,"#,
+    ] {
+        assert_eq!(read(&with(silent)), None, "{silent}");
+    }
+    assert_eq!(
+        read(&with(
+            r#""overageStatus":"rejected","overageDisabledReason":"Not A Word!","#
+        )),
+        Some(CreditsWord::Off {
+            reason: None,
+            until: None,
+        })
+    );
+}
+
+/// WHEN THE SESSION'S NEWEST ANSWER CAME (accounts v2 S5): what the usage
+/// notices on its screen were true at ([`transcript_last_answer`]) — the
+/// latest row of the model's own, a sidechain's included, or a limit's
+/// rejection, whatever follows it — of those that came by the second it is
+/// asked for: an answer written after it is none a screen read then can show.
+/// NEGATIVE CONTROLS: a person's prompt or a local command's output written
+/// after it is no answer (a notice drawn before stays as old as its answer),
+/// nor is a synthetic row that is no limit's; a tail with no answer has none,
+/// and neither has one whose answers all came later.
+#[test]
+fn the_newest_answer_is_the_last_response_row() {
+    let at = |ts: &str| crate::harness::upgrade_models::parse_utc(ts).expect("a time");
+    let answer = said_row("2026-09-27T15:00:00.000Z", "Fixed.");
+    let wall = limit_row("2026-09-27T15:04:28.344Z");
+    let sidechain = said_row("2026-09-27T15:06:00.000Z", "Sub.")
+        .replace(r#""isSidechain":false"#, r#""isSidechain":true"#);
+    let prompt = r#"{"type":"user","timestamp":"2026-09-27T16:00:00.000Z","message":{"role":"user","content":"keep going"}}"#;
+    let local = r#"{"type":"system","subtype":"local_command","timestamp":"2026-09-27T16:01:00.000Z","content":"<local-command-stdout>Limit reset</local-command-stdout>"}"#;
+    let synthetic = said_row("2026-09-27T16:02:00.000Z", "No response requested.")
+        .replace("claude-opus-5-5", "<synthetic>");
+    let tail = |rows: &[&str]| transcript_last_answer(&rows.join("\n"), u64::MAX);
+    assert_eq!(tail(&[&answer]), Some(at("2026-09-27T15:00:00.000Z")));
+    assert_eq!(
+        tail(&[&answer, &wall]),
+        Some(at("2026-09-27T15:04:28.344Z"))
+    );
+    let all = [&*answer, &wall, &sidechain, prompt, local, &synthetic].join("\n");
+    assert_eq!(
+        transcript_last_answer(&all, u64::MAX),
+        Some(at("2026-09-27T15:06:00.000Z"))
+    );
+    assert_eq!(tail(&[prompt, local, &synthetic]), None);
+    // By a second: the newest that had come.
+    let by = |ts: &str| transcript_last_answer(&all, at(ts));
+    assert_eq!(
+        by("2026-09-27T15:05:59.000Z"),
+        Some(at("2026-09-27T15:04:28.344Z"))
+    );
+    assert_eq!(
+        by("2026-09-27T15:04:28.000Z"),
+        Some(at("2026-09-27T15:04:28.344Z"))
+    );
+    assert_eq!(
+        by("2026-09-27T15:04:27.000Z"),
+        Some(at("2026-09-27T15:00:00.000Z"))
+    );
+    assert_eq!(by("2026-09-27T14:59:59.000Z"), None);
+}
+
+/// THE REWRITE OWNS ONLY aterm's OWN `--settings` VALUE (the usage tap,
+/// `super::super::tap::is_ours`): dropped in both spellings, so a stale path
+/// or a tap switched off leaves at the next relaunch and a resume line shown
+/// to a person never carries it; a person's own `--settings` — inline or a
+/// file — is carried verbatim, in its spelling. NEGATIVE CONTROL: a near
+/// miss of the tap (a key more, another refresh) is a person's, kept.
+#[test]
+fn the_rewrite_sheds_only_aterms_own_tap() {
+    let ours = super::super::tap::settings_value(std::path::Path::new(
+        "/Applications/aterm.app/Contents/MacOS/aterm",
+    ))
+    .expect("an admissible path");
+    let resumed = |rest: &[&str]| {
+        let words: Vec<&str> = std::iter::once("claude")
+            .chain(rest.iter().copied())
+            .collect();
+        rewrite_argv(&argv(&words), ID).expect("carried")
+    };
+    assert_eq!(
+        resumed(&["--verbose", "--settings", &ours]),
+        argv(&["--verbose", "--resume", ID])
+    );
+    assert_eq!(
+        resumed(&[&format!("--settings={ours}"), "--verbose"]),
+        argv(&["--verbose", "--resume", ID])
+    );
+    let near = ours.replace("\"refreshInterval\":10", "\"refreshInterval\":30");
+    let extra = ours.replacen("}}", "},\"model\":\"x\"}", 1);
+    for theirs in [r#"{"model":"x"}"#, "/Users//example/s.json", &near, &extra] {
+        assert_eq!(
+            resumed(&["--settings", theirs]),
+            argv(&["--settings", theirs, "--resume", ID]),
+            "{theirs}"
+        );
+        let inline = format!("--settings={theirs}");
+        assert_eq!(resumed(&[&inline]), argv(&[&inline, "--resume", ID]));
+    }
+    // The resume command a person is told carries none of it either.
+    let told =
+        super::super::resume::command(&argv(&["claude", "--settings", &ours]), ID).expect("a line");
+    assert_eq!(told, format!("claude --resume {ID}"));
+    assert_eq!(
+        carried_names(&argv(&["claude", "--settings", &ours, "--bare"])).ok(),
+        Some(vec!["--bare"])
+    );
 }

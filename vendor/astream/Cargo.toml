@@ -1,6 +1,6 @@
 # astream — a small, reproducibly-buildable, agent-native message bus.
 # The gate (astream-wire + astream-evidence) is the
-# foundation; the 13 members below are the built system — see README "Layout".
+# foundation; the 14 members below are the built system — see README "Layout".
 #
 # HARD INVARIANT: zero private / git dependencies. Everything resolves from
 # crates.io with a committed Cargo.lock so `targo --unverified build --locked`
@@ -11,6 +11,7 @@
 resolver = "2"
 members = [
     "crates/astream-wire",
+    "crates/astream-digest",
     "crates/astream-evidence",
     "crates/astream-term",
     "crates/astream-engine",
@@ -39,6 +40,7 @@ rust-version = "1.89"
 
 [workspace.dependencies]
 astream-wire = { path = "crates/astream-wire", version = "0.2.0" }
+astream-digest = { path = "crates/astream-digest", version = "0.2.0" }
 # astream-broker's sibling crates are declared HERE, with the version crates.io
 # requires beside `path`, because `pub bump` moves only the ROOT manifest's
 # intra-workspace requirements. A requirement left in a member manifest does not
@@ -49,7 +51,6 @@ astream-aead = { path = "crates/astream-aead", version = "0.2.0" }
 # Third-party (crates.io only — no git, no path-to-private):
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
-sha2 = "0.10"
 proptest = "1.5"
 
 [profile.release]

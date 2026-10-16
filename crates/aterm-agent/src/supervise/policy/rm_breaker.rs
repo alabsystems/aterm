@@ -12,15 +12,14 @@
 //! whether the rest of the line is a read. [`critical_path`] and
 //! [`is_known_flag`] are its path and flag tables.
 //!
-//! **When it decides a press.** Under `approve = "safe"`, and under the
-//! withdrawn `approve_all`, `read_outside_cwd` or `trust_dialog = false`
-//! (each caps the level at `safe`): a line it proves is pressed, one it does
-//! not is a person's. Under full power (`approve = "all"`, the default) every
-//! rm breaker is pressed anyway, and this resolver only names the rule in the
-//! ledger (`rm-breaker@…`, or `allow-once@v1` with its reason as
-//! `unproven`). Under the withdrawn `rm_breaker = false` the loop hands it no
-//! scratch root, and it proves nothing, not even a directory the line's own
-//! `mktemp -d` made ([`RmScope::roots`]).
+//! **When it decides a press.** Under `approve = "safe"` (also the cap of the
+//! retired `approve_all`, `read_outside_cwd` and `trust_dialog` written
+//! `false`) a line it proves is pressed, one it does not is a person's. Under
+//! `approve = "all"` (the default) every rm breaker is pressed anyway, and
+//! this resolver only names the rule in the ledger (`rm-breaker@…`, or
+//! `allow-once@v1` with its reason as `unproven`). Under the retired
+//! `rm_breaker = false` the loop hands it no scratch root, and it proves
+//! nothing ([`RmScope::roots`]).
 //!
 //! **What resolves.** The line is read left to right as straight-line shell,
 //! with a variable table filled by literal assignments only: `NAME=/abs/lit`,
@@ -29,144 +28,93 @@
 //! A variable the line does not assign is not known. An assignment counts
 //! only where it surely runs, in this shell: first in its `&&`/`||` list,
 //! not piped, and not in a list that ends in `&` (`test -d x || S=/y`, `S=/y
-//! rm …` and `S=/y && true &` all leave `S` unknown). `export` expands all
-//! its words before it assigns any (`export S=/x T=$S/b` makes `T` `/b`). A
-//! command with an assignment in front of it guards nothing (`${D:?}`), and
-//! the names it assigns are unknown after it (zsh and bash disagree on
-//! `S=/etc export T=$S`).
+//! rm …` and `S=/y && true &` all leave `S` unknown). A command with an
+//! assignment in front of it guards nothing (`${D:?}`), and the names it
+//! assigns are unknown after it.
 //!
 //! **A `$(mktemp -d)` that fails** leaves its variable empty (`"$D/etc"` is
-//! then `/etc`). So an operand built on one is proven only where the rm
-//! cannot run with it empty: behind `&&` (or `|`) after the assignment (whose
-//! status is the substitution's when it is the command's only one), after
+//! then `/etc`), so an operand built on one is proven only where the rm
+//! cannot run with it empty: behind `&&` (or `|`) after the assignment, after
 //! `D=$(…) || exit`, or after `test -n "$D" &&` / `[ -d "$D" ] &&`; or where
-//! its variable is written `${D:?}` (a non-interactive shell exits on an
-//! empty one; `${D?}` tests only unset), in the rm's own words or in a
-//! command that surely ran before it (`: "${D:?}"`). An operand that is the
-//! variable alone (`"$D"`) is `""` when it fails, which removes nothing.
+//! its variable is written `${D:?}` (a non-interactive shell exits on an empty
+//! one; `${D?}` tests only unset), in the rm's own words or in a command that
+//! surely ran before it (`: "${D:?}"`). An operand that is the variable alone
+//! (`"$D"`) is `""` when it fails, which removes nothing.
 //!
 //! **A directory the line itself just made** ([`Eval::fresh_dir`]).
 //! `mktemp -d` makes a new directory under a unique name and fails rather
-//! than reuse one, so removing it or anything under it removes nothing else,
-//! wherever `$TMPDIR` points. An operand is proven when it is `"$D"`, or lies
-//! lexically under it (`"$D/x"`, `"$D"/x/y`: no `..`, no glob, no other
-//! variable), where `D` holds exactly the output of one `$(mktemp -d …)` on
-//! this line (any template), the rm runs only if that run succeeded (or the
-//! operand is `"$D"` alone), and the operand is double-quoted. A path under
-//! `"$D"` also needs every use of `$D` on the line double-quoted, since
-//! `$TMPDIR` may hold a space or a glob. The rule proves nothing while the rm
-//! rule is withheld (no scratch root at all: [`RmScope::roots`]; owner
-//! decision D9).
+//! than reuse one, so removing it or anything lexically under it removes
+//! nothing else, wherever `$TMPDIR` points. The operand must be
+//! double-quoted, and a path under `"$D"` needs every use of `$D` on the line
+//! double-quoted, since `$TMPDIR` may hold a space or a glob.
 //!
 //! **What escalates**: everything else, by construction: a loop or any other
 //! compound command, `set`/`shift`/`eval`/`read`/`local` and the other
 //! builtins that change a variable, a subshell or group, a backtick, a
 //! here-document, `$'…'`, a `${…}` form other than `${NAME}` and
 //! `${NAME:?…}`, a positional parameter, a variable the line does not assign
-//! a literal (`$HOME`, `$TMPDIR`, `$USER`, any other), `~`, a relative
-//! operand and `$PWD`, an `rm` word anywhere but at a command head (`xargs
-//! rm`, `sh -c 'rm …'`) in any letter case (the default macOS volume finds
-//! `/bin/rm` for `Rm`), an unknown `rm` flag, and a redirect on the `rm`
-//! other than `/dev/null` or a descriptor.
+//! a literal (`$HOME`, `$TMPDIR`, any other), `~`, a relative operand and
+//! `$PWD`, an `rm` word anywhere but at a command head (`xargs rm`, `sh -c
+//! 'rm …'`) in any letter case, an unknown `rm` flag, and a redirect on the
+//! `rm` other than `/dev/null` or a descriptor.
 //!
-//! **zsh**, whose reading the Bash tool gets on macOS: `$=V` word-splits;
-//! `$~V`, `$^V`, `$+V`, a modifier on a bare name (`"$S:h:h"`) and a name in
-//! non-ASCII letters are not computed; a subscript on a bare name (`$S[1,0]`)
-//! and `$[…]` are arithmetic, which assigns (`$A[S=0]`, `$[S=5]`), and
-//! escalate wherever they are. A `:` after a bare name is a modifier only
-//! before a modifier letter. A command this resolver does not model may
-//! assign a variable it names (zsh's `print -v S /etc`, `print -vS`, bash's
-//! `printf -vS`, `zparseopts a:=S`, `zstyle -s c s S`, `zformat -f S /etc`,
-//! zsh/stat's `stat -A S`) or evaluate arithmetic (`[ -t "1/(S=5)" ]`,
-//! `printf %d "S=5"`, `printf -%d S=5`, `return S=5`), so each variable a
-//! command's words name is unknown after it ([`Eval::forget_named`]: a lone
-//! option cluster names only what is glued after its first letter, a path
-//! word with no arithmetic operator names nothing). zsh's arithmetic reads a
-//! variable's value as arithmetic in turn (`A=S=5; printf %d A` sets `S`),
-//! so a named variable's value names what it names; under a command that
-//! evaluates a word as arithmetic ([`ARITH_HEADS`]) a name the line did not
-//! assign leaves every variable unknown.
+//! **zsh**, whose reading the Bash tool gets on macOS: `$=V`, `$~V`, `$^V`,
+//! `$+V`, a modifier on a bare name (`"$S:h:h"`) and a name in non-ASCII
+//! letters are not computed; a subscript on a bare name (`$S[1,0]`) and
+//! `$[…]` are arithmetic, which assigns (`$A[S=0]`, `$[S=5]`), and escalate
+//! wherever they are. What a command it does not model may do to the line's
+//! variables is [`Eval::forget_named`]'s. Under `EXTENDED_GLOB`, which a
+//! user's `setopt` can carry into the shell snapshot, `^`, `#`, `(` and a `~`
+//! past a word's start glob too ([`GLOB_CHARS`], [`expands_apart`]).
 //!
-//! Every variable is unknown after a word whose text is not known, unless
-//! the word is double-quoted and the command takes no word as a name or
-//! arithmetic ([`PLAIN_CONSUMERS`]), or it is data past `printf`'s as-written
-//! format that reads no arithmetic (`printf '%s\n' "$x"`), or a string or
-//! file operand of `test`/`[` ([`test_operands`]). An unquoted unknown word,
-//! a zsh form, or a value with a glob can run code under `GLOB_SUBST`. The
-//! words of a [`PLAIN_CONSUMERS`] command name nothing, except zsh's
-//! `{S}>file`, which stores a descriptor's number in `S` under any builtin,
-//! so an unquoted `{NAME}` word forgets `NAME` under every command. Positions
-//! are read on the words as written; a word the shell brace-expands or globs
-//! moves them (`A=S=5; printf {%d,A}` is zsh's `printf %d A`; `printf %d *`
-//! with a file `S=5` there; under `EXTENDED_GLOB`, which a user's `setopt`
-//! can carry into Claude Code's shell snapshot, `^`, `#`, `~` and `(` glob
-//! too, [`GLOB_CHARS`]). Under a command not in [`PLAIN_CONSUMERS`] such a
-//! word leaves every variable unknown, unless it is data past `printf`'s
-//! as-written format, or it expands to absolute paths only
-//! ([`expands_apart`]).
-//!
-//! **Names the shell keeps.** `$_` is the previous command's last argument,
-//! and a name the shell itself sets, ties or reads (`_`, `PWD`, `HOME`,
-//! `IFS`, `PATH`/`path`, zsh's read-only `status`, `SECONDS`, `LINES`, …:
-//! every name whose assignment does not read back in zsh 5.9 or bash 3.2,
-//! kept so by a test) is never assigned by a line this resolver follows; nor
-//! is a variable appended to (`S+=/..`) or assigned through a subscript
-//! (`S[0]=/etc`, `S[1,-1]=/etc`). An unquoted `~` or `=` that starts an
+//! **Names the shell keeps** (`SHELL_NAMES`: `_`, `PWD`, `IFS`, `PATH`, zsh's
+//! read-only `status`, …) are never assigned by a line this resolver
+//! follows; nor is a variable appended to (`S+=/..`) or assigned through a
+//! subscript (`S[0]=/etc`). An unquoted `~` or `=` that starts an
 //! assignment's value or follows a `:` in it is expanded (`S=/a:~/b`, zsh's
 //! `S==ls`), so such a value is unknown.
 //!
 //! **Variables from the environment** are not proven. The Bash tool's shell
-//! inherits Claude Code's live environment, which its settings `env`
-//! rewrites after start, into which it sets names of its own (a sandboxed
-//! command's `TMPDIR`), and to which shell startup (`~/.zshenv`) and a
-//! SessionStart hook's `CLAUDE_ENV_FILE` add: no process the supervisor can
-//! read holds it (the worker-environment reader the git rule uses,
-//! [`super::git_config`], is not asked here for that reason). `$TMPDIR` as
-//! the supervisor has it is still a scratch root a literal path may sit in
-//! ([`super::approval`]'s `ApprovalCtx::new`): a root, never a value.
+//! inherits Claude Code's live environment, which its settings `env`, its own
+//! names (a sandboxed command's `TMPDIR`), shell startup and a SessionStart
+//! hook's `CLAUDE_ENV_FILE` change: no process the supervisor can read holds
+//! it, so the git rule's worker-environment reader ([`super::git_config`]) is
+//! not asked here. `$TMPDIR` as the supervisor has it is still a scratch root
+//! a literal path may sit in ([`super::approval`]'s `ApprovalCtx::new`): a
+//! root, never a value.
 //!
 //! **The shell's startup.** The resolver models zsh 5.9 and bash 3.2 under
-//! their default options, with no user alias or function. Claude Code's Bash
-//! tool runs every command as `source <shell snapshot> && setopt
-//! NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL && … eval <command>`, and the snapshot
-//! replays the options, functions and aliases of the person's `~/.zshrc`
-//! (`setopt globsubst` makes `N='~'; rm -rf $N` remove the home directory),
-//! with `.zshenv`, bash's `BASH_ENV`, the `CLAUDE_ENV_FILE` and a hook's env
-//! script run first. The resolver reads none of that; the approval rule does
-//! ([`super::shell_startup`], `ApprovalCtx::shell`) and proves nothing where
-//! it differs: an option outside the inert lists, or an unreadable startup,
-//! fails every line; an alias or function fails a line with a word spelled
-//! as its name. Unseen: a word a command outside [`ARITH_HEADS`] evaluates as
-//! arithmetic (a module's builtin), reading a value from the environment.
+//! their default options, with no user alias or function. Claude Code's shell
+//! snapshot replays the person's options, functions and aliases (`setopt
+//! globsubst` makes `N='~'; rm -rf $N` remove the home directory); the
+//! approval rule reads it ([`super::shell_startup`], `ApprovalCtx::shell`)
+//! and proves nothing where it differs. Unseen: a word a command outside
+//! [`ARITH_HEADS`] evaluates as arithmetic (a module's builtin), reading a
+//! value from the environment.
 //!
 //! **No relative operand and no `$PWD`.** The only working directory the
 //! supervisor can read is where Claude Code was launched (`meta cwd=`); the
 //! Bash tool keeps its own, which the worker moves between calls. The launch
-//! directory is still used for the `<cwd>/target*` root and the guard that no
+//! directory still gives the `<cwd>/target*` root and the guard that no
 //! operand is it or an ancestor of it.
 //!
 //! **Where an operand may point.** Strictly inside a [`ScratchRoot`] (never
 //! the root itself), with no glob at or above the first component under the
 //! root, no `..`, no `.git`, not the cwd or an ancestor of it, and past every
-//! [`critical_path`] (the filesystem root, the home directory and its
-//! ancestors, `/Users/<x>`, a glob in the first component), as written and
-//! where the disk leads it.
+//! [`critical_path`], as written and where the disk leads it.
 //!
 //! **On the disk.** `rm` follows a symbolic link in every directory of an
 //! operand (and in its last component after a trailing `/`), never the last
 //! component itself: with `/private/tmp/p/out -> /etc`, `rm -rf
 //! /private/tmp/p/out/x` removes `/etc/x`. So the operand's directories are
-//! resolved when the box is judged (the deepest part that exists, each link
-//! followed as the kernel does, the rest as written), and the result must
-//! pass the same checks against the roots, the cwd and the home directory
-//! resolved the same way. A root is resolved only through links root owns
-//! (macOS's `/tmp`, `/var`), so a scratch directory swapped for a link to the
-//! home directory holds nothing; the `<cwd>/target*` root is resolved where
-//! the session cwd leads. A glob in a directory may match a link, so it
-//! escalates; a link the disk will not show (a permission refused, a loop)
-//! escalates. Not seen: a link made after the box is judged by a job the
-//! worker left running (nothing else on the line may write:
-//! `classify_except_rm`).
+//! resolved when the box is judged (`physical`), and the result must pass the
+//! same checks against the roots, the cwd and the home directory resolved the
+//! same way. A root is resolved only through links root owns (macOS's `/tmp`,
+//! `/var`), so a scratch directory swapped for a link to the home directory
+//! holds nothing. A glob in a directory (it may match a link), or a link the
+//! disk will not show (a permission refused, a loop), escalates. Not seen: a
+//! link made after the box is judged by a job the worker left running
+//! (nothing else on the line may write: `classify_except_rm`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
@@ -446,10 +394,10 @@ pub struct RmScope<'a> {
     pub cwd: &'a Path,
     /// The owner's home directory, for the deny table.
     pub home: Option<&'a Path>,
-    /// Where an operand may point. Empty is the rule withheld (the withdrawn
-    /// `rm_breaker = false`, owner decision D9: the loop clears the roots):
-    /// then nothing is proven, not even a directory the line's own `mktemp
-    /// -d` made ([`Eval::fresh_dir`], which asks no root otherwise).
+    /// Where an operand may point. Empty is the rule withheld (the retired
+    /// `rm_breaker = false`: the loop clears the roots): then nothing is
+    /// proven, not even a directory the line's own `mktemp -d` made
+    /// ([`Eval::fresh_dir`], which asks no root otherwise).
     pub roots: &'a [ScratchRoot],
 }
 
@@ -1004,7 +952,7 @@ enum Val {
         runs: Vec<u32>,
         /// The value were every one of `runs` to fail.
         failed: String,
-        /// Whether the value IS one run's output and nothing else, so it is
+        /// Whether the value is one run's output and nothing else, so it is
         /// empty as a whole when that run fails: what `${V:?}` guards.
         whole: bool,
     },
@@ -1428,13 +1376,12 @@ fn arith_words(head: &str, words: &[String], parts: &[Word]) -> Reading {
 /// the command's head, 0), by POSIX's rules for 1, 2 and 3 arguments, every
 /// operator a literal: `[ X ]`, `[ ! X ]`, `[ -n X ]`, `[ X = Y ]`, `[ ! -d X
 /// ]`. A double-quoted word there names nothing whatever its value
-/// ([`Eval::forget_named`]): in zsh 5.9 and bash 3.2, values such as `-t`,
-/// `S=5`, `-v`, `-vS`, `path[$(cmd)]`, `(`, `)`, `!`, `=`, `-a`, `-o`, `-t
-/// S=5` and `1/(S=5)` in those forms assign and run nothing. `-t`'s operand
-/// is arithmetic ([`arith_words`]), and `-v` and `-R` name a variable (zsh's
-/// `[ -v "$x" ]` evaluates the subscript in `x`): no operand. Four words or
-/// more: none. Nor any when a word holds `"$@"`, which is as many words as
-/// there are positional parameters (`set -- -t S=0; [ "$@" ]` sets `S`).
+/// ([`Eval::forget_named`]): in zsh 5.9 and bash 3.2 no value there (`-t`,
+/// `S=5`, `-vS`, `path[$(cmd)]`, `(`, `!`, `1/(S=5)`, …) assigns or runs
+/// anything. `-t`'s operand is arithmetic ([`arith_words`]), and `-v` and
+/// `-R` name a variable (zsh's `[ -v "$x" ]` evaluates a subscript in `x`):
+/// no operand. Four words or more: none; nor any when a word holds `"$@"`
+/// (`set -- -t S=0; [ "$@" ]` sets `S`).
 fn test_operands(head: &str, words: &[Word]) -> Vec<usize> {
     let args = match (head, words.get(1..).unwrap_or_default()) {
         ("test", args) => args,
@@ -1753,26 +1700,27 @@ impl Eval<'_> {
     }
 
     /// What a command this resolver does not model may do to the line's
-    /// variables (module docs, "zsh"): a builtin assigns a variable named in
-    /// its words (`print -v S /etc`, `print -vS`, bash `printf -vS`,
-    /// `zparseopts a:=S`, `zstyle -s c s S`, `zformat -f S /etc`, `stat -A S`)
-    /// or evaluates a word as arithmetic, which assigns (`[ -t "1/(S=5)" ]`,
-    /// zsh `printf %d "S=5"`), so every variable a word names, as the word
-    /// expands, is unknown after it. A lone option cluster (`-d`, `-sh`) names
-    /// only what is glued after its first letter (`-vS` → `S`), and a path
-    /// word (a `/`, and none of `=`, `(`, `[`, `++`, `--`) names nothing.
-    /// Every variable is unknown after a word whose text is not known, unless
-    /// the word is double-quoted and the command is a [`PLAIN_CONSUMERS`] one,
-    /// or the word is data past `printf`'s as-written format that reads no
-    /// arithmetic: an unquoted unknown word, a zsh form, or an unquoted value
-    /// with a glob can run code in this shell (a glob qualifier under
-    /// `GLOB_SUBST`), and any other command may read it as a name. A
-    /// [`PLAIN_CONSUMERS`] command's words name nothing. A word an
-    /// [`ARITH_HEADS`] command evaluates as arithmetic ([`arith_words`]) is
-    /// read as zsh reads it ([`Self::forget_arith`]). Whatever the command, an
-    /// unquoted `{NAME}` word forgets `NAME`: zsh's `{S}>file` stores the
-    /// number of the descriptor it opens in `S` under a builtin (`echo hi
-    /// {S}>/dev/null`, `: {S}</dev/null`, a blank before the `>` too).
+    /// variables: a builtin may assign a variable named in its words (`print
+    /// -v S /etc`, `print -vS`, bash `printf -vS`, `zparseopts a:=S`, `zstyle -s
+    /// c s S`, `zformat -f S /etc`, `stat -A S`) or evaluate a word as
+    /// arithmetic, which assigns (`[ -t "1/(S=5)" ]`, zsh `printf %d "S=5"`), so
+    /// every variable a word names, as the word expands, is unknown after it. A
+    /// lone option cluster (`-d`, `-sh`) names only what is glued after its
+    /// first letter (`-vS` → `S`), and a path word (a `/`, and none of `=`,
+    /// `(`, `[`, `++`, `--`) names nothing.
+    ///
+    /// Every variable is unknown after a word whose text is not known (an
+    /// unquoted unknown word, a zsh form or an unquoted value with a glob can
+    /// run code under `GLOB_SUBST`), unless the word is double-quoted and the
+    /// command is a [`PLAIN_CONSUMERS`] one, whose words name nothing, or the
+    /// word is plain data to the command (past `printf`'s as-written format
+    /// that reads no arithmetic, a [`test_operands`] operand). So is every
+    /// variable after a word the shell makes several words of
+    /// ([`expands_apart`]) where positions matter. A word an [`ARITH_HEADS`]
+    /// command evaluates ([`arith_words`]) is read as zsh reads it
+    /// ([`Self::forget_arith`]). Whatever the command, an unquoted `{NAME}`
+    /// word forgets `NAME`: zsh's `{S}>file` stores the descriptor's number in
+    /// `S` under a builtin.
     fn forget_named(&mut self, cmd: &Cmd, head: &str) {
         for w in &cmd.words {
             if let [

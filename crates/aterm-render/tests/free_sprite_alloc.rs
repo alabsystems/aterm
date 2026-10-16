@@ -102,10 +102,8 @@ fn sprite(x: i32, w: u16, h: u16, aw: u16, ah: u16, flip_x: bool) -> FreeSprite 
     }
 }
 
-/// The pet/mote/note regime is 1:1 and must allocate nothing even on its first
-/// real stamp; scaled/flip sprites may grow the column map once, then must reuse
-/// it across motion frames. Before the resident scratch fix, each counted frame
-/// allocated and dropped a fresh `Vec<u32>` in `stamp_free_sprites`.
+/// 1:1 sprites (pets, motes, notes) allocate nothing even on their first stamp;
+/// scaled/flipped sprites may grow the resident column map once, then reuse it.
 #[test]
 fn active_free_sprites_do_not_allocate_per_frame() {
     let mut renderer = Renderer::from_bytes(embedded_font(), 16.0, Theme::default())

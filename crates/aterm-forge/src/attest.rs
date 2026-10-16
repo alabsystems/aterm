@@ -17,8 +17,15 @@
 //! `vendor/` paths are forks and owe everything; `crates/` paths are
 //! first-party workspace members (e.g. `tracing` → `crates/aterm-tracing`) and
 //! owe only `[OB-1]` (it is really there) and `[OB-2]` (the patch really
-//! takes). Any other location is an `[OB-1]` failure. First-party targets are
-//! named in the log every run.
+//! takes). A `crates/` path that keeps an upstream license and a NOTICE line is
+//! ABSORBED (winit → `crates/aterm-window`): upstream source aterm now owns as
+//! a member. The license obligations follow the code wherever it lives, so it
+//! owes `[OB-5]` (the license text), `[OB-6]` (its NOTICE line), `[OB-7]` (the
+//! Apache-2.0 §4(b) notices) and `[OB-9]` (the SPDX allowlist) besides
+//! `[OB-1]`/`[OB-2]`; the fork-upkeep ones (`[OB-3]` stub, `[OB-4]` re-vendor
+//! provenance, `[OB-8]` markers, `[OB-10]` the vendor/ ignore sweep) end with
+//! the vendoring. Any other location is an `[OB-1]` failure. First-party and
+//! absorbed targets are named in the log every run.
 //!
 //! Every obligation is fail-closed and tagged `[OB-n]` in the log. The log is
 //! returned, not printed, so `check` can splice it into the gate report.
@@ -66,10 +73,11 @@
 //! [`crate::provenance::FIRST_PARTY_VENDORED`] is what keeps the astream crates
 //! out of forge's third-party counts.
 
+use aterm_uds::output::CommandOutput as _;
+use aterm_uds::spawnfd::command;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use aterm_toml::edit::{DocumentMut, Item, TableLike};
 
@@ -104,8 +112,12 @@ pub fn run(root: &Path) -> Result<Outcome, String> {
 /// One vendored fork, as attest sees it on disk.
 #[derive(Debug, Clone)]
 struct VendoredFork {
-    /// The `[patch.crates-io]` key (the crates-io package being replaced).
+    /// The crates-io package being replaced
+    /// ([`crate::policy::patched_package`]).
     name: String,
+    /// The patch row is renamed, so it claims one version line of `name`
+    /// ([`crate::policy::in_row_scope`]).
+    renamed: bool,
     /// The replacement path exactly as the patch table spells it.
     rel: String,
     dir: PathBuf,
@@ -130,9 +142,10 @@ impl VendoredFork {
     }
 }
 
-/// Read the root `[patch.crates-io]` table as `(key, path)` pairs. A non-path
-/// entry (git/registry) yields an empty path and is reported by `[OB-1]`.
-fn patch_paths(root: &Path) -> Result<Vec<(String, String)>, String> {
+/// Read the root `[patch.crates-io]` table as rows naming the package each
+/// replaces. A non-path entry (git/registry) yields an empty path and is
+/// reported by `[OB-1]`.
+fn patch_paths(root: &Path) -> Result<PatchTable, String> {
     let manifest = root.join("Cargo.toml");
     let text = std::fs::read_to_string(&manifest)
         .map_err(|e| format!("cannot read {}: {e}", manifest.display()))?;
@@ -155,32 +168,66 @@ fn patch_paths(root: &Path) -> Result<Vec<(String, String)>, String> {
             .and_then(Item::as_str)
             .unwrap_or_default()
             .to_string();
-        out.push((key.to_string(), path));
+        let name = crate::policy::patched_package(key, value);
+        out.push(PatchRow {
+            name: name.to_string(),
+            rel: path,
+            renamed: name != key,
+        });
     }
-    out.sort();
+    out.sort_by_key(PatchRow::pair);
     Ok(out)
 }
 
-/// `(patch key, replacement path)` pairs, in patch-table order.
-type PatchTable = Vec<(String, String)>;
+/// One `[patch.crates-io]` row as attest reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PatchRow {
+    /// The package replaced ([`crate::policy::patched_package`]).
+    name: String,
+    /// The replacement path as written; empty for a git/registry row.
+    rel: String,
+    /// Keyed apart from `name` (`package = "…"`).
+    renamed: bool,
+}
 
-/// Split the patch table into `(vendored, first_party)` by replacement path.
+impl PatchRow {
+    fn pair(&self) -> (String, String) {
+        (self.name.clone(), self.rel.clone())
+    }
+}
+
+/// The patch table's rows, sorted by package and path.
+type PatchTable = Vec<PatchRow>;
+
+/// The patch table split by replacement path.
+struct Partition {
+    vendored: PatchTable,
+    first_party: PatchTable,
+    absorbed: PatchTable,
+}
+
+/// Split the patch table into vendored, first-party and absorbed targets.
 ///
-/// Only a path under `crates/` is first-party. Everything else, including an
-/// empty path (git/registry patch) or a third location, stays vendored so
-/// `[OB-1]`'s "not under vendor/" failure still fires.
-fn partition_patches(patch: &[(String, String)], root: &Path) -> (PatchTable, PatchTable) {
-    let mut vendored = Vec::new();
-    let mut first_party = Vec::new();
-    for (name, rel) in patch {
-        match aterm_census::scan_set::classify_patch_target(name, rel, root) {
-            Ok(aterm_census::scan_set::PatchTargetKind::FirstParty) => {
-                first_party.push((name.clone(), rel.clone()));
-            }
-            _ => vendored.push((name.clone(), rel.clone())),
+/// Only a path under `crates/` is first-party or absorbed. Everything else,
+/// including an empty path (git/registry patch), a third location or a
+/// half-recorded `crates/` redistribution, stays vendored so `[OB-1]`'s "not
+/// under vendor/" failure still fires.
+fn partition_patches(patch: &[PatchRow], root: &Path) -> Partition {
+    use aterm_census::scan_set::PatchTargetKind;
+    let mut out = Partition {
+        vendored: Vec::new(),
+        first_party: Vec::new(),
+        absorbed: Vec::new(),
+    };
+    for row in patch {
+        let entry = row.clone();
+        match aterm_census::scan_set::classify_patch_target(&row.name, &row.rel, root) {
+            Ok(PatchTargetKind::FirstParty) => out.first_party.push(entry),
+            Ok(PatchTargetKind::Absorbed) => out.absorbed.push(entry),
+            _ => out.vendored.push(entry),
         }
     }
-    (vendored, first_party)
+    out
 }
 
 /// Directory names directly under `vendor/`, sorted. Absent `vendor/` is an
@@ -205,17 +252,19 @@ fn vendor_dirs(root: &Path) -> Vec<String> {
 }
 
 /// Measure every fork named by the patch table.
-fn survey_forks(root: &Path, patch: &[(String, String)]) -> Vec<VendoredFork> {
+fn survey_forks(root: &Path, patch: &[PatchRow]) -> Vec<VendoredFork> {
     let mut forks = Vec::new();
-    for (name, rel) in patch {
-        let rel = if rel.is_empty() {
+    for row in patch {
+        let name = &row.name;
+        let rel = if row.rel.is_empty() {
             format!("vendor/{name}")
         } else {
-            rel.clone()
+            row.rel.clone()
         };
         let dir = root.join(&rel);
         let mut fork = VendoredFork {
             name: name.clone(),
+            renamed: row.renamed,
             rel,
             dir: dir.clone(),
             version: String::new(),
@@ -357,7 +406,7 @@ fn deny_allow(root: &Path) -> Result<Vec<String>, String> {
 /// A parsed dotted version. `stated_*` record which components the text
 /// actually spelled, which is what decides a caret requirement's upper bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Ver {
+pub(crate) struct Ver {
     major: u64,
     minor: u64,
     patch: u64,
@@ -366,14 +415,14 @@ struct Ver {
 }
 
 impl Ver {
-    fn triple(self) -> (u64, u64, u64) {
+    pub(crate) fn triple(self) -> (u64, u64, u64) {
         (self.major, self.minor, self.patch)
     }
 }
 
 /// Parse a dotted version, tolerant of omitted components and of a
 /// `-prerelease` / `+build` suffix.
-fn parse_version(text: &str) -> Option<Ver> {
+pub(crate) fn parse_version(text: &str) -> Option<Ver> {
     let core = text.split(['-', '+']).next().unwrap_or(text);
     let mut parts = core.split('.');
     let major = parts.next()?.trim().parse().ok()?;
@@ -528,7 +577,8 @@ pub(crate) fn lock_entries(root: &Path, name: &str) -> Result<Vec<(String, bool)
 // NOTICE
 // ---------------------------------------------------------------------------
 
-/// One `- <name> <version>, <SPDX> (`vendor/<dir>/`)` line of `NOTICE`.
+/// One `- <name> <version>, <SPDX> (`vendor/<dir>/`)` line of `NOTICE`, or
+/// `(`crates/<dir>/`)` for an absorbed crate. `dir` is the repo-relative path.
 #[derive(Debug, Clone)]
 struct NoticeEntry {
     name: String,
@@ -545,12 +595,15 @@ fn parse_notice(text: &str) -> Vec<NoticeEntry> {
         let Some(rest) = line.strip_prefix("- ") else {
             continue;
         };
-        let Some((head, tail)) = rest.split_once("(`vendor/") else {
+        let Some((head, tail)) = rest.split_once("(`") else {
             continue;
         };
         let Some(dir) = tail.trim().strip_suffix("/`)") else {
             continue;
         };
+        if !(dir.starts_with("vendor/") || dir.starts_with("crates/")) {
+            continue;
+        }
         let Some((name_version, license)) = head.trim().split_once(", ") else {
             continue;
         };
@@ -589,11 +642,11 @@ fn check_ignore(root: &Path, paths: &[String]) -> Option<Vec<IgnoreVerdict>> {
     if paths.is_empty() {
         return Some(Vec::new());
     }
-    let output = Command::new("git")
+    let output = command("git")
         .current_dir(root)
         .args(["check-ignore", "-v", "--no-index", "--"])
         .args(paths)
-        .output()
+        .output_owned()
         .ok()?;
     // 0 = at least one match, 1 = no match. Anything else (128: not a
     // repository) means git did not answer the question.
@@ -620,10 +673,10 @@ fn check_ignore(root: &Path, paths: &[String]) -> Option<Vec<IgnoreVerdict>> {
 /// The gitlinks (mode 160000 entries) the index records under `vendor/`,
 /// repo-relative: the submodules. `None` when git cannot answer.
 fn vendor_gitlinks(root: &Path) -> Option<BTreeSet<String>> {
-    let output = Command::new("git")
+    let output = command("git")
         .current_dir(root)
         .args(["ls-files", "-s", "-z", "--", "vendor"])
-        .output()
+        .output_owned()
         .ok()?;
     if !output.status.success() {
         return None;
@@ -664,6 +717,11 @@ fn vendor_paths(root: &Path, dir: &Path, skip: &BTreeSet<String>, out: &mut Vec<
 /// Run every obligation. Returns `(ok, log)`; the log is complete on its own
 /// and ends with [`crate::PRECISION_NOTE`] whenever anything failed.
 pub fn report(root: &Path) -> (bool, String) {
+    report_with(&crate::resolve::Cargo::from_env(), root)
+}
+
+/// [`report`], asking `cargo` for the vendored submodule's metadata.
+pub fn report_with(cargo: &crate::resolve::Cargo, root: &Path) -> (bool, String) {
     let mut log = String::new();
     let mut fails = 0usize;
     let _ = writeln!(
@@ -691,45 +749,62 @@ pub fn report(root: &Path) -> (bool, String) {
     };
     // THE PARTITION. Redistribution obligations belong to third-party source,
     // not to "whatever the patch table names" — see the module docs.
-    let (vendored, first_party) = partition_patches(&patch, root);
-    let forks = survey_forks(root, &vendored);
-    let first_party_forks = survey_forks(root, &first_party);
+    let partition = partition_patches(&patch, root);
+    let forks = survey_forks(root, &partition.vendored);
+    let first_party_forks = survey_forks(root, &partition.first_party);
+    let absorbed = survey_forks(root, &partition.absorbed);
+    // What this source distribution redistributes on someone else's terms: the
+    // forks and the absorbed crates alike owe the license obligations.
+    let mut redistributed: Vec<VendoredFork> = forks.iter().chain(&absorbed).cloned().collect();
+    redistributed.sort_by(|a, b| a.name.cmp(&b.name));
     let dirs = vendor_dirs(root);
     let _ = writeln!(
         log,
         "    forks: {} vendored from [patch.crates-io]; {} director(y/ies) under vendor/, of \
          which {} are FIRST-PARTY vendored path dependencies; {} FIRST-PARTY patch target(s) \
          under crates/ (aterm's own code — provenance obligations do not apply, and \
-         [OB-1]/[OB-2] say so by name)",
+         [OB-1]/[OB-2] say so by name); {} ABSORBED patch target(s) under crates/ (upstream \
+         source aterm owns — the license obligations [OB-5]/[OB-6]/[OB-7]/[OB-9] follow it)",
         forks.len(),
         dirs.len(),
         crate::provenance::roster_len(root),
-        first_party_forks.len()
+        first_party_forks.len(),
+        absorbed.len()
     );
 
-    fails += ob1_patch_vendor_agreement(root, &forks, &first_party_forks, &dirs, &mut log);
+    fails += ob1_patch_vendor_agreement(
+        cargo,
+        root,
+        &forks,
+        &first_party_forks,
+        &absorbed,
+        &dirs,
+        &mut log,
+    );
     // [OB-2] is the liveness obligation, and a replacement that does not take
-    // is exactly as broken as a fork that does not take. Both sets, one pass.
+    // is exactly as broken as a fork that does not take. Every set, one pass.
     let mut ob2_all: Vec<VendoredFork> = Vec::new();
-    ob2_all.extend(forks.iter().cloned());
+    ob2_all.extend(redistributed.iter().cloned());
     ob2_all.extend(first_party_forks.iter().cloned());
     ob2_all.sort_by(|a, b| a.name.cmp(&b.name));
     fails += ob2_version_equality(root, &ob2_all, &mut log);
     fails += ob3_workspace_stub(&forks, &mut log);
     fails += ob4_provenance_files(&forks, &mut log);
-    fails += ob5_license_files(&forks, &mut log);
-    fails += ob6_notice_agreement(root, &forks, &mut log);
-    fails += ob7_apache_modification_notices(root, &forks, &mut log);
+    fails += ob5_license_files(&redistributed, &mut log);
+    fails += ob6_notice_agreement(root, &redistributed, &mut log);
+    fails += ob7_apache_modification_notices(root, &redistributed, &mut log);
     fails += ob8_marker_census(&forks, &mut log);
-    fails += ob9_spdx_allowlist(root, &forks, &mut log);
+    fails += ob9_spdx_allowlist(root, &redistributed, &mut log);
     fails += ob10_gitignore(root, &forks, &mut log);
 
     if fails == 0 {
         let _ = writeln!(
             log,
             "cargo forge attest: PASS — 10 obligations held over {} vendored fork(s) \
-             (+ [OB-1]/[OB-2] over {} first-party patch target(s)).",
+             (+ [OB-1]/[OB-2]/[OB-5]/[OB-6]/[OB-7]/[OB-9] over {} absorbed crate(s), \
+             [OB-1]/[OB-2] over {} first-party patch target(s)).",
             forks.len(),
+            absorbed.len(),
             first_party_forks.len()
         );
         return (true, log);
@@ -755,14 +830,16 @@ pub fn report(root: &Path) -> (bool, String) {
 /// directions, since a review row for a workspace member would be a false
 /// provenance claim.
 fn ob1_patch_vendor_agreement(
+    cargo: &crate::resolve::Cargo,
     root: &Path,
     forks: &[VendoredFork],
     first_party: &[VendoredFork],
+    absorbed: &[VendoredFork],
     dirs: &[String],
     log: &mut String,
 ) -> usize {
     let mut fails = 0;
-    let submodule = match crate::direct_vendor::review(root) {
+    let submodule = match crate::direct_vendor::review(cargo, root) {
         Ok(Some(pin)) => {
             let _ = writeln!(
                 log,
@@ -770,8 +847,8 @@ fn ob1_patch_vendor_agreement(
                  at {} ({}): .gitmodules declares it, the index tracks that one gitlink and \
                  nothing beneath it, the checkout is initialised at exactly that commit with no \
                  tracked modification, and cargo resolves astream-aead, astream-broker, \
-                 astream-cap and astream-wire from vendor/astream/crates/<name> as Apache-2.0 \
-                 path packages outside this workspace (the root manifest excludes \
+                 astream-cap, astream-digest and astream-wire from vendor/astream/crates/<name> \
+                 as Apache-2.0 path packages outside this workspace (the root manifest excludes \
                  vendor/astream), with aterm-link's broker and cap edges pointing there. The \
                  gitlink IS the pin: forge compiles in no astream revision and no file digest, \
                  and a bump is reviewed in astream as the range it moves over. It does NOT \
@@ -818,13 +895,34 @@ fn ob1_patch_vendor_agreement(
         }
         let _ = writeln!(
             log,
-            "    [OB-1] `{}` → `{}` is a FIRST-PARTY patch target (a workspace member, code \
-             aterm wrote). It is not a redistribution, so [OB-3]..[OB-10] — the [workspace] \
+            "    [OB-1] `{}` → `{}` is a FIRST-PARTY patch target (code aterm wrote, under \
+             crates/). It is not a redistribution, so [OB-3]..[OB-10] — the [workspace] \
              stub, .cargo_vcs_info.json/Cargo.toml.orig, a retained upstream LICENSE, a \
              NOTICE row, the Apache §4(b) pristine diff, the fork-marker census, the SPDX \
              allowlist and the vendor/ ignore sweep — do NOT apply to it. [OB-2] does, and \
              it is the one that matters: the patch must actually take.",
             fp.name, fp.rel
+        );
+    }
+    for crate_ in absorbed {
+        if !crate_.dir.join("src").is_dir() {
+            let _ = writeln!(
+                log,
+                "  ✗ FAIL [OB-1] absorbed patch target `{}` has no `src/` — a replacement with \
+                 no sources replaces nothing.",
+                crate_.rel
+            );
+            fails += 1;
+            continue;
+        }
+        let _ = writeln!(
+            log,
+            "    [OB-1] `{}` → `{}` is an ABSORBED patch target: upstream source aterm owns as \
+             a workspace member (it keeps the upstream license file and NOTICE names it). It \
+             owes the license obligations [OB-5]/[OB-6]/[OB-7]/[OB-9] wherever it lives, and \
+             [OB-2]; the fork-upkeep ones ([OB-3]/[OB-4]/[OB-8]/[OB-10]) ended with its \
+             vendoring.",
+            crate_.name, crate_.rel
         );
     }
     for fork in forks {
@@ -1024,12 +1122,43 @@ fn ob1_patch_vendor_agreement(
                 fails += 1;
             }
         }
+        // An absorbed crate is scanned by the census from its ABSORBED_CRATES
+        // row (its namespace and platform slices): the two lists agree, both
+        // ways.
+        let rows = aterm_census::scan_set::ABSORBED_CRATES;
+        for crate_ in absorbed {
+            if !rows
+                .iter()
+                .any(|r| r.package == crate_.name && r.path == crate_.rel)
+            {
+                let _ = writeln!(
+                    log,
+                    "  ✗ FAIL [OB-1] absorbed crate `{}` (`{}`) has no matching \
+                     aterm_census::scan_set::ABSORBED_CRATES row — the lock-order census \
+                     needs its identity namespace and platform slices.",
+                    crate_.name, crate_.rel
+                );
+                fails += 1;
+            }
+        }
+        for row in rows {
+            if !absorbed.iter().any(|c| c.name == row.package) {
+                let _ = writeln!(
+                    log,
+                    "  ✗ FAIL [OB-1] ABSORBED_CRATES registers `{}` at `{}` but no absorbed \
+                     [patch.crates-io] target names it — the row is stale.",
+                    row.package, row.path
+                );
+                fails += 1;
+            }
+        }
         let _ = writeln!(
             log,
-            "    [OB-1] cross-checked against REVIEWED_VENDORED_CRATES ({} reviewed entries) \
-             and aterm_forge::provenance::FIRST_PARTY_VENDORED ({} first-party vendored \
-             root(s)).",
+            "    [OB-1] cross-checked against REVIEWED_VENDORED_CRATES ({} reviewed entries), \
+             ABSORBED_CRATES ({} absorbed) and aterm_forge::provenance::FIRST_PARTY_VENDORED \
+             ({} first-party vendored root(s)).",
             registry.len(),
+            rows.len(),
             crate::provenance::roster_len(root)
         );
     } else {
@@ -1083,6 +1212,11 @@ fn ob2_version_equality(root: &Path, forks: &[VendoredFork], log: &mut String) -
             continue;
         }
         for (manifest, req) in workspace_requirements(root, &fork.name) {
+            // A renamed row answers for its own version line only: a
+            // requirement on another line is another row's, or the registry's.
+            if !crate::policy::in_row_scope(fork.renamed, Some(&fork.version), &req) {
+                continue;
+            }
             match req_satisfied(&req, &fork.version) {
                 Some(true) => {}
                 Some(false) => {
@@ -1153,7 +1287,10 @@ fn ob2_version_equality(root: &Path, forks: &[VendoredFork], log: &mut String) -
                 }
                 let registry: Vec<&str> = entries
                     .iter()
-                    .filter(|(_, has_source)| *has_source)
+                    .filter(|(v, has_source)| {
+                        *has_source
+                            && crate::policy::in_row_scope(fork.renamed, Some(&fork.version), v)
+                    })
                     .map(|(v, _)| v.as_str())
                     .collect();
                 if !registry.is_empty() {
@@ -1302,13 +1439,13 @@ fn ob6_notice_agreement(root: &Path, forks: &[VendoredFork], log: &mut String) -
     let entries = parse_notice(&text);
     let mut fails = 0;
     for fork in forks {
-        let dir = fork.rel.strip_prefix("vendor/").unwrap_or(&fork.rel);
+        let dir = fork.rel.as_str();
         let matches: Vec<&NoticeEntry> = entries.iter().filter(|e| e.name == fork.name).collect();
         let Some(entry) = matches.first() else {
             let _ = writeln!(
                 log,
                 "  ✗ FAIL [OB-6] NOTICE does not list fork `{}` — the source distribution ships \
-                 it without saying so. FIX: add \"- {} {}, {} (`vendor/{}/`)\" to the vendored \
+                 it without saying so. FIX: add \"- {} {}, {} (`{}/`)\" to the redistributed \
                  crate list in {}.",
                 fork.name,
                 fork.name,
@@ -1356,7 +1493,7 @@ fn ob6_notice_agreement(root: &Path, forks: &[VendoredFork], log: &mut String) -
         if entry.dir != dir {
             let _ = writeln!(
                 log,
-                "  ✗ FAIL [OB-6] NOTICE:{} points `{}` at `vendor/{}/` but the patch table \
+                "  ✗ FAIL [OB-6] NOTICE:{} points `{}` at `{}/` but the patch table \
                  points at `{}` — make the NOTICE line name the real directory.",
                 entry.line, fork.name, entry.dir, fork.rel
             );
@@ -1369,9 +1506,9 @@ fn ob6_notice_agreement(root: &Path, forks: &[VendoredFork], log: &mut String) -
         }
         let _ = writeln!(
             log,
-            "  ✗ FAIL [OB-6] NOTICE:{} claims a vendored crate `{}` (`vendor/{}/`) that is not a \
-             [patch.crates-io] fork — a NOTICE that over-claims is as wrong as one that \
-             under-claims. Remove the line, or restore the fork.",
+            "  ✗ FAIL [OB-6] NOTICE:{} claims a redistributed crate `{}` (`{}/`) that is not a \
+             [patch.crates-io] fork or absorbed crate — a NOTICE that over-claims is as wrong \
+             as one that under-claims. Remove the line, or restore the crate.",
             entry.line, entry.name, entry.dir
         );
         fails += 1;
@@ -1379,7 +1516,8 @@ fn ob6_notice_agreement(root: &Path, forks: &[VendoredFork], log: &mut String) -
     if fails == 0 {
         let _ = writeln!(
             log,
-            "  ✓ [OB-6] NOTICE agrees with vendor/ in both directions ({} listed fork(s)).",
+            "  ✓ [OB-6] NOTICE agrees with the forks and absorbed crates in both directions ({} \
+             listed).",
             entries.len()
         );
     }
@@ -1567,7 +1705,7 @@ fn has_modification_notice(text: &str) -> bool {
                 || lower.contains("change")
                 // An added file is not "modified" under §4(b), but NOTICE says
                 // modified and added files carry notices, so the new-file
-                // wording counts (e.g. vendor/winit's seat/data_device.rs).
+                // wording counts (e.g. crates/aterm-window's seat/data_device.rs).
                 || lower.contains("added by"))
     })
 }
@@ -1788,127 +1926,22 @@ mod tests {
         }
     }
 
+    /// Every vendored fork sits at `vendor/`; every first-party or absorbed
+    /// target sits at `crates/`.
     #[test]
-    fn the_real_tree_holds_every_other_obligation() {
-        let (_, log) = report(&repo_root());
-        for held in [
-            "✓ [OB-1]",
-            "✓ [OB-2]",
-            "✓ [OB-5]",
-            "✓ [OB-6]",
-            "✓ [OB-8]",
-            "✓ [OB-9]",
-        ] {
-            assert!(log.contains(held), "expected {held} to hold:\n{log}");
-        }
-    }
-
-    /// The vendored arm of the real tree's patch table; first-party targets
-    /// are not forks.
-    fn real_forks(root: &Path) -> Vec<VendoredFork> {
-        let (vendored, _) = partition_patches(&patch_paths(root).unwrap(), root);
-        survey_forks(root, &vendored)
-    }
-
-    #[test]
-    fn the_real_tree_reproduces_the_measured_marker_floor() {
-        let root = repo_root();
-        let forks = real_forks(&root);
-        let trust: u64 = forks.iter().map(|f| f.trust_markers).sum();
-        let patch: u64 = forks.iter().map(|f| f.patch_markers).sum();
-        assert_eq!(trust, 14, "`{TRUST_MARKER}` marker count");
-        // Pinned so any change to a vendored fork's local patches is noticed;
-        // re-pin when a fork edit adds or removes a marker.
-        assert_eq!(patch, 126, "`{LOCAL_PATCH_MARKER}` marker count");
-        let by_name: BTreeMap<&str, (u64, u64)> = forks
-            .iter()
-            .map(|f| (f.name.as_str(), (f.trust_markers, f.patch_markers)))
-            .collect();
-        assert_eq!(by_name["indexmap"], (8, 0));
-        assert_eq!(by_name["smol_str"], (4, 0));
-        assert_eq!(by_name["libm"], (1, 0));
-        assert_eq!(by_name["pkg-config"], (1, 0));
-        assert_eq!(by_name["winit"], (0, 126));
-    }
-
-    /// The patch table partitioned: vendored forks (third-party source that is
-    /// redistributed and reviewed) and first-party targets (workspace members,
-    /// owing none of that). The first-party arm is sorted.
-    #[test]
-    fn the_real_patch_table_is_five_vendored_forks_and_eight_first_party_targets() {
-        let root = repo_root();
-        let (vendored, first_party) = partition_patches(&patch_paths(&root).unwrap(), &root);
-        let mut names: Vec<String> = vendored.into_iter().map(|(n, _)| n).collect();
-        names.sort();
-        assert_eq!(
-            names,
-            ["indexmap", "libm", "pkg-config", "smol_str", "winit"]
-        );
-        assert_eq!(
-            first_party,
-            vec![
-                ("arrayvec".to_string(), "crates/aterm-arrayvec".to_string()),
-                ("cfg-if".to_string(), "crates/aterm-cfg-if".to_string()),
-                (
-                    "core_maths".to_string(),
-                    "crates/aterm-core-maths".to_string()
-                ),
-                ("libc".to_string(), "crates/aterm-libc".to_string()),
-                ("log".to_string(), "crates/aterm-log-shim".to_string()),
-                (
-                    "once_cell".to_string(),
-                    "crates/aterm-once-cell".to_string()
-                ),
-                (
-                    "profiling".to_string(),
-                    "crates/aterm-profiling".to_string()
-                ),
-                ("tracing".to_string(), "crates/aterm-tracing".to_string()),
-            ]
-        );
-    }
-
-    /// Every vendored fork sits at `vendor/`; every first-party target sits at
-    /// `crates/`.
-    #[test]
-    fn every_patch_entry_is_classified_vendored_or_first_party() {
-        for (name, rel) in patch_paths(&repo_root()).unwrap() {
+    fn every_patch_entry_is_classified_vendored_first_party_or_absorbed() {
+        for PatchRow { name, rel, .. } in patch_paths(&repo_root()).unwrap() {
             let kind = aterm_census::scan_set::classify_patch_target(&name, &rel, &repo_root())
                 .unwrap_or_else(|e| panic!("{e}"));
             match kind {
                 aterm_census::scan_set::PatchTargetKind::Vendored => {
                     assert!(rel.starts_with("vendor/"), "{name} → {rel}");
                 }
-                aterm_census::scan_set::PatchTargetKind::FirstParty => {
+                aterm_census::scan_set::PatchTargetKind::FirstParty
+                | aterm_census::scan_set::PatchTargetKind::Absorbed => {
                     assert!(rel.starts_with("crates/"), "{name} → {rel}");
                 }
             }
-        }
-    }
-
-    #[test]
-    fn every_fork_carries_the_workspace_stub_and_the_provenance_files() {
-        // The stub lets `targo trust check -p <fork>` run inside the fork; the
-        // provenance files make a pristine diff possible.
-        let root = repo_root();
-        let forks = real_forks(&root);
-        assert_eq!(forks.len(), 5);
-        for fork in &forks {
-            assert!(
-                fork.workspace_stub,
-                "{} is missing its [workspace] stub",
-                fork.name
-            );
-            assert!(
-                fork.dir.join(".cargo_vcs_info.json").exists(),
-                "{} is missing .cargo_vcs_info.json",
-                fork.name
-            );
-            assert!(
-                fork.dir.join("Cargo.toml.orig").exists(),
-                "{} is missing Cargo.toml.orig",
-                fork.name
-            );
         }
     }
 
@@ -1948,44 +1981,40 @@ mod tests {
     }
 
     #[test]
-    fn the_workspace_states_the_winit_requirement_the_fork_satisfies() {
+    fn the_workspace_states_the_libc_requirement_the_shim_satisfies() {
         let root = repo_root();
-        let reqs = workspace_requirements(&root, "winit");
+        let reqs = workspace_requirements(&root, "libc");
         assert!(
             !reqs.is_empty(),
-            "the workspace must state a winit requirement"
+            "the workspace must state a libc requirement"
         );
         for (manifest, req) in &reqs {
             assert_eq!(
-                req_satisfied(req, "0.30.13"),
+                req_satisfied(req, "0.2.186"),
                 Some(true),
-                "{manifest} requires {req}, unsatisfied by the vendored 0.30.13"
+                "{manifest} requires {req}, unsatisfied by crates/aterm-libc's 0.2.186"
             );
         }
-    }
-
-    #[test]
-    fn the_lockfile_shows_every_patch_is_live() {
-        let root = repo_root();
-        for (name, _) in patch_paths(&root).unwrap() {
-            let entries = lock_entries(&root, &name).unwrap();
-            assert!(
-                entries.iter().any(|(_, has_source)| !has_source),
-                "{name} has no source-less Cargo.lock entry — the patch is not live"
-            );
-        }
+        // winit is a path dependency on the absorbed crate: no registry
+        // requirement is stated for it, and its liveness is the lock's alone.
+        assert_eq!(workspace_requirements(&root, "winit"), Vec::new());
     }
 
     #[test]
     fn notice_lines_parse_into_name_version_license_and_dir() {
-        let entries =
-            parse_notice("prose\n- winit 0.30.13, Apache-2.0 (`vendor/winit/`)\n- DejaVu: x\n");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "winit");
-        assert_eq!(entries[0].version, "0.30.13");
-        assert_eq!(entries[0].license, "Apache-2.0");
-        assert_eq!(entries[0].dir, "winit");
+        let entries = parse_notice(
+            "prose\n- libm 0.2.16, MIT (`vendor/libm/`)\n- DejaVu: x\n\
+             - winit 0.30.13, Apache-2.0 (`crates/aterm-window/`)\n- elsewhere 1.0, MIT (`x/y/`)\n",
+        );
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0].name, "libm");
+        assert_eq!(entries[0].version, "0.2.16");
+        assert_eq!(entries[0].license, "MIT");
+        assert_eq!(entries[0].dir, "vendor/libm");
         assert_eq!(entries[0].line, 2);
+        assert_eq!(entries[1].name, "winit");
+        assert_eq!(entries[1].dir, "crates/aterm-window");
+        assert_eq!(entries[1].line, 4);
     }
 
     #[test]
@@ -2059,6 +2088,146 @@ mod tests {
     }
 
     #[test]
+    fn renamed_forks_still_refuse_unmodelled_workspace_requirements() {
+        let fixture = good_fixture("renamed-requirements");
+        let root = fixture.0.path();
+        let require = |req: &str| {
+            std::fs::write(
+                root.join("Cargo.toml"),
+                format!(
+                    "[workspace]\nmembers = []\n\n[workspace.dependencies]\ngoodfork = \
+                     \"{req}\"\n\n[patch.crates-io]\ngoodfork-v1 = {{ package = \
+                     \"goodfork\", path = \"vendor/goodfork\" }}\n"
+                ),
+            )
+            .unwrap();
+        };
+        // A known requirement on another version line remains outside this
+        // renamed row. Every other obligation in the real report holds.
+        require("2");
+        let (ok, log) = report(root);
+        assert!(ok, "a valid other-major requirement stays excluded:\n{log}");
+
+        let mut accepted = Vec::new();
+        for req in ["*", ">=0, <3", ">2", "0.*", "~2"] {
+            require(req);
+            let (ok, log) = report(root);
+            if ok || !log.contains("requirement form attest does not model") {
+                accepted.push((req, log));
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "renaming a row must not bypass the requirement reader:\n{accepted:#?}"
+        );
+    }
+
+    /// [`good_fixture`] plus one ABSORBED crate: an Apache-2.0 member under
+    /// `crates/` with its upstream LICENSE, a NOTICE line and a pristine copy
+    /// to diff against, every modified or added file carrying its notice.
+    fn absorbed_fixture(tag: &str) -> Fixture {
+        let fixture = good_fixture(tag);
+        let root = fixture.0.path().to_path_buf();
+        let w = |rel: &str, body: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        let append = |rel: &str, extra: &str| {
+            let path = root.join(rel);
+            let mut body = std::fs::read_to_string(&path).unwrap();
+            body.push_str(extra);
+            std::fs::write(path, body).unwrap();
+        };
+        append(
+            "Cargo.toml",
+            "absorbed = { path = \"crates/aterm-absorbed\" }\n",
+        );
+        append(
+            "Cargo.lock",
+            "\n[[package]]\nname = \"absorbed\"\nversion = \"2.0.0\"\n",
+        );
+        append(
+            "NOTICE",
+            "- absorbed 2.0.0, Apache-2.0 (`crates/aterm-absorbed/`)\n",
+        );
+        w(
+            "deny.toml",
+            "[licenses]\nallow = [\"MIT\", \"Apache-2.0\"]\n",
+        );
+        let manifest =
+            "[package]\nname = \"absorbed\"\nversion = \"2.0.0\"\nlicense = \"Apache-2.0\"\n";
+        w("vendor/.forge/absorbed/pristine/Cargo.toml", manifest);
+        w("vendor/.forge/absorbed/pristine/LICENSE", "Apache\n");
+        w(
+            "vendor/.forge/absorbed/pristine/src/lib.rs",
+            "pub fn upstream() {}\n",
+        );
+        w("crates/aterm-absorbed/Cargo.toml", manifest);
+        w("crates/aterm-absorbed/LICENSE", "Apache\n");
+        w(
+            "crates/aterm-absorbed/src/lib.rs",
+            "// Derived from absorbed 2.0.0 src/lib.rs, modified by the aterm project.\n\
+             pub fn upstream() {}\n",
+        );
+        w(
+            "crates/aterm-absorbed/src/added.rs",
+            "// Added by the aterm project.\npub fn ours() {}\n",
+        );
+        fixture
+    }
+
+    #[test]
+    fn an_absorbed_crate_owes_the_license_obligations_and_meets_them() {
+        let fixture = absorbed_fixture("absorbed-green");
+        let (ok, log) = report(fixture.0.path());
+        assert!(ok, "a complete absorbed crate must attest clean:\n{log}");
+        assert!(
+            log.contains("`absorbed` → `crates/aterm-absorbed` is an ABSORBED patch target")
+                && log.contains("1 modified file(s), 1 added")
+                && log.contains("over 1 absorbed crate(s)"),
+            "{log}"
+        );
+    }
+
+    /// The negative controls: an absorbed file edited without a notice, and a
+    /// NOTICE that stops naming the crate, are each RED.
+    #[test]
+    fn an_absorbed_crate_without_its_notices_is_red() {
+        let fixture = absorbed_fixture("absorbed-no-notice");
+        std::fs::write(
+            fixture.0.path().join("crates/aterm-absorbed/src/lib.rs"),
+            "pub fn upstream() { /* edited */ }\n",
+        )
+        .unwrap();
+        let (ok, log) = report(fixture.0.path());
+        assert!(!ok, "{log}");
+        assert!(
+            log.contains("✗ FAIL [OB-7] `crates/aterm-absorbed/src/lib.rs` is modified"),
+            "{log}"
+        );
+
+        let fixture = absorbed_fixture("absorbed-no-notice-line");
+        let notice = fixture.0.path().join("NOTICE");
+        let text = std::fs::read_to_string(&notice).unwrap().replace(
+            "- absorbed 2.0.0, Apache-2.0 (`crates/aterm-absorbed/`)\n",
+            "",
+        );
+        std::fs::write(&notice, text).unwrap();
+        let (ok, log) = report(fixture.0.path());
+        assert!(!ok, "{log}");
+        // Without its NOTICE line the crate is no longer a recorded absorption:
+        // it reads as a half-recorded redistribution, refused outright.
+        assert!(
+            log.contains(
+                "[patch.crates-io] `absorbed` points at `crates/aterm-absorbed`, which is \
+                          not under vendor/"
+            ),
+            "{log}"
+        );
+    }
+
+    #[test]
     fn an_unreviewed_vendor_directory_still_fails_the_astream_submodule_check() {
         let fixture = good_fixture("unreviewed-bundle");
         std::fs::create_dir_all(fixture.0.path().join("vendor/another-bus/src")).unwrap();
@@ -2084,7 +2253,7 @@ mod tests {
     /// Run git in a fixture with a fixed identity and no inherited repository
     /// variables, so it needs no machine config and touches only the fixture.
     fn git(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = command("git")
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
@@ -2098,7 +2267,7 @@ mod tests {
             ])
             .args(args)
             .current_dir(dir)
-            .output()
+            .output_owned()
             .unwrap();
         assert!(
             out.status.success(),

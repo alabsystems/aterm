@@ -3,24 +3,19 @@
 
 //! The GPU atlas must follow the CPU's rasters.
 //!
-//! `GpuRenderer` wraps a CPU `Renderer` and uploads that renderer's glyph
-//! pixels into its own atlas, so every setter that changes them must drop both.
-//! A forwarding setter whose CPU side drops its glyphs but whose GPU side keeps
-//! the atlas re-rasterizes on the CPU while the GPU serves the old upload: the
-//! edit reaches the face and never reaches the glass.
+//! `GpuRenderer` uploads its CPU `Renderer`'s glyph pixels into its own atlas, so a forwarding
+//! setter whose CPU side drops its glyphs must drop the atlas too, or the GPU keeps serving the
+//! old upload.
 //!
-//! This is a source scan, like `ty_drivers_are_armed.rs`: the failure is a
-//! setter that never calls the shared helper, which no runtime hook on the
-//! helper can observe. It needs no GPU, so it gates on every host.
-//!
-//! The predicate is `clear_glyph_images`, not any `.clear()`: the CPU's
-//! `subpx_glyphs` (the LCD overlay) is CPU-only and never reaches this atlas.
+//! A source scan: the failure is a setter that never calls the shared helper, which no runtime
+//! hook can observe. It needs no GPU. The predicate is `clear_glyph_images`, not any `.clear()`:
+//! the CPU's `subpx_glyphs` (the LCD overlay) never reaches this atlas.
 
 use std::collections::BTreeMap;
 
-/// Bodies of every `    pub fn <name>(` in `path`, keyed by name: the lines from
-/// the signature to the first line that is exactly `    }`. Crude on purpose —
-/// it depends only on rustfmt's indentation, which `trustfmt` enforces.
+/// Bodies of every `    pub fn set_<name>(` in `path`, keyed by name: the lines from the
+/// signature to the first line that is exactly `    }`. Crude on purpose: it depends only on
+/// rustfmt's indentation, which `trustfmt` enforces.
 fn public_setter_bodies(path: &str) -> BTreeMap<String, String> {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
     let lines: Vec<&str> = text.lines().collect();
@@ -59,8 +54,7 @@ fn every_gpu_setter_whose_cpu_twin_drops_rasters_invalidates_the_atlas() {
     let mut examined = Vec::new();
     let mut mismatched = Vec::new();
     for (name, gpu_body) in &gpu {
-        // Only the forwarding setters: a purely GPU-side one has no CPU twin to
-        // disagree with.
+        // Only forwarding setters have a CPU twin to disagree with.
         if !gpu_body.contains("self.cpu.") {
             continue;
         }
@@ -71,18 +65,15 @@ fn every_gpu_setter_whose_cpu_twin_drops_rasters_invalidates_the_atlas() {
             continue;
         }
         examined.push(name.clone());
-        // An explicit, reasoned exemption is allowed — the same escape hatch
-        // `activate_px` already documents for the content-addressed case — but it
-        // has to be written down, not left as an absence.
+        // A written-down exemption (a `Deliberately NO` comment, as `activate_px` has) passes.
         if gpu_body.contains("invalidate_atlas") || gpu_body.contains("Deliberately NO") {
             continue;
         }
         mismatched.push(name.clone());
     }
 
-    // Anti-vacuity: a scan that stopped matching (a rustfmt change, setters
-    // moved out of the file) would examine nothing and pass. The floor sits
-    // well under the current count so ordinary additions do not trip it.
+    // Anti-vacuity: a scan that stopped matching would examine nothing and pass. The floor
+    // sits well under the current count.
     assert!(
         examined.len() >= 8,
         "the scan examined only {} setter pair(s) — it has stopped finding them, \

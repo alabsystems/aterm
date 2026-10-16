@@ -36,10 +36,8 @@ fn assert_decision(model: &Model, before: &State, actual: &Option<ParkEnd>, labe
     }
 }
 
-/// The real atpkg flock and GUI park choice refine every relevant model input.
-/// Held, released, disabled, bump, and vendor rows include wake and no-wake
-/// outcomes. Two fabricated wrong results reject both the early-pass and
-/// extra-hour failure modes.
+/// The real atpkg flock and GUI park choice refine the model's `Check` step for held, released,
+/// disabled, bump and vendor states; two fabricated results are the negative controls.
 #[test]
 fn real_store_release_wakes_contention_without_stealing_priority() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -106,9 +104,8 @@ fn real_store_release_wakes_contention_without_stealing_priority() {
         "the real wedge park checks release in five-second slices"
     );
 
-    // The actual sleep loop reaches the local probe even when no vendor watch
-    // exists. A short deadline keeps this integration check fast; PARK_SLICE
-    // above pins the production latency bound.
+    // The sleep loop reaches the store probe with no vendor watch. A short deadline keeps this
+    // fast; PARK_SLICE above pins the production bound.
     let short = Duration::from_millis(20);
     let holder = atpkg::lock::try_lock_store(&layout).unwrap();
     let while_held = sleep_interval_watching_bump(

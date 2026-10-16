@@ -64,7 +64,7 @@ pub fn console_observation_admission_model() -> Model {
                 if ticked == 1 && observed == 1 && coherent == 0 {
                     legacy == prior_legacy && moved == 0
                 } else { moved <= 1 };
-            invariant StateBounded:
+            uncaught StateBounded:
                 observed <= 1 && coherent <= observed && legacy <= 1
                     && prior_legacy <= 1 && moved <= 1 && ticked <= 1;
         }

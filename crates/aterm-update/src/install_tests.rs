@@ -4234,30 +4234,6 @@ fn zip_claim_refuses_a_file_with_no_end_record() {
 // Stage-verify tests.
 // -----------------------------------------------------------------------
 
-/// A hand-installed, ad-hoc-signed bundle in `/Applications` can never be
-/// updated by any lane (the seamless apply and the cold-launch fallback's step 7
-/// both refuse it as the rollback source). The refusal names the cause and the
-/// path, and the way out: reinstall the signed release (`tools/install.sh`, or
-/// the release DMG), or mark a local build `ATermDevBuild`.
-#[test]
-fn a_rollback_source_refusal_names_the_remedy() {
-    let root = std::env::temp_dir().join(format!(
-        "aterm-rollback-remedy-{}-{}",
-        std::process::id(),
-        super::unix_now_secs()
-    ));
-    let error = super::preverify_installed_rollback_source(Some(&root), 100, Some("abcdef0"))
-        .expect_err("a path that is not a bundle cannot be a rollback source");
-    assert!(
-        error.contains("tools/install.sh"),
-        "the refusal must say how to put a signed release back: {error}"
-    );
-    assert!(
-        error.contains("ATermDevBuild"),
-        "…and how to take a local build out of the channel on purpose: {error}"
-    );
-}
-
 /// Both lanes sweep both kinds of scratch: a `mnt-<pid>` a DMG stage left behind
 /// (possibly with its image still attached) is reclaimed by the zip lane too, and
 /// the sweep runs before the unpack, so a zip `ditto` cannot open still reclaims

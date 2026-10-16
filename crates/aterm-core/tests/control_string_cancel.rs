@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! CAN (0x18) and SUB (0x1A) cancel a control string. A program killed in
-//! the middle of an OSC 52 clipboard write, an OSC 8 link, a title, a kitty
-//! graphics command or a DECRQSS/XTGETTCAP query leaves a truncated string
-//! that the next CAN or SUB (a shell's line editor, `reset`, a TUI's cleanup,
-//! the foreground handback) ends; xterm then delivers nothing. Each case is
-//! fed whole, byte by byte and split at every byte, with ST as the negative
-//! control.
+//! CAN (0x18) and SUB (0x1A) cancel a control string, which then delivers nothing (as in
+//! xterm): a program killed mid OSC 52, OSC 8, title, kitty graphics command or
+//! DECRQSS/XTGETTCAP query leaves a truncated string that the next CAN or SUB ends. Each
+//! case is fed whole, byte by byte and split at every byte, with ST as the negative control.
 
 use aterm_core::terminal::{ClipboardAccess, Terminal};
 

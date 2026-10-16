@@ -2,11 +2,8 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Boundary condition, correctness and API-contract tests for grid operations:
-//! ED/EL modes with the cursor at edges, line feed / reverse line feed with
-//! scroll regions, write_ascii_blast content, carriage return, erase-rect
-//! clamping, history line ordering (ring and tiered), complex char overflow,
-//! cell extras and damage tracking.
+//! Boundary, correctness and API-contract tests for grid operations, one
+//! submodule per area.
 
 use super::super::*;
 use crate::grid::test_support::write_marker_line;

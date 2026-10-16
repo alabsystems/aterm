@@ -2,12 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Shared mouse encoding types and functions.
-//!
-//! This module provides the canonical mouse encoding contract used by both
-//! `aterm-core` and `aterm-alacritty-bridge`. Encoding types, button definitions,
-//! modifier constants, and pure encoding functions live here so neither crate
-//! needs to duplicate mouse byte-encoding logic.
+//! Shared mouse encoding: tracking modes, encoding formats, buttons, modifier masks and the
+//! pure byte encoders.
 
 mod encode;
 mod types;

@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::{WriteStep, classify_write_result, write_all};
-use aterm_spec::verify::ty_escalation;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// The bounded buffer length the conformance trajectory uses (matches the cfg
 /// `Size` we pin below). Small so the ty runs are cheap.
@@ -84,15 +82,9 @@ fn validate(
     )
     .expect("write cfg");
     std::fs::write(&trace_f, transition_trace(prev, next, action)).expect("write trace");
-    let mut cmd = Command::new(ty);
-    cmd.arg("trace")
-        .arg("validate")
-        .arg(&trace_f)
-        .arg("--spec")
-        .arg(&spec_f)
-        .arg("--config")
-        .arg(&cfg_f);
-    let out = aterm_spec::verify::ty_output(&mut cmd).expect("run ty trace validate");
+    let out = aterm_spec::verify::TyCommand::trace_validate(ty, &trace_f, &spec_f, &cfg_f)
+        .output()
+        .expect("run ty trace validate");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -172,13 +164,11 @@ fn real_write_all_drains_a_large_payload_over_a_pipe() {
     assert_eq!(got, expect, "write_all delivered corrupted/reordered bytes");
 }
 
+// Only `ty` reads the hand-written spec: `-- --ignored _under_ty` runs it.
 #[test]
-fn real_write_all_offset_trajectory_conforms_to_writeall_spec() {
-    // TIERED (VERIFY-1): a committed hand-written `.tla` — external-tool
-    // obligation; runs only where the Trust toolchain is installed.
-    let Some(ty) = ty_escalation("WriteAll conformance") else {
-        return;
-    };
+#[ignore = "needs Trust ty: `targo --unverified test -- --ignored _under_ty`"]
+fn real_write_all_offset_trajectory_conforms_to_writeall_spec_under_ty() {
+    let ty = aterm_spec::verify::required_ty();
     let dir = std::env::temp_dir().join(format!("aterm-writeall-conf-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("mk tempdir");
     let spec = parameterized_spec();

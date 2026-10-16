@@ -3,10 +3,8 @@
 
 //! True cost: `dom(C) = reach(root) \ reach(root, block C)`.
 //!
-//! The set of packages that would leave the graph if `C` left it: `C` plus
-//! everything only `C` was holding in. This is the only sanctioned answer to
-//! "what does this dependency cost"; a subtree count double-bills shared
-//! dependencies (e.g. a subtree of dozens whose dominator is a handful).
+//! The set of packages that would leave the graph if `C` left it: `C` plus everything only `C`
+//! was holding in. A subtree count double-bills shared dependencies.
 //!
 //! The counterfactual blocks a node during traversal rather than mutating the
 //! graph, so the same [`crate::model::Graph`] answers every query.
@@ -14,9 +12,8 @@
 use crate::model::{CellSurvey, PkgId};
 use std::collections::BTreeSet;
 
-/// What falls if one package falls, third-party only: a first-party member
-/// reachable only through third-party parents (a `[patch.crates-io]` target)
-/// is not billed to the dependency. See [`dom_against`].
+/// What falls if one package falls, third-party only: a first-party member reachable only
+/// through third-party parents (a `[patch.crates-io]` target) is not billed to the dependency.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DomCost {
     /// Third-party packages removed, including the target when it is
@@ -29,8 +26,7 @@ pub struct DomCost {
     pub also: Vec<PkgId>,
 }
 
-/// The dominator cost of one package in one cell. A package that is not in the
-/// graph costs nothing, which is the honest answer: it is not there.
+/// The dominator cost of one package in one cell. A package not in the graph costs nothing.
 pub fn dom(s: &CellSurvey, target: &PkgId) -> DomCost {
     dom_against(s, &s.graph.reach(None), target)
 }
@@ -46,8 +42,7 @@ pub fn ranked(s: &CellSurvey) -> Vec<(PkgId, DomCost)> {
         .third_party()
         .map(|id| (id.clone(), dom_against(s, &base, id)))
         .collect();
-    // LOC descending, then name/version ascending, so the table is stable
-    // across runs and two versions of one crate sort adjacently.
+    // LOC descending, then (name, version), so the table is stable across runs.
     out.sort_by(|a, b| b.1.loc.cmp(&a.1.loc).then_with(|| a.0.cmp(&b.0)));
     out
 }
@@ -55,16 +50,12 @@ pub fn ranked(s: &CellSurvey) -> Vec<(PkgId, DomCost)> {
 fn dom_against(s: &CellSurvey, base: &BTreeSet<PkgId>, target: &PkgId) -> DomCost {
     let without = s.graph.reach(Some(target));
     let mut cost = DomCost::default();
-    // `BTreeSet::difference` yields ascending order, so `also` is sorted by
-    // construction rather than by a second pass.
+    // `difference` yields ascending order, so `also` is sorted.
     for id in base.difference(&without) {
-        // First-party removals are not a third-party cost: `[patch.crates-io]`
-        // targets such as `crates/aterm-profiling` hang only under third-party
-        // parents and would otherwise be billed to them (and break the survey's
-        // partition check).
-        //
-        // A package with no `facts` entry is counted in: a measurement gap is
-        // not evidence of first-partyness.
+        // First-party removals are not a third-party cost: `[patch.crates-io]` targets such as
+        // `crates/aterm-profiling` hang only under third-party parents and would otherwise be
+        // billed to them (breaking the survey's partition check). A package with no `facts`
+        // entry counts: a measurement gap is not evidence of first-partyness.
         if s.facts.get(id).is_some_and(|f| !f.is_third_party) {
             continue;
         }
@@ -185,7 +176,7 @@ mod tests {
             .get_mut(&shim)
             .expect("fixture has only_b")
             .is_third_party = false;
-        // CONTROL: with it third-party (above), `b` costs 2 / 200.
+        // Control: with `only_b` third-party, `b` costs 2 / 200 (the test above).
         let b = dom(&s, &PkgId::new("b", "1.0.0"));
         assert_eq!(
             (b.pkgs, b.loc),
@@ -225,9 +216,9 @@ mod tests {
     #[test]
     fn naga_falls_with_wgpu_and_libc_has_left_the_surface() {
         let s = survey(0);
-        // wgpu and naga are absent from mac-arm (the Metal renderer is the
-        // default; wgpu is a dev-edge oracle). Asserted as absence, since a
-        // zero dominator would also be reported for an unseen package.
+        // wgpu and naga are absent from mac-arm (Metal is the default renderer; wgpu is a
+        // dev-edge oracle). Each check asserts absence: `dom` also reports zero for an unseen
+        // package.
         for gone in ["wgpu", "wgpu-hal", "wgpu-core", "naga"] {
             assert!(
                 !s.third_party().any(|id| id.name == gone),
@@ -236,15 +227,13 @@ mod tests {
             );
         }
 
-        // `libc` is first-party (`crates/aterm-libc`); asserted as absence,
-        // since an empty dominator also holds for a package that is gone.
+        // `libc` is first-party (`crates/aterm-libc`).
         assert!(
             !s.third_party().any(|id| id.name == "libc"),
             "libc is patched to crates/aterm-libc and must not be third-party"
         );
 
-        // The objc2 family is absent from mac-arm (ported onto aterm-objc);
-        // asserted as absence for the same reason.
+        // The objc2 family is gone from mac-arm (ported onto aterm-objc).
         for gone in [
             "objc2",
             "objc2-app-kit",
@@ -256,8 +245,7 @@ mod tests {
         ] {
             assert!(
                 !s.third_party().any(|id| id.name == gone),
-                "`{gone}` must not be in the mac-arm normal graph after the objc2 exit \
-                 (crates/aterm-objc/tests/objc2_exit_condition.rs holds both halves at zero)"
+                "`{gone}` must not be in the mac-arm normal graph after the objc2 exit"
             );
         }
     }

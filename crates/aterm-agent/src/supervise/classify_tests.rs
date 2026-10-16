@@ -1662,12 +1662,12 @@ fn zsh_in(dir: &std::path::Path, script: &str, secs: u32) -> Option<String> {
 /// THE HANG DETECTOR of a [`zsh_walk`] ([`ZSH_PROBE_RUNNER`]): half an
 /// hour in which the walk printed nothing. The walk prints after every
 /// experiment, so this bounds one experiment's silence, never the walk's
-/// run, and it is ten times the longest silence measured (2026-09-30, at
-/// the merge gate's `nice -n 19` and a load of 95–155): 14 s for an
-/// experiment, 164 s for a first read of `$userdirs`, which walks the user
-/// database (`getpwent`, an XPC round trip to opendirectoryd) as slowly as
-/// the machine is busy while none of the walk's processes runs, so not
-/// even "a minute in which nothing could run" is a hang.
+/// run, and it is ten times the longest silence measured at `nice -n 19` on
+/// a machine at a load of 95–155: 14 s for an experiment, 164 s for a first
+/// read of `$userdirs`, which walks the user database (`getpwent`, an XPC
+/// round trip to opendirectoryd) as slowly as the machine is busy while none
+/// of the walk's processes runs, so not even "a minute in which nothing could
+/// run" is a hang.
 #[cfg(unix)]
 const ZSH_HANG_S: u32 = 1800;
 
@@ -1695,8 +1695,7 @@ const ZSH_WALK_WARM: &str = ": ${#userdirs}; ";
 /// so the caller can clean up before failing. One `zsh -f` pays one
 /// `$userdirs` round trip and walks a name listed twice once; over every
 /// name a runs walk is ~15,900 processes and ~24 s of CPU, ~4,500 and
-/// ~6 s with [`ZSH_READ_SHIMS`] (measured 2026-09-30), and CPU is what a
-/// loaded gate lacks.
+/// ~6 s with [`ZSH_READ_SHIMS`], and CPU is what a loaded machine lacks.
 #[cfg(unix)]
 fn zsh_walk(
     dir: &std::path::Path,

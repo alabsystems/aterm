@@ -1,30 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE INPUT/EGRESS CONTRACT OF 2026-09-25, driven through the GUI's real
-//! seams: the per-session ordered writer ([`super::paste_order`]) admits
-//! against one bounded budget and refuses what it cannot hold, a paste or a
-//! report never taking the keys' reserve; a key typed into a full input queue
-//! is refused and said once, never parked and never falsely delivered; a
-//! session's teardown unblocks every waiter;
-//! terminal replies never land inside a paste's bracketed envelope; a key
-//! that waited behind a paste arms the echo clock at its own write; closing a
-//! session releases everything waiting on it; a mouse or focus report waits
-//! behind what was queued before it; and the Windows arm (every key and every
-//! report through the writer) runs here on unix.
+//! The input/egress contract, driven through the GUI's real seams: the
+//! per-session ordered writer ([`super::paste_order`]) admits against one
+//! bounded budget and refuses what it cannot hold, a paste or report never
+//! taking the keys' reserve; a key into a full input queue is refused and said
+//! once, never parked or falsely delivered; replies never land inside a paste's
+//! bracketed envelope; a key that waited behind a paste arms the echo clock at
+//! its own write; closing a session releases everything waiting on it; a
+//! report waits behind what was queued before it; and the Windows (ConPTY)
+//! route runs here on unix.
 //!
-//! Every fixture wedges a REAL fd — a socketpair or pipe filled until the
-//! kernel refuses more — so "the program stopped reading" is a kernel fact,
-//! not a mock.
+//! Every fixture wedges a real fd (a socketpair or pipe filled until the
+//! kernel refuses more), so "the program stopped reading" is a kernel fact.
 
 use super::paste_order;
 use crate::input::{Delivery, Egress, InputEvent, InputOutcome, PasteFraming, Source};
 use crate::{App, WindowId};
 use aterm_session::sink::{BulkMeter, BulkState, SinkWriter};
-// How long every test here waits for what MUST happen — the accepted bytes,
-// the drained spill, the retyped key, a paste reaching `Writing`, a sever
-// releasing its writer, a reply read back: a hang detector, never a latency
-// budget.
+// The wait for anything that must happen here: a hang detector, never a
+// latency budget.
 use aterm_spec::wait::MUST_HAPPEN;
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -87,14 +82,11 @@ fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
     aterm_spec::wait::within(limit, Duration::from_millis(2), || done().then_some(())).is_some()
 }
 
-/// THE PARK WITNESS for the never-parks tests: a thread that reads the
-/// program's input out ONLY if `done` is not set within a minute, and says
-/// whether it had to. A dispatch that parks on the wedged fd returns only once
-/// this watchdog has unwedged it, so `true` is the park, decided by order; a
-/// dispatch that returns by itself sets `done` first, however loaded the
-/// machine. The minute is a hang detector — never a latency budget, which a
-/// loaded machine's pass once crossed (a 2 s bound on the dispatch's wall
-/// clock against this watchdog's 20 s unwedge).
+/// The park witness for the never-parks tests: a thread that reads the
+/// program's input out only if `done` is not set within a minute, and returns
+/// whether it had to. A dispatch that parks on the wedged fd returns only after
+/// this unwedges it, so `true` is the park, decided by order rather than a wall
+/// clock. The minute is a hang detector, never a latency budget.
 fn park_witness(reader: i32, done: Arc<AtomicBool>) -> std::thread::JoinHandle<bool> {
     std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -167,13 +159,11 @@ fn read_until(fd: i32, want: usize) -> Vec<u8> {
     got
 }
 
-/// Close a fixture's pipe, taking the test's last handle on its sink. The
-/// sink over `pipe[1]` BORROWS the fd, and every job its ordered writer
-/// admitted holds a clone that keeps its serializer registered, live, under
-/// this fd number; closed under such a job, the number can go to the next
-/// fixture's `pipe()`, whose jobs then reach this serializer. A reader can see a
-/// queued report's bytes before the writer thread drops its job, and
-/// `ordered_egress_count() == 0` comes a few instructions early
+/// Close a fixture's pipe, taking the test's last handle on its sink. The sink
+/// borrows `pipe[1]`, and each job its ordered writer admitted holds a clone
+/// that keeps its serializer registered under this fd number; closing under
+/// such a job hands the number to the next fixture's `pipe()`, whose jobs then
+/// reach this serializer. `ordered_egress_count() == 0` comes slightly early
 /// (`Reservation::drop` retires the count before its `sink` clone drops), so
 /// this waits until `sink` is the last clone. Drop the app first: its session
 /// holds one.
@@ -189,18 +179,13 @@ fn close_pipe(sink: Arc<SinkWriter>, pipe: [i32; 2]) {
     }
 }
 
-/// STALL THE PROGRAM, FILL THE SPILL, TYPE A KEY (docs/AUDIT-typing-to-pixels
-/// P0, decided 2026-09-25). The key is REFUSED: dispatch returns at once (no
-/// park on the event loop), the outcome is a failure (no false success), the
-/// refusal is counted and said ONCE — one "Couldn't send your input" row for the
-/// session however many keys are refused, never a bell per key — and once the
-/// program reads, every byte accepted before the key arrives in order with the
-/// refused keys nowhere among it — and a key typed then goes through. RED
-/// before: the key parked the UI thread in `write_frame_after_reserve` until
-/// the program read.
-///
-/// A watchdog reads the pipe out after a minute ([`park_witness`]), so a
-/// regression FAILS on the watchdog's word instead of hanging the suite.
+/// A key typed into a full input queue (program stalled, spill at its cap) is
+/// refused (docs/AUDIT-typing-to-pixels-2026-08-26.md P0): dispatch returns at
+/// once, the outcome is a failure, and the refusal is counted and said once per
+/// session (one "Couldn't send your input" row, never a bell per key). Once the
+/// program reads, every byte accepted before arrives in order without the
+/// refused keys, and a key typed then goes through. [`park_witness`] turns a
+/// park into a failure instead of a hang.
 #[test]
 fn a_key_into_a_full_input_queue_is_refused_and_said_once_never_parked() {
     let (mut app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -288,17 +273,11 @@ fn a_key_into_a_full_input_queue_is_refused_and_said_once_never_parked() {
     close_pipe(sink, pipe);
 }
 
-/// REPEATED MAXIMUM PASTES PLATEAU, AND TEARDOWN UNBLOCKS EVERY WAITER. Into
-/// a program that stopped reading, the first maximum paste is written until
-/// it parks, and every maximum paste after it is REFUSED at submission while
-/// it holds its room — the admission never holds more than a paste may use,
-/// however many are pasted. RED before: the FIFO was an unbounded channel and
-/// each queued paste kept its 16 MiB alive in it.
-///
-/// Then the session closes (the sink's sever, `Session::drop`): the parked
-/// writer abandons its frame, its meter settles, its slot retires and every
-/// admitted byte comes back. Negative control: before the sever the paste is
-/// still parked.
+/// Into a program that stopped reading, the first maximum paste parks and every
+/// later one is refused at submission: admission never holds more than a paste
+/// may use. Then the session's sever (`Session::drop`) releases the parked
+/// writer, settles its meter and returns every admitted byte. Negative control:
+/// before the sever the paste still waits.
 #[test]
 fn repeated_maximum_pastes_plateau_and_teardown_unblocks_every_waiter() {
     let (app, app_sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -358,13 +337,10 @@ fn repeated_maximum_pastes_plateau_and_teardown_unblocks_every_waiter() {
     close_pipe(app_sink, pipe);
 }
 
-/// TERMINAL REPLIES STAY WHOLLY OUTSIDE A PASTE'S ENVELOPE, before and
-/// during the paste (contract 1: one envelope; a reply waits behind the
-/// paste, never inside it). A reply answered before the paste reaches the
-/// program first; one answered while the paste is parked on a slow reader,
-/// and a key typed then, both arrive after the closing bracket; the envelope
-/// is one contiguous run. The reply goes through the real reply writer, the
-/// paste and the key through the real ordered writer.
+/// Terminal replies stay wholly outside a paste's bracketed envelope: a reply
+/// answered before the paste reaches the program first; one answered while the
+/// paste is parked, and a key typed then, arrive after the closing bracket; the
+/// envelope is one contiguous run. Real reply writer, real ordered writer.
 #[test]
 fn replies_stay_outside_the_paste_envelope_before_and_during_it() {
     let (app, app_sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -442,13 +418,11 @@ fn replies_stay_outside_the_paste_envelope_before_and_during_it() {
     close_pipe(app_sink, pipe);
 }
 
-/// THE WINDOWS ARM, ON UNIX: ConPTY has no non-blocking write, so there every
-/// key goes through the per-session ordered writer and the UI thread only
-/// enqueues. Routed that way here, a key with no paste in flight is still
-/// deferred to the writer (it wrote nothing inline) and reaches the program;
-/// and once the writer admits nothing more, the next key is refused
-/// (`queue_full`) — not queued, not written, and never written around the
-/// FIFO.
+/// The ConPTY route, on unix: ConPTY has no non-blocking write, so every key
+/// goes through the ordered writer and the UI thread only enqueues. A key with
+/// no paste in flight is still handed to the writer and reaches the program;
+/// once the writer admits nothing more, the next key is refused (`queue_full`),
+/// never written around the FIFO.
 #[test]
 fn the_conpty_route_sends_every_key_through_the_ordered_writer() {
     let (app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -503,14 +477,10 @@ fn the_conpty_route_sends_every_key_through_the_ordered_writer() {
     close_pipe(sink, pipe);
 }
 
-/// A KEY THAT WAITED BEHIND A PASTE ARMS THE ECHO CLOCK AT ITS OWN WRITE
-/// (typing audit P1). The key is dispatched while the session's FIFO is
-/// occupied, so the UI thread's bracket closes before the key is written;
-/// the writer arms the clock once the key's receipt carries an accepted
-/// order. The bracket, closed only after that write moved the sink's epoch,
-/// arms nothing: exactly one arm, no coalesced double. RED before: the
-/// writer never armed (`arms == 0` if the bracket closed first), and a
-/// bracket that closed after the write armed for bytes it did not write.
+/// A key that waited behind a paste arms the echo clock at its own write: the
+/// UI thread's bracket closes before the key is written, the writer arms once
+/// the key's receipt carries an accepted order, and the bracket arms nothing.
+/// Exactly one arm, no coalesced double.
 #[test]
 fn a_key_deferred_behind_a_paste_arms_the_echo_clock_at_its_write() {
     let _echo = crate::echo_rtt::fresh_for_test();
@@ -551,13 +521,9 @@ fn a_key_deferred_behind_a_paste_arms_the_echo_clock_at_its_write() {
     close_pipe(sink, pipe);
 }
 
-/// CLOSING THE TAB IS THE TEARDOWN: `Session::drop` severs the session's
-/// input, so a paste the ordered writer has parked on a program that stopped
-/// reading — and a key queued behind it — are released the moment the
-/// session goes, not when (if ever) the program reads again. RED before: the
-/// parked writer held its sink clone (and with it the master and the queued
-/// jobs) for as long as the program stayed frozen; a child that outlived its
-/// hang-up in another process group kept it forever.
+/// Closing the tab is the teardown: `Session::drop` severs the session's input,
+/// so a paste parked on a program that stopped reading, and a key queued behind
+/// it, are released when the session goes.
 #[test]
 fn closing_the_session_releases_its_parked_writer_and_queued_input() {
     let (mut app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -603,12 +569,9 @@ fn closing_the_session_releases_its_parked_writer_and_queued_input() {
     close_pipe(sink, pipe);
 }
 
-/// A REPLY FLOOD PLATEAUS TOO. A program that floods queries it never reads
-/// the answers to (large colour or clipboard replies included) cannot grow
-/// the reply lane past its byte budget: once the writer is parked on the
-/// wedged tty and the budget is held, every further reply is dropped at
-/// submission (and counted), never queued. RED before: the lane was bounded
-/// only by count — 1024 replies of any size.
+/// A reply flood into a stalled program plateaus at the reply lane's byte
+/// budget: once the writer is parked and the budget held, every further reply
+/// is dropped at submission and counted, never queued.
 #[test]
 fn a_reply_flood_into_a_stalled_program_plateaus_at_the_reply_budget() {
     let (sink, _reader, _filled) = wedged_socket();
@@ -647,14 +610,12 @@ fn a_reply_flood_into_a_stalled_program_plateaus_at_the_reply_budget() {
     drop(replies);
 }
 
-/// THE WINDOWS ARM FOR REPORTS, ON UNIX (2026-09-26): a mouse, wheel or focus
-/// report written inline could park the UI thread on ConPTY as surely as a
-/// key, so there it takes the keys' route. Routed that way here: with
-/// tracking off the seam decides locally and nothing is queued or written;
-/// with tracking on, a press and a focus report are ENCODED on the calling
-/// thread (the bytes an inline write would have sent) and handed to the
-/// ordered writer, which writes them in order; and once the writer admits
-/// nothing more, the next report is refused (`queue_full`), never written.
+/// The ConPTY route for reports, on unix: a mouse, wheel or focus report written
+/// inline could park the UI thread on ConPTY, so there it takes the keys' route.
+/// With tracking off nothing is queued or written; with tracking on, a press and
+/// a focus report are encoded on the calling thread and written in order by the
+/// ordered writer; once the writer admits nothing more, the next report is
+/// refused (`queue_full`).
 #[test]
 fn the_conpty_route_sends_every_report_through_the_ordered_writer() {
     let (app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -722,13 +683,8 @@ fn the_conpty_route_sends_every_report_through_the_ordered_writer() {
     close_pipe(sink, pipe);
 }
 
-/// A REPORT WAITS BEHIND WHAT WAS QUEUED BEFORE IT (2026-09-26), as a key
-/// does. Paste A is parked on a program that stopped reading and paste B
-/// waits behind it on the ordered writer; a click made now reaches the
-/// program after B, not inside the run of pastes it followed. RED before: the
-/// click was written inline, lost the fd lock to the parked paste and went to
-/// the spill, which drains ahead of the writer's next job — the program read
-/// A, the click, then B.
+/// A mouse report waits behind what was queued before it, as a key does: with
+/// paste A parked and paste B queued, a click reaches the program after B.
 #[test]
 fn a_mouse_report_waits_behind_the_pastes_queued_before_it() {
     let (mut app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -802,14 +758,9 @@ fn arm_focus_in(app: &mut App) {
     app.focus_reported = None;
 }
 
-/// A TAB SWITCH'S FOCUS REPORT WAITS BEHIND THE PASTES QUEUED BEFORE IT
-/// (2026-09-26 review), as a click does. The focus delta every tab switch,
-/// pane focus, split, close, detach and migrate converges on
-/// (`recompute_focus_reports`) is sent while paste A is parked on a program
-/// that stopped reading and paste B waits behind it: the program reads A, B,
-/// then `ESC[I`. RED before: that path still wrote inline — the report lost
-/// the fd lock to the parked paste, went to the spill, and drained ahead of
-/// B, so the program read A, the report, then B.
+/// A tab switch's focus report (`recompute_focus_reports`, which every tab
+/// switch, pane focus, split, close, detach and migrate converges on) waits
+/// behind the pastes queued before it: the program reads A, B, then `ESC[I`.
 #[test]
 fn a_tab_switch_focus_report_waits_behind_the_pastes_queued_before_it() {
     let (mut app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -862,15 +813,10 @@ fn a_tab_switch_focus_report_waits_behind_the_pastes_queued_before_it() {
     close_pipe(sink, pipe);
 }
 
-/// THE WINDOWS ARM OF A TAB SWITCH'S FOCUS REPORT, ON UNIX: on ConPTY the
-/// focus delta goes through the ordered writer like every other report, so
-/// the UI thread never parks on a frozen program's input pipe. Routed that
-/// way (`force_conpty_route_for_test`) with the writer admitting nothing, the
-/// report is REFUSED — which only a queued report can be — and nothing is
-/// written. Negative control: on the unix route with nothing queued, the
-/// same delta is written inline, whatever the writer would admit. RED
-/// before: the path wrote inline on every platform, so the forced route
-/// still wrote `ESC[I`.
+/// On the ConPTY route (`force_conpty_route_for_test`) a tab switch's focus
+/// report goes through the ordered writer, so with the writer admitting nothing
+/// it is refused and nothing is written. Negative control: on the unix route
+/// with nothing queued, the same delta is written inline.
 #[test]
 fn a_tab_switch_focus_report_takes_the_conpty_route() {
     let (mut app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -900,13 +846,9 @@ fn a_tab_switch_focus_report_takes_the_conpty_route() {
     close_pipe(sink, pipe);
 }
 
-/// A MOTION FLOOD BEHIND A PASTE NEVER REFUSES A KEY (2026-09-26 review).
-/// Under any-motion tracking (DEC 1003) a pointer moving over a program that
-/// has stopped reading queues one report per motion event behind the parked
-/// paste. They are admitted as a paste is, never into the keys' reserve: the
-/// flood is refused once it has used the room a paste may use, and a key
-/// typed then is still queued. RED before: reports were admitted as keys, so
-/// the flood took the keys' room too and the key was refused.
+/// Under any-motion tracking (DEC 1003), a motion flood queued behind a parked
+/// paste is admitted as a paste is, never into the keys' reserve: it is refused
+/// once it uses a paste's room, and a key typed then still queues.
 #[test]
 fn a_motion_flood_behind_a_paste_never_refuses_a_key() {
     let (app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -979,11 +921,8 @@ fn a_motion_flood_behind_a_paste_never_refuses_a_key() {
     );
     assert!(receipt.is_queued());
     sink.sever_input();
-    // Drain before closing: every admitted job holds this BORROWED sink, and
-    // closing the pipe under a writer still draining them frees its fd number
-    // to the next fixture while this serializer stays registered — live —
-    // under it (the 2026-09-27 flake; see
-    // `a_sinks_admission_never_reads_an_fd_number_twins_serializer`).
+    // Drain before closing: each admitted job holds this borrowed sink (see
+    // `close_pipe`).
     assert!(
         wait_until(MUST_HAPPEN, || sink.ordered_egress_count() == 0),
         "the sever released the paste, the flood and the key"
@@ -993,22 +932,10 @@ fn a_motion_flood_behind_a_paste_never_refuses_a_key() {
     close_pipe(sink, pipe);
 }
 
-/// A SINK'S ADMISSION IS ITS OWN, NEVER AN FD-NUMBER TWIN'S (2026-09-27).
-/// The merge contract on ec742fb1f (18 test threads) failed
-/// `the_conpty_route_sends_every_report_through_the_ordered_writer` at its
-/// first `admitted_for_test(&sink) == (0, 0)` with `(225, 306092)`: exactly
-/// what [`a_motion_flood_behind_a_paste_never_refuses_a_key`] leaves admitted
-/// (one paste, the flood up to a paste's job room, one key). That fixture
-/// closed its borrowed pipe while its writer was still draining; each queued
-/// job holds the old sink, so its serializer stayed registered under the fd
-/// number — LIVE, which is why pruning dead sinks could not drop it — and the
-/// next fixture's `pipe()` was handed that number. The registry is keyed by
-/// the number, so the helper read the other sink's budget.
-///
-/// Built here without load: a paste parks on a filled pipe (its sink's
-/// serializer holds one admitted job), and a second sink is built on the
-/// SAME fd number. RED before: the twin reported the parked paste's budget.
-/// Positive control: the owner still reports it.
+/// A sink's admission is its own: the serializer registry is keyed by fd
+/// number, which `pipe()` can hand to a second sink while a closed fixture's
+/// writer still drains under it, and that twin reads nothing of the first's.
+/// Positive control: the owner still reports its parked paste.
 #[test]
 fn a_sinks_admission_never_reads_an_fd_number_twins_serializer() {
     let (app, owner, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -1057,18 +984,11 @@ fn a_sinks_admission_never_reads_an_fd_number_twins_serializer() {
     close_pipe(owner, pipe);
 }
 
-/// AN OS APPEARANCE CHANGE NEVER PARKS THE UI THREAD (2026-09-26 review).
-/// A program with DEC 2031 on has stopped reading, and earlier input filled
-/// the spill to its cap; the OS flips to light mode. The colour-scheme
-/// report takes the reports' route: `apply_os_color_scheme` returns at once,
-/// the report (advisory) is refused rather than queued without bound, and
-/// once the program reads, everything accepted before it arrives in order.
-/// RED before: the report went through the BLOCKING `write_frame`, which
-/// waited at the spill cap until the program read — the event loop, and
-/// every window, parked for as long as the program stayed frozen.
-///
-/// A watchdog reads the pipe out after a minute ([`park_witness`]), so a
-/// regression FAILS on the watchdog's word instead of hanging the suite.
+/// An OS appearance change into a stalled program with DEC 2031 on never parks
+/// the UI thread: the colour-scheme report takes the reports' route, is refused
+/// at the full spill rather than queued without bound, and everything accepted
+/// before it arrives in order. The split `theme` gives the flip a light palette
+/// to report. [`park_witness`] turns a park into a failure.
 #[test]
 fn an_os_appearance_change_into_a_stalled_program_never_parks_the_ui_thread() {
     let (mut app, sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -1083,8 +1003,10 @@ fn an_os_appearance_change_into_a_stalled_program_never_parks_the_ui_thread() {
 
     let done = Arc::new(AtomicBool::new(false));
     let watchdog = park_witness(pipe[0], Arc::clone(&done));
+    app.config =
+        aterm_toml::from_str(r#"theme = "dark:Dracula,light:GitHub Light""#).expect("split theme");
     let t0 = Instant::now();
-    app.apply_os_color_scheme(WindowId(0), aterm_types::Appearance::Light);
+    app.sync_app_theme_to_appearance(aterm_types::Appearance::Light);
     let took = t0.elapsed();
     done.store(true, Ordering::Release);
     assert!(

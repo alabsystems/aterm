@@ -9,11 +9,6 @@ use aterm_spec::{
 #[test]
 fn an_empty_local_look_does_not_delay_the_first_eligible_index_probe() {
     let model = atpkg_session_index_eligibility_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, "atpkg session index eligibility");
 
     let mut healthy = model.init_state();
@@ -31,11 +26,6 @@ fn an_empty_local_look_does_not_delay_the_first_eligible_index_probe() {
 #[test]
 fn a_near_index_answer_obeys_the_seat_window_and_verified_floor() {
     let model = atpkg_session_index_handoff_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name)
-    );
     verify::prove_and_catch_scalar(&model, "atpkg session index handoff");
 
     let mut s = model.init_state();

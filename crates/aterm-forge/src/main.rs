@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `targo --unverified forge` — the front door. Arg parsing lives in [`cli`], every verb's
-//! work lives in the library, and this file stays thin forever.
+//! `targo --unverified forge`: arg parsing lives in [`cli`], every verb's work in the library.
 
 mod cli;
 
@@ -41,9 +40,17 @@ fn main() -> ExitCode {
         cli::Cmd::Budget {
             update,
             allow_regress,
-        } => aterm_forge::budget::run(&root, update, allow_regress.as_deref()),
+        } => aterm_forge::budget::run(
+            &aterm_forge::resolve::Cargo::from_env(),
+            &root,
+            update,
+            allow_regress.as_deref(),
+        ),
         cli::Cmd::Attest => aterm_forge::attest::run(&root),
-        cli::Cmd::Check { cells } => aterm_forge::check::run(&root, &cells),
+        cli::Cmd::Check { cells } => {
+            aterm_forge::check::run(&aterm_forge::resolve::Cargo::from_env(), &root, &cells)
+        }
+        cli::Cmd::SerdeAttrs { paths } => aterm_forge::serde_attrs::run(&root, &paths),
     };
 
     match out {
@@ -51,8 +58,6 @@ fn main() -> ExitCode {
             print!("{log}");
             ExitCode::from(if ok { exit::PASS } else { exit::FAIL })
         }
-        // COULD_NOT_RUN is a distinct code on purpose: a gate that cannot run
-        // must never be read as a gate that passed.
         Err(msg) => {
             eprintln!("cargo forge: could not run: {msg}");
             ExitCode::from(exit::COULD_NOT_RUN)

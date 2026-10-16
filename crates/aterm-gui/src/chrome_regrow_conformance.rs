@@ -1,68 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `ChromeRegrowFloor`
-//! (`aterm_spec::derive::chrome_regrow_floor_model`, ruling 414) —
-//! after any rise of a window's chrome rows, no chrome source's quiet fall
-//! re-grids the window back inside `CHROME_REGROW_SETTLE`.
+//! Tier-1 bind for `ChromeRegrowFloor` (`aterm_spec::derive::chrome_regrow_floor_model`):
+//! after any rise of a window's chrome rows, no chrome source's quiet fall re-grids the
+//! window back inside `CHROME_REGROW_SETTLE`.
 //!
-//! WHAT WAS MEASURED (2026-09-29, main `8b24e99a4`, real windows, a stand-in
-//! that reads its size 20 ms after the `SIGWINCH` and ticks a spinner every
-//! 5 ms): three cross-source net-zero pairs still shifted the alternate
-//! screen — the presence row born 4–6 ms before the band's quiet shrink, a
-//! band row rising 11–13 ms before the presence row's timed fold, and a band
-//! row rising 3–6 ms before a person's key folded a presence row that had
-//! stood its quiet. Every single-source pair was 1.5 s apart.
-//!
-//! THE RIG. Everything shipping is REAL: the band through the center
-//! (`MessageCenter::post`, `dismiss`) and the host's step
-//! (`App::settle_messages`: the band's commit with the floor the host hands,
-//! the re-grid, the rise noted on every window); the presence row through a
-//! turn's lease and its wake (`App::on_presence_wake`), a told story
-//! (`App::tell_story`) and the fold law's keystroke (`App::note_human_acted`,
-//! a test-only seam onto `drive::human_acted`; the shipping key arm,
-//! `App::dispatch_hw_key`, reads through `drive::human_acted_on` after
-//! `on_key`, and the rig does not drive that dispatch) — the presence
-//! driver's commit, with the floor the App's `Desk` reads —
-//! and the loop's wake (`App::settle_messages`, `App::presence_tick`,
-//! `App::sync_message_band_rows`). The window is a headless one standing in
-//! for glass (`chrome_regrids_for_test`, which every glass test of the host
-//! reads through `app_presence::chrome_regrids_grid`: the floor, and both
-//! afford laws), and the rig steps ONE clock for both drivers (the band's
-//! `now`, the presence driver's `set_presence_clock_for_test`), so every
-//! instant is the rig's. The window's own shrink is the stand-in's terminal
-//! rows taken to none ([`Step::Cramp`]), which a real window's `on_resize`
-//! books after a drag or a zoom.
-//!
-//! The schedules: the three measured ones (each with its negative control);
-//! the window's own shrink taking each source's waiting row inside the floor
-//! (`BandTaken`, `PresTaken`); and a second window whose presence birth
-//! holds the band's shrink — the band re-grids every window, so it waits
-//! the latest floor of all of them (its negative control: the second window
-//! without glass, so without a floor).
-//!
-//! Each step is one of the model's: an EVENT (a source's want, a read), a
-//! passage of TIME with no host code run (a tick of the floor, a source's own
-//! quiet), or the loop's WAKE. After each, the host is projected onto the
-//! model's variables ([`project`]) and checked BY NAME: an event or a passage
-//! of time must be the model's action it is; a wake that re-grids must be a
-//! fall the model admits; a wake that declines must decline exactly where
-//! the model enables no fall. The host's armed deadlines must name the floor.
-//!
-//! Projection: `bw`/`b` the band's want (`MessageCenter::wanted_rows`) and
-//! reserved rows (`message_band_rows`); `pw`/`p` the presence row's words and
-//! committed rows; `bq`/`pq` whether a pending fall's OWN due has passed
-//! (`MessageCenter::quiet_shrink_at`, `presence::drive::fold_due`); `since`
-//! the ENGINE's count, off the window's `RegrowFloor`; and — ground truth,
-//! from what the rig SAW — `age` (the chrome total's last rise), `quick` (an
-//! unforced fall inside the settle of it), `cramped` (the rig took the
-//! window's room) and `flips`.
-//!
-//! NEGATIVE CONTROL: the three measured schedules on a window with no floor
-//! (a headless window not standing in for glass: the law before 2026-09-29,
-//! each source's fall once its own quiet ran) re-grid back inside the
-//! settle, which the committed model rejects and `Buggy = 1` admits only as
-//! `BandFallOwnQuiet` or `PresFallOwnQuiet`.
+//! The rig drives the shipping band (`MessageCenter::post`/`dismiss`,
+//! `App::settle_messages`) and presence row (a turn's lease, `App::on_presence_wake`,
+//! `App::tell_story`, the test-only `App::note_human_acted`) on one clock, against a
+//! headless window standing in for glass (`chrome_regrids_for_test`). After each step the
+//! host is projected onto the model ([`project`]): an event or a passage of time must be
+//! its model action, a wake that re-grids must be a fall the model admits, and a wake that
+//! declines must decline exactly where the model enables no fall. Negative control: on a
+//! window with no floor each cross-source schedule re-grids back inside the settle, which
+//! the committed model rejects and `Buggy = 1` admits only as `BandFallOwnQuiet` or
+//! `PresFallOwnQuiet`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -80,7 +32,7 @@ const STAMP: WallStamp = WallStamp {
     unix_ms: 1_790_000_000_000,
 };
 
-/// What the rig SAW, the projection's ground truth.
+/// What the rig saw: the projection's ground truth.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Seen {
     /// When the window's chrome total last rose.
@@ -101,8 +53,8 @@ pub(crate) fn project(app: &App, wid: WindowId, now: Instant, seen: &Seen) -> St
     let b = app.message_band_rows > 0;
     let pw = v.words.is_some();
     let p = v.rows > 0;
-    // A source's OWN quiet reads as run unless a fall of it is pending and
-    // its own due is still ahead.
+    // A source's own quiet reads as run unless a fall of it is pending and its own due is
+    // still ahead.
     let bq = !(b && !bw) || app.messages.quiet_shrink_at().is_some_and(|x| now >= x);
     let pq = !(p && !pw) || drive::fold_due(v, app.looked_at(wid)).is_some_and(|x| now >= x);
     let young = |at: Option<Instant>| at.is_some_and(|x| now < x);
@@ -152,10 +104,8 @@ enum Step {
     PresUnwant,
     /// A person's keystroke reads the story (the fold law).
     PresRead,
-    /// The window's frame loses its room: the stand-in's terminal rows drop
-    /// to none, so its grid can afford neither chrome row (the drag or zoom
-    /// a real window's `on_resize` books). Both afford laws read the
-    /// stand-in as glass (`app_presence::chrome_regrids_grid`).
+    /// The window's frame loses its room (a drag or zoom `on_resize` books): the stand-in's
+    /// terminal rows drop to none, so its grid can afford neither chrome row.
     Cramp,
     /// Time passes to the given offset past the rig's origin, running no
     /// host code: the model's action it is, or `None` for a span in which
@@ -236,9 +186,9 @@ impl Rig {
         self.app.windows[&self.wid].regrow_floor.floor()
     }
 
-    /// Book what the step did to the chrome total: a rise anchors the
-    /// ground truth, and an UNFORCED fall inside its settle is `quick` (a
-    /// fall on a cramped window is the window's own, exempt by name).
+    /// Book what the step did to the chrome total: a rise anchors the ground truth, and an
+    /// unforced fall inside its settle is `quick` (a fall on a cramped window is the
+    /// window's own, exempt).
     fn book_total(&mut self) {
         let total = self.app.chrome_rows(self.wid);
         if total > self.total {
@@ -255,11 +205,10 @@ impl Rig {
         self.total = total;
     }
 
-    /// The loop's wake at the rig's instant: the timer's sweep (the band's
-    /// step, then the presence tick), the focus/restore funnel that projects
-    /// every window whatever its deadline (so a fall the floor holds is
-    /// judged by the commit itself, not only by the deadline the tick reads),
-    /// and the park's convergence of the band's count.
+    /// The loop's wake at the rig's instant: the timer's sweep (band step, then presence
+    /// tick), the focus/restore funnel that projects every window whatever its deadline (so
+    /// a fall the floor holds is judged by the commit itself), and the park's convergence
+    /// of the band's count.
     fn wake(&mut self) {
         let now = self.now;
         let _ = self.app.settle_messages(now);
@@ -369,9 +318,9 @@ fn event_action(step: Step) -> Option<&'static str> {
 /// window's own shrink takes.
 const FALLS: [&str; 4] = ["BandFall", "PresFall", "BandTaken", "PresTaken"];
 
-/// THE FIXED BUILD: every step the model's, every wake's decision the
-/// model's, every projected state inside the invariants. Returns how many
-/// wakes re-gridded and how many declined.
+/// The fixed build: every step the model's, every wake's decision the model's, every
+/// projected state inside the invariants. Returns how many wakes re-gridded and how many
+/// declined.
 fn check_fixed(rig: &Rig) -> (usize, usize) {
     let (mut fell, mut declined) = (0, 0);
     for (i, (step, before, after)) in rig.trace.iter().enumerate() {
@@ -415,9 +364,8 @@ fn check_fixed(rig: &Rig) -> (usize, usize) {
     (fell, declined)
 }
 
-/// THE NEGATIVE CONTROL: some wake's re-grid is rejected by the committed
-/// model and admitted at `Buggy = 1` only as `mutant`; every other step is
-/// admitted at `Buggy = 1`.
+/// The negative control: exactly one wake's re-grid is rejected by the committed model and
+/// admitted at `Buggy = 1` only as `mutant`; every other step is admitted at `Buggy = 1`.
 fn check_control(rig: &Rig, mutant: &str) {
     let mut caught = 0;
     for (i, (step, before, after)) in rig.trace.iter().enumerate() {
@@ -444,9 +392,8 @@ fn check_control(rig: &Rig, mutant: &str) {
     );
 }
 
-/// RAISE THEN BANDSHRINK: a band row is up and dismissed; 5 ms before its
-/// quiet shrink the presence row is born. The band waits the floor, and its
-/// state deadline names it.
+/// A band row is up and dismissed; 5 ms before its quiet shrink the presence row is born.
+/// The band waits the floor, and its deadline names it.
 fn raise_then_bandshrink(rig: &mut Rig) {
     let ms = Duration::from_millis;
     let dropped = ms(1000);
@@ -480,7 +427,7 @@ fn a_presence_birth_just_before_the_bands_quiet_shrink_holds_it_to_the_floor() {
         let (fell, declined) = check_fixed(&rig);
         assert_eq!((fell, declined), (1, 1), "{:#?}", rig.trace);
 
-        // NEGATIVE CONTROL: no floor — the shrink lands 5 ms after the birth.
+        // Negative control: no floor, so the shrink lands 5 ms after the birth.
         let mut control = Rig::new(false);
         raise_then_bandshrink(&mut control);
         assert_eq!(control.app.message_band_rows, 0);
@@ -488,9 +435,8 @@ fn a_presence_birth_just_before_the_bands_quiet_shrink_holds_it_to_the_floor() {
     });
 }
 
-/// BAND THEN QUIET FOLD: the turn's lease raised the row and ended; 12 ms
-/// before the row's timed fold a band row rises. The fold waits the floor,
-/// and the presence deadline names it.
+/// The turn's lease raised the row and ended; 12 ms before the row's timed fold a band row
+/// rises. The fold waits the floor, and the presence deadline names it.
 fn band_then_quietfold(rig: &mut Rig) {
     let ms = Duration::from_millis;
     let dropped = ms(500);
@@ -530,9 +476,8 @@ fn a_band_rise_just_before_the_presence_rows_timed_fold_holds_it_to_the_floor() 
     });
 }
 
-/// BAND THEN A PERSON'S READ: a told story's row has stood its quiet; a band
-/// row rises and 3 ms later a person's key reads the story. The read is kept
-/// and folds at the floor.
+/// A told story's row has stood its quiet; a band row rises and 3 ms later a person's key
+/// reads the story. The read is kept and folds at the floor.
 fn band_then_fold_stood(rig: &mut Rig) {
     let ms = Duration::from_millis;
     rig.run(&[
@@ -560,10 +505,9 @@ fn a_band_rise_just_before_a_persons_read_holds_the_read_to_the_floor() {
         let (fell, declined) = check_fixed(&rig);
         assert_eq!((fell, declined), (1, 1), "{:#?}", rig.trace);
 
-        // NEGATIVE CONTROL: the read folds at once, 3 ms after the rise — the
-        // read and an unfloored fold in one step, which the committed model
-        // rejects and `Buggy = 1` admits only as the read then
-        // `PresFallOwnQuiet`.
+        // Negative control: the read folds at once, 3 ms after the rise (the read and an
+        // unfloored fold in one step), which the committed model rejects and `Buggy = 1`
+        // admits only as the read then `PresFallOwnQuiet`.
         let mut control = Rig::new(false);
         band_then_fold_stood(&mut control);
         assert_eq!(control.app.presence_view(control.wid).unwrap().rows, 0);
@@ -587,11 +531,9 @@ fn a_band_rise_just_before_a_persons_read_holds_the_read_to_the_floor() {
     });
 }
 
-/// THE WINDOW'S OWN SHRINK, the band's: a band row rises and is dismissed,
-/// and 100 ms later — inside the floor its own rise noted, and inside its
-/// own quiet — the window loses its room. The window takes the row at the
-/// next wake (D1's exception), neither quiet nor the floor applying: the
-/// model's `BandTaken`.
+/// The window's own shrink, band row: a band row rises and is dismissed, and 100 ms later,
+/// inside both its floor and its own quiet, the window loses its room. The window takes
+/// the row at the next wake, neither quiet nor floor applying: `BandTaken`.
 fn band_taken(rig: &mut Rig) {
     let ms = Duration::from_millis;
     rig.run(&[
@@ -604,9 +546,8 @@ fn band_taken(rig: &mut Rig) {
     ]);
 }
 
-/// THE WINDOW'S OWN SHRINK, the presence row's: the row is born and its
-/// want drops, and inside the floor the window loses its room. The window
-/// takes the row at once: the model's `PresTaken`.
+/// The window's own shrink, presence row: the row is born and its want drops, and inside
+/// the floor the window loses its room. The window takes the row at once: `PresTaken`.
 fn pres_taken(rig: &mut Rig) {
     let ms = Duration::from_millis;
     rig.run(&[
@@ -657,11 +598,10 @@ fn a_window_that_loses_its_room_takes_the_presence_rows_waiting_row_inside_the_f
     });
 }
 
-/// TWO WINDOWS: the band re-grids every window, so its quiet shrink waits
-/// the LATEST floor of every window with glass (`App::band_regrow_floor`).
-/// A band row is up and dismissed; 5 ms before its quiet shrink a presence
-/// row is born in the OTHER window (window 1), whose floor alone then holds
-/// the band. `other_glass`: whether window 1 stands in for glass too.
+/// Two windows: the band re-grids every window, so its quiet shrink waits the latest floor
+/// of every window with glass (`App::band_regrow_floor`). A band row is up and dismissed;
+/// 5 ms before its quiet shrink a presence row is born in window 1, whose floor alone then
+/// holds the band. `other_glass`: whether window 1 stands in for glass too.
 fn two_windows(other_glass: bool) -> (Rig, WindowId) {
     let ms = Duration::from_millis;
     let mut rig = Rig::new(true);
@@ -669,8 +609,8 @@ fn two_windows(other_glass: bool) -> (Rig, WindowId) {
     let other = rig
         .app
         .insert_logical_window(crate::stub_session(first), 24, 80);
-    // A window's first stub session is not registered (no pty); a pushed tab
-    // is, as the rig's own window's is, so its lease reaches the driver.
+    // A window's first stub session is not registered (no pty); a pushed tab is, so its
+    // lease reaches the driver.
     let sid = rig.app.next_session_id;
     rig.app.push_stub_tab(other, crate::stub_session(sid));
     rig.app.frontmost_window = Some(rig.wid);
@@ -708,11 +648,9 @@ fn two_windows(other_glass: bool) -> (Rig, WindowId) {
     (rig, other)
 }
 
-/// THE BAND WAITS EVERY WINDOW'S FLOOR: the birth in window 1 holds the
-/// band's shrink to window 1's floor, and the band's wake names it.
-/// NEGATIVE CONTROL: window 1 not standing in for glass has no floor, and
-/// the band shrinks 5 ms after the birth there — what a band floor that
-/// read only the band's own window, or dropped the other windows, would do.
+/// A birth in window 1 holds the band's shrink to window 1's floor, and the band's wake
+/// names it. Negative control: window 1 without glass has no floor, and the band shrinks
+/// 5 ms after the birth, as a band floor that read only its own window would.
 #[test]
 fn a_presence_birth_in_another_window_holds_the_bands_shrink_to_that_windows_floor() {
     crate::fabric::with_link_reset(|| {
@@ -750,9 +688,8 @@ fn a_presence_birth_in_another_window_holds_the_bands_shrink_to_that_windows_flo
     });
 }
 
-/// A window that never re-grids for its chrome (headless, no stand-in) has
-/// no floor at all — its falls keep the law before — and one that does reads
-/// the latest rise of any source.
+/// A window that never re-grids for its chrome (headless, no stand-in) has no floor; one
+/// that does reads the latest rise of any source.
 #[test]
 fn only_a_window_whose_grid_moves_for_its_chrome_has_a_floor() {
     crate::fabric::with_link_reset(|| {
@@ -770,10 +707,9 @@ fn only_a_window_whose_grid_moves_for_its_chrome_has_a_floor() {
     });
 }
 
-// The machine's other actions: the environment's steps, time, the frame and
-// the `Buggy` members. `BandRise`/`BandFall`/`BandTaken` carry `#[refines]`
-// anchors on `App::regrid_message_band`, `PresRise`/`PresFall`/`PresTaken`
-// on `App::regrid_window_for_chrome_rows`.
+// The machine's other actions: environment steps, time, the frame and the `Buggy`
+// members. The re-grids carry `#[refines]` anchors on `App::regrid_message_band` and
+// `App::regrid_window_for_chrome_rows`.
 #[aterm_spec::spec_unmodeled(
     machine = "ChromeRegrowFloor",
     action = "BandUnwant",

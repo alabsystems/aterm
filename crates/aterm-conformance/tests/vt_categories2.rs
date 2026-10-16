@@ -16,7 +16,6 @@ fn irm_insert_mode_shifts_right() {
 
 #[test]
 fn irm_off_overwrites() {
-    // without insert mode, typing overwrites
     let s = run(b"abc\x1b[1;1HXY");
     assert_eq!(s.row(0), "XYc");
 }

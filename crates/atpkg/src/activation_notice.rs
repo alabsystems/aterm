@@ -3,14 +3,12 @@
 
 //! A best-effort wake for the running agent harness after a managed agent twin moves.
 //!
-//! The CLI publishes only after a mutating pass has returned and the FINAL
-//! target of an agent twin the live upgrade moves — `agents/claude`, and
-//! `agents/codex` (the harness's Codex branch) — differs from the one it
-//! found under the store lock.
-//! The window watches the dedicated notice directory for an atomic replacement
-//! of this marker; it re-reads the twin before acting, and its minute timer remains the
-//! fallback if the hint cannot be written or observed. No release fact or
-//! authority is carried in the marker itself.
+//! The CLI publishes only after a mutating pass has returned and the final target of a
+//! twin the live upgrade moves sessions onto
+//! ([`crate::vendor_direct::VendorSpec::live_upgrade`]: `agents/claude`, `agents/codex`)
+//! differs from the one it found under the store lock. The window watches the notice
+//! directory for an atomic replacement of the marker and re-reads the twin before acting;
+//! its minute timer is the fallback. The marker carries no release fact or authority.
 
 use std::path::PathBuf;
 
@@ -20,21 +18,13 @@ use crate::store::{Layout, ToolName};
 /// an active download cannot repeatedly wake the idle harness host.
 pub const NOTICE_DIR: &str = "activation-notices";
 
-/// One fixed child of that directory, replaced after a change of any twin in
-/// [`AGENTS`] (named for the first of them, which the window has watched
-/// since before Codex joined).
+/// One fixed child of that directory, replaced after a change of any twin the live upgrade
+/// moves sessions onto (named for the first of them).
 pub const CLAUDE_MARKER: &str = "claude";
 
-/// The agents whose twins the live upgrade moves sessions onto: a pass that
-/// moves either one wakes the window's host.
-pub const AGENTS: [&str; 2] = ["claude", "codex"];
-
-/// Create the notice directory before a pass can start writing progress. Its
-/// creation is a one-time event; errors are only a lost hint. The window's
-/// host calls it too, for a prefix that already exists, so its watch sits on
-/// the directory itself from the start — never on an ancestor it would have
-/// to look at again on a timer until the first install (the philosophy
-/// review of 2026-09-25).
+/// Create the notice directory before a pass can start writing progress; an error is only
+/// a lost hint. The window's host calls it too, so its watch sits on the directory itself
+/// from the start, never on an ancestor it would have to poll until the first install.
 pub fn prepare(layout: &Layout) {
     let _ = layout.ensure_dir(&layout.prefix.join(NOTICE_DIR));
 }
@@ -59,15 +49,21 @@ fn claude_target(layout: &Layout) -> Option<PathBuf> {
     agent_target(layout, "claude")
 }
 
-/// The live target of every twin in [`AGENTS`], in that order: what a pass
-/// snapshots under the store lock and compares after ([`note_if_changed`]).
+/// The live target of the twin of every agent the live upgrade moves sessions
+/// onto ([`crate::vendor_direct::VendorSpec::live_upgrade`]), in table order:
+/// what a pass snapshots under the store lock and compares after
+/// ([`note_if_changed`]).
 #[must_use]
 pub(crate) fn agent_targets(layout: &Layout) -> Vec<Option<PathBuf>> {
-    AGENTS.iter().map(|a| agent_target(layout, a)).collect()
+    crate::vendor_direct::VENDORS
+        .iter()
+        .filter(|row| row.live_upgrade)
+        .map(|row| agent_target(layout, row.program))
+        .collect()
 }
 
 /// Publish one coalescible hint when a completed pass changed a live target
-/// of [`AGENTS`] (`before`: [`agent_targets`] as the pass found them). An
+/// [`agent_targets`] reads (`before`: as the pass found them). An
 /// unrelated pass or a transaction rolled back to its original twins writes
 /// nothing. A failed hint does not turn a successful install into a failure:
 /// the host still looks at a worker's start.
@@ -91,9 +87,9 @@ fn publish(layout: &Layout) -> std::io::Result<()> {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    // `create_new` refuses a planted link rather than following it. One
-    // process owns the store lock, and a stale temp can at worst lose this
-    // hint; the next minute's sweep remains authoritative.
+    // `create_new` refuses a planted link rather than following it. One process owns the
+    // store lock, so a stale temp at worst loses this hint; the minute sweep stays
+    // authoritative.
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -194,10 +190,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&prefix);
     }
 
-    /// THE CODEX BRANCH IS WOKEN TOO: a pass that moves only `agents/codex`
-    /// replaces the one marker the window watches, so a running Codex
-    /// session's worker asks at once whether its session has somewhere to
-    /// go. NEGATIVE CONTROL: the same twin laid again moves nothing.
+    /// A pass that moves only `agents/codex` replaces the same marker; laying the same twin
+    /// again moves nothing (the negative control).
     #[test]
     fn a_codex_twin_change_replaces_the_marker_too() {
         let prefix = crate::testdir::dir("atpkg-codex-activation-notice-");

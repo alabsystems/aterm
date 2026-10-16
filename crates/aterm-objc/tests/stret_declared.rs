@@ -6,7 +6,7 @@
 //! The SEND side is [`aterm_objc::msg`], which picks `objc_msgSend_stret` from
 //! the prototype's return type (`tests/abi.rs` proves the threshold). This file
 //! covers trampolines registered by `declare_class!` that return a struct by
-//! value, such as `vendor/winit`'s `-firstRectForCharacterRange:actualRange:` —
+//! value, such as `crates/aterm-window`'s `-firstRectForCharacterRange:actualRange:` —
 //! a 32-byte `NSRect` return beside a by-value `NSRange` and an `NSRange *`
 //! out-parameter.
 //!
@@ -99,7 +99,7 @@ declare_class! {
         const NAME: &str = "ATermW3StretProbe";
         type Ivars = ();
 
-        /// `vendor/winit`'s `view.rs:376` row, spelling for spelling: a
+        /// `crates/aterm-window`'s `view.rs:376` row, spelling for spelling: a
         /// by-value `NSRange`, an `NSRange *` out-parameter, a 32-byte
         /// `NSRect` return. The values returned are DERIVED from the argument
         /// so that a register shift cannot produce them by accident.

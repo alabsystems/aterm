@@ -5,7 +5,7 @@
 # THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE, and here the directory
 # also had to grow a suffix.
 #
-# `[patch.crates-io]` matches on PACKAGE name, so to redirect the fourteen
+# `[patch.crates-io]` matches on PACKAGE name, so to redirect the thirteen
 # third-party consumers' `log = "0.4.x"` lines at this code the package must be
 # called `log` — nothing else works. The DIRECTORY keeps the `aterm-` prefix so
 # a `ls crates/` or a stack trace still reads as ours and nobody mistakes this
@@ -21,12 +21,13 @@
 name = "log"
 # NOT `version.workspace = true`. This version is a SEMVER CONTRACT with the
 # consumers, not an aterm release number. Measured requirements across the
-# fourteen consumers, all four cells (`cargo tree -e all --workspace --target
+# consumers, all four cells (`cargo tree -e all --workspace --target
 # <cell> --depth 2 -i log`, then each parent's manifest):
 #   ^0.4.29 — naga, wgpu, wgpu-core, wgpu-hal, wgpu-types  (the strictest)
-#   ^0.4.22 — rustybuzz
 #   ^0.4    — the other eight
-# 0.4.32 satisfies all three requirements and is what the graph resolved to
+# (rustybuzz's ^0.4.22 left the graph with it at TF.6 of
+# docs/AUDIT-third-party-2026-10-15.md.)
+# 0.4.32 satisfies both requirements and is what the graph resolved to
 # before the swap, so the lockfile's version line did not move when the
 # `[patch.crates-io]` row landed: the lock holds one `log 0.4.32`, this member.
 version = "0.4.32"
@@ -49,7 +50,7 @@ description = "First-party no-op `log` facade for aterm (package `log`; replaces
 #      input; upstream has `FromStr`, which does not. Re-exporting the type
 #      exports the inherent method too, under the name `log::LevelFilter::parse`.
 #   4. `no_std`. aterm-log is std-only (`std::sync::OnceLock`, `std::env`);
-#      seven consumers are `#![no_std]` and none enables `log/std`.
+#      six consumers are `#![no_std]` and none enables `log/std`.
 # Reasons 2 and 3 are cases where DELEGATING WOULD SHIP A WRONG API, not merely
 # an inelegant one — so the exception swallows the rule for this target.
 

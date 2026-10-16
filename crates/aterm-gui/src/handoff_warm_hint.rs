@@ -28,7 +28,8 @@
 
 /// The launch-environment name. Captured (read and cleared) with every other
 /// handoff name by `HandoffEnv::capture`; read only from that snapshot.
-pub(crate) const ENV_WARM_HINT: &str = "ATERM_HANDOFF_WARM_HINT";
+pub(crate) const ENV_WARM_HINT: crate::handoff_env::HandoffName =
+    crate::handoff_env::HandoffName::new("ATERM_HANDOFF_WARM_HINT");
 
 /// The only wire version written or read; any other is ignored whole, which is
 /// always safe for a guess.

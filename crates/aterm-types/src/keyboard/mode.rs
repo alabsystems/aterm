@@ -2,19 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Keyboard-relevant terminal mode flags.
-//!
-//! A focused subset of terminal mode flags that affect keyboard encoding.
-//! This type is bridge-agnostic and lives in `aterm-types` so both
-//! `aterm-core-ffi` and `aterm-alacritty-bridge` can use it without
-//! creating a dependency between them.
+//! The terminal mode flags that affect keyboard encoding.
 
 bitflags! {
-    /// Terminal mode flags relevant to keyboard encoding.
-    ///
-    /// Contains only the flags that affect how key presses are encoded
-    /// into escape sequences. This is intentionally a subset of the full
-    /// terminal mode flags.
+    /// Terminal mode flags relevant to keyboard encoding: a subset of the full terminal modes.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct KeyboardMode: u16 {
         /// Kitty keyboard protocol: disambiguate escape codes (CSI u encoding).
@@ -39,59 +30,38 @@ bitflags! {
         const REPORT_ASSOCIATED_TEXT = 1 << 9;
         /// VT52 compatibility mode — arrow keys use `ESC A`..`ESC D` (no CSI/SS3).
         const VT52_MODE = 1 << 10;
-        /// DECBKM (DEC private mode 67): the Backspace key sends BS (0x08) instead
-        /// of the default DEL (0x7f). Affects only legacy encoding; the Ctrl
-        /// modifier inverts it (xterm `backarrowKey`).
+        /// DECBKM (DEC private mode 67): Backspace sends BS (0x08) instead of DEL (0x7f), and
+        /// Ctrl+Backspace the other (xterm `backarrowKey`). Legacy encoding only.
         const BACKARROW_SENDS_BS = 1 << 11;
-        /// xterm `altSendsEscape` OFF (DEC private mode 1039 reset): when present,
-        /// an `Alt`-modified key in legacy encoding is sent WITHOUT the ESC (0x1b)
-        /// prefix. Absent (the default) keeps xterm's ESC-prefixed Alt behavior.
-        /// Modeled as a negative flag so the default `empty()` mode preserves the
-        /// historical "Alt always prefixes ESC" contract.
+        /// xterm `altSendsEscape` reset (DEC private mode 1039): an Alt-modified key in legacy
+        /// encoding goes without the ESC prefix. A negative flag, so `empty()` keeps xterm's
+        /// default ESC-prefixed Alt.
         const ALT_NO_ESC = 1 << 12;
-        /// xterm `metaSendsEscape` ON (DEC private mode 1036 set): when present,
-        /// a `Meta`-modified key in legacy encoding is prefixed with ESC (0x1b),
-        /// mirroring the `Alt` ESC behavior. Absent (the default) leaves Meta
-        /// unhandled in the legacy path, matching prior behavior.
+        /// xterm `metaSendsEscape` set (DEC private mode 1036): a Meta-modified key in legacy
+        /// encoding is ESC-prefixed like Alt. Off by default.
         const META_SENDS_ESC = 1 << 13;
-        /// xterm `numLock`/special-modifiers OFF (DEC private mode 1035 reset):
-        /// when present, the `NumLock` modifier bit is NOT treated as a real
-        /// modifier and is stripped before encoding. Absent (the default) keeps
-        /// NumLock as a special modifier, matching xterm's power-on `numLock`.
+        /// xterm `numLock` reset (DEC private mode 1035): the NumLock modifier bit is stripped
+        /// before encoding. Absent (the default, xterm's power-on state) keeps it.
         const NO_SPECIAL_MODIFIERS = 1 << 14;
-        /// ConPTY win32-input-mode (DEC private mode 9001) is SET: the console
-        /// host on the far side of the PTY asked for INPUT_RECORD-faithful key
-        /// reports (`CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`, microsoft/terminal
-        /// spec #4999). conhost requests it at every ConPTY start, and it is the
-        /// ONLY way a key can carry Windows modifiers across the pipe: legacy VT
-        /// has no byte for Shift+Enter or Ctrl+Enter, and conhost reads aterm's
-        /// legacy Shift+Enter LF (0x0a) as Ctrl+Enter (measured:
-        /// `ReadKey` → `KEY=Enter MODS=Control CHAR=0xA`, so PSReadLine ran
-        /// InsertLineAbove instead of AddLine). Once conhost has read ONE record
-        /// it also stops settling a lone ESC by the end of the read, so the
-        /// keys whose legacy bytes are a bare or dangling ESC — Escape, Ctrl+[,
-        /// Alt+[, Alt+Backspace, … — go out as records too, or the Escape key
-        /// dies in that tab for good (measured; the list is
-        /// `conhost_holds_once_switched` in `encode.rs`).
+        /// ConPTY win32-input-mode (DEC private mode 9001) is set: conhost, which requests it
+        /// at every ConPTY start, wants INPUT_RECORD key reports
+        /// (`CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`, microsoft/terminal spec #4999). It is the only
+        /// way a key carries Windows modifiers across the pipe: legacy VT has no Shift+Enter or
+        /// Ctrl+Enter, and conhost reads aterm's Shift+Enter LF as Ctrl+Enter. Once conhost has
+        /// read one record it also holds a lone or dangling ESC, so Escape, Ctrl+[, Alt+[,
+        /// Alt+Backspace and the like go out as records too (`conhost_holds_once_switched` in
+        /// `encode.rs`).
         ///
-        /// A NEGOTIATION BIT WITH THE HOST, NOT A KITTY FLAG. It lives in this
-        /// word only because the encoder reads one word; it is never part of
-        /// the `CSI ? flags u` answer, the kitty push/pop stack, or any
-        /// projection an application sees (`kitty_suppresses_predictive_echo`,
-        /// `kitty_reports_functional_keys`). In the ENCODER, though, it
-        /// outranks a kitty push for the keys it covers: under ConPTY conhost
-        /// is the only reader, an application's `CSI > 1 u` reaches this
-        /// terminal verbatim through the pipe, and conhost's input parser then
-        /// DROPS the `CSI 13;2 u` written back (measured: no record
-        /// reached a `ReadKey` loop) — so the record is the only spelling of
-        /// Shift+Enter that ever arrives at the application that asked for
-        /// kitty. The kitty flags themselves stay set; every key the record
-        /// does not cover follows them exactly as before.
+        /// A negotiation bit with the host, not a kitty flag, in this word only because the
+        /// encoder reads one word: it is never part of the `CSI ? flags u` answer, the kitty
+        /// stack, or any projection an application sees (`kitty_suppresses_predictive_echo`,
+        /// `kitty_reports_functional_keys`). In the encoder it outranks a kitty push for the
+        /// keys it covers, because conhost drops the CSI-u reports written back; every other key
+        /// follows the kitty flags.
         const WIN32_INPUT = 1 << 15;
 
-        /// Aggregate: any kitty keyboard protocol progressive-enhancement flag.
-        /// When any of these is active the app negotiated kitty semantics, which
-        /// supersede xterm modifyOtherKeys and the legacy keypad fold.
+        /// Aggregate: any kitty progressive-enhancement flag. With one set the app negotiated
+        /// kitty semantics, which supersede xterm modifyOtherKeys.
         const KITTY_PROTOCOL_FLAGS = Self::DISAMBIGUATE_ESC_CODES.bits()
             | Self::REPORT_EVENT_TYPES.bits()
             | Self::REPORT_ALTERNATE_KEYS.bits()

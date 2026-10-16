@@ -399,10 +399,9 @@ fn a_word_is_named_only_whole() {
     }
 }
 
-/// Hooks a `zsh -c` never runs (`precmd`, `preexec`, `periodic`,
-/// `zshaddhistory` run only around an interactive prompt or history; only
-/// `chpwd` and `zshexit` fire), so a person's `precmd() { vcs_info }` fails
-/// only the lines that name it.
+/// The hooks a `zsh -c` never runs (`precmd`, `preexec`, `periodic`,
+/// `zshaddhistory`; only `chpwd` and `zshexit` fire) are ordinary functions:
+/// a person's `precmd() { vcs_info }` fails only the lines that name it.
 #[test]
 fn a_prompt_or_history_hook_is_an_ordinary_function() {
     let s = Scratch::new("prompt-hooks");
@@ -426,10 +425,8 @@ fn a_prompt_or_history_hook_is_an_ordinary_function() {
     }
 }
 
-/// zsh finds a function by the word after quote removal (`r\m`, `r""m`,
-/// `$'\x72m'`, `r\<newline>m` and `eval "r\\m d"` all run a function `rm`),
-/// and the line models remove the quotes too, so a quoted spelling of a
-/// function's name is that function.
+/// A quoted spelling of a function's name (`r\m`, `r""m`, `$'\x72m'`,
+/// `r\<newline>m`, `eval "r\\m d"`) runs that function.
 #[test]
 fn a_function_is_named_by_any_quoting_of_its_name() {
     let s = Scratch::new("quoted-fn");
@@ -465,12 +462,9 @@ fn a_function_is_named_by_any_quoting_of_its_name() {
     }
 }
 
-/// A plain alias is expanded only in command position (a line's first word,
-/// one after `;`, `&&`, `|`, `(`, `{`, a backtick or a newline, after
-/// `if`/`then`/`do`/`!`/`time`/…, an assignment or a redirection, or after an
-/// alias whose value ends in a blank), and 2.1.284's snapshot demotes a global
-/// alias to a plain one. So oh-my-zsh's `alias 1='cd -1'` … `9` and `alias --
-/// -='cd -'` fail `5` and `x && 1`, not `tail -n 5`.
+/// A plain alias runs only in command position, and 2.1.284's snapshot demotes
+/// a global alias to a plain one: oh-my-zsh's `alias 1='cd -1'` … `9` and
+/// `alias -- -='cd -'` fail `5` and `x && 1`, not `tail -n 5`.
 #[test]
 fn an_alias_fails_only_a_line_that_may_run_it() {
     let s = Scratch::new("omz-aliases");

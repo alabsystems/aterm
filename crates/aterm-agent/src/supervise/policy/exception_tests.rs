@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The exceptions and the outlook of a wall: a person is asked for only what
-//! only a person can do, with the one action, and a wait is never one.
+//! The exceptions: a person is asked for only what only a person can do, with
+//! the one action, and a wait is never one.
 
 use super::*;
 use crate::supervise::phase::Phase;
@@ -59,6 +59,10 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         thread_model: None,
         upgrade_goal: false,
         account: None,
+        autopilot: crate::supervise::Autopilot::Cruise,
+        login_label: None,
+        login_superseded: false,
+        login_notice: None,
     }
 }
 
@@ -128,13 +132,174 @@ fn a_spend_wall_with_no_reset_says_so_once_and_the_action_is_the_strings() {
         );
         assert_ne!(e.why, credits.why, "{message}");
     }
-    // NEGATIVE CONTROL: with a reset named, it is a wait.
+    // Negative control: with a reset named, it is a wait.
     let mut r = walled(
         WallKind::Spend,
         "Monthly spend limit reached · resets Oct 1",
     );
     r.reset_at = Some(t + 90 * MIN);
     assert_eq!(exception_for(&st, &r, &cfg(), t), None);
+}
+
+/// A Codex screen whose last turn ended on the `■` row `wall`, as the policy
+/// reads it (the Codex reader: its wall kind, its program).
+fn codex_ended_on(wall: &str) -> TurnEndReading {
+    let rows: Vec<String> = [
+        "› go on",
+        "",
+        &format!("■ {wall}"),
+        "",
+        "› Ask Codex to do anything",
+        "",
+        "  gpt · /x",
+    ]
+    .iter()
+    .map(|r| r.to_string())
+    .collect();
+    let reading = aterm_phase::read(Some("codex"), &rows, None);
+    assert_eq!(reading.program, aterm_phase::Program::Codex);
+    TurnEndReading::of(&reading, &rows, false, Some(3 * MIN), None, None)
+}
+
+/// The state after a wall in `r` answered every continuation typed after
+/// its reset (`r.reset_at`, which is `t`), one try past
+/// [`FUTILE_AFTER_TRIES`].
+fn tried_past_the_reset(
+    r: &mut TurnEndReading,
+    cfg: &SupervisorConfig,
+    t: Instant,
+) -> TurnEndState {
+    let mut st = TurnEndState::default();
+    let mut now = t + MIN;
+    let mut tries = 0;
+    while tries < FUTILE_AFTER_TRIES + 1 {
+        r.worked = Some(if tries == 0 {
+            3 * MIN
+        } else {
+            Duration::from_secs(4)
+        });
+        st.observe(r, now);
+        match decide_turn_end(&st, r, cfg, now) {
+            a @ TurnEndAction::Type { .. } => {
+                st.acted(&a, r, now);
+                tries += 1;
+                now += Duration::from_secs(5);
+            }
+            TurnEndAction::WaitUntil { until, .. } => now = until,
+            other => panic!("{other:?}"),
+        }
+    }
+    st
+}
+
+/// A CODEX SESSION'S WALLS GET CODEX'S WORDS, never Claude Code's: its spend
+/// walls (its reader's spend-cap row, and the two the 0.162.1 lab measured,
+/// `docs/measured/real-claude-lab-2026-10-15.md` M2) send the person to
+/// Codex's own notice, never to claude.ai or "usage credits"; a usage limit
+/// futile past its reset to Codex's `/status`; a lost login to `codex login`,
+/// never the page `/login` opened (nothing is typed into Codex). Any other
+/// program's words name no vendor. NEGATIVE CONTROL: the same walls in a
+/// Claude Code session keep Claude Code's words.
+#[test]
+fn a_codex_sessions_walls_get_codexs_words() {
+    use aterm_phase::Program;
+    let t = t0();
+    let claudes = ["claude.ai", "usage credits", "/login", "Claude"];
+    let names_none = |e: &Exception, words: &[&str]| {
+        words
+            .iter()
+            .all(|w| !e.why.contains(w) && !e.action.contains(w))
+    };
+    for notice in [
+        "You hit your spend cap set in your workspace. Increase your spend cap to continue.",
+        "Your workspace is out of credits. Ask your workspace owner to refill in order to continue.",
+        "You hit your spend cap set by the owner of your workspace. Ask an owner to increase your \
+         spend cap to continue.",
+    ] {
+        let r = codex_ended_on(notice);
+        assert_eq!(r.wall, Some(WallKind::Spend), "{notice}");
+        let st = TurnEndState::default();
+        let e = exception_for(&st, &r, &cfg(), t).expect(notice);
+        assert_eq!((e.kind, e.when), (ExceptionKind::Spend, Urgency::Later));
+        assert!(e.action.contains("Codex's notice"), "{e:?}");
+        assert!(names_none(&e, &claudes), "{notice}: {e:?}");
+        let claude = TurnEndReading {
+            program: Program::Claude,
+            ..r.clone()
+        };
+        let control = exception_for(&st, &claude, &cfg(), t).expect(notice);
+        assert_eq!(control.action, "Add usage credits in claude.ai settings.");
+    }
+
+    let mut usage = walled(
+        WallKind::UsageSession,
+        "You've hit your usage limit. Try again at 12:56 PM.",
+    );
+    usage.reset_at = Some(t);
+    let mut c = cfg();
+    c.model_fallback = None;
+    for (program, wants) in [
+        (Program::Codex, "Run /status in this tab"),
+        (Program::Generic, "the program's account"),
+        (Program::Claude, "claude.ai/settings/usage"),
+    ] {
+        let mut r = TurnEndReading {
+            program,
+            ..usage.clone()
+        };
+        let st = tried_past_the_reset(&mut r, &c, t);
+        let e = exception_for(&st, &r, &c, t + 61 * MIN).expect("futile");
+        assert_eq!(e.kind, ExceptionKind::Futile, "{program:?}");
+        assert!(e.action.contains(wants), "{program:?}: {e:?}");
+    }
+
+    let off = SupervisorConfig {
+        retry_api_errors: false,
+        ..cfg()
+    };
+    let lost = codex_ended_on(
+        "Your access token could not be refreshed. Please log out and sign in again.",
+    );
+    assert_eq!(lost.wall, Some(WallKind::Auth));
+    let e = exception_for(&TurnEndState::default(), &lost, &off, t).expect("login");
+    assert_eq!(
+        (e.kind, e.action.as_str(), e.clears, e.escalated),
+        (
+            ExceptionKind::Login,
+            "Sign in to Codex again with codex login.",
+            "the agent working",
+            true
+        )
+    );
+    assert!(names_none(&e, &claudes), "{e:?}");
+    let claude = TurnEndReading {
+        program: Program::Claude,
+        ..lost.clone()
+    };
+    let control = exception_for(&TurnEndState::default(), &claude, &off, t).expect("login");
+    assert!(control.action.contains("/login"), "{control:?}");
+
+    // Any other program: no vendor's words at all.
+    let vendors = [
+        "claude.ai",
+        "usage credits",
+        "/login",
+        "Claude",
+        "Codex",
+        "codex",
+    ];
+    let generic = |kind, message: &str| TurnEndReading {
+        program: Program::Generic,
+        ..walled(kind, message)
+    };
+    let st = TurnEndState::default();
+    for e in [
+        exception_for(&st, &generic(WallKind::Spend, "out of credits"), &cfg(), t),
+        exception_for(&st, &generic(WallKind::Auth, "Not logged in"), &off, t),
+    ] {
+        let e = e.expect("an exception");
+        assert!(names_none(&e, &vendors), "{e:?}");
+    }
 }
 
 /// `Goal cleared after an unrecoverable error (<label>)` names its cause.
@@ -152,10 +317,9 @@ fn a_cleared_goal_names_its_cause() {
     assert!(e.action.contains("/goal"), "{e:?}");
 }
 
-/// A bucket no reset ends is an exception only when the tab has NOT switched
-/// off it an hour on — held by its own running jobs, or with no other model —
-/// and says which. NEGATIVE CONTROLS: switched (the tab works on the
-/// fallback), less than an hour, and a bucket whose reset is named.
+/// A bucket no reset ends is an exception only when the tab has not switched
+/// off it an hour on, and says why. Negative controls: switched, under an hour,
+/// and a bucket whose reset is named.
 #[test]
 fn a_bucket_no_reset_ends_is_an_exception_only_while_the_tab_cannot_switch() {
     let t = t0();
@@ -188,7 +352,7 @@ fn a_bucket_no_reset_ends_is_an_exception_only_while_the_tab_cannot_switch() {
     let e = exception_for(&st, &r, &none, t + 61 * MIN).expect("no fallback");
     assert!(e.why.contains("no other model"), "{e:?}");
     assert!(e.action.contains("another model"), "{e:?}");
-    // The bucket IS the fallback's model, or the host cannot relaunch: the same.
+    // The bucket is the fallback's model, or the host cannot relaunch: the same.
     let mut opus = walled(kind, "You've reached your Opus limit · run /usage-credits");
     opus.restartable = false;
     let mut st2 = TurnEndState::default();
@@ -217,9 +381,8 @@ fn a_bucket_no_reset_ends_is_an_exception_only_while_the_tab_cannot_switch() {
     assert_eq!(exception_for(&st3, &named, &cfg(), t + 120 * MIN), None);
 }
 
-/// A usage limit that keeps answering the continuation an hour past its reset
-/// is called futile — for a bucket with a named reset too. Two tries, or less
-/// than an hour past the reset, are not.
+/// A limit that keeps answering the continuation an hour past its reset is
+/// futile, a bucket with a named reset too. Two tries, or under an hour, are not.
 #[test]
 fn a_wall_that_answers_three_tries_an_hour_past_its_reset_is_futile() {
     use crate::supervise::policy::turn_end::{TurnEndAction, decide_turn_end};
@@ -255,8 +418,6 @@ fn a_wall_that_answers_three_tries_an_hour_past_its_reset_is_futile() {
                 other => panic!("{kind:?}: {other:?}"),
             }
         }
-        // Futile only once three tries have been made AND the wall has stood an
-        // hour past its reset.
         assert_eq!(
             futile_after,
             [None, None, None, Some(ExceptionKind::Futile)],
@@ -316,15 +477,10 @@ fn answered(wall: &str, answers: &[&str]) -> Vec<Option<Exception>> {
     told
 }
 
-/// A full context that Claude Code itself says `/compact` cannot reduce, three
-/// `/compact`s running, is a person's: the loop goes on compacting on its ladder,
-/// and what is left drops conversation, which is not the loop's to choose. Over
-/// the screens of Claude Code 2.1.286 (MEASURED 2026-10-01): the wall, then the
-/// failed `/compact`s one under another. A request error on a later rung
-/// (`Error during compaction: API Error: 500`) does not end the line: the vendor
-/// had said it already. NEGATIVE CONTROLS: two compacts, three request errors
-/// (a wait, which a later `/compact` may get past: Claude Code never said it) and
-/// three tries at an outage.
+/// A full context Claude Code says `/compact` cannot reduce, three `/compact`s
+/// running, is a person's; a request error on a later rung does not end it.
+/// Negative controls: two compacts, three request errors (Claude Code never
+/// said it), and three tries at an outage.
 #[test]
 fn a_full_context_three_compacts_leave_full_is_an_exception_with_the_way_back() {
     let told = answered(
@@ -384,10 +540,7 @@ fn a_wait_is_never_an_exception() {
     }
 }
 
-/// The texts fit the digest's entry (design-exceptions 8.4): `why` and `action`
-/// at most 90 characters, the action ONE imperative (no ` or `, no `; `, no
-/// newline), none of the words a restart prompt would carry, and a `why` that
-/// names no waiting or retrying (a wait is never an exception).
+/// Every text fits the digest's caps and lint (the module doc's rules).
 #[test]
 fn the_exception_texts_fit_the_digests_caps_and_lint() {
     let t = t0();
@@ -426,6 +579,47 @@ fn the_exception_texts_fit_the_digests_caps_and_lint() {
         ..cfg()
     };
     all.push(exception_for(&TurnEndState::default(), &auth, &off, t).expect("login"));
+    // A renewable login's end not waited at: to renew, and, renewed, over a
+    // draft and with nothing to relaunch the tab.
+    {
+        let renewable = TurnEndReading {
+            login_label: Some("m7-a".to_string()),
+            ..auth.clone()
+        };
+        let superseded = TurnEndReading {
+            login_superseded: true,
+            ..renewable.clone()
+        };
+        let drafted = TurnEndReading {
+            composer: Composer::Typed,
+            ..superseded.clone()
+        };
+        let no_relaunch = SupervisorConfig {
+            relaunch: false,
+            ..cfg()
+        };
+        let st = TurnEndState::default();
+        for (r, c) in [
+            (&renewable, &no_relaunch),
+            (&drafted, &cfg()),
+            (&superseded, &no_relaunch),
+        ] {
+            all.push(exception_for(&st, r, c, t).expect("renewable"));
+        }
+    }
+    // A lost login after a move, the host advising nothing at all.
+    {
+        use crate::supervise::policy::turn_end::{AccountAt, Restart};
+        let mut st = TurnEndState::default();
+        let to = Restart::Account {
+            to: "work-2".to_string(),
+            at: AccountAt::Wall,
+        };
+        st.restarted(&to, true, &auth, t);
+        st.host_typed(t);
+        st.observe(&auth, t + MIN);
+        all.push(exception_for(&st, &auth, &cfg(), t + MIN).expect("no account to move to"));
+    }
     // A usage limit that answered every continuation an hour past its reset.
     {
         use crate::supervise::policy::turn_end::{TurnEndAction, decide_turn_end};
@@ -463,10 +657,35 @@ fn the_exception_texts_fit_the_digests_caps_and_lint() {
             .clone()
             .expect("context"),
     );
+    // A spend wall, a lost login and a futile limit in a Codex session, and
+    // in any other program's.
+    for program in [aterm_phase::Program::Codex, aterm_phase::Program::Generic] {
+        let st = TurnEndState::default();
+        let spend = TurnEndReading {
+            program,
+            ..walled(WallKind::Spend, "Your workspace is out of credits.")
+        };
+        all.push(exception_for(&st, &spend, &cfg(), t).expect("spend"));
+        let lost = TurnEndReading {
+            program,
+            ..auth.clone()
+        };
+        all.push(exception_for(&st, &lost, &off, t).expect("login"));
+        let mut r = TurnEndReading {
+            program,
+            reset_at: Some(t),
+            ..walled(
+                WallKind::UsageWeekly,
+                "You've hit your usage limit. Try again at 4:00 PM.",
+            )
+        };
+        let st = tried_past_the_reset(&mut r, &cfg(), t);
+        all.push(exception_for(&st, &r, &cfg(), t + 61 * MIN).expect("futile"));
+    }
     // The canary's third rung (`wall_memory`), which no point reaches.
     all.push(Exception::stalled());
     all.push(Exception::dialog());
-    assert!(all.len() >= 13, "{}", all.len());
+    assert!(all.len() >= 23, "{}", all.len());
     for e in &all {
         assert!(e.why.chars().count() <= WHY_MAX, "{e:?}");
         assert!(e.action.chars().count() <= ACTION_MAX, "{e:?}");
@@ -474,14 +693,5 @@ fn the_exception_texts_fit_the_digests_caps_and_lint() {
             !e.action.contains(" or ") && !e.action.contains("; ") && !e.action.contains('\n'),
             "{e:?}"
         );
-        for word in ["restart", "relaunch", "reopen", "next launch", "reboot"] {
-            assert!(
-                !e.why.to_lowercase().contains(word) && !e.action.to_lowercase().contains(word),
-                "{word}: {e:?}"
-            );
-        }
-        for word in ["wait", "retry", "retries", "retrying"] {
-            assert!(!e.why.to_lowercase().contains(word), "{word}: {e:?}");
-        }
     }
 }

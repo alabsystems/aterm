@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for fixed-path snapshot generations and handle-anchored
-//! artifacts.
-//!
-//! The tests drive the shipping generation fence, `PinnedDir` accessors, and the
-//! video lease registry, project their observable states onto the derived
-//! models, and validate every concrete transition. Deliberately stale/outside
-//! post-states are rejected as non-vacuous controls. `ArtifactReplyPublication`
-//! is driven where its writer and ACK wait live, in `control`'s tests
-//! (`capture_reply_*`); its projection is here.
+//! Tier-1 conformance for fixed-path snapshot generations and handle-anchored artifacts: the
+//! shipping generation fence, `PinnedDir` accessors and video lease registry are projected onto
+//! the derived models, with stale or outside post-states as negative controls.
+//! `ArtifactReplyPublication` is driven in `control`'s `capture_reply_*` tests; its projection
+//! is here.
 
 #![cfg(test)]
 
@@ -151,18 +147,13 @@ pub(crate) fn project_video_batch_publication_durability(
     state
 }
 
-/// Test-visible projection of the refcounted recording-lease registry.
-///
-/// Production anchors intentionally name this exact function. Their concrete
-/// observations are: registry `count` -> `leases`, the entry's
-/// `video_sweep_requested` -> `armed`, an entry whose reserved `video_retention`
-/// admission is gone -> `admission_spent`, retained recording-identity
-/// disagreement -> `identity_mismatch`, the last-release handoff -> `pending`,
-/// and callback execution -> `sweeping`. `requested` is the caller's history —
-/// an arm the test made and no finished sweep has discharged — so a registry
-/// that lost an armed entry still reads as owing its sweep.
-/// `replacement_joined` is a negative-control witness and is always false for
-/// shipping code.
+/// Test-visible projection of the refcounted recording-lease registry; production anchors name
+/// this function. Registry `count` -> `leases`, the entry's `video_sweep_requested` -> `armed`,
+/// an entry without its reserved `video_retention` admission -> `admission_spent`, a retained
+/// recording-identity disagreement -> `identity_mismatch`, the last-release handoff ->
+/// `pending`, callback execution -> `sweeping`. `requested` is the caller's history (an arm no
+/// finished sweep has discharged), so a registry that lost an armed entry still owes its sweep.
+/// `replacement_joined` is a negative-control witness, always false for shipping code.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ArtifactReaderObservation {
     leases: i64,
@@ -1112,7 +1103,7 @@ fn observe_reader(model: &Model, key: &Path, requested: bool, identity_mismatch:
     )
 }
 
-/// TIER-1: the shipping lease registry — `retain_video_artifact_path`,
+/// Tier-1: the shipping lease registry — `retain_video_artifact_path`,
 /// `arm_video_retention_sweep`, a lease's drop, and the cleanup worker's
 /// sweep — read back after every step. Twelve published recordings over the
 /// keep-limit of eight make the sweep's work visible: a sweep that ran prunes.
@@ -1247,8 +1238,8 @@ fn real_video_reader_registry_conforms_to_last_release_sweep_lifecycle() {
         "acquisition fails closed while the sweep owns the entry",
     );
     drop(hold);
-    // Waits until the entry is GONE: a finish that reset the entry's flags and
-    // kept it (with its recorded identity) times out here.
+    // Waits until the entry is gone: a finish that reset the entry's flags and kept it (with
+    // its recorded identity) times out here.
     crate::control_auth::wait_for_artifact_cleanup_for_test(&key);
     let swept = observe_reader(&model, &key, false, false);
     assert_transition(
@@ -1329,7 +1320,7 @@ fn real_video_reader_registry_conforms_to_last_release_sweep_lifecycle() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// TIER-1: a same-name replacement cannot join a live recording's lease group.
+/// Tier-1: a same-name replacement cannot join a live recording's lease group.
 /// The replacement is the environment's move; the refusal is the registry's.
 #[cfg(unix)]
 #[test]
@@ -1616,12 +1607,11 @@ fn landed(moved: &Path, outside: &Path, bytes: &[u8]) -> i64 {
     }
 }
 
-/// TIER-1: the swap happens between pinning and the operation. Both shipping
-/// operations run through the handle retained before the swap, and where their
-/// bytes went is read back off the filesystem — the retained original
-/// (`effect_target = 1`) or the swapped-in outside directory (`2`). A path that
-/// is resolved again after the swap, the confinement before 6aeae4606, is
-/// replayed with the same reads and writes by path, and refused.
+/// Tier-1: the swap happens between pinning and the operation. Both shipping operations run
+/// through the handle retained before the swap, and where their bytes went is read back off
+/// the filesystem: the retained original (`effect_target = 1`) or the swapped-in outside
+/// directory (`2`). The same reads and writes by path, re-resolved after the swap, are the
+/// negative controls the model refuses.
 #[cfg(unix)]
 #[test]
 fn swapped_ancestor_fails_reply_and_outside_mutants_are_rejected() {

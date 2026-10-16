@@ -1,53 +1,29 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Signature-**during**-selection (§5) — choosing which published index to trust.
+//! Signature-during-selection (§5): choosing which published index to trust.
 //!
-//! The reused release-listing flow (`aterm-update`'s `github.rs`) picks the highest
-//! `build_number` release and *then* parses it. That ordering is exploitable here: a
-//! repo-write adversary could publish a release carrying a huge (API-reported) build
-//! number but an **unsigned / garbage `index.toml`**, and either DoS updates (the real
-//! signed index is never reached) or shadow a lower, genuinely-signed index. So the order
-//! is inverted: verify **first**, select **after**.
+//! Verify first, select after. Taking the highest API-reported `build_number` and then
+//! parsing it would let a repo-write adversary publish a huge build number over an unsigned
+//! `index.toml` and block updates or shadow the genuine signed index.
 //!
-//! [`select_index`] considers a candidate only if the WHOLE chain holds for it — the
-//! candidate's master-signed roster admits, the index verifies under a machine that
-//! roster still authorizes, the index's own attribution binds to the machine that
-//! actually signed, and its *signed* `index_build` (the one inside the verified bytes —
-//! never the unsigned API-reported number) is ≥ the durable high-water `floor`. Among
-//! those it returns the highest signed `index_build`. A candidate that fails ANY of that
-//! is **skipped, not a global abort**, so an unsigned high-build release can never
-//! suppress a lower signed one. Freshness (`valid_until`) and the *advancing* floor
-//! writes are applied by the caller to the winner (§8 gates 2–3).
+//! [`select_index`] considers a candidate only if the whole chain holds: its master-signed
+//! roster admits, the index verifies under a machine that roster still authorizes, the
+//! index's attribution binds to the signing machine, and its signed `index_build` (never the
+//! API number) clears the durable floor. The highest signed `index_build` among those wins;
+//! a candidate that fails is skipped, never a global abort. Index freshness and the
+//! advancing floor writes are the caller's (§8 gates 2–3).
 //!
-//! # The roster travels WITH the index, per candidate
+//! Each candidate carries the roster published beside it, not one roster fetched for the
+//! repo: applying one fresh roster to older indexes would let whoever publishes it revive an
+//! old index that generation still authorizes. A release with no roster pair yields no
+//! candidate ([`crate::net`] builds none): a denial of service the index server already
+//! had, never a fallback to an older root.
 //!
-//! Each candidate carries the roster generation published beside it, not a roster fetched
-//! once for the repo. Two reasons, and the second is the load-bearing one:
+//! # The newest admitted generation decides
 //!
-//! * a release is a self-contained authorization unit — the machine that cut it, the
-//!   generation that authorized that machine, and the index it signed all ride together,
-//!   exactly as the appcast and `aterm-machines.toml` do on an aterm release;
-//! * a single repo-wide roster fetch would have to be reconciled against N candidate
-//!   indexes of different ages, and the natural way to do that ("use the newest roster
-//!   for all of them") is precisely how an attacker who can publish ONE fresh roster
-//!   revives an old index that generation still authorizes. Per-candidate binding makes
-//!   `roster_seq` inside the index have to match the roster served with it.
-//!
-//! # A suppressed roster is a REFUSAL, never a downgrade
-//!
-//! A release carrying `index.toml` + `.sig` but no roster pair yields no candidate at
-//! all — [`crate::net`] will not even build one. Whoever serves the index can therefore
-//! stop atpkg from installing, which is a denial of service they already had (they serve
-//! the index). What they cannot do is get an older root honoured instead: there is no
-//! older root left to fall back to.
-//!
-//! # THE NEWEST ADMITTED GENERATION DECIDES — ranking is not by `index_build` alone
-//!
-//! Because the roster travels PER CANDIDATE, two candidates in one fetch can disagree about
-//! who is authorized. Ranking them by signed `index_build` alone — the rule that predates
-//! the roster and knew nothing about generations — hands the fetch to whichever party can
-//! publish the bigger number, and the party who wants to is precisely the one being revoked:
+//! Candidates can disagree about who is authorized. Ranking by `index_build` alone hands
+//! the fetch to whoever publishes the bigger number, which is the machine being revoked:
 //!
 //! ```text
 //!   owner  : roster_seq 5 (revokes m11), index_build  50, signed by m3
@@ -56,84 +32,62 @@
 //!                                    has to keep outbidding the owner's build number.
 //! ```
 //!
-//! So [`select_index`] runs in two passes. Pass one admits every candidate's roster and
-//! takes the HIGHEST generation admitted; pass two considers only the candidates carrying
-//! that generation. Anything older is discarded before its index signature is ever checked
-//! — the same "leave the candidate set before any crypto" rule revocation itself uses, one
-//! level up. A generation the client has merely SEEN kills every older one in the same
-//! pass, and [`Selection::observed_roster_seq`] is what the caller ratchets durably so it
-//! stays dead in every later pass too.
-//!
-//! This does hand a repo-write attacker a way to suppress older candidates by serving the
-//! newest (public, master-signed) roster beside a garbage index. That is not a downgrade —
-//! it is the correct reading of "generation 5 exists", and it is the denial of service they
-//! already had. What they cannot do is revive generation 4.
+//! So pass one admits every candidate's roster and takes the highest generation; pass two
+//! considers only candidates on it, dropping older ones before their index signature is
+//! checked. The caller ratchets [`Selection::observed_roster_seq`] durably. Serving the
+//! newest roster beside a garbage index suppresses older candidates: the same denial of
+//! service, not a downgrade.
 
 use crate::sig::{Anchor, BuildFloor, TrustedIndex, TrustedRoster, VerifiedBytes, admit_roster};
 
-/// One release's signed index + the master-signed roster published beside it.
-///
-/// All four blobs are RAW wire bytes and are handed to the verifier unmodified — no lossy
-/// conversion, no re-serialization. Anything that stores or forwards a `Candidate` (the
-/// §14 cache, the chained fetcher) is moving BYTES, never trust.
+/// One release's signed index and the master-signed roster published beside it, as raw
+/// wire bytes handed to the verifier unmodified. Storing or forwarding one moves bytes,
+/// never trust.
 #[derive(Debug, Clone)]
 pub struct Candidate {
-    /// Release tag / id (diagnostics only — never trusted for selection).
+    /// Release tag / id (diagnostics only).
     pub label: String,
-    /// The raw `index.toml` asset bytes (verified as-is; never lossily converted).
+    /// The raw `index.toml` asset bytes.
     pub index_bytes: Vec<u8>,
-    /// The detached `index.toml.sig` bytes — a MACHINE signature under the roster below.
+    /// The detached `index.toml.sig` bytes: a machine signature under the roster below.
     pub sig: Vec<u8>,
     /// The raw `aterm-machines.toml` bytes published on the same release.
     pub roster_bytes: Vec<u8>,
-    /// The detached `aterm-machines.toml.sig` bytes — the PAPER MASTER's signature, and
-    /// the only thing in this struct that a pinned key verifies directly.
+    /// The detached `aterm-machines.toml.sig` bytes: the paper master's signature, the only
+    /// thing here a pinned key verifies directly.
     pub roster_sig: Vec<u8>,
 }
 
-/// The chosen index: authorized by a master-signed roster generation, past the floor,
-/// plus its raw verified bytes (for the caller to record / re-use) and the originating
-/// release label.
+/// The chosen index, its verified bytes and its release label.
 #[derive(Debug)]
 pub struct Selected {
     /// The release the winning index came from.
     pub label: String,
-    /// The parsed index, paired with the roster generation that authorized it — which is
-    /// also the authority every `pkg-*.toml` under it verifies against.
+    /// The parsed index and the roster generation that authorized it, which every
+    /// `pkg-*.toml` under it verifies against.
     pub index: TrustedIndex,
     /// The exact verified bytes the index was parsed from.
     pub verified: VerifiedBytes,
-    /// Which of the candidates handed in won, by position — the caller's handle on the
-    /// winning candidate itself (a label is diagnostics only and need not be unique).
+    /// The winner's position in the candidates handed in (a label need not be unique).
     pub candidate: usize,
 }
 
-/// What one verify-then-select pass learned: the winner (if any) **and** the newest roster
-/// generation the pass admitted.
+/// One verify-then-select pass: the winner, if any, and the newest roster generation it
+/// admitted.
 ///
-/// The second field is returned even when nothing was selected, and that is the point.
-/// Admitting a generation is an OBSERVATION, and the replay defence is only worth having if
-/// an observation is durable: a client that verified generation *n* must refuse *n-1*
-/// forever after, whether or not it went on to install anything. Returning it separately —
-/// rather than reading it back off the winner — means a pass that selected nothing (every
-/// index refused, a fetch that only carried the revoking roster, a plan that held on a local
-/// pin) still ratchets. `aterm-update`'s sibling tier ratchets on observation for exactly
-/// this reason; atpkg used to ratchet only after a completed install, which left a client
-/// that saw a revocation but installed nothing accepting the pre-revocation roster — and the
-/// revoked machine with it — on the next pass.
+/// The generation is returned even when nothing was selected: admitting a generation is an
+/// observation, and a client that verified generation *n* must refuse *n-1* from then on
+/// whether or not it installed anything (as `aterm-update`'s tier does).
 #[derive(Debug)]
 pub struct Selection {
     /// The winning index, or `None` if no candidate survived the whole chain.
     pub selected: Option<Selected>,
-    /// The highest `roster_seq` ADMITTED in this pass (master-signed, parsed from the
-    /// verified wrapper, above the durable floor, and fresh). `0` if none was. The caller
-    /// ratchets its durable roster floor to this before doing anything else with the
-    /// winner.
+    /// The highest `roster_seq` admitted in this pass, `0` if none. The caller ratchets its
+    /// durable roster floor to this before using the winner.
     pub observed_roster_seq: u64,
 }
 
-/// One candidate that got past the roster tier: the generation that admitted it, and the
-/// index bytes still waiting to be verified under it.
+/// A candidate past the roster tier, its index still to be verified under `roster`.
 struct Admitted {
     at: usize,
     label: String,
@@ -142,12 +96,8 @@ struct Admitted {
     roster: TrustedRoster,
 }
 
-/// One distinct roster pair Pass 1 has already weighed, and the verdict it reached.
-///
-/// A refusal (`None`) is remembered too: identical bytes under one anchor and one clock
-/// refuse identically, so re-running a doomed master verify for each repeat is the same
-/// waste as re-running a successful one — and remembering the refusal cannot turn into
-/// an admission, there being nothing here that can flip a `None` to a `Some`.
+/// One distinct roster pair Pass 1 has weighed, and its verdict. A refusal is remembered
+/// too: identical bytes under one anchor and clock refuse identically.
 struct Weighed {
     roster_bytes: Vec<u8>,
     roster_sig: Vec<u8>,
@@ -156,15 +106,12 @@ struct Weighed {
 
 /// Verify-then-select over `candidates` (see the module docs). `anchor` is the pinned
 /// paper-master keyset plus the durable `roster_seq` floor; `floor` is the durable
-/// `index_build` high-water **and the generation that set it** ([`BuildFloor`]); `now_unix`
-/// drives the roster's freshness window and the per-machine expiry gates.
+/// `index_build` high-water and its generation; `now_unix` drives roster freshness and
+/// per-machine expiry.
 ///
-/// Returns the highest-signed-`index_build` candidate that survives the whole chain, among
-/// only those carrying the NEWEST generation this pass admitted — plus that generation, for
-/// the caller's durable ratchet.
-///
-/// The caller still applies the index's own freshness gate and the *advancing* floor
-/// writes (this function only reads the floors as filters).
+/// Returns the highest signed `index_build` among candidates on the newest admitted
+/// generation, plus that generation. The floors are only read here; the caller applies
+/// index freshness and the advancing floor writes.
 #[must_use]
 pub fn select_index(
     anchor: &Anchor,
@@ -176,47 +123,27 @@ pub fn select_index(
         selected: None,
         observed_roster_seq: 0,
     };
-    // THE INERT GUARD, stated here as well as inside `admit_roster`. This loop's shape is
-    // "skip anything that fails", and that shape is one negated condition away from
-    // "accept anything that is handed to us": if an unarmed anchor ever stopped refusing,
-    // every candidate below would sail through. An unpinned build selects NOTHING — and
-    // observes nothing either, so it cannot even ratchet a floor.
+    // The inert guard, stated here as well as in `admit_roster`: this loop skips failures,
+    // one negated condition away from accepting everything. An unpinned build selects and
+    // observes nothing.
     if !anchor.is_armed() {
         return nothing;
     }
 
-    // PASS 1 — THE ROSTER TIER, for every candidate. Master signature, parse-from-verified,
-    // schema, the roster_seq ratchet, freshness. Nothing about any index is looked at until
-    // every generation on offer has been weighed, because which generation is newest decides
-    // WHO may have signed an index — and that question has to be settled before, not after,
-    // ranking by a number the signer chose.
+    // Pass 1: the roster tier for every candidate. Which generation is newest decides who
+    // may have signed an index, so it is settled before any index is looked at.
     //
-    // ONE ADMISSION PER DISTINCT ROSTER PAIR, not one per candidate. The candidates in a
-    // pass are successive releases of ONE repo, and each publishes the same master-signed
-    // `aterm-machines.toml` generation beside its index — on a real store all four cached
-    // candidates carry byte-identical roster bytes AND signature, so three of the four
-    // master verifies (plus parse, plus admission) only rebuilt a `TrustedRoster` already
-    // in hand, on every resolve, in every process.
-    //
-    // What the memo may NOT do is loosen the pairing rule this module exists to enforce:
-    // a candidate is still admitted by the roster published BESIDE IT, and the memo hits
-    // only on the EXACT bytes of both halves (`==`, never a digest — a hash collision must
-    // never be able to stand in for a master signature). Under one anchor and one
-    // `now_unix`, identical bytes are the same verdict: `verify_roster`, `Roster::parse`
-    // and `Roster::admit` are all pure.
-    //
-    // It also stays inside the freeze contract on `TrustedRoster` ("valid for ONE apply —
-    // do not cache"): the memo is a local, lives exactly as long as this call, and a reused
-    // generation therefore carries the very clock reading its own admission froze — the
-    // same reading every other candidate in this pass is being weighed against.
+    // One admission per distinct roster pair: successive releases of one repo usually carry
+    // byte-identical roster bytes and signature. Each candidate is still admitted by the
+    // roster beside it: the memo hits only on the exact bytes of both halves (`==`, never a
+    // digest, so no hash collision stands in for a master signature), and under one anchor
+    // and one `now_unix` the verdict is pure. It lives only for this call, so it stays
+    // within `TrustedRoster`'s freeze contract.
     let mut weighed: Vec<Weighed> = Vec::new();
     let mut admitted: Vec<Admitted> = Vec::new();
     let mut observed_roster_seq = 0u64;
     for (at, c) in candidates.into_iter().enumerate() {
-        // Taken as an owned verdict, not a borrow, so the miss arm below can extend the
-        // memo. `Some(None)` is "already weighed, already refused"; `None` is "not yet
-        // weighed". The scan is linear in the number of DISTINCT pairs, which is bounded
-        // by the candidate count and is in practice 1.
+        // `Some(None)` is "weighed and refused"; `None` is "not yet weighed".
         let seen = weighed
             .iter()
             .find(|w| w.roster_bytes == c.roster_bytes && w.roster_sig == c.roster_sig)
@@ -250,31 +177,26 @@ pub fn select_index(
         return nothing;
     }
 
-    // PASS 2 — only the newest generation gets to authorize anything. An older generation's
-    // candidate is dropped HERE, before its index signature is checked, so a revoked
-    // machine's mathematically valid index signature is never verified — the same ordering
-    // rule the deny-list gets, applied one tier up.
+    // Pass 2: only the newest generation authorizes. An older generation's candidate is
+    // dropped before its index signature is checked, so a revoked machine's signature is
+    // never verified.
     let mut best: Option<Selected> = None;
     for a in admitted {
         if a.roster.seq() != observed_roster_seq {
             continue;
         }
-        // (2) THE INDEX — verified under the LIVE machines only (revoked and expired ones
-        // left the set before any crypto), parsed only from the verified bytes, then bound
-        // to the machine that actually signed it.
+        // Verified under the live machines only, parsed from the verified bytes, bound to
+        // the machine that signed it.
         let Ok((index, verified)) = a.roster.authorize_index(a.index_bytes, &a.sig) else {
             continue;
         };
-        // (3) Anti-rollback on the SIGNED build (never the unsigned API number), scoped to
-        // the generation that recorded the floor: a strictly newer generation re-bases it,
-        // which is what keeps one machine's absurd `index_build` from bricking the store
-        // beyond the master's reach. See `BuildFloor`.
-        // The generation the index DECLARES, never the one it was served beside —
-        // see `TrustedIndex::authorizing_seq`.
+        // Anti-rollback on the signed build, scoped to the generation the index declares
+        // (`TrustedIndex::authorizing_seq`, never the one it was served beside): a strictly
+        // newer generation re-bases the floor. See `BuildFloor`.
         if !floor.admits(index.authorizing_seq(), index.index_build) {
             continue;
         }
-        // (4) Highest signed index_build wins, within the newest generation.
+        // Highest signed index_build wins, within the newest generation.
         if best
             .as_ref()
             .is_none_or(|b| index.index_build > b.index.index_build)
@@ -332,7 +254,6 @@ mod tests {
         c
     }
 
-    /// The anchor the tests select under.
     fn anchor(roster_floor: u64) -> Anchor {
         Anchor::of(
             vec![testkit::pubkey_b64(&testkit::MASTER_SEED)],
@@ -340,10 +261,7 @@ mod tests {
         )
     }
 
-    /// A build floor of `build`, recorded under the fixture's own generation — i.e. one
-    /// that actually BINDS, which is what a floor test wants. A floor carrying a different
-    /// generation would be silently waived and every floor assertion below would pass
-    /// vacuously.
+    /// A build floor of `build` under the fixture's own generation, so it binds.
     fn floor(build: u64) -> BuildFloor {
         BuildFloor {
             index_build: build,
@@ -356,10 +274,7 @@ mod tests {
         BuildFloor::none()
     }
 
-    // THE DANGEROUS DIRECTION. An unarmed anchor selects NOTHING, even from a candidate
-    // set every byte of which is genuinely signed. Delete the `is_armed` guard and this
-    // fails on the first assertion — `admit_roster` still refuses, so it fails there
-    // instead, which is the belt-and-braces the double statement buys.
+    // An unarmed anchor selects nothing, even from genuinely signed candidates.
     #[test]
     fn an_unarmed_anchor_selects_nothing() {
         let cands = vec![signed("v60", 60)];
@@ -378,8 +293,7 @@ mod tests {
             "an unpinned build observes nothing either — it must not ratchet a floor it \
              cannot have verified"
         );
-        // NON-VACUITY: the identical candidate set is selected the moment a master is
-        // pinned, so the refusal above is the anchor and not a broken fixture.
+        // The same set is selected once a master is pinned.
         assert!(
             select_index(&anchor(0), cands, no_floor(), testkit::NOW)
                 .selected
@@ -387,8 +301,7 @@ mod tests {
         );
     }
 
-    // The highest SIGNED index_build wins; an unsigned higher-build release is skipped and
-    // can never suppress it (§5 DoS-resistance).
+    // The highest signed index_build wins; an unsigned higher build cannot suppress it.
     #[test]
     fn picks_highest_signed_skips_unsigned() {
         let cands = vec![
@@ -409,8 +322,7 @@ mod tests {
         );
     }
 
-    // A signed index BELOW the floor is filtered out (anti-rollback); the winner is the
-    // highest signed build at-or-above the floor.
+    // A signed index below the floor is filtered out (anti-rollback).
     #[test]
     fn floor_filters_below_high_water() {
         let cands = vec![signed("v30", 30), signed("v45", 45), signed("v42", 42)];
@@ -427,8 +339,7 @@ mod tests {
         );
     }
 
-    // A DIFFERENT paper master ⇒ every candidate's roster fails to verify ⇒ None. Fail
-    // closed, with no fallback to any other root — there is no other root.
+    // A different paper master: every roster fails to verify, and there is no other root.
     #[test]
     fn a_different_master_selects_nothing() {
         let other = Anchor::of(vec![testkit::pubkey_b64(&testkit::OUTSIDER_SEED)], 0);
@@ -440,8 +351,7 @@ mod tests {
         );
     }
 
-    // A candidate whose roster is MISSING (or empty) is skipped: no roster, no authority.
-    // The index bytes and their signature are untouched and perfectly genuine.
+    // A candidate with no roster is skipped, however genuine its index and signature.
     #[test]
     fn a_candidate_with_no_roster_is_skipped() {
         let mut c = signed("v60", 60);
@@ -452,8 +362,7 @@ mod tests {
                 .selected
                 .is_none()
         );
-        // ...and the one beside it, with its roster intact, still wins — a suppressed
-        // roster takes down its own candidate, not the whole selection.
+        // A broken roster takes down its own candidate, not the whole selection.
         let mut broken = signed("v70", 70);
         broken.roster_sig = vec![0u8; 64];
         let sel = select_index(
@@ -470,8 +379,7 @@ mod tests {
         );
     }
 
-    // A REPLAYED roster generation is refused by the durable roster floor, even though the
-    // index it authorizes is fresh and genuinely signed.
+    // A replayed roster generation is refused by the durable roster floor.
     #[test]
     fn a_rolled_back_roster_generation_selects_nothing() {
         let out = select_index(
@@ -488,7 +396,7 @@ mod tests {
             out.observed_roster_seq, 0,
             "a generation the ratchet refused was never admitted, so it is not an observation"
         );
-        // Equal is allowed, so re-fetching the current generation is not read as an attack.
+        // Equal is allowed: re-fetching the current generation is not an attack.
         assert!(
             select_index(
                 &anchor(testkit::SEQ),
@@ -501,12 +409,10 @@ mod tests {
         );
     }
 
-    // A STALE roster (its own window lapsed) selects nothing — the only defence a
-    // brand-new install has, since it carries no floor.
+    // A stale roster selects nothing: the only defence a fresh install has, carrying no floor.
     #[test]
     fn a_stale_roster_selects_nothing() {
-        // 2103 — past the fixture roster's 2099 valid_until, and chosen explicitly so
-        // this test says which gate it is exercising rather than inheriting a deadline.
+        // 2103: past the fixture roster's 2099 valid_until.
         let far_future = 4_200_000_000_i64;
         assert!(
             select_index(&anchor(0), vec![signed("v60", 60)], no_floor(), far_future)
@@ -515,7 +421,6 @@ mod tests {
         );
     }
 
-    // Empty candidate list ⇒ None.
     #[test]
     fn no_candidates_selects_nothing() {
         let out = select_index(&anchor(0), vec![], no_floor(), testkit::NOW);
@@ -523,7 +428,7 @@ mod tests {
         assert_eq!(out.observed_roster_seq, 0);
     }
 
-    // An equal-build tie does not regress below floor; equal to floor is allowed (>=).
+    // Equal to the floor is allowed (>=).
     #[test]
     fn equal_to_floor_is_allowed() {
         let sel = select_index(&anchor(0), vec![signed("v41", 41)], floor(41), testkit::NOW)
@@ -532,26 +437,16 @@ mod tests {
         assert_eq!(sel.index.index_build, 41);
     }
 
-    // ---------------------------------------------------------------------------------
-    // THE NEWEST ADMITTED GENERATION DECIDES.
-    // ---------------------------------------------------------------------------------
-
-    /// A candidate on a generation OLDER than the newest this pass admitted is discarded,
-    /// however high its signed `index_build` — because "who may sign an index" is settled by
-    /// the roster tier before any index number is compared.
+    /// A candidate on a generation older than the newest admitted is discarded however high
+    /// its signed `index_build`.
     ///
-    /// The fixture cannot use `signed()` (one fixed generation), so it builds the two
-    /// generations explicitly; `sig`'s own tests cover the revoked-machine case with real
-    /// deny-lists, and `atpkg-keys`' owner→client suite drives the whole thing end to end.
-    ///
-    /// MUTATION: delete the `a.roster.seq() != observed_roster_seq` guard and this fails
-    /// with the higher build winning.
+    /// MUTATION: delete the `a.roster.seq() != observed_roster_seq` guard and the higher
+    /// build wins.
     #[test]
     fn an_older_generation_loses_however_high_its_build() {
         use aterm_update_core::roster::Roster;
 
-        // Generation SEQ+1, same single machine — a plain bump, so the ONLY difference
-        // between the two candidates is which generation authorized them.
+        // Generation SEQ+1, same single machine: the candidates differ only in generation.
         let mut newer: Roster = testkit::roster();
         newer.roster_seq = testkit::SEQ + 1;
         let newer_bytes = newer.to_toml().expect("a valid roster emits").into_bytes();
@@ -571,7 +466,7 @@ mod tests {
             roster_bytes: newer_bytes,
             roster_sig: newer_sig,
         };
-        // ...and a candidate on the OLD generation with a far higher build.
+        // A candidate on the old generation with a far higher build.
         let on_older = signed("old-generation-big-build", 9_000);
 
         let out = select_index(
@@ -590,8 +485,7 @@ mod tests {
         assert_eq!(sel.index.index_build, 5);
         assert_eq!(out.observed_roster_seq, testkit::SEQ + 1);
 
-        // NON-VACUITY: without the newer generation present, the big-build candidate wins —
-        // so the loss above is the generation ordering and not a broken fixture.
+        // Alone, the big-build candidate wins, so the loss above is the generation rule.
         let alone = select_index(
             &anchor(0),
             vec![signed("old-generation-big-build", 9_000)],
@@ -603,11 +497,10 @@ mod tests {
         assert_eq!(alone.index.index_build, 9_000);
     }
 
-    /// A build floor recorded under an OLDER generation does not bind: the paper master can
-    /// always rescue a store whose floor a machine drove out of reach.
+    /// A build floor recorded under an older generation does not bind, so the paper master
+    /// can rescue a store whose floor a machine drove out of reach.
     ///
-    /// MUTATION: change `BuildFloor::admits`' `roster_seq > self.roster_seq` to `>=` (or
-    /// drop the branch) and this fails — the rescue index is filtered out.
+    /// MUTATION: make `BuildFloor::admits`' `>` a `>=` and the rescue index is filtered out.
     #[test]
     fn a_floor_from_an_older_generation_is_rebased_not_obeyed() {
         // A floor at the u64 ceiling, recorded one generation back.
@@ -625,8 +518,7 @@ mod tests {
         .expect("a newer generation re-bases the floor");
         assert_eq!(sel.index.index_build, 41);
 
-        // NON-VACUITY, and the fail-closed direction: the SAME absurd floor recorded under
-        // THIS generation still binds, so the waiver is strictly about being newer.
+        // The same floor recorded under this generation still binds.
         let same_generation = BuildFloor {
             index_build: u64::MAX,
             roster_seq: testkit::SEQ,
@@ -644,18 +536,9 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------------------
-    // ONE ADMISSION PER DISTINCT ROSTER, not one per candidate.
-    // ---------------------------------------------------------------------------------
-
-    /// The candidates in one pass are successive releases of ONE repo, and every one of
-    /// them publishes the same master-signed roster generation beside its index — on a
-    /// real machine all four cached candidates carry byte-identical `roster_b64` and
-    /// `roster_sig_b64`. Pass 1 must weigh that generation ONCE; three further master
-    /// verifies and TOML parses only rebuild a `TrustedRoster` already in hand.
+    /// Candidates carrying one roster pair cost one master verify, not one each.
     ///
-    /// MUTATION: drop the memo in Pass 1 and this fails with four verifies for one
-    /// generation.
+    /// MUTATION: drop the memo in Pass 1 and this counts four verifies.
     #[test]
     fn one_generation_costs_one_admission_however_many_candidates_carry_it() {
         let cands = vec![
@@ -664,8 +547,7 @@ mod tests {
             signed("atpkg-index-31", 31),
             signed("atpkg-index-32", 32),
         ];
-        // The premise, asserted rather than assumed: this fixture models the listing
-        // lane, where one generation is published beside every release.
+        // Premise: one roster pair published beside every release.
         assert!(
             cands
                 .iter()
@@ -680,7 +562,6 @@ mod tests {
             1,
             "four candidates carrying ONE roster generation must cost one master verify"
         );
-        // ...and the verdict is byte-for-byte the one the repeated verifies reached.
         let sel = out.selected.expect("the highest signed build wins");
         assert_eq!(sel.label, "atpkg-index-32");
         assert_eq!(sel.index.index_build, 32);
@@ -692,13 +573,11 @@ mod tests {
         );
     }
 
-    /// NON-VACUITY, and the direction that must never collapse: the memo is keyed on the
-    /// EXACT bytes of BOTH halves, so two different pairs are two admissions — and a pair
-    /// whose master signature is forged is refused on its own account, never waved
-    /// through on the strength of the genuine pair sitting beside it.
+    /// The memo keys on the exact bytes of both halves: a pair with a forged master
+    /// signature is refused on its own account, not waved through by the genuine one.
     #[test]
     fn distinct_roster_pairs_are_each_admitted_on_their_own() {
-        // Same roster bytes, a master signature nobody made: a DIFFERENT pair.
+        // Same roster bytes, a forged master signature: a different pair.
         let mut forged = signed("forged-master-sig", 9_000);
         forged.roster_sig = vec![0u8; 64];
         let before = testkit::master_verifies();

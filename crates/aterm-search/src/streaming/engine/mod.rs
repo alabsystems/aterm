@@ -15,15 +15,8 @@ mod operations;
 
 /// Streaming search engine with memory-bounded results.
 ///
-/// Spec of record: `aterm_spec::derive::streaming_search_model()` (machine
-/// `StreamingSearch`), the derived drift-free twin — see `streaming/mod.rs`.
-///
-/// ## Staleness Detection
-///
-/// A generation counter bumps on every content mutation (scan, add, invalidate,
-/// cancel, pattern change). Consumers caching `StreamingMatch` coordinates
-/// should snapshot [`generation()`](Self::generation) before using results and
-/// discard cached coordinates when the generation changes (#7271).
+/// Spec of record: `aterm_spec::derive::streaming_search_model()` (see
+/// `streaming/mod.rs`).
 #[derive(Debug)]
 pub struct StreamingSearch {
     /// Current search state.
@@ -46,9 +39,8 @@ pub struct StreamingSearch {
     config: StreamingSearchConfig,
     /// Deduplication set (row, start_col).
     seen_positions: SeenPositions,
-    /// Monotonically increasing generation counter (#7271).
-    ///
-    /// Bumped on every mutation that changes results or invalidates coordinates.
+    /// Bumped when a search starts, restarts or is cancelled, and when a content change
+    /// alters the results; scanning only appends.
     generation: u64,
 }
 
@@ -132,6 +124,23 @@ impl StreamingSearch {
         self.total_matches
     }
 
+    /// Whether the current search has omitted matches because its result cap
+    /// or a regex scan budget was exhausted. A finished search with no results
+    /// is not a definitive miss when this is true.
+    ///
+    /// Regex exhaustion is conservative and sticky for the current compiled
+    /// pattern, including content changes and reflows. [`start_search`](Self::start_search)
+    /// starts a fresh scan and clears that history.
+    #[must_use]
+    pub fn incomplete(&self) -> bool {
+        self.total_matches > self.results.len()
+            || (self.filter_mode == FilterMode::Regex
+                && self
+                    .compiled_regex
+                    .as_ref()
+                    .is_some_and(aterm_regex::Regex::step_limit_exceeded))
+    }
+
     /// Get the number of stored results.
     #[must_use]
     pub fn result_count(&self) -> usize {
@@ -160,10 +169,6 @@ impl StreamingSearch {
     }
 
     /// Get the current generation counter.
-    ///
-    /// Bumped on every mutation that changes results or invalidates coordinates.
-    /// Consumers should snapshot this before using results and discard cached
-    /// coordinates when the generation changes (#7271).
     #[must_use]
     #[inline]
     #[cfg(test)]
@@ -179,7 +184,7 @@ impl Default for StreamingSearch {
 }
 
 impl StreamingSearch {
-    /// Bump the generation counter (internal helper for #7271).
+    /// Bump the generation counter.
     #[inline]
     fn bump_generation(&mut self) {
         self.generation = self.generation.wrapping_add(1);

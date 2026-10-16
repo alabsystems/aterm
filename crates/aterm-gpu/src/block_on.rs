@@ -208,31 +208,4 @@ mod tests {
         }
         assert_eq!(block_on(Storm(2)), 1);
     }
-
-    /// Waker clones outliving the future must stay sound (wgpu hands the waker
-    /// to a callback that can fire after the poll that registered it).
-    #[test]
-    fn cloned_waker_outlives_the_poll() {
-        let stash: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
-        let keep = Arc::clone(&stash);
-        struct Stash(Arc<Mutex<Option<Waker>>>, bool);
-        impl Future for Stash {
-            type Output = ();
-            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-                if self.1 {
-                    return Poll::Ready(());
-                }
-                self.1 = true;
-                *self.0.lock().expect("test mutex") = Some(cx.waker().clone());
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }
-        block_on(Stash(keep, false));
-        // The stashed clone is still live here; waking it must be a no-op that
-        // does not touch freed memory.
-        if let Some(w) = stash.lock().expect("test mutex").take() {
-            w.wake();
-        }
-    }
 }

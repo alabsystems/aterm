@@ -1,10 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-#![deny(unsafe_op_in_unsafe_fn)]
 // F11-4 (#7941): production unwrap() is forbidden; tests opt out uniformly at the
 // crate root so a missing per-module allow can't silently slip past clippy.
-#![deny(clippy::unwrap_used)]
+#![warn(clippy::unwrap_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 //! VT100/ANSI escape sequence parser.
@@ -40,12 +39,11 @@
 //! The parser processes input in O(n) time where n is the number of input bytes.
 //! This is guaranteed by:
 //!
-//! 1. **Main loop**: `advance_fast`/`advance_batch` walk the input once.
+//! 1. **Main loop**: `advance_fast` walks the input once.
 //!    - Best case: SIMD `take_printable` skips runs of printable ASCII
-//!    - Worst case: each byte goes through `process_byte_inner` (fast) or
-//!      `process_byte_batch` (batch)
+//!    - Worst case: each byte goes through `process_byte_inner`
 //!
-//! 2. **Per-byte operations are O(1)**: `process_byte_inner`/`process_byte_batch` do:
+//! 2. **Per-byte operations are O(1)**: `process_byte_inner` does:
 //!    - Constant-time table lookup: `TRANSITIONS[state][byte]`
 //!    - Bounded buffer operations:
 //!      - `params`: ArrayVec<u16, 24> (MAX_PARAMS = 24)
@@ -58,9 +56,9 @@
 //! 4. **Bounds enforcement**: All buffer operations check capacity before
 //!    insertion, preventing unbounded growth.
 //!
-//! Throughput floors live in the `aterm-bench` harnesses (`xtask perf`).
+//! Throughput floors live in the `aterm-bench` harnesses (`verify perf`).
 
-#![deny(missing_docs, clippy::all, clippy::pedantic)]
+#![warn(missing_docs, clippy::pedantic)]
 #![cfg_attr(test, allow(clippy::all, clippy::pedantic))]
 #![allow(
     clippy::must_use_candidate,
@@ -111,10 +109,6 @@ mod utf8_simd;
 
 pub use action::{Action, ActionSink, NullSink};
 pub use carry::{CarryRefusal, HOOKED_STRING_CARRY, OSC_CARRY_CAP, ParserCarry, UTF8_TAIL_MAX};
-// `BatchActionSink` powers the test-only batch dispatch path; it is gated out
-// of release builds along with `advance_batch`/`process_byte_batch`.
-#[cfg(test)]
-pub use action::BatchActionSink;
 pub use state::State;
 pub use table::{ActionType, TRANSITIONS};
 

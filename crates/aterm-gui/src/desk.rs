@@ -8,7 +8,7 @@
 //!
 //! THE LAB'S SEAM (2026-10-09). The cold restore — aterm quit or crashed while
 //! an agent ran — is checkable against the REAL Claude Code only in
-//! `tools/real-claude-lab`, which runs a private headless instance. Under the
+//! the real-Claude lab, which runs a private headless instance. Under the
 //! [`HEADLESS_RESTORE_SEAM`] development seam ([`aterm_types::dev_seam!`]: a
 //! debug build, or an optimized one with `--features dev-seams`) a headless
 //! instance keeps its desk as a window does, with two differences a window
@@ -105,19 +105,6 @@ mod tests {
                 assert_eq!(desk.on_glass(flag), flag);
                 assert_eq!(desk.quit_keeps_agents(flag), flag);
             }
-        }
-    }
-
-    /// A BUILD WITHOUT SEAMS NEVER TAKES IT, whatever the environment holds:
-    /// only a release test build without `dev-seams` compiles this, and it is
-    /// meant to run with the seam SET
-    /// (`ATERM_DEBUG_HEADLESS_RESTORE=1 targo --unverified test --release -p
-    /// aterm-gui --lib desk::`).
-    #[cfg(not(any(debug_assertions, feature = "dev-seams")))]
-    #[test]
-    fn a_build_without_seams_keeps_todays_desk() {
-        for headless in [false, true] {
-            assert_eq!(Desk::of(headless), Desk::new(headless, false));
         }
     }
 

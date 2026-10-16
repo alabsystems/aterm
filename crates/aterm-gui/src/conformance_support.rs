@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The checks the in-crate Tier-1 conformance binds share: one real step,
-//! projected onto a derived model, admitted as exactly the action the test
-//! names with every invariant holding after it; and the enumeration of every
-//! bounded schedule a bind replays. Each bind keeps its own projection, its
-//! own schedules and its own negative controls — only these bodies were
-//! written out identically in each file.
+//! Checks shared by the in-crate Tier-1 conformance binds: one real step, projected onto a
+//! derived model, admitted as exactly the action the test names with every invariant holding
+//! after it; and the enumeration of every bounded schedule a bind replays. Each bind keeps its
+//! own projection, schedules and negative controls.
 
 #![cfg(test)]
 
@@ -31,7 +29,7 @@ pub(crate) fn assert_transition(model: &Model, before: &State, after: &State, ac
     }
 }
 
-/// [`assert_transition`], and `after` is the ONLY state `action` leads to
+/// [`assert_transition`], and `after` is the only state `action` leads to
 /// from `before`: the real step is the model's step, not one of several.
 pub(crate) fn assert_sole_transition(model: &Model, before: &State, after: &State, action: &str) {
     assert_eq!(
@@ -42,7 +40,7 @@ pub(crate) fn assert_sole_transition(model: &Model, before: &State, after: &Stat
     assert_transition(model, before, after, action);
 }
 
-/// The real step `before -> after`, labelled `label`, IS `actions` fired in
+/// The real step `before -> after`, labelled `label`, is `actions` fired in
 /// order on `model` from `before`, and every invariant holds after it.
 #[cfg(unix)]
 pub(crate) fn assert_fired(

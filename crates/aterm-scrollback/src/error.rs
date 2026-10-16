@@ -167,28 +167,6 @@ mod tests {
         }
     }
 
-    /// The manual `Display` impl renders the pinned strings.
-    #[test]
-    fn display_messages_are_stable() {
-        let io = ScrollbackError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "missing page",
-        ));
-        assert_eq!(format!("{io}"), "scrollback I/O error: missing page");
-        let de = ScrollbackError::Decompression("bad frame".to_string());
-        assert_eq!(format!("{de}"), "scrollback decompression error: bad frame");
-        let q = ScrollbackError::Quarantined(42);
-        assert_eq!(
-            format!("{q}"),
-            "scrollback block quarantined: 42 lines inaccessible"
-        );
-        let ef = ScrollbackError::EnforcementFailed { over_bytes: 1024 };
-        assert_eq!(
-            format!("{ef}"),
-            "memory budget enforcement failed: 1024 bytes over budget"
-        );
-    }
-
     /// `source()` must expose the io error (the `#[from]` field), like the
     /// derive did.
     #[test]

@@ -1,71 +1,44 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The release's source take: the bytes its one build compiles, made from git
-//! OBJECTS.
+//! The release's source take: the bytes its one build compiles, read from git objects.
 //!
-//! A release builds its release commit C once (`artifact::build`; the cut signs
-//! those bytes and compiles nothing), so its source is C's tree as git stores it:
-//! C's commit object, every tree under it ([`ObjectReader`], walked here, recursing
-//! into each submodule gitlink at the commit it records) and every blob (read through
-//! ONE `git cat-file --batch` child per repository). The working tree is never read:
-//! an edit made in it (and reverted) while the build runs, an untracked file, an
-//! ignored directory or a filesystem attribute cannot reach the build, because none
-//! of them is a git object.
+//! A release builds commit C once (`artifact::build`), so its source is C's tree as git
+//! stores it: the commit, every tree under it (recursing into each submodule gitlink at the
+//! commit it records) and every blob. The working tree is never read, so an edit, an
+//! untracked or ignored file, or a filesystem attribute cannot reach the build.
 //!
-//! Every git here is [`crate::ledger::object_git`]: no `GIT_*` variable, system or
-//! global config steers it, and replace refs are ignored — `git replace` would
-//! otherwise hand back another object's bytes under the id asked for. git itself
-//! checks a commit's bytes when it resolves one, but `cat-file` serves any object
-//! unchecked, and `ls-tree -r` reads every tree below the root unchecked (MEASURED: a
-//! planted subtree's entries are listed as the commit's). So every object — the
-//! commit, each tree, each gitlink's commit and each blob — is hashed here as git
-//! hashes it (`<kind> <len>\0<bytes>`) and refused unless that is the id it was read
-//! for: the one asked for, or the one its parent tree records. A replaced, corrupted
-//! or planted object cannot become a source byte, nor change which bytes are.
-//! A symbolic link is refused, in the tree and in the vendored output alike: its
-//! target is not a byte of the take, and the digest could not see what it reaches.
+//! Every git here is [`crate::ledger::object_git`]. `cat-file` serves any object unchecked
+//! and `ls-tree -r` reads subtrees unchecked, so every object is hashed here as git hashes
+//! it (`<kind> <len>\0<bytes>`) and refused unless that is the id it was read for: the one
+//! asked for, or the one its parent tree records. A symbolic link is refused, in the tree
+//! and in the vendored output: its target is not a byte of the take.
 //!
-//! The bytes are synced into a stable per-clone cache, `<clone>-release.noindex`
-//! beside the clone ([`CacheRoot`]): only a file whose bytes or mode differ is
-//! written, a file C no longer has is removed, and an unchanged file keeps its
-//! mtime — so cargo's path fingerprints, and with them the build, stay warm from
-//! one cut to the next. The sync is exact about names on a volume that is not (macOS's
-//! APFS ignores case and Unicode normalization by default): an entry the volume finds
-//! under another spelling of a name is not that name ([`Syncer`]). The `.noindex`
-//! name is what keeps Spotlight out of the cache (MEASURED on this Mac: a directory
-//! named `*.noindex` is excluded, a `.metadata_never_index` marker is not, and
-//! `~/Library/Caches` is indexed). One take at a time holds it ([`CacheHold`]).
+//! The bytes are synced into a per-clone cache ([`CacheRoot`]), writing only files whose
+//! bytes or mode differ, so unchanged files keep their mtimes and cargo's fingerprints stay
+//! warm across cuts. What C no longer has is removed from `src/` before vendoring resolves
+//! the workspace there ([`take_tree`]): a leftover crate is still a member of a
+//! `members = ["crates/*"]` workspace. The sync is exact about names on a case-insensitive
+//! volume ([`Syncer`]).
 //!
-//! Dependencies come from `targo vendor --locked --versioned-dirs` into a
-//! cutter-private `CARGO_HOME` that holds no Cargo config (one found there is removed,
-//! and a root `/.cargo/config*` is refused), after every cached `.crate` the lockfile
-//! names was hashed against its `Cargo.lock` checksum (a mismatch is deleted, so cargo
-//! fetches it again and checks it as it does) and the unpacked registry sources were
-//! removed, so every crate is extracted again from an archive the lock vouches for.
-//! After vendoring, every locked crate's archive must be in that cache with the lock's
-//! checksum — that is what ties the vendored bytes to the lock. Each vendored
-//! crate's `.cargo-checksum.json` `package` must also equal the lock's checksum, which
-//! says only that vendoring agreed with the lock: cargo writes that field from the
-//! lock, not from the bytes. The vendor tree is synced byte-wise like the source. A
-//! sealed source-replacement config ([`SEALED_CONFIG`]) points crates.io at that tree
-//! and turns the network off, so the build reads nothing a cut did not check.
+//! Dependencies come from `targo vendor --locked --versioned-dirs` into a private
+//! `CARGO_HOME` holding no Cargo config, after every cached `.crate` the lockfile names is
+//! hashed against its checksum (a mismatch is deleted and refetched) and the unpacked
+//! registry sources are removed. After vendoring, every locked crate's archive must be in
+//! that cache with the lock's checksum ([`check_crate_archives`]). [`SEALED_CONFIG`] points
+//! crates.io at the vendored tree and turns the network off.
 //!
-//! The take's [`Snapshot::digest`] is one SHA-256 over the schema tag and the
-//! sorted `(path, kind, mode, content hash)` of every file under it — relative paths
-//! only, so the same commit has the same digest across runs and checkout paths by
-//! construction. [`Snapshot::verify`] walks it again after the build: a byte that
-//! changed while cargo ran refuses the build.
-//!
-//! Nothing here lists, reads, removes or refuses an extended attribute: the
-//! bytes are git's, and a file's attributes are not part of them.
+//! [`Snapshot::digest`] is one SHA-256 over [`SCHEMA`] and the sorted
+//! `(path, kind, mode, content hash)` of every file, relative paths only, so the same
+//! commit has the same digest in every checkout. [`Snapshot::verify`] walks the take again
+//! after the build and refuses a changed byte.
 
+use aterm_uds::spawnfd::{Stdio, command};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
 
 /// The digest's schema tag: a change to what the digest covers changes this.
 pub const SCHEMA: &str = "aterm-release-snapshot-v1";
@@ -75,11 +48,9 @@ const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
 /// The sealed source-replacement config, at `<snapshot>/.cargo/config.toml`.
 ///
-/// `directory = "vendor"` is relative on purpose: cargo resolves a path in a
-/// config FILE against the parent of the directory holding it — here the
-/// snapshot root — whether the file is discovered or passed with `--config`, so
-/// the config is the same bytes in every clone and the digest stays
-/// path-independent.
+/// `directory = "vendor"` is relative on purpose: cargo resolves a path in a config file
+/// against the parent of the directory holding it (the snapshot root), whether the file is
+/// discovered or passed with `--config`, so the config and the digest are path-independent.
 pub const SEALED_CONFIG: &str = "# Written by the release cutter (crates/aterm-release/src/snapshot.rs):\n\
 # every crates.io package comes from the vendored, checksum-verified tree\n\
 # beside `src/`, and nothing is fetched while the release builds.\n\
@@ -97,12 +68,11 @@ const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// The per-clone release cache: `<clone>-release.noindex`, beside the clone.
 ///
-/// One per clone, shared by every linked worktree of it (the cut tree is one, and so
-/// is a Linux worker's per-run tree), so one take at a time holds it ([`CacheHold`]);
-/// two clones never share one. Outside the working tree, so the clean-tree judge never
-/// sees it; outside `.git`, so no git operation reaches it; and named `.noindex`, the
-/// one Spotlight exclusion measured to work. It is private (mode 0700) and must be a
-/// real directory owned by this user.
+/// Shared by every linked worktree of the clone (the cut tree is one), never by two clones.
+/// Outside the working tree, so the clean-tree judge never sees it; outside `.git`, so no
+/// git operation reaches it; named `.noindex`, the Spotlight exclusion measured to work
+/// (a `.metadata_never_index` marker is not, and `~/Library/Caches` is indexed). Private
+/// (mode 0700), a real directory owned by this user.
 #[derive(Debug, Clone)]
 pub struct CacheRoot {
     root: PathBuf,
@@ -111,16 +81,13 @@ pub struct CacheRoot {
 /// One take's exclusive hold on its [`CacheRoot`], from [`CacheRoot::hold`] until it
 /// drops.
 ///
-/// Every take of a clone — a cut, a dry run, a rehearsal, a Linux worker's run, from
-/// any worktree of it — syncs the same `snapshot/`, builds in the same `target/`, and
-/// recreates the same `stage/` and `cargo-home-build/`; a take that fails its
-/// [`Snapshot::verify`] removes the target. Two at once would compile each other's
-/// bytes and delete each other's output, so a take holds the cache from before its
-/// snapshot until what it built has left the cache. The hold is an advisory `flock` on
-/// `<cache>/lock` through [`aterm_update_core::FileLock`], whose drop lets go by
-/// `LOCK_UN` (clippy.toml's flock release rule), and which the kernel lets go of with a
-/// holder that dies, so there is no stale holder to judge. `<cache>/holder` names the
-/// holding pid for whoever waits.
+/// Every take of a clone (a cut, a dry run, a rehearsal, a Linux worker's run, from any
+/// worktree) shares `snapshot/`, `target/`, `stage/` and `cargo-home-build/`; two at once
+/// would compile each other's bytes and delete each other's output, so a take holds the
+/// cache from before its snapshot until what it built has left the cache. The hold is an
+/// advisory `flock` on `<cache>/lock` ([`aterm_update_core::FileLock`]), released by
+/// `LOCK_UN` on drop (clippy.toml's flock release rule) and by the kernel when a holder
+/// dies, so there is no stale holder to judge. `<cache>/holder` names the holding pid.
 pub struct CacheHold {
     cache: CacheRoot,
     _lock: aterm_update_core::FileLock,
@@ -266,9 +233,9 @@ impl CacheRoot {
         self.root.join("tmp")
     }
 
-    /// `ship release`'s preflight: the engine dry run's scratch clone and log, the
-    /// wasm32 check's source copy, target directory and log. Its own subtree, so no take
-    /// and no preflight touch the other's files.
+    /// `ship check`'s export and wasm32 gates: each run's engine copy, scratch clone,
+    /// wasm32 source copy and logs under `runs/`, and the shared wasm32 target
+    /// directory. Its own subtree, so no take and no check touch the other's files.
     #[must_use]
     pub fn preflight(&self) -> PathBuf {
         self.root.join("preflight")
@@ -324,7 +291,7 @@ pub fn private_dir(path: &Path, what: &str) -> Result<(), String> {
 pub struct Snapshot {
     /// `<cache>/snapshot`.
     pub root: PathBuf,
-    /// `<root>/src`: commit C's tree, submodules included (`<root>/vendor` holds
+    /// `<root>/src`: commit C's tree exactly, submodules included (`<root>/vendor` holds
     /// every crates.io package its lockfile names).
     pub src: PathBuf,
     /// `<root>/.cargo/config.toml`: [`SEALED_CONFIG`].
@@ -349,17 +316,17 @@ pub struct SyncReport {
     pub removed: usize,
 }
 
-/// Materialize commit `commit` of `repo` (and its submodules) into the held cache,
-/// vendor its crates.io dependencies with `targo`, write the sealed config, and digest
-/// it.
+/// Materialize commit `commit` of `repo` (and its submodules) into the held cache's `src/`
+/// and make it exact ([`take_tree`]); only then vendor its crates.io dependencies with
+/// `targo` from that tree, write the sealed config, prune the rest of the snapshot
+/// ([`Syncer::finish`]), and digest it.
 ///
 /// # Errors
-/// A commit that does not resolve, a submodule whose commit is not fetched, a
-/// symbolic link in the tree or the vendored output, an object whose bytes are not
-/// the object its id names, two tree paths the volume cannot hold apart, a lockfile
-/// naming a non-crates.io source or a registry package without a checksum, a
-/// vendoring failure, a vendored checksum or archive that disagrees with the
-/// lockfile, a root Cargo config, and any filesystem failure.
+/// A commit that does not resolve, an unfetched submodule commit, a symbolic link, an
+/// object whose bytes do not hash to its id, two tree paths the volume cannot hold apart,
+/// a lockfile source other than crates.io or a package without a checksum, a vendoring
+/// failure or a vendored result that disagrees with the lock, a root Cargo config, and any
+/// filesystem failure.
 pub fn materialize(
     repo: &Path,
     commit: &str,
@@ -386,11 +353,7 @@ pub fn materialize(
     let root = cache.snapshot();
     private_dir(&root, "release snapshot")?;
     let mut sync = Syncer::new(&root);
-
-    let mut repos = vec![repo.to_path_buf()];
-    let mut entries = Vec::new();
-    list_tree(&mut repos, 0, &commit, b"src/", &mut entries)?;
-    read_blobs(&repos, &entries, &mut sync)?;
+    take_tree(repo, &commit, &mut sync)?;
 
     let src = root.join("src");
     let vendored = vendor_into(&src, cache, targo, &mut sync)?;
@@ -509,16 +472,12 @@ fn object_id(kind: &str, data: &[u8], hex_digits: usize) -> Option<String> {
     Some(aterm_codec::hex::encode_lower(hash.finish().as_ref()))
 }
 
-/// One repository's `git cat-file --batch`, asked for one object at a time, every
-/// answer held to the id and the kind asked for.
-///
-/// `cat-file` serves an object's bytes without checking them against its id (and
-/// `ls-tree -r` reads every tree below a commit's root the same way), so the bytes' own
-/// hash is the only thing that says they are that object. No `--buffer`: git flushes
-/// each answer, so a question can wait for its answer before the next is asked.
+/// One repository's `git cat-file --batch`, asked for one object at a time, every answer
+/// held to the id and kind asked for. No `--buffer`: git flushes each answer, so a question
+/// can wait for its answer before the next is asked.
 struct ObjectReader {
     dir: PathBuf,
-    child: std::process::Child,
+    child: aterm_uds::spawnfd::Child,
     stdin: Option<std::process::ChildStdin>,
     stdout: BufReader<std::process::ChildStdout>,
 }
@@ -647,12 +606,10 @@ impl Drop for ObjectReader {
     }
 }
 
-/// Append every file of `commit`'s tree in `repos[repo]` under `prefix`, recursing
-/// into each gitlink at the commit it records. Every object is read through one
-/// [`ObjectReader`] per repository and held to its id: the commit to the id asked
-/// for, each tree and each gitlink's commit to the id its parent tree records. A
-/// gitlink whose repository is not checked out, or does not hold that commit, refuses
-/// with the command that fetches it.
+/// Append every file of `commit`'s tree in `repos[repo]` under `prefix`, recursing into
+/// each gitlink at the commit it records, one [`ObjectReader`] per repository. A gitlink
+/// whose repository is not checked out, or does not hold that commit, refuses with the
+/// command that fetches it.
 fn list_tree(
     repos: &mut Vec<PathBuf>,
     repo: usize,
@@ -829,6 +786,21 @@ fn submodule_at(sub: &Path, oid: &str, path: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Sync `commit`'s tree in `repo`, submodules included, into `sync`'s `src/`, then remove
+/// every path under `src/` the tree does not name ([`Syncer::prune_under`]) before anything
+/// reads it. Vendoring resolves the workspace from `src/`, where a leftover is not inert: a
+/// crate an older take left is still a member under `members = ["crates/*"]`, and
+/// `targo vendor --locked` refuses the commit's lock, which lacks it. The rest of the
+/// snapshot (`vendor/`, `.cargo/`) is pruned at [`Syncer::finish`], after the later steps
+/// have put theirs, so an unchanged vendored file keeps its mtime.
+fn take_tree(repo: &Path, commit: &str, sync: &mut Syncer) -> Result<(), String> {
+    let mut repos = vec![repo.to_path_buf()];
+    let mut entries = Vec::new();
+    list_tree(&mut repos, 0, commit, b"src/", &mut entries)?;
+    read_blobs(&repos, &entries, sync)?;
+    sync.prune_under(Path::new("src"))
+}
+
 /// Stream every entry's blob through one `git cat-file --batch` per repository
 /// into `sync`, each held to its tree entry's id.
 fn read_blobs(repos: &[PathBuf], entries: &[TreeEntry], sync: &mut Syncer) -> Result<(), String> {
@@ -895,8 +867,7 @@ fn read_blobs(repos: &[PathBuf], entries: &[TreeEntry], sync: &mut Syncer) -> Re
                     break;
                 }
                 data.pop();
-                // The header echoes the id asked for, whatever bytes follow it: only
-                // the bytes' own hash says they are that object.
+                // The header echoes the id asked for; only the bytes' hash says they are it.
                 if object_id("blob", &data, entry.oid.len()).as_deref() != Some(&entry.oid) {
                     result = Err(format!(
                         "the object store of {} answered {} with bytes that are not that \
@@ -978,18 +949,16 @@ fn check_relative(path: &[u8]) -> Result<(), String> {
 // the byte-wise sync
 // ---------------------------------------------------------------------------
 
-/// Writes a tree into `root` one path at a time, touching only what differs, then
-/// ([`Syncer::finish`]) removes every path it was not given.
+/// Writes a tree into `root` one path at a time, touching only what differs, then removes
+/// every path it was not given: in a completed subtree at [`Syncer::prune_under`], everywhere
+/// else at [`Syncer::finish`].
 ///
-/// EXACT ABOUT NAMES. A volume may find an entry under another spelling of its name:
-/// macOS's APFS ignores case and Unicode normalization by default (MEASURED on m3:
-/// `CARGO.TOML` and `src/Dir` both resolve there), so a commit that renames `src/dir`
-/// to `src/Dir` would see the old entry as the new one — kept, and a same-bytes file
-/// in it counted unchanged — and [`Syncer::finish`], which compares names byte for
-/// byte, would then delete it with everything just synced into it. So an entry is the
-/// one a path names only when its directory LISTS that exact name; one the volume finds
-/// under another spelling is removed before the path is written, and a tree that names
-/// two spellings the volume cannot hold apart is refused.
+/// Exact about names: APFS by default ignores case and Unicode normalization, so a rename of
+/// `src/dir` to `src/Dir` would find the old entry under the new name, keep it, and then the
+/// prune (which compares names byte for byte) would delete it with everything synced into
+/// it. An entry is the one a path names only when its directory lists that exact name; one
+/// found under another spelling is removed before the path is written, and a tree naming two
+/// spellings the volume cannot hold apart is refused.
 pub struct Syncer {
     root: PathBuf,
     keep: BTreeSet<PathBuf>,
@@ -1015,16 +984,7 @@ impl Syncer {
     /// anything else is written beside it and renamed over it, so a reader never sees
     /// half a file.
     pub fn put(&mut self, rel: &Path, data: &[u8], exec: bool) -> Result<(), String> {
-        let parts: Vec<&OsStr> = rel
-            .components()
-            .map(|c| match c {
-                Component::Normal(part) => Ok(part),
-                _ => Err(format!("refusing the take path {}", rel.display())),
-            })
-            .collect::<Result<_, _>>()?;
-        if parts.is_empty() {
-            return Err("refusing an empty take path".into());
-        }
+        let parts = take_parts(rel)?;
         let mut dir = PathBuf::new();
         for part in &parts[..parts.len() - 1] {
             dir.push(part);
@@ -1165,7 +1125,48 @@ impl Syncer {
         self.names.retain(|dir, _| !dir.starts_with(rel));
     }
 
-    /// Remove every path under the root that no [`Syncer::put`] named, and report.
+    /// `rel` (a file or a whole directory) was removed: counted, taken out of its
+    /// directory's listing, and every listing under it forgotten, so a later
+    /// [`Syncer::put`] sees the disk as it now is.
+    fn removed(&mut self, rel: &Path) {
+        let parent = rel.parent().unwrap_or_else(|| Path::new(""));
+        if let (Some(names), Some(name)) = (self.names.get_mut(parent), rel.file_name()) {
+            names.remove(name);
+        }
+        self.forget(rel);
+        self.report.removed += 1;
+    }
+
+    /// Remove now every path at or under `rel` that no [`Syncer::put`] has named, for a
+    /// subtree whose every path has been put; paths outside `rel` wait for
+    /// [`Syncer::finish`]. `rel` itself is matched by its exact name, as [`Syncer::put`]
+    /// matches it: when nothing was put under it, whatever the volume holds under that name
+    /// is stale and goes.
+    pub fn prune_under(&mut self, rel: &Path) -> Result<(), String> {
+        take_parts(rel)?;
+        let full = self.root.join(rel);
+        if self.keep.contains(rel) {
+            let meta = fs::symlink_metadata(&full)
+                .map_err(|e| format!("inspect {}: {e}", full.display()))?;
+            return if meta.is_dir() {
+                self.prune(&full, rel)
+            } else {
+                Ok(())
+            };
+        }
+        if let Some(meta) = self.exact(rel)? {
+            if meta.is_dir() {
+                fs::remove_dir_all(&full)
+            } else {
+                fs::remove_file(&full)
+            }
+            .map_err(|e| format!("remove {}: {e}", full.display()))?;
+            self.removed(rel);
+        }
+        Ok(())
+    }
+
+    /// Remove every remaining path under the root that no [`Syncer::put`] named, and report.
     pub fn finish(mut self) -> Result<SyncReport, String> {
         let root = self.root.clone();
         self.prune(&root, Path::new(""))?;
@@ -1188,13 +1189,29 @@ impl Syncer {
                     fs::remove_file(&path)
                 }
                 .map_err(|e| format!("remove {}: {e}", path.display()))?;
-                self.report.removed += 1;
+                self.removed(&here);
             } else if kind.is_dir() {
                 self.prune(&path, &here)?;
             }
         }
         Ok(())
     }
+}
+
+/// The components of a take path, refused unless it is a non-empty relative path of
+/// plain components: nothing a [`Syncer`] writes or removes is outside its root.
+fn take_parts(rel: &Path) -> Result<Vec<&OsStr>, String> {
+    let parts: Vec<&OsStr> = rel
+        .components()
+        .map(|c| match c {
+            Component::Normal(part) => Ok(part),
+            _ => Err(format!("refusing the take path {}", rel.display())),
+        })
+        .collect::<Result<_, _>>()?;
+    if parts.is_empty() {
+        return Err("refusing an empty take path".into());
+    }
+    Ok(parts)
 }
 
 /// Whether two inspections are of one directory entry.
@@ -1525,7 +1542,7 @@ fn vendor_into(
     path.push(":");
     path.push(SYSTEM_PATH);
     let home = std::env::var_os("HOME").ok_or("vendoring needs HOME")?;
-    let result = Command::new(targo)
+    let result = command(targo)
         .args(["vendor", "--locked", "--versioned-dirs", "--manifest-path"])
         .arg(src.join("Cargo.toml"))
         .arg(&out)
@@ -1714,10 +1731,8 @@ mod tests {
         String::from_utf8(out.stdout).unwrap().trim().to_owned()
     }
 
-    /// The reader answers only with an object's own bytes: another commit's bytes
-    /// planted under a commit's id — which a plain `git cat-file` serves, the negative
-    /// control — are refused, and so are an object of another kind than the one asked
-    /// for and one the store lacks; a refusal closes the reader.
+    /// The reader refuses planted bytes under an id (which plain `git cat-file` serves, the
+    /// negative control), a wrong kind and a missing object; a refusal closes it.
     #[test]
     fn the_object_reader_holds_every_answer_to_its_id_and_kind() {
         let scratch = aterm_tempfile::Builder::new()
@@ -1772,6 +1787,85 @@ mod tests {
                 "answered the commit {head} with bytes that are not that object"
             )),
             "{err}"
+        );
+    }
+
+    /// A path the new commit dropped is gone from `src/` when [`take_tree`] returns, before
+    /// [`vendor_into`] reads it (a `members = ["crates/*"]` workspace still takes a leftover
+    /// crate as a member). An unchanged file keeps its mtime, a leftover outside `src/` waits
+    /// for [`Syncer::finish`] (pruning `vendor/` early would rewrite every vendored file),
+    /// and what the later steps put there survives it.
+    #[test]
+    fn a_path_the_commit_dropped_is_gone_from_src_before_vendoring_reads_it() {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-take-")
+            .tempdir()
+            .unwrap();
+        let workspace = "[workspace]\nmembers = [\"crates/*\"]\n";
+        let kept = "[package]\nname = \"kept\"\n";
+        let repo = scratch.path().join("repo");
+        fs::create_dir_all(repo.join("crates/kept")).unwrap();
+        git(&repo, &["init", "-q"]);
+        fs::write(repo.join("Cargo.toml"), workspace).unwrap();
+        fs::write(repo.join("crates/kept/Cargo.toml"), kept).unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "the release"]);
+        let commit = git(&repo, &["rev-parse", "HEAD"]);
+
+        let root = scratch.path().join("snapshot");
+        for (rel, data) in [
+            ("src/Cargo.toml", workspace),
+            ("src/crates/kept/Cargo.toml", kept),
+            ("src/crates/gone/Cargo.toml", "[package]\nname = \"gone\"\n"),
+            ("vendor/old-1.0.0/src/lib.rs", "pub fn old() {}\n"),
+        ] {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, data).unwrap();
+        }
+        let mtime = |rel: &str| fs::metadata(root.join(rel)).unwrap().modified().unwrap();
+        let before = mtime("src/crates/kept/Cargo.toml");
+        let listed = |rel: &str| {
+            let mut names: Vec<String> = fs::read_dir(root.join(rel))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+
+        let mut sync = Syncer::new(&root);
+        take_tree(&repo, &commit, &mut sync).unwrap();
+        assert_eq!(
+            listed("src/crates"),
+            ["kept"],
+            "the tree vendoring resolves is the commit's alone"
+        );
+        assert_eq!(mtime("src/crates/kept/Cargo.toml"), before);
+        assert_eq!(listed("vendor"), ["old-1.0.0"]);
+
+        sync.put(
+            Path::new("vendor/new-1.0.0/src/lib.rs"),
+            b"pub fn new() {}\n",
+            false,
+        )
+        .unwrap();
+        sync.put(
+            Path::new(".cargo/config.toml"),
+            SEALED_CONFIG.as_bytes(),
+            false,
+        )
+        .unwrap();
+        let report = sync.finish().unwrap();
+        assert_eq!(listed("vendor"), ["new-1.0.0"]);
+        assert_eq!(listed(".cargo"), ["config.toml"]);
+        assert_eq!(
+            report,
+            SyncReport {
+                written: 2,
+                unchanged: 2,
+                removed: 2,
+            }
         );
     }
 }

@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-#![deny(clippy::all)]
-#![deny(unsafe_op_in_unsafe_fn)]
 // Trust verification tool attribute (`#[trust::skip]`) registration, mirroring
 // aterm-log / aterm-types. Active only under the `trust_verify` cfg.
 #![cfg_attr(trust_verify, feature(register_tool))]
@@ -39,6 +37,13 @@
 //!     // Use injection.argv_override if Some (bash --rcfile)
 //! }
 //! ```
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_types,
+        reason = "test code: a stand-in child may inherit descriptors"
+    )
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -46,11 +51,7 @@ use std::sync::{Mutex, PoisonError};
 /// Embedded shell integration scripts (compiled into the binary).
 ///
 /// This crate is the canonical owner of the shell script bodies (`aterm-core`
-/// re-exports it as `shell_integration`). The macOS
-/// app bundle ships byte-identical copies in
-/// `apps/aterm-mac/Sources/ATermMac/Resources/ShellIntegration/`, and the
-/// shell-integration test module enforces that parity so cross-consumer drift
-/// fails in Rust tests instead of shipping silently.
+/// re-exports it as `shell_integration`).
 pub mod scripts {
     /// zsh shell integration (OSC 7/133 + prompt override).
     pub const ZSH: &str = include_str!("scripts/aterm_shell_integration.zsh");
@@ -58,8 +59,7 @@ pub mod scripts {
     pub const BASH: &str = include_str!("scripts/aterm_shell_integration.bash");
     /// fish shell integration (OSC 7/133 + prompt override).
     pub const FISH: &str = include_str!("scripts/aterm_shell_integration.fish");
-    /// PowerShell / pwsh shell integration (OSC 7/133; no macOS bundle
-    /// counterpart — the Windows/pwsh path ships from the Rust binary only).
+    /// PowerShell / pwsh shell integration (OSC 7/133).
     pub const POWERSHELL: &str = include_str!("scripts/aterm_shell_integration.ps1");
 
     /// The comment that opens the BODY of the zsh, bash and fish scripts:
@@ -295,15 +295,15 @@ pub fn generate_nonce() -> ShellNonce {
 /// platform.
 ///
 /// Unix and Windows go through [`aterm_uds::rand::fill`] — `getentropy(2)` with
-/// a bounded `read_exact` fallback, `BCryptGenRandom` on Windows — the audited
-/// helper `tools/grep_guard.sh` B4 requires.
+/// a bounded `read_exact` fallback, `BCryptGenRandom` on Windows — the
+/// workspace's one audited entropy helper.
 ///
 /// # No `wasm32` arm
 /// The callers (aterm-gui's `spawn.rs`, `shell_rekey.rs`) mint a nonce for a
 /// spawned shell, and a browser spawns none. A target with no `aterm_uds::rand`
 /// gets no `generate_nonce`, so reaching for one is a name error rather than a
 /// nonce from an unaudited source. Adding a target means adding its CSPRNG here
-/// first; `tools/grep_guard.sh` B18 bars third-party entropy crates.
+/// first; deny.toml bars third-party entropy crates (`forge check` [OB-18]).
 ///
 /// # Panics
 /// When the OS CSPRNG is unavailable. Deliberate and documented: a weaker
@@ -561,6 +561,65 @@ pub fn ensure_script_set() -> Result<PathBuf, std::io::Error> {
     ensure_cached(cache_dir(), &SCRIPTS_WRITTEN)
 }
 
+/// The zsh loader and body of a script folder (`dir`, as [`ensure_script_set`]
+/// returns it), compiled to wordcode beside them by `zsh`, the shell the
+/// sessions run: `<script>.zwc`, which zsh sources in place of the text when it
+/// is not older than the text and was made by the same zsh version, and passes
+/// over in silence when it is not. One the folder already holds is kept.
+///
+/// WHY: a fresh zsh parses the whole loader before its first prompt. Measured
+/// 2026-10-16 (zsh 5.9, a PTY, the captured aterm spawn env, interleaved, n=12):
+/// the compiled loader brought the first prompt 0.7 ms sooner than the text
+/// without its comment lines ([`script_set`]), 1.7 ms sooner than the commented
+/// text.
+///
+/// Each is compiled under a scratch name and renamed into place, so a shell
+/// starting meanwhile reads the whole wordcode or none (`zcompile` writes its
+/// output in place). `-f`: the parse sees zsh's default options and no alias,
+/// where the text was parsed under whatever the user's `.zshenv` (sourced first)
+/// had set; `-U` expands no alias into the wordcode. A failure leaves the folder
+/// as it was, and its shells parse the text.
+///
+/// Only where `aterm_uds` spawns a child (its target table in `Cargo.toml`): a
+/// browser build of this crate has no process to run a zsh in.
+///
+/// # Errors
+/// When `zsh` cannot be run, `zcompile` fails, or the rename does.
+#[cfg(any(unix, windows))]
+pub fn compile_zsh_scripts(dir: &Path, zsh: &Path) -> Result<(), std::io::Error> {
+    for name in [
+        "aterm_shell_integration.zsh",
+        "aterm_shell_integration_body.zsh",
+    ] {
+        let compiled = dir.join(format!("{name}.zwc"));
+        if compiled.exists() {
+            continue;
+        }
+        // Ends in `.zwc`, or `zcompile` would append it.
+        let scratch = dir.join(format!(".{name}.tmp-{}.zwc", scratch_suffix()));
+        let status = aterm_uds::spawnfd::command(zsh)
+            .args(["-f", "-c", "zcompile -U -- \"$1\" \"$2\"", "zsh"])
+            .arg(&scratch)
+            .arg(dir.join(name))
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .status();
+        let placed = match status {
+            Ok(status) if status.success() => std::fs::rename(&scratch, &compiled),
+            Ok(status) => Err(std::io::Error::other(format!(
+                "zcompile of {name} exited {status}"
+            ))),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = placed {
+            let _ = std::fs::remove_file(&scratch);
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
 /// [`prepare`] body with the cache root and the memoization state injected for
 /// testability.
 ///
@@ -600,10 +659,16 @@ fn ensure_cached(
         install_script_set(&root)?;
         *written = Some(base.clone());
         drop(written);
-        // wasm-clock-guard: allow — script installation runs only for a shell a
-        // host spawns (`prepare`'s one caller is aterm-gui spawn.rs); a browser
-        // spawns none and has no filesystem, and this clock is compared with
-        // file mtimes, which are std's.
+        // Script installation runs only for a shell a host spawns (`prepare`'s
+        // one caller is aterm-gui spawn.rs): a browser spawns none, and this
+        // clock is compared with file mtimes, which are std's.
+        #[cfg_attr(
+            all(target_arch = "wasm32", target_os = "unknown"),
+            expect(
+                clippy::disallowed_methods,
+                reason = "a browser spawns no shell, so it never installs scripts"
+            )
+        )]
         collect_old_script_sets(&root, std::time::SystemTime::now());
     } else {
         drop(written);
@@ -621,19 +686,31 @@ fn ensure_cached(
 /// loader sources it from a folder like this one when its host points it here.
 /// A body is part of the set, so it is part of the address, and a folder that
 /// names a body holds exactly the bytes that address says.
+///
+/// The zsh and bash loaders, and so their bodies, are written as the shell runs
+/// them: without their comment lines ([`installed_zsh`], [`installed_bash`]).
 fn script_set() -> [(&'static str, std::borrow::Cow<'static, str>); 10] {
     [
-        ("aterm_shell_integration.zsh", lf_only(scripts::ZSH)),
-        ("aterm_shell_integration.bash", lf_only(scripts::BASH)),
+        (
+            "aterm_shell_integration.zsh",
+            std::borrow::Cow::Borrowed(installed_zsh()),
+        ),
+        (
+            "aterm_shell_integration.bash",
+            std::borrow::Cow::Borrowed(installed_bash()),
+        ),
         ("aterm_shell_integration.fish", lf_only(scripts::FISH)),
-        ("aterm_shell_integration_body.zsh", body_file(scripts::ZSH)),
+        (
+            "aterm_shell_integration_body.zsh",
+            body_file(installed_zsh()),
+        ),
         (
             "aterm_shell_integration_body.bash",
-            body_file(scripts::BASH),
+            body_file(installed_bash()),
         ),
         (
             "aterm_shell_integration_body.fish",
-            body_file(scripts::FISH),
+            body_file(&lf_only(scripts::FISH)),
         ),
         // No BOM on purpose: the script is ASCII-only so Windows PowerShell 5.1
         // (which decodes BOM-less source as ANSI) reads it correctly.
@@ -654,15 +731,63 @@ fn script_set() -> [(&'static str, std::borrow::Cow<'static, str>); 10] {
 }
 
 /// A loader's BODY as its own file: [`BODY_FILE_HEADER`], then the text between
-/// the loader's markers ([`scripts::body`]), LF-normalised like the loader.
+/// the markers ([`scripts::body`]) of `loader`, the loader as the folder holds it.
 ///
 /// # Panics
-/// When `script` has no body markers — a build whose zsh/bash/fish script lost
+/// When `loader` has no body markers — a build whose zsh/bash/fish script lost
 /// them would ship folders with no body a running shell could take, so it fails
 /// at its first `prepare` (and in this crate's tests) instead.
-fn body_file(script: &'static str) -> std::borrow::Cow<'static, str> {
-    let body = scripts::body(script).expect("a zsh/bash/fish script carries its body markers");
-    std::borrow::Cow::Owned(format!("{BODY_FILE_HEADER}{}", lf_only(body)))
+fn body_file(loader: &str) -> std::borrow::Cow<'static, str> {
+    let body = scripts::body(loader).expect("a zsh/bash/fish script carries its body markers");
+    std::borrow::Cow::Owned(format!("{BODY_FILE_HEADER}{body}"))
+}
+
+/// The zsh loader as a script folder holds it: [`scripts::ZSH`] LF-normalised,
+/// without its comment lines ([`strip_comment_lines`]). Built once per process.
+fn installed_zsh() -> &'static str {
+    static INSTALLED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| strip_comment_lines(&lf_only(scripts::ZSH)))
+}
+
+/// The bash loader as a script folder holds it ([`installed_zsh`]'s twin).
+fn installed_bash() -> &'static str {
+    static INSTALLED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| strip_comment_lines(&lf_only(scripts::BASH)))
+}
+
+/// `script` without its comment lines: every line whose first character past
+/// leading blanks is `#`, except a first-line `#!` and the BODY markers
+/// ([`scripts::BODY_BEGIN`], [`scripts::BODY_END`]), which [`scripts::body`]
+/// cuts at.
+///
+/// WHY: a shell pays to READ every line it sources, whatever the line holds, and
+/// the scripts are mostly comment — 858 of the zsh loader's 1,538 lines, 695 of
+/// bash's 1,289. Measured 2026-10-16 (zsh 5.9, bash 3.2.57, a PTY, the captured
+/// aterm spawn env, interleaved, n=12 each): taking them out brought a fresh
+/// zsh's first prompt 1.2 ms sooner and bash's 1.9 ms; blanking them to empty
+/// lines saved zsh nothing, so the lines go, and a shell's error names a line
+/// of the file it read, not of this source. The comments stay where they are
+/// read: in this crate.
+///
+/// SAFE because no comment line of these scripts sits where a shell would read
+/// it as TEXT — inside a quoted string or a here-document spanning lines, or
+/// after a line continuation. That is held by the shell's own reading, not by
+/// this function: `installed_scripts_run_the_code_of_their_source` has a real
+/// zsh and bash print the canonical text of each script with and without its
+/// comment lines, and a script that ever puts such a line in a string fails it.
+fn strip_comment_lines(script: &str) -> String {
+    let mut out = String::with_capacity(script.len());
+    for (index, line) in script.split_inclusive('\n').enumerate() {
+        let code = line.trim_start_matches([' ', '\t']);
+        let comment = code.starts_with('#')
+            && !(index == 0 && line.starts_with("#!"))
+            && !code.starts_with(scripts::BODY_BEGIN)
+            && !code.starts_with(scripts::BODY_END);
+        if !comment {
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 /// The name of this build's script folder: the first 16 hex digits of a SHA-256
@@ -705,8 +830,13 @@ fn script_set_matches(dir: &Path) -> bool {
 /// the first rename taking it away from under the second (`NotFound`).
 fn scratch_suffix() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    // wasm-clock-guard: allow — only for a scratch folder beside the script
-    // sets, which exist only where a host spawns shells (see `prepare`).
+    #[cfg_attr(
+        all(target_arch = "wasm32", target_os = "unknown"),
+        expect(
+            clippy::disallowed_methods,
+            reason = "only for a scratch folder beside the script sets, which a browser never writes"
+        )
+    )]
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -1317,7 +1447,7 @@ const CMD_PROMPT_TITLE: &str = "$e]0;$P$e\\";
 ///   is how a cmd user keeps a title of their own. (The script-driven shells'
 ///   `ATERM_DISABLE_PROMPT_TITLES` has no cmd counterpart: cmd cannot read a
 ///   variable in `PROMPT`, and aterm's own run-time code reads no user knob
-///   from its environment — the owner's rule, `env_reads.rs`.) `$P`
+///   from its environment — the owner's rule.) `$P`
 ///   needs no sanitising, unlike the pwsh title: a Win32 file name cannot hold
 ///   a character from 1 through 31, so no directory can end the OSC early. It
 ///   is the full path, not `~\…` — cmd's prompt has no string operations.

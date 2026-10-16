@@ -28,8 +28,9 @@
 //! known-answer-tested, widely-audited implementation of a standard AEAD), and
 //! this crate's own known-answer test pins the full ciphertext and tag of the
 //! draft-irtf-cfrg-xchacha §A.3.1 vector. This crate is the ONE place astream
-//! pulls a cipher dependency — deliberately isolated, exactly as `astream-cap`
-//! isolates `sha2`. `forbid(unsafe_code)` applies to this crate's own code.
+//! pulls a cipher dependency — deliberately isolated; the handshake's HMAC/HKDF
+//! run over the workspace's own SHA-256 (`astream-digest`).
+//! `forbid(unsafe_code)` applies to this crate's own code.
 #![forbid(unsafe_code)]
 
 mod stream;

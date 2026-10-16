@@ -55,10 +55,9 @@ pub fn pid_alive(pid: u32) -> bool {
         // Can't even query it: only "exists but is not ours" counts as alive.
         return unsafe { ffi::GetLastError() } == ERROR_ACCESS_DENIED;
     }
-    // Unsignaled (WAIT_TIMEOUT) means still running. `GetExitCodeProcess ==
-    // STILL_ACTIVE` alone is not enough: a process that exited with code 259
-    // collides with that sentinel. Windows reuses pids quickly, so "alive" is
-    // advisory; `socket_is_live` is the authoritative probe.
+    // Unsignaled (WAIT_TIMEOUT) means still running; `GetExitCodeProcess == STILL_ACTIVE`
+    // alone is not enough, since a process can exit with code 259. Windows reuses pids
+    // quickly, so "alive" is advisory; aterm-gui's `socket_is_live` is the authoritative probe.
     let mut code: u32 = 0;
     let alive = unsafe { WaitForSingleObject(handle, 0) } == WAIT_TIMEOUT
         && unsafe { ffi::GetExitCodeProcess(handle, &mut code) } != 0
@@ -93,9 +92,8 @@ pub fn read_process_birth(pid: i32) -> Option<ProcessBirth> {
     read_bsdinfo(pid).map(|info| info.birth)
 }
 
-/// The pid of `pid`'s parent, or `None` on the terms of [`read_process_birth`]
-/// (no such process of THIS uid, or a zombie). `Some(1)` says its launcher
-/// has exited and launchd adopted it: an orphan.
+/// The pid of `pid`'s parent, or `None` on the terms of [`read_process_birth`]. `Some(1)`: its
+/// launcher has exited and launchd adopted it.
 ///
 /// macOS: `proc_pidinfo(PROC_PIDTBSDINFO)`'s `pbi_ppid`. Other platforms: `None`.
 #[cfg(target_vendor = "apple")]
@@ -111,13 +109,11 @@ pub fn read_process_parent(_pid: i32) -> Option<u32> {
     None
 }
 
-/// The executable the kernel records for `pid` (`proc_pidpath`), on the terms
-/// of [`read_process_birth`]: `None` unless it is a live process of THIS uid,
-/// AND `None` when the kernel cannot name the file any more — measured
-/// 2026-09-30: `proc_pidpath` returns 0 for a live process whose binary was
-/// deleted (`lsof` still shows the vnode's old path). So a live process
-/// ([`read_process_birth`] is `Some`) with no path here runs a deleted binary.
-/// Other platforms: `None`.
+/// The executable the kernel records for `pid` (`proc_pidpath`), on the terms of
+/// [`read_process_birth`], and `None` when the kernel cannot name the file any more:
+/// `proc_pidpath` returns 0 for a live process whose binary was deleted. So a live process
+/// ([`read_process_birth`] is `Some`) with no path here runs a deleted binary. Other
+/// platforms: `None`.
 #[cfg(target_vendor = "apple")]
 #[must_use]
 // Skip: bottoms out at the `proc_pidpath` FFI call.
@@ -147,7 +143,7 @@ pub fn read_process_path(_pid: i32) -> Option<std::path::PathBuf> {
     None
 }
 
-/// The `proc_bsdinfo` fields this module reads, for a live process of THIS uid.
+/// The `proc_bsdinfo` fields this module reads, for a live process of this uid.
 #[cfg(target_vendor = "apple")]
 struct BsdInfo {
     birth: ProcessBirth,
@@ -160,11 +156,9 @@ struct BsdInfo {
 // Skip: bottoms out at the `proc_pidinfo`/`geteuid` FFI calls.
 #[cfg_attr(trust_verify, trust::skip)]
 fn read_bsdinfo(pid: i32) -> Option<BsdInfo> {
-    // `struct proc_bsdinfo` (sys/proc_info.h): 136 bytes on both Apple ABIs,
-    // measured with the SDK (`offsetof`) on 2026-09-28. Read as bytes at the
-    // measured offsets rather than declared as a struct, so this leaf crate
-    // stays dependency-free and a size change fails the exact-size check below
-    // instead of misreading a field.
+    // `struct proc_bsdinfo` (sys/proc_info.h): 136 bytes on both Apple ABIs (the SDK's
+    // `offsetof`). Read as bytes at those offsets, so this leaf crate stays dependency-free
+    // and a size change fails the exact-size check below instead of misreading a field.
     const PROC_PIDTBSDINFO: i32 = 3;
     const SIZE: usize = 136;
     const STATUS: usize = 4;
@@ -565,9 +559,9 @@ pub mod procfs {
     }
 }
 
-/// End this process by `SIGKILL`, here: no destructor, exit handler or buffered
-/// flush runs. For fault injection that must die at one exact point; unlike
-/// `abort`'s `SIGABRT`, `SIGKILL` makes macOS write no crash report.
+/// End this process by `SIGKILL`, here: no destructor, exit handler or buffered flush runs.
+/// For fault injection that must die at one exact point; a `SIGKILL` death leaves no macOS
+/// crash report.
 #[cfg(unix)]
 // Skip: signals this process via the `getpid`/`kill` syscalls (FFI, unverifiable body).
 #[cfg_attr(trust_verify, trust::skip)]
@@ -581,21 +575,27 @@ pub fn kill_self_now() -> ! {
     // SAFETY: neither call takes a pointer, and `getpid` cannot fail.
     let sent = unsafe { kill(getpid(), SIGKILL) };
     if sent == 0 {
-        // SIGKILL delivery is asynchronous: in a multithreaded process this
-        // thread can return from `kill` before the kernel ends the process, so
-        // wait here, running nothing, rather than fall through to `abort`.
+        // Delivery is asynchronous: in a multithreaded process this thread can return from
+        // `kill` before the kernel ends the process, so it waits here, running nothing.
         loop {
             std::thread::park();
         }
     }
     // Only if the kernel refused our own pid, which it does not; keeps the `!`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "unreachable: the kernel never refuses SIGKILL to this process's own pid"
+    )]
     std::process::abort()
 }
 
-/// End this process here, running nothing (see the Unix twin): Windows has no
-/// `SIGKILL`.
+/// End this process here, running nothing (see the Unix twin); Windows has no `SIGKILL`.
 #[cfg(windows)]
 pub fn kill_self_now() -> ! {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Windows has no SIGKILL: abort ends the process at once, and no macOS crash report exists here"
+    )]
     std::process::abort()
 }
 
@@ -603,10 +603,8 @@ pub fn kill_self_now() -> ! {
 mod start_tests {
     use super::{BootClock, procfs};
 
-    /// What Linux wrote (`USER_HZ` 100): a process whose command name holds a
-    /// space and both parentheses, running and then a zombie, and the
-    /// `/proc/self/stat` of a `cat` read at uptime 518318.71 s (field 22 is
-    /// 51831871 ticks).
+    /// Real `/proc` text (`USER_HZ` 100): a command name holding a space and both parentheses,
+    /// running and as a zombie, and a `cat` read at uptime 518318.71 s.
     const TRICKY: &str = "7 (a) b (c) S 1 1 1 0 -1 4194368 63 0 0 0 0 0 0 0 20 0 1 0 51832760 \
          7032832 463 18446744073709551615 205458244435968 205458248030472 281474793899808 0 0 0 \
          0 128 0 1 0 0 17 0 0 0 0 0 0 205458248044264 205458248115556 205458772447232 \
@@ -620,11 +618,9 @@ mod start_tests {
     const STATUS_501: &str = "Name:\tcat\nState:\tR (running)\nTgid:\t13\nPid:\t13\n\
          Uid:\t501\t502\t501\t502\nGid:\t20\t20\t20\t20\n";
 
-    /// The Linux start record parsed from what Linux writes, on any host: field
-    /// 22 counted from the command name's last `)`, the effective uid as the
-    /// second `Uid:` id, and a tick as its first instant. Another pid's line, a
-    /// zombie, another effective uid, two disagreeing `stat` reads, a line cut
-    /// short and a zero tick rate all answer `None`.
+    /// Field 22 counted from the command name's last `)`, the effective uid as the second
+    /// `Uid:` id, a tick as its first instant; another pid's line, a zombie, another euid, two
+    /// disagreeing `stat` reads, a short line and a zero tick rate answer `None`.
     #[test]
     fn a_linux_start_is_read_off_proc_as_linux_writes_it() {
         assert_eq!(procfs::stat_start(TRICKY, 7), Some(('S', 51_832_760)));
@@ -677,17 +673,11 @@ mod start_tests {
         assert_eq!(procfs::tick_start(7, 3), Some(BootClock(2_333_333_333)));
     }
 
-    /// A start record orders a process against a boot-clock reading: a child
-    /// spawned after a reading starts later, and no later than a reading taken
-    /// once it runs; this test process started earlier; an ended process has
-    /// no record. The bracket pins the unit (a wrong `USER_HZ` lands outside
-    /// it). The child is spawned two Linux ticks after the first reading, since
-    /// truncation errs toward earlier. On Apple the wall record must match
-    /// [`super::read_process_birth`]; where neither is wired, there is no clock
-    /// and no record.
-    ///
-    /// Under Rosetta there is no boot clock, and the child is ordered on its
-    /// wall record instead ([`super::apple_boot_clock`]).
+    /// A child spawned after a boot-clock reading starts later, and no later than a reading
+    /// taken once it runs; this process started earlier; an ended process has no record. The
+    /// bracket pins the unit (a wrong `USER_HZ` lands outside it); the 20 ms gap covers two
+    /// Linux ticks of truncation. On Apple the wall record matches `read_process_birth`; under
+    /// Rosetta the child is ordered on its wall record instead.
     #[cfg(unix)]
     #[test]
     fn a_child_started_after_a_boot_clock_reading_reads_later() {
@@ -725,10 +715,8 @@ mod start_tests {
         assert_eq!(super::read_process_start(1), None, "never pid 1");
     }
 
-    /// The translated half of
-    /// [`a_child_started_after_a_boot_clock_reading_reads_later`]: the start
-    /// record is still read, and its wall record orders a child spawned after
-    /// a wall-clock reading as later.
+    /// The translated half of [`a_child_started_after_a_boot_clock_reading_reads_later`]: the
+    /// wall record orders a child spawned after a wall-clock reading as later.
     #[cfg(unix)]
     fn a_child_started_after_a_wall_reading_reads_later() {
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -750,10 +738,8 @@ mod start_tests {
         assert!(wall > moment, "{wall:?} after {moment:?}");
     }
 
-    /// A translated process has no boot clock: with the translation injected,
-    /// `Translated` answers `None` without reading the clock, `Native` answers
-    /// the reading as is, and `Unknown` reads it too (its only possible error
-    /// is a reading too late).
+    /// With the translation injected, `Translated` answers `None` without reading the clock,
+    /// and `Native` and `Unknown` answer the reading as is.
     #[test]
     fn a_translated_process_reads_no_boot_clock() {
         let native_ticks = 16_941_646_465_128;
@@ -854,13 +840,11 @@ mod parent_and_path_tests {
         );
     }
 
-    /// An ORPHAN reads parent 1: a shell backgrounds a `sleep` and exits, and
-    /// launchd adopts the sleep. The control is the shell's own child while the
-    /// shell still runs. The sleep dies by SIGKILL, never a crash signal.
+    /// An orphan reads parent 1: a shell backgrounds a `sleep` and exits, and launchd adopts
+    /// the sleep. The control is the shell's own child while the shell still runs.
     #[test]
     fn an_orphan_reads_parent_one() {
-        // `spawnfd`'s: the shell and the `sleep` it leaves hold their stdio and
-        // nothing else of this process, not another test thread's pipe.
+        // `spawnfd`'s, so neither the shell nor its `sleep` holds another test thread's pipe.
         let mut shell = crate::spawnfd::command("/bin/sh")
             .args(["-c", "/bin/sleep 120 & echo $!; read -r _"])
             .stdin(crate::spawnfd::Stdio::piped())

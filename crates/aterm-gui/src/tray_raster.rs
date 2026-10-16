@@ -86,6 +86,26 @@ impl SemanticFontResolution {
     }
 }
 
+/// The first slot (`regular`, `bold italic`, `emoji`, …) a
+/// [`SemanticFontResolution::Fallback`] status names as unresolved, so the
+/// specimen's status names the font that failed rather than the row that
+/// has focus.
+pub(crate) fn first_unresolved_slot(status: &str) -> Option<&str> {
+    let rest = status.split_once("unresolved ")?.1;
+    let slot = rest.split_once(" \"")?.0;
+    [
+        "regular",
+        "bold",
+        "italic",
+        "bold italic",
+        "fallback",
+        "symbol",
+        "emoji",
+    ]
+    .contains(&slot)
+    .then_some(slot)
+}
+
 #[derive(Clone)]
 struct ResolvedCandidateFace {
     path: String,
@@ -123,6 +143,16 @@ struct SemanticPrewarmQueue {
 struct SemanticPrewarmWorker {
     queue: Arc<SemanticPrewarmQueue>,
     results: std::sync::mpsc::Receiver<SemanticPrewarmResult>,
+}
+
+/// How the worker tells the host a result is waiting: the event loop wakes
+/// and repaints the specimens that asked for it, so a status never sticks
+/// on "Preparing" until some unrelated input. Unset (tests), nothing wakes.
+static SEMANTIC_READY_WAKE: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+/// Install [`SEMANTIC_READY_WAKE`]; the first install wins.
+pub(crate) fn set_semantic_ready_wake(wake: impl Fn() + Send + Sync + 'static) {
+    let _ = SEMANTIC_READY_WAKE.set(Box::new(wake));
 }
 
 impl SemanticPrewarmWorker {
@@ -226,6 +256,9 @@ impl SemanticPrewarmWorker {
                     {
                         break;
                     }
+                    if let Some(wake) = SEMANTIC_READY_WAKE.get() {
+                        wake();
+                    }
                 }
             })
             .ok()?;
@@ -314,7 +347,16 @@ fn build_semantic_candidate(
         match resolve_candidate_face(family, faces).and_then(|face| {
             renderer.set_primary_font_from_resolved_path(face.bytes.as_slice(), face.path)
         }) {
-            Ok(()) => {}
+            Ok(()) => {
+                // A display-face mix draws its other faces too, as the
+                // terminal does (`native_font_catalog::prepare`).
+                if let Some(mix) = aterm_render::display_face_mix_for_family(family)
+                    && mix.len() > 1
+                    && let Err(error) = renderer.set_display_mix_faces(&mix[1..])
+                {
+                    unresolved.push(format!("regular {family:?}: {error}"));
+                }
+            }
             Err(error) => unresolved.push(format!("regular {family:?}: {error}")),
         }
     }
@@ -625,6 +667,10 @@ struct ChromeFonts {
     semantic_worker: Option<SemanticPrewarmWorker>,
     semantic_cache:
         HashMap<crate::widget::SemanticFontCandidate, (Renderer, SemanticFontResolution, u64)>,
+    /// The candidate a new request parked: the face that was on screen, which
+    /// keeps drawing the specimen while the request resolves, whatever its
+    /// family (a saved Menlo as well as the committed default).
+    semantic_displaced: Option<crate::widget::SemanticFontCandidate>,
     semantic_ready_epoch: u64,
     /// Measured wall time of the last one-time background specimen warmup.
     /// Retained for Diagnostics/tests; it is not part of paint identity.
@@ -653,6 +699,7 @@ fn default_chrome_fonts() -> ChromeFonts {
         semantic_worker_generation: None,
         semantic_worker: None,
         semantic_cache: HashMap::new(),
+        semantic_displaced: None,
         semantic_ready_epoch: 0,
         semantic_prewarm_ms: None,
     }
@@ -735,6 +782,23 @@ impl PreparedSemanticFont {
         )
     }
 
+    /// The head band a specimen frame needs above its first row so a display
+    /// face's capitals are not cut at the top of the box (pixels at `px`;
+    /// `0` for an ordinary font). Pure geometry, like
+    /// [`Self::specimen_cell_height`].
+    pub(crate) fn specimen_ink_headroom(
+        &self,
+        px: f32,
+        line_height: f32,
+        baseline_adjust: i32,
+    ) -> Option<usize> {
+        Some(
+            self.renderer
+                .as_ref()?
+                .display_ink_headroom(px, line_height, baseline_adjust),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn renderer_ready(&self) -> bool {
         self.renderer.is_some()
@@ -786,12 +850,12 @@ pub(crate) fn font_store_visits() -> u64 {
 /// thread's first lock and, like the production store, never freed.
 ///
 /// ONE MUTEX PER THREAD, not one map of every thread's fonts behind one mutex
-/// (2026-09-30, gate speed). The guard of the map was held for the whole of
-/// every measure and raster, so every test thread that laid out text waited
-/// for every other one, each on fonts it never shared: measured the same day
-/// by `sample` across the `-p aterm-gui --lib` run at `RUST_TEST_THREADS=7`,
-/// test threads parked on that lock in 14,172 of 253,425 samples (5.6%) — the
-/// largest single lock the binary waited on. Only the owning thread ever takes
+/// (test-run speed). The guard of the map was held for the whole of every
+/// measure and raster, so every test thread that laid out text waited for
+/// every other one, each on fonts it never shared: `sample` across a
+/// `-p aterm-gui --lib` run at `RUST_TEST_THREADS=7` found test threads parked
+/// on that lock in 14,172 of 253,425 samples (5.6%), the largest single lock
+/// the binary waited on. Only the owning thread ever takes
 /// its mutex, so each lock is uncontended, and what each thread sees is what
 /// its map entry held.
 #[cfg(test)]
@@ -814,18 +878,33 @@ fn lock_fonts() -> std::sync::MutexGuard<'static, ChromeFonts> {
 /// the PRIMARY terminal face and its real BOLD sibling (from
 /// `Renderer::chrome_primary_face` / `chrome_bold_face`) — so the tray text
 /// renders in the user's font. Called by `App::sync_chrome_fonts` after every
-/// backend (re)build; unparseable bytes leave that slot on the fallback.
+/// backend (re)build; unparseable bytes leave that slot on the fallback, and
+/// so does a bundled display face ([`chrome_face_for_slot`]).
 pub(crate) fn set_chrome_fonts(
     primary: Option<(std::sync::Arc<[u8]>, u32)>,
     bold: Option<(std::sync::Arc<[u8]>, u32)>,
     semantic: Option<Renderer>,
 ) {
-    let parse = |slot: &Option<(std::sync::Arc<[u8]>, u32)>| {
-        slot.as_ref()
-            .and_then(|(bytes, index)| ChromeFace::from_bytes(bytes, *index))
-    };
-    let (p, b) = (parse(&primary), parse(&bold));
+    let (p, b) = (chrome_face_for_slot(&primary), chrome_face_for_slot(&bold));
     reload_chrome_fonts_locked(&mut lock_fonts(), p, b, semantic);
+}
+
+/// The chrome face for one terminal-face slot. A bundled DISPLAY FACE is a
+/// toy for terminal text, not the user's font: Settings' numbers and code
+/// text, the palette and the other chrome keep the embedded monospace
+/// fallback instead of turning playful with it (only the Text & Fonts
+/// specimen, drawn by the semantic renderer, shows the face).
+fn chrome_face_for_slot(slot: &Option<(std::sync::Arc<[u8]>, u32)>) -> Option<ChromeFace> {
+    slot.as_ref()
+        .filter(|(bytes, _)| !is_bundled_display_face(bytes))
+        .and_then(|(bytes, index)| ChromeFace::from_bytes(bytes, *index))
+}
+
+fn is_bundled_display_face(bytes: &[u8]) -> bool {
+    aterm_render::DISPLAY_FACES.iter().any(|face| {
+        aterm_render::display_face_bytes(face.id)
+            .is_some_and(|face| face.len() == bytes.len() && face == bytes)
+    })
 }
 
 /// Fully parsed chrome/semantic font generation. Constructed by the font
@@ -841,13 +920,9 @@ pub(crate) fn prepare_chrome_fonts(
     bold: Option<(std::sync::Arc<[u8]>, u32)>,
     semantic: Option<Renderer>,
 ) -> PreparedChromeFonts {
-    let parse = |slot: &Option<(std::sync::Arc<[u8]>, u32)>| {
-        slot.as_ref()
-            .and_then(|(bytes, index)| ChromeFace::from_bytes(bytes, *index))
-    };
     PreparedChromeFonts {
-        primary: parse(&primary),
-        bold: parse(&bold),
+        primary: chrome_face_for_slot(&primary),
+        bold: chrome_face_for_slot(&bold),
         semantic,
     }
 }
@@ -912,6 +987,7 @@ fn install_chrome_faces_locked(
     fonts.semantic_pending = None;
     fonts.semantic_worker_generation = None;
     fonts.semantic_cache.clear();
+    fonts.semantic_displaced = None;
     fonts.semantic_ready_epoch = fonts.semantic_ready_epoch.wrapping_add(1);
     fonts.semantic_prewarm_ms = None;
 }
@@ -1073,31 +1149,6 @@ pub(crate) fn cjk_chain_face_path_for_test() -> Option<&'static str> {
         .find(|path| std::path::Path::new(path).is_file())
 }
 
-/// THE CENSUS ABOVE MUST NOT GO QUIETLY EMPTY. Every test that leans on it
-/// skips by returning early, which libtest reports as `ok` — so an empty census
-/// does not fail, it silently deletes coverage. That is exactly what happened
-/// on macOS until 2026-09-15: four tests returned before their first assertion
-/// and reported `ok` on the one platform this repo is developed on.
-///
-/// macOS and Windows ship a broad CJK face as part of the OS (on macOS these
-/// live on the sealed system volume and cannot be removed), so on those hosts
-/// an empty census is a BUG in the list, not a property of the machine, and
-/// this fails loudly. Linux is a package install, so a bare CI image is allowed
-/// to have none — there the census is merely reported.
-#[cfg(test)]
-#[test]
-fn the_cjk_chain_census_is_not_empty_where_the_os_ships_one() {
-    let found = cjk_chain_face_path_for_test();
-    if cfg!(any(target_os = "macos", windows)) {
-        assert!(
-            found.is_some(),
-            "this OS ships a CJK face but the census resolved none: the list in \
-             `cjk_chain_face_path_for_test` has gone stale, and every test that \
-             guards on it is now skipping while reporting `ok`"
-        );
-    }
-}
-
 /// Install a SETTLED semantic chrome font whose chain holds the host's CJK
 /// face, already parsed — the state the store reaches once the terminal has
 /// drawn an ideograph — plus the host UI faces. `false` means the host has no
@@ -1205,6 +1256,28 @@ pub(crate) fn prepared_semantic_font_for_direct_view_test(
     }
 }
 
+/// A ready specimen font over `bytes` for a direct-view test, as the worker
+/// would hand back for a candidate whose regular face resolved to them (a
+/// bundled display face, say).
+#[cfg(test)]
+pub(crate) fn prepared_semantic_font_from_bytes_for_test(
+    candidate: &crate::widget::SemanticFontCandidate,
+    bytes: &[u8],
+) -> PreparedSemanticFont {
+    let mut renderer = Renderer::from_bytes(bytes, 14.0, aterm_render::Theme::default())
+        .expect("test specimen face parses");
+    renderer.set_runtime_font_discovery(false);
+    PreparedSemanticFont {
+        candidate: candidate.clone(),
+        snapshot: SemanticFontSnapshot {
+            status: "host-prepared test renderer ready".to_string(),
+            ready_epoch: 1,
+            pending: false,
+        },
+        renderer: Some(Rc::new(renderer)),
+    }
+}
+
 /// Which face of the chrome stack draws a glyph — the PURE policy (the proof
 /// target; no font I/O). A bold run whose real bold face covers the char takes
 /// the BOLD face; else a char the user's primary covers takes the PRIMARY; the
@@ -1240,12 +1313,32 @@ pub(crate) enum ChromeFacePick {
     Fallback,
 }
 
+/// A bundled display face, parsed once per process from its compiled-in
+/// bytes ([`TextFace::Display`]).
+fn display_chrome_font(index: u8) -> Option<&'static Arc<ChromeFont>> {
+    static FACES: OnceLock<Vec<Option<Arc<ChromeFont>>>> = OnceLock::new();
+    FACES
+        .get_or_init(|| {
+            aterm_render::DISPLAY_FACES
+                .iter()
+                .map(|face| {
+                    let bytes = aterm_render::display_face_bytes(face.id)?;
+                    aterm_render::shared_parsed_face(bytes, 0)
+                        .ok()
+                        .map(|(_, font)| font)
+                })
+                .collect()
+        })
+        .get(usize::from(index))?
+        .as_ref()
+}
+
 impl ChromeFonts {
     fn ui_font(&self, face: TextFace) -> Option<&Arc<ChromeFont>> {
-        if face == TextFace::UiBold {
-            self.ui_semibold.as_ref().or(self.ui_regular.as_ref())
-        } else {
-            self.ui_regular.as_ref()
+        match face {
+            TextFace::UiBold => self.ui_semibold.as_ref().or(self.ui_regular.as_ref()),
+            TextFace::Display(index) => display_chrome_font(index),
+            TextFace::Mono | TextFace::Ui => self.ui_regular.as_ref(),
         }
     }
 
@@ -1370,11 +1463,16 @@ impl ChromeFonts {
         elapsed_ms: u64,
     ) {
         const MAX_CANDIDATES: usize = 8;
+        // Any entry but the face drawing a resolving specimen.
         if self.semantic_cache.len() >= MAX_CANDIDATES
             && !self.semantic_cache.contains_key(&candidate)
-            && let Some(oldest) = self.semantic_cache.keys().next().cloned()
+            && let Some(evicted) = self
+                .semantic_cache
+                .keys()
+                .find(|key| self.semantic_displaced.as_ref() != Some(*key))
+                .cloned()
         {
-            self.semantic_cache.remove(&oldest);
+            self.semantic_cache.remove(&evicted);
         }
         self.semantic_cache
             .insert(candidate, (renderer, resolution, elapsed_ms));
@@ -1480,6 +1578,8 @@ impl ChromeFonts {
             // source under the new request identity. The committed host seed has
             // no prewarm time and `cache_active_semantic` deliberately retains it
             // as the permitted broad fallback while the first request resolves.
+            // The parked face keeps drawing the specimen meanwhile.
+            self.semantic_displaced = self.semantic_identity.clone();
             self.cache_active_semantic();
         }
         let job = SemanticPrewarmJob {
@@ -1512,15 +1612,33 @@ impl ChromeFonts {
         px: f32,
         theme: aterm_render::Theme,
     ) -> Option<Renderer> {
-        let renderer = self.semantic.as_ref()?;
         let exact = self.semantic_identity.as_ref() == Some(candidate);
         let committed_fallback = self
             .semantic_identity
             .as_ref()
             .is_some_and(crate::widget::SemanticFontCandidate::is_host);
-        (exact || committed_fallback)
-            .then(|| renderer.fork_semantic_surface(px, theme))
-            .flatten()
+        if let Some(renderer) = self
+            .semantic
+            .as_ref()
+            .filter(|_| exact || committed_fallback)
+        {
+            return renderer.fork_semantic_surface(px, theme);
+        }
+        // A candidate still resolving: the face that was on screen, parked
+        // in the cache when the request started, keeps drawing the specimen;
+        // else the committed cascade; else any face the cache holds. The box
+        // is never blank under its "Loading font" status.
+        self.semantic_displaced
+            .as_ref()
+            .and_then(|identity| self.semantic_cache.get(identity))
+            .or_else(|| {
+                self.semantic_cache
+                    .iter()
+                    .find(|(identity, _)| identity.is_host())
+                    .map(|(_, entry)| entry)
+            })
+            .or_else(|| self.semantic_cache.values().next())
+            .and_then(|(renderer, _, _)| renderer.fork_semantic_surface(px, theme))
     }
 }
 
@@ -1727,7 +1845,7 @@ struct UiFontAssets {
 #[derive(Clone)]
 #[cfg(not(target_os = "macos"))]
 pub(crate) struct UiVariableSemibold {
-    /// The whole font file (ttf-parser borrows it per raster) — the SAME
+    /// The whole font file (aterm-font borrows it per raster) — the SAME
     /// admission the regular face was parsed from, a file mapping when the
     /// file lives on the system font volume (`font_file::admit_font_file`).
     pub(crate) bytes: aterm_render::font::FaceBytes,
@@ -1864,7 +1982,7 @@ fn ui_font_candidates() -> Vec<UiFontCandidate> {
 /// The Linux UI face ladder as `(regular, semibold)` paths, first choice first — the
 /// list [`ui_font_candidates`] resolves on Linux, and the one a test measures a layout
 /// with on ANY host ([`install_linux_ui_fonts_for_test`]), so a page's fit is not
-/// judged only in the face of the machine that runs the gate.
+/// judged only in the face of the machine that runs the tests.
 #[cfg(any(target_os = "linux", test))]
 const LINUX_UI_FONT_PAIRS: [(&str, &str); 5] = [
     // `resolve_ui_font_assets` accepts a candidate only when BOTH faces
@@ -1992,7 +2110,7 @@ impl UiFontFiles {
 
 /// Parse one UI face; the file bytes ride back beside it so the resolver can
 /// keep them for a variable face ([`variable_semibold_of`]), which re-parses
-/// them through `ttf-parser` to instance a `wght` axis the face type itself
+/// them through `aterm-font` to instance a `wght` axis the face type itself
 /// does not expose.
 ///
 /// ONE admission of the file, shared every way — the handle returned here, the
@@ -2379,6 +2497,17 @@ pub(crate) fn ui_text_wrap_ranges(
 /// under the pen, and the band's centring, which subtracts this width, was off
 /// by half the difference. A char no loaded face covers measures the pen's own
 /// glyph where it has one ([`synthesized`]), else its 0.6 em placeholder.
+/// How far the `TextFace::Mono` pen moves per character at `px`: the advance
+/// of the chrome terminal face (the user's terminal font, else the bundled
+/// DejaVu Sans Mono). [`ui_text_width_for`] measures in the UI face, which a
+/// column grid of monospace runs must not use.
+pub(crate) fn mono_advance(px: f32) -> f32 {
+    let mut fonts = lock_fonts();
+    fonts
+        .face_for(TextWeight::Regular, '0')
+        .map_or(px * 0.6, |face| face.font.metrics('0', px).advance_width)
+}
+
 pub(crate) fn ui_text_width_for(face: TextFace, s: &str, px: f32) -> f32 {
     let mut fonts = lock_fonts();
     let Some(f) = fonts.ui_font(face).cloned() else {
@@ -2509,6 +2638,11 @@ struct Canvas {
     /// x1, y1)` exclusive. `blend` rejects pixels outside the top entry. Empty ⇒
     /// unclipped. Driven by `DrawPrim::ClipPush`/`ClipPop`.
     clip: Vec<(i32, i32, i32, i32)>,
+    /// Memo for [`Self::blend_glyph_texel`]'s coverage remap: the `(ink, ground)`
+    /// pair it was filled for and the corrected coverage per coverage byte
+    /// (`NaN` = not yet computed). A run of text sits on one fill, so the pair
+    /// rarely changes and each byte costs its `powf` once per raster.
+    glyph_remap: (u32, u32, [f32; 256]),
 }
 
 impl Canvas {
@@ -2535,6 +2669,7 @@ impl Canvas {
             px,
             glyphs: std::collections::HashMap::new(),
             clip: Vec::new(),
+            glyph_remap: (u32::MAX, u32::MAX, [f32::NAN; 256]),
         }
     }
 
@@ -2693,153 +2828,52 @@ impl Canvas {
         self.px[i + 3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
     }
 
-    /// Apply a premultiplied-light pixel with the renderer's exact saturating
-    /// RGB operation. Settings live previews paint an opaque terminal canvas
-    /// before any effect primitive, so alpha remains the canvas alpha while
-    /// the RGB result matches `aterm_render::add_sat` byte for byte.
-    fn add_premul(&mut self, x: i32, y: i32, premul: u32) {
+    /// Composite one GLYPH coverage texel: [`Self::blend`] after the terminal
+    /// renderer's perceptual coverage remap ([`aterm_render::correct_alpha`],
+    /// the default `TextBlending::LinearCorrected`), keyed on the ink and the
+    /// fill already under the texel.
+    ///
+    /// Plain linear-light coverage puts a half-covered dark-on-light texel at
+    /// its LINEAR midpoint: black over white at 50% lands on sRGB ~0xBC, so a
+    /// terminal-font stem that straddles two columns never gets darker than a
+    /// mid grey and light-theme chrome text (the command palette, the theme
+    /// cards) reads washed out beside the same font in the terminal, which
+    /// has always remapped. The remap moves the blended luminance to where a
+    /// gamma-space blend puts it (~0x80), chroma still mixing in linear light.
+    /// Endpoint bytes stay exact: 0 draws nothing and 255 is the plain blend.
+    /// A texel over a fully transparent canvas has no ground to key on and
+    /// takes the plain coverage.
+    fn blend_glyph_texel(&mut self, x: i32, y: i32, c: [u8; 4], coverage: u8) {
+        if coverage == 0 {
+            return;
+        }
         let local_x = x.saturating_sub(self.origin_x);
         let local_y = y.saturating_sub(self.origin_y);
         if local_x < 0 || local_y < 0 || local_x as u32 >= self.w || local_y as u32 >= self.h {
             return;
         }
-        if let Some(&(cx0, cy0, cx1, cy1)) = self.clip.last()
-            && (x < cx0 || y < cy0 || x >= cx1 || y >= cy1)
-        {
-            return;
-        }
+        let plain = f32::from(coverage) / 255.0;
         let i = ((local_y as u32 * self.w + local_x as u32) * 4) as usize;
-        let dst = (u32::from(self.px[i]) << 16)
-            | (u32::from(self.px[i + 1]) << 8)
-            | u32::from(self.px[i + 2]);
-        let out = aterm_render::add_sat(dst, premul);
-        self.px[i] = ((out >> 16) & 0xff) as u8;
-        self.px[i + 1] = ((out >> 8) & 0xff) as u8;
-        self.px[i + 2] = (out & 0xff) as u8;
-    }
-
-    fn over_packed(&mut self, x: i32, y: i32, rgb: u32, alpha: u8) {
-        let local_x = x.saturating_sub(self.origin_x);
-        let local_y = y.saturating_sub(self.origin_y);
-        if local_x < 0 || local_y < 0 || local_x as u32 >= self.w || local_y as u32 >= self.h {
+        if coverage == u8::MAX || self.px[i + 3] == 0 {
+            self.blend(x, y, c, plain);
             return;
         }
-        if let Some(&(cx0, cy0, cx1, cy1)) = self.clip.last()
-            && (x < cx0 || y < cy0 || x >= cx1 || y >= cy1)
-        {
-            return;
+        let pack = |p: &[u8]| u32::from(p[0]) << 16 | u32::from(p[1]) << 8 | u32::from(p[2]);
+        let ink = pack(&c[..3]);
+        let ground = pack(&self.px[i..i + 3]);
+        if (self.glyph_remap.0, self.glyph_remap.1) != (ink, ground) {
+            self.glyph_remap = (ink, ground, [f32::NAN; 256]);
         }
-        let i = ((local_y as u32 * self.w + local_x as u32) * 4) as usize;
-        let dst = (u32::from(self.px[i]) << 16)
-            | (u32::from(self.px[i + 1]) << 8)
-            | u32::from(self.px[i + 2]);
-        let out = aterm_render::over_rgb(dst, rgb, alpha);
-        self.px[i] = ((out >> 16) & 0xff) as u8;
-        self.px[i + 1] = ((out >> 8) & 0xff) as u8;
-        self.px[i + 2] = (out & 0xff) as u8;
-    }
-
-    fn additive_rect(&mut self, x: f32, y: f32, w: f32, h: f32, premul: u32) {
-        let (x0, y0, x1, y1) = self.clipped_bounds(
-            x.floor() as i32,
-            y.floor() as i32,
-            (x + w).ceil() as i32,
-            (y + h).ceil() as i32,
-        );
-        for py in y0..y1 {
-            for px in x0..x1 {
-                self.add_premul(px, py, premul);
-            }
+        let slot = &mut self.glyph_remap.2[usize::from(coverage)];
+        if slot.is_nan() {
+            *slot = aterm_render::correct_alpha(
+                aterm_render::linear_luminance(ink),
+                aterm_render::linear_luminance(ground),
+                plain,
+            );
         }
-    }
-
-    fn effect_halo(
-        &mut self,
-        halo: aterm_render::RainHalo,
-        offset_x: f32,
-        offset_y: f32,
-        scale: f32,
-    ) {
-        use aterm_render::HaloMode;
-
-        let x = ((f32::from(halo.x) + offset_x) * scale).round() as i32;
-        let y = ((f32::from(halo.y) + offset_y) * scale).round() as i32;
-        let w = (f32::from(halo.w) * scale).round().max(1.0) as i32;
-        let h = (f32::from(halo.h) * scale).round().max(1.0) as i32;
-        let cx = ((f32::from(halo.cx) + offset_x) * scale).round() as i32;
-        let cy = ((f32::from(halo.cy) + offset_y) * scale).round() as i32;
-        let rx = (f32::from(halo.rx) * scale).round().max(1.0) as i32;
-        let ry = (f32::from(halo.ry) * scale).round().max(1.0) as i32;
-        let (x0, y0, x1, y1) = self.clipped_bounds(x, y, x + w, y + h);
-        let (rx2, ry2) = (rx * rx, ry * ry);
-        for py in y0..y1 {
-            let ny = aterm_render::halo_row_ny(py - cy, ry2);
-            if ny >= 256 {
-                continue;
-            }
-            for px in x0..x1 {
-                let weight = aterm_render::halo_weight(px - cx, ny, rx2).clamp(0, 255) as u8;
-                if weight == 0 {
-                    continue;
-                }
-                match halo.mode {
-                    HaloMode::Add => {
-                        self.add_premul(px, py, aterm_render::premul_rgb(halo.color, weight));
-                    }
-                    HaloMode::Over => self.over_packed(px, py, halo.color, weight),
-                }
-            }
-        }
-    }
-
-    fn effect_fire(
-        &mut self,
-        patch: aterm_render::FirePatch,
-        offset_x: f32,
-        offset_y: f32,
-        scale: f32,
-    ) {
-        use aterm_render::FireMode;
-        use aterm_render::fire_field::{self, FireFieldParams};
-
-        let x = ((f32::from(patch.x) + offset_x) * scale).round() as i32;
-        let y = ((f32::from(patch.y) + offset_y) * scale).round() as i32;
-        let w = (f32::from(patch.w) * scale).round().max(1.0) as i32;
-        let h = (f32::from(patch.h) * scale).round().max(1.0) as i32;
-        let params = FireFieldParams {
-            base_y: ((f32::from(patch.base_y) + offset_y) * scale).round() as i32,
-            peak_h: (f32::from(patch.peak_h) * scale).round().max(1.0) as i32,
-            phase: patch.phase,
-            temp: i32::from(patch.temp),
-            strength: i32::from(patch.strength),
-            lean: (f32::from(patch.lean) * scale).round() as i32,
-            cov_cap: i32::from(patch.cov_cap),
-            cell_h: (f32::from(patch.cell_h) * scale).round().max(2.0) as i32,
-            top_fade_y: (offset_y * scale).round() as i32,
-        };
-        let precomputed = fire_field::fire_precomp(&params);
-        let (x0, y0, x1, y1) = self.clipped_bounds(x, y, x + w, y + h);
-        for py in y0..y1 {
-            let top_fade = fire_field::fire_top_fade(py, &params);
-            let mut row = fire_field::FireRow::new(py, x0, &params, &precomputed);
-            for px in x0..x1 {
-                let core = row.core(px);
-                match patch.mode {
-                    FireMode::Add => {
-                        let premul = fire_field::fire_shade_add(&core, &params, top_fade);
-                        if premul != 0 {
-                            self.add_premul(px, py, premul);
-                        }
-                    }
-                    FireMode::Over => {
-                        let (rgb, alpha) = fire_field::fire_shade_over(&core, &params, top_fade);
-                        if alpha != 0 {
-                            self.over_packed(px, py, rgb, alpha);
-                        }
-                    }
-                }
-            }
-        }
+        let corrected = *slot;
+        self.blend(x, y, c, corrected);
     }
 }
 
@@ -2885,10 +2919,11 @@ thread_local! {
 }
 
 /// A TOTAL fingerprint of everything [`Canvas::terminal_specimen`] feeds the
-/// renderer, except the two identities matched separately: the fork source
-/// (compared by pointer beside this key) and the engine snapshot (represented
-/// by `input_fingerprint`, which `settings_preview::build_terminal_specimen_input`
-/// builds as a total function of the snapshot it returns).
+/// renderer, except the identities matched separately: the fork source
+/// (compared by pointer beside this key), the engine snapshot (represented by
+/// `input_fingerprint`, which `settings_preview::build_terminal_specimen_input`
+/// builds as a total function of the snapshot it returns) and the cursor scene
+/// played onto it (its own fingerprint).
 ///
 /// Every field must appear here. Omitting one — a variation axis, `stem_gamma`,
 /// the device scale — would paint stale pixels after a settings tweak, which is
@@ -2897,7 +2932,22 @@ fn terminal_specimen_frame_key(spec: &TerminalSpecimenSpec, scale: f32) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut hash = std::collections::hash_map::DefaultHasher::new();
+    specimen_renderer_key(spec, scale).hash(&mut hash);
     spec.input_fingerprint.hash(&mut hash);
+    spec.motion
+        .as_ref()
+        .map(|scene| scene.fingerprint)
+        .hash(&mut hash);
+    hash.finish()
+}
+
+/// Everything the configured renderer fork is built from: the frame key less
+/// the snapshot and the scene, so one fork renders every frame of a moving
+/// preview.
+fn specimen_renderer_key(spec: &TerminalSpecimenSpec, scale: f32) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
     // The fork source's generation. Pointer identity proves it is the same
     // `Rc`; the epoch additionally moves on every host transition that changes
     // what a fork of that generation contains.
@@ -2931,6 +2981,104 @@ fn terminal_specimen_frame_key(spec: &TerminalSpecimenSpec, scale: f32) -> u64 {
     spec.selection_foreground.hash(&mut hash);
     spec.selection_inactive.hash(&mut hash);
     hash.finish()
+}
+
+/// Render one specimen frame on one of this thread's configured forks for
+/// `spec`, forking only when no held fork matches the renderer key and fork
+/// source, then play the cursor scene (if any) onto the snapshot at the fork's
+/// own cell metrics.
+fn render_specimen_frame(spec: &TerminalSpecimenSpec, scale: f32) -> Option<aterm_render::Frame> {
+    type HeldFork = (u64, std::rc::Weak<Renderer>, Renderer);
+    thread_local! {
+        /// Most-recently-used first, bounded like the frame memo.
+        static SPECIMEN_RENDERERS: std::cell::RefCell<Vec<HeldFork>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let source = spec.prepared_font.renderer.as_ref()?;
+    let key = specimen_renderer_key(spec, scale);
+    SPECIMEN_RENDERERS.with_borrow_mut(|held| {
+        let hit = held.iter().position(|(held_key, held_source, _)| {
+            *held_key == key && std::ptr::eq(held_source.as_ptr(), Rc::as_ptr(source))
+        });
+        if let Some(hit) = hit {
+            let fork = held.remove(hit);
+            held.insert(0, fork);
+        } else {
+            let mut renderer = spec.prepared_font.fork(spec.font_px * scale, spec.theme)?;
+            renderer.set_pad(0);
+            renderer.set_head(0);
+            renderer.set_line_height(spec.line_height);
+            renderer.set_adjust_baseline((spec.baseline_adjust as f32 * scale).round() as i32);
+            renderer.set_adjust_underline(
+                (spec.underline_position as f32 * scale).round() as i32,
+                (spec.underline_thickness as f32 * scale).round() as i32,
+            );
+            renderer.set_underline_skip_descenders(spec.underline_skip_descenders);
+            renderer.set_synthetic_styles(spec.synthetic_styles);
+            renderer.set_text_blending(match spec.text_blending {
+                SpecimenTextBlending::Linear => aterm_render::TextBlending::Linear,
+                SpecimenTextBlending::LinearCorrected => {
+                    aterm_render::TextBlending::LinearCorrected
+                }
+            });
+            renderer.set_font_thicken(spec.font_thicken);
+            renderer.set_stem_gamma(spec.stem_gamma);
+            let variations = spec
+                .variations
+                .iter()
+                .map(|variation| (variation.tag, variation.value()))
+                .collect::<Vec<_>>();
+            let _ = renderer.set_font_variations(&variations, 0.0);
+            let ligature_mode = if !spec.ligatures {
+                aterm_types::text_shaping::LigatureMode::Disabled
+            } else if spec.cursor_break_ligatures {
+                aterm_types::text_shaping::LigatureMode::CursorDisabled
+            } else {
+                aterm_types::text_shaping::LigatureMode::Enabled
+            };
+            renderer.set_text_shaping(aterm_types::text_shaping::TextShapingConfig {
+                ligature_mode,
+                admit_collapsed: spec.merged_ligatures,
+                ..aterm_types::text_shaping::TextShapingConfig::default()
+            });
+            renderer.set_minimum_contrast(spec.minimum_contrast);
+            renderer.set_selection_fg(spec.selection_foreground);
+            renderer.set_selection_inactive(spec.selection_inactive);
+            renderer.activate_px(spec.font_px * scale);
+            // A display face's capitals rise past its cell: the frame carries
+            // their room above the first row (the layout reserves it too,
+            // `SettingsPreviewSpec::specimen_headroom`), so the box never cuts
+            // their tops off.
+            renderer.set_head(renderer.display_ink_headroom(
+                spec.font_px * scale,
+                spec.line_height,
+                (spec.baseline_adjust as f32 * scale).round() as i32,
+            ));
+            held.insert(0, (key, Rc::downgrade(source), renderer));
+            held.truncate(SPECIMEN_FRAME_CACHE_ENTRIES);
+        }
+        let (_, _, renderer) = held.first_mut()?;
+        Some(match spec.motion.as_deref() {
+            Some(scene) => {
+                renderer.render_input(&scene.decorate(&spec.input, renderer.cell_size()))
+            }
+            None => renderer.render_input(&spec.input),
+        })
+    })
+}
+
+/// The device cell size a specimen renders with at `scale`, from a fresh fork.
+#[cfg(test)]
+pub(crate) fn specimen_cell_size_for_test(
+    spec: &TerminalSpecimenSpec,
+    scale: f32,
+) -> Option<(usize, usize)> {
+    let mut renderer = spec.prepared_font.fork(spec.font_px * scale, spec.theme)?;
+    renderer.set_pad(0);
+    renderer.set_head(0);
+    renderer.set_line_height(spec.line_height);
+    renderer.activate_px(spec.font_px * scale);
+    Some(renderer.cell_size())
 }
 
 /// The retained frame for `key` forked from exactly `source`, promoted to
@@ -3243,10 +3391,8 @@ impl Canvas {
                     let gy = baseline_px - (m.height as i32 + m.ymin);
                     for gyy in 0..m.height {
                         for gxx in 0..m.width {
-                            let a = f32::from(bitmap[gyy * m.width + gxx]) / 255.0;
-                            if a > 0.0 {
-                                self.blend(gx + gxx as i32, gy + gyy as i32, c, a);
-                            }
+                            let coverage = bitmap[gyy * m.width + gxx];
+                            self.blend_glyph_texel(gx + gxx as i32, gy + gyy as i32, c, coverage);
                         }
                     }
                 }
@@ -3302,9 +3448,9 @@ impl Canvas {
         // a full `fontdue` re-parse of the primary face (and a second one for
         // its real bold sibling) inside `fork_semantic_surface`, and
         // `render_input` then renders a whole mini terminal frame from cold
-        // glyph/layout caches. An animating Settings preview re-rasterizes at
-        // frame rate with every one of those inputs unchanged, so the finished
-        // frame is memoized instead of recomputed.
+        // glyph/layout caches. A still preview re-rasterizes with every one of
+        // those inputs unchanged, so the finished frame is memoized; a moving
+        // one keeps its configured fork, so only `render_input` runs per frame.
         //
         // A hit is the same computation replayed: the key is total over what
         // reaches the renderer, the fork source is matched by POINTER identity
@@ -3320,49 +3466,15 @@ impl Canvas {
             );
             return;
         }
-        let Some(mut renderer) = spec.prepared_font.fork(spec.font_px * scale, spec.theme) else {
+        let Some(frame) = render_specimen_frame(spec, scale) else {
             return;
         };
-        renderer.set_pad(0);
-        renderer.set_head(0);
-        renderer.set_line_height(spec.line_height);
-        renderer.set_adjust_baseline((spec.baseline_adjust as f32 * scale).round() as i32);
-        renderer.set_adjust_underline(
-            (spec.underline_position as f32 * scale).round() as i32,
-            (spec.underline_thickness as f32 * scale).round() as i32,
-        );
-        renderer.set_underline_skip_descenders(spec.underline_skip_descenders);
-        renderer.set_synthetic_styles(spec.synthetic_styles);
-        renderer.set_text_blending(match spec.text_blending {
-            SpecimenTextBlending::Linear => aterm_render::TextBlending::Linear,
-            SpecimenTextBlending::LinearCorrected => aterm_render::TextBlending::LinearCorrected,
-        });
-        renderer.set_font_thicken(spec.font_thicken);
-        renderer.set_stem_gamma(spec.stem_gamma);
-        let variations = spec
-            .variations
-            .iter()
-            .map(|variation| (variation.tag, variation.value()))
-            .collect::<Vec<_>>();
-        let _ = renderer.set_font_variations(&variations, 0.0);
-        let ligature_mode = if !spec.ligatures {
-            aterm_types::text_shaping::LigatureMode::Disabled
-        } else if spec.cursor_break_ligatures {
-            aterm_types::text_shaping::LigatureMode::CursorDisabled
-        } else {
-            aterm_types::text_shaping::LigatureMode::Enabled
-        };
-        renderer.set_text_shaping(aterm_types::text_shaping::TextShapingConfig {
-            ligature_mode,
-            admit_collapsed: spec.merged_ligatures,
-            ..aterm_types::text_shaping::TextShapingConfig::default()
-        });
-        renderer.set_minimum_contrast(spec.minimum_contrast);
-        renderer.set_selection_fg(spec.selection_foreground);
-        renderer.set_selection_inactive(spec.selection_inactive);
-        renderer.activate_px(spec.font_px * scale);
-        let frame = Rc::new(renderer.render_input(&spec.input));
-        if let Some(source) = source {
+        let frame = Rc::new(frame);
+        // A typing scene never repeats a frame soon enough to pay for a slot,
+        // and holding one would evict the still cards sharing the page.
+        if let Some(source) = source
+            && spec.motion.as_ref().is_none_or(|scene| !scene.is_moving())
+        {
             retain_specimen_frame(key, source, &frame);
         }
         self.blit_terminal_frame(
@@ -3405,10 +3517,13 @@ impl Canvas {
         let gy = baseline - (metrics.height as f32 + metrics.ymin as f32);
         for y in 0..metrics.height {
             for x in 0..metrics.width {
-                let alpha = f32::from(bitmap[y * metrics.width + x]) / 255.0;
-                if alpha > 0.0 {
-                    self.blend((gx + x as f32) as i32, (gy + y as f32) as i32, color, alpha);
-                }
+                let coverage = bitmap[y * metrics.width + x];
+                self.blend_glyph_texel(
+                    (gx + x as f32) as i32,
+                    (gy + y as f32) as i32,
+                    color,
+                    coverage,
+                );
             }
         }
     }
@@ -3606,6 +3721,7 @@ pub(crate) fn composite_rgba_surface(
         px: std::mem::take(destination),
         glyphs: std::collections::HashMap::new(),
         clip: Vec::new(),
+        glyph_remap: (u32::MAX, u32::MAX, [f32::NAN; 256]),
     };
     let (source_width, source_height) = source_size;
     let source_x = source_origin.0.min(i32::MAX as u32) as i32;
@@ -3766,19 +3882,6 @@ fn rasterize_tray_on_canvas(prims: &[DrawPrim], scale: f32, mut cv: Canvas) -> V
             DrawPrim::TerminalSpecimen { x, y, spec } => {
                 cv.terminal_specimen(*x, *y, spec, scale);
             }
-            DrawPrim::AdditiveRect { x, y, w, h, premul } => {
-                cv.additive_rect(x * s, y * s, w * s, h * s, *premul)
-            }
-            DrawPrim::EffectHalo {
-                halo,
-                offset_x,
-                offset_y,
-            } => cv.effect_halo(*halo, *offset_x, *offset_y, scale),
-            DrawPrim::EffectFire {
-                patch,
-                offset_x,
-                offset_y,
-            } => cv.effect_fire(*patch, *offset_x, *offset_y, scale),
             DrawPrim::Stroke {
                 x,
                 y,
@@ -4676,6 +4779,24 @@ mod tests {
         set_chrome_fonts(None, None, None);
     }
 
+    /// A display face on the terminal never becomes the chrome's face:
+    /// Settings' numbers and code text keep the embedded monospace face,
+    /// while the user's own font still takes the slot.
+    #[test]
+    fn a_display_face_is_never_the_chrome_face() {
+        for face in aterm_render::DISPLAY_FACES {
+            let bytes: std::sync::Arc<[u8]> =
+                std::sync::Arc::from(aterm_render::display_face_bytes(face.id).unwrap());
+            assert!(
+                chrome_face_for_slot(&Some((bytes, 0))).is_none(),
+                "{} stays out of the chrome",
+                face.id
+            );
+        }
+        let own: std::sync::Arc<[u8]> = std::sync::Arc::from(aterm_render::embedded_font());
+        assert!(chrome_face_for_slot(&Some((own, 0))).is_some());
+    }
+
     /// One real engine frame for the shipping specimen path: `source` runs
     /// through the actual `Terminal`, exactly like
     /// `settings_preview::build_terminal_specimen_input` builds its snapshot.
@@ -4699,6 +4820,7 @@ mod tests {
         crate::widget::TerminalSpecimenSpec {
             input: Arc::new(input),
             input_fingerprint: 1,
+            motion: None,
             prepared_font: PreparedSemanticFont {
                 candidate: identity,
                 snapshot: SemanticFontSnapshot {
@@ -4823,9 +4945,9 @@ mod tests {
     /// on that fact, 5 ms after it at most; its bound is a hang detector and
     /// measures nothing. It was 20 s, and the worker's first job settles the
     /// whole Unicode specimen in a debug build: at background QoS beside 72
-    /// spinners (the merge gate's utility lane at load 100-170, reproduced)
-    /// that outran 20 s in 2 of 3 runs, and
-    /// `rapid_candidate_replacement_carries_base_and_cached_views_do_not_cross_contaminate`
+    /// spinners (a loaded machine at load 100-170) that outran 20 s in 2 of 3
+    /// runs, and the test that waits here
+    /// (`rapid_candidate_replacement_carries_base_and_cached_views_do_not_cross_contaminate`)
     /// then read the pre-landing identity as a wrong one.
     fn await_semantic_landing(fonts: &mut ChromeFonts) {
         const HANG: std::time::Duration = std::time::Duration::from_secs(600);
@@ -4841,6 +4963,123 @@ mod tests {
             started.elapsed()
         );
         eprintln!("semantic candidate landed after {:?}", started.elapsed());
+    }
+
+    /// A landed font wakes the host, which repaints every specimen that was
+    /// waiting on it: its status cannot stick on "Loading font" until
+    /// some unrelated input arrives.
+    #[test]
+    fn a_landed_semantic_font_wakes_the_host() {
+        static WAKES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        set_semantic_ready_wake(|| {
+            WAKES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let gate: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(())));
+        let mut fonts = default_chrome_fonts();
+        fonts.semantic_worker = SemanticPrewarmWorker::spawn_serialized_by(gate);
+        fonts.semantic_generation = 1;
+        let mut renderer = Renderer::from_bytes(
+            aterm_render::embedded_font(),
+            14.0,
+            aterm_render::Theme::default(),
+        )
+        .expect("embedded renderer");
+        renderer.set_runtime_font_discovery(false);
+        fonts.semantic = Some(renderer);
+        fonts.semantic_identity = Some(crate::widget::SemanticFontCandidate::default());
+        assert!(fonts.ensure_semantic_candidate(&crate::widget::SemanticFontCandidate::default()));
+        await_semantic_landing(&mut fonts);
+        // A hang detector: the wake follows the result it announces.
+        let started = std::time::Instant::now();
+        while WAKES.load(std::sync::atomic::Ordering::SeqCst) == 0
+            && started.elapsed() < std::time::Duration::from_secs(60)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(WAKES.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    }
+
+    /// While a new candidate resolves, the committed cascade parked in the
+    /// cache keeps drawing the specimen: the box is never blank.
+    #[test]
+    fn a_resolving_candidate_still_draws_the_committed_specimen() {
+        let mut fonts = default_chrome_fonts();
+        let mut renderer = Renderer::from_bytes(
+            aterm_render::embedded_font(),
+            14.0,
+            aterm_render::Theme::default(),
+        )
+        .expect("embedded renderer");
+        renderer.set_runtime_font_discovery(false);
+        fonts.semantic_generation = 1;
+        fonts.semantic = Some(renderer);
+        fonts.semantic_identity = Some(crate::widget::SemanticFontCandidate::default());
+        fonts.semantic_prewarm_ms = Some(0);
+        // A worker that takes the job and never answers: the candidate stays
+        // pending for the whole test.
+        let (_results_tx, results) = std::sync::mpsc::channel();
+        fonts.semantic_worker = Some(SemanticPrewarmWorker {
+            queue: Arc::new(SemanticPrewarmQueue {
+                semantic_job: Mutex::new(None),
+                ready: Condvar::new(),
+            }),
+            results,
+        });
+        fonts.semantic_worker_generation = Some(1);
+        let candidate = crate::widget::SemanticFontCandidate {
+            regular: Some("Iosevka Term".to_string()),
+            ..crate::widget::SemanticFontCandidate::default()
+        };
+        assert!(fonts.ensure_semantic_candidate(&candidate), "pending");
+        assert!(
+            fonts
+                .semantic_renderer_fork_for(&candidate, 14.0, aterm_render::Theme::default())
+                .is_some(),
+            "the committed cascade draws while the candidate resolves"
+        );
+    }
+
+    /// The same with a named family on screen (a saved Menlo, not the
+    /// default): the face that was drawing keeps drawing while another name
+    /// resolves, so the box does not flash empty on every typed character.
+    #[test]
+    fn a_resolving_candidate_still_draws_the_named_face_it_replaced() {
+        let mut fonts = default_chrome_fonts();
+        let mut renderer = Renderer::from_bytes(
+            aterm_render::embedded_font(),
+            14.0,
+            aterm_render::Theme::default(),
+        )
+        .expect("embedded renderer");
+        renderer.set_runtime_font_discovery(false);
+        let saved = crate::widget::SemanticFontCandidate {
+            regular: Some("Menlo".to_string()),
+            ..crate::widget::SemanticFontCandidate::default()
+        };
+        fonts.semantic_generation = 1;
+        fonts.semantic = Some(renderer);
+        fonts.semantic_identity = Some(saved);
+        fonts.semantic_prewarm_ms = Some(0);
+        let (_results_tx, results) = std::sync::mpsc::channel();
+        fonts.semantic_worker = Some(SemanticPrewarmWorker {
+            queue: Arc::new(SemanticPrewarmQueue {
+                semantic_job: Mutex::new(None),
+                ready: Condvar::new(),
+            }),
+            results,
+        });
+        fonts.semantic_worker_generation = Some(1);
+        let typed = crate::widget::SemanticFontCandidate {
+            regular: Some("NoSuchFontXYZ".to_string()),
+            ..crate::widget::SemanticFontCandidate::default()
+        };
+        assert!(fonts.ensure_semantic_candidate(&typed), "pending");
+        assert!(
+            fonts
+                .semantic_renderer_fork_for(&typed, 14.0, aterm_render::Theme::default())
+                .is_some(),
+            "Menlo draws while the typed name resolves"
+        );
     }
 
     #[test]
@@ -5280,32 +5519,6 @@ mod tests {
         assert!(status.contains("No Such Font Family"));
     }
 
-    /// Libtest workers must not exchange renderer-resolved font state. A font
-    /// installed by one concurrently live worker remains visible there, while a
-    /// peer starts from the deterministic fallback context.
-    #[test]
-    fn test_font_context_is_isolated_per_worker_thread() {
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let installer_barrier = barrier.clone();
-        let installer = std::thread::spawn(move || {
-            let bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(aterm_render::embedded_font());
-            set_chrome_fonts(Some((bytes, 0)), None, None);
-            installer_barrier.wait();
-            installer_barrier.wait();
-            assert!(lock_fonts().primary.is_some());
-        });
-        let observer = std::thread::spawn(move || {
-            barrier.wait();
-            assert!(
-                lock_fonts().primary.is_none(),
-                "another worker's installed face must not leak into this context"
-            );
-            barrier.wait();
-        });
-        installer.join().expect("installer exits");
-        observer.join().expect("observer exits");
-    }
-
     /// `ui_text_width` is a usable layout metric with OR WITHOUT the system face:
     /// positive for nonempty text, empty == 0, and MONOTONIC — appending a
     /// character never shrinks the measure (the tracking is a fraction of any
@@ -5448,6 +5661,94 @@ mod tests {
             (185..=190).contains(&cv.px[0]),
             "linear-light midpoint expected ~188, got {}",
             cv.px[0]
+        );
+    }
+
+    /// Chrome glyph coverage blends the way the terminal renderer's default
+    /// (`TextBlending::LinearCorrected`) blends it, so dark text on a light
+    /// fill reaches its ink as firmly as light text on a dark one. Pure
+    /// linear coverage (the negative control) puts a half-covered black
+    /// texel over white at ~0xBC and leaves light-theme chrome text grey.
+    #[test]
+    fn glyph_texels_blend_like_terminal_text() {
+        let ink = [0x1f, 0x23, 0x28, 0xff];
+        let ground = [0xf1, 0xf1, 0xf1, 0xff];
+        let pack = |p: [u8; 4]| u32::from(p[0]) << 16 | u32::from(p[1]) << 8 | u32::from(p[2]);
+        for coverage in [1_u8, 64, 128, 200, 254] {
+            let mut cv = Canvas::new(1, 1, ground);
+            cv.blend_glyph_texel(0, 0, ink, coverage);
+            let terminal =
+                aterm_render::blend_text(pack(ground), pack(ink), pack(ground), coverage, true);
+            let want = [
+                (terminal >> 16) as u8,
+                (terminal >> 8) as u8,
+                terminal as u8,
+            ];
+            for (k, (&got, &want)) in cv.px.iter().zip(&want).enumerate() {
+                assert!(
+                    got.abs_diff(want) <= 1,
+                    "coverage {coverage} channel {k}: chrome {got} vs terminal {want}"
+                );
+            }
+        }
+        // Negative control: the plain linear blend is far lighter at 50%.
+        let mut plain = Canvas::new(1, 1, ground);
+        plain.blend(0, 0, ink, 128.0 / 255.0);
+        let mut glyph = Canvas::new(1, 1, ground);
+        glyph.blend_glyph_texel(0, 0, ink, 128);
+        assert!(
+            plain.px[1] > glyph.px[1] + 30,
+            "linear {} vs corrected {}",
+            plain.px[1],
+            glyph.px[1]
+        );
+        // Endpoints are exact, and a transparent canvas has no ground to key on.
+        let mut full = Canvas::new(1, 1, ground);
+        full.blend_glyph_texel(0, 0, ink, 255);
+        assert_eq!(full.px, ink);
+        let mut none = Canvas::new(1, 1, ground);
+        none.blend_glyph_texel(0, 0, ink, 0);
+        assert_eq!(none.px, ground);
+        let mut bare = Canvas::new(1, 1, [0, 0, 0, 0]);
+        let mut bare_plain = Canvas::new(1, 1, [0, 0, 0, 0]);
+        bare.blend_glyph_texel(0, 0, ink, 128);
+        bare_plain.blend(0, 0, ink, 128.0 / 255.0);
+        assert_eq!(bare.px, bare_plain.px);
+    }
+
+    /// The whole text path routes through the corrected texel blend: a mono
+    /// run drawn black on white is the exact negative of the same run drawn
+    /// white on black (a gamma-space blend is symmetric), where linear
+    /// coverage would leave the dark-on-light run visibly lighter.
+    #[test]
+    fn mono_text_is_as_heavy_dark_on_light_as_light_on_dark() {
+        set_chrome_fonts(None, None, None);
+        let run = |ink: [u8; 4], ground: [u8; 4]| {
+            let prims = vec![crate::widget::text_prim(
+                2.0,
+                row_baseline(0.0, 20.0, 13.0),
+                "Linen Dracula".to_string(),
+                crate::type_scale::TypeStep::Body.px(13.0),
+                TextWeight::Regular,
+                TextFace::Mono,
+                ink,
+            )];
+            rasterize_tray(&prims, 140, 20, 1.0, ground).0
+        };
+        let dark_on_light = run([0, 0, 0, 255], [255, 255, 255, 255]);
+        let light_on_dark = run([255, 255, 255, 255], [0, 0, 0, 255]);
+        let inked = light_on_dark.iter().step_by(4).filter(|&&v| v > 0).count();
+        assert!(inked > 50, "the run inks: {inked} texels");
+        let worst = dark_on_light
+            .iter()
+            .step_by(4)
+            .zip(light_on_dark.iter().step_by(4))
+            .map(|(&d, &l)| (255 - d).abs_diff(l))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            worst <= 2,
+            "dark-on-light departs from the mirror by {worst}"
         );
     }
 

@@ -7,8 +7,9 @@
 //!
 //! Stage 1 ([`crate::session_timeline`]) gave every session a user identity
 //! (`meta set title|description|icon|role|attention`) and a bounded lifecycle timeline. This
-//! module turns those — plus the generated live activity, the engine's cwd, and
-//! the registry's lifecycle state — into TWO renderings of the same identity facts:
+//! module turns those — plus the session-status activity line, the engine's cwd,
+//! and the registry's lifecycle state — into TWO renderings of the same identity
+//! facts:
 //!
 //! * [`compose_tooltip`] — the multi-line text applied to a macOS strip
 //!   [`crate::toolbar`] `TabView` via `setToolTip:` (and carried on
@@ -41,7 +42,7 @@ use crate::menu::MenuAction;
 /// serves the full ring.
 pub(crate) const TIMELINE_TAIL: usize = 5;
 
-/// Display cap for authored description and generated activity prose (GRAPHEME
+/// Display cap for authored description and status activity prose (GRAPHEME
 /// CLUSTERS, not bytes or `char`s — the cap must never split a user-perceived
 /// glyph, and a ZWJ emoji or combining sequence spans several `char`s).
 /// `meta set description` stores up to 1024 BYTES; a tooltip/menu header is a
@@ -61,10 +62,11 @@ pub(crate) struct SessionChromeInput {
     /// `meta set icon` token (emoji / short name), prefixed onto the title line.
     pub icon: Option<String>,
     /// `meta set description` free text (display-truncated, see the cap).
-    /// This is durable, user-authored identity and is never replaced by a
-    /// generated activity summary.
+    /// This is durable, user-authored identity and is never replaced by the
+    /// activity line.
     pub description: Option<String>,
-    /// Generated live terminal activity. This is transient presentation data,
+    /// The live activity line — Tab Subject & Status's words
+    /// (`App::session_status_text`). This is transient presentation data,
     /// kept distinct from the user-authored [`Self::description`]. When no
     /// authored description exists it supplies the descriptive header line;
     /// when both exist the composer renders both with honest labels.
@@ -288,10 +290,10 @@ pub(crate) struct CachedChrome {
     /// The resolved tab label at compose time — covers OSC-title drift, which
     /// (for a BACKGROUND tab) may move without a timeline record.
     pub label: String,
-    /// Monotonic revision of the generated activity at compose time. Activity
-    /// can change without a session-timeline event and can be omitted from the
-    /// visible label by title-format settings, so it must be an independent
-    /// cache epoch rather than relying on `high_id` or `label`.
+    /// The session-status revision at compose time. The activity line can
+    /// change without a session-timeline event and is never part of the label,
+    /// so it must be an independent cache epoch rather than relying on
+    /// `high_id` or `label`.
     pub activity_revision: u64,
     /// The connection store's revision at compose time (design §2.4 [v5]): a
     /// connection mint/revoke/sweep moves NONE of the other epochs, so without
@@ -494,10 +496,10 @@ fn connection_lines(input: &SessionChromeInput) -> Vec<String> {
 }
 
 /// The shared identity/timeline HEADER LINES (title, durable description,
-/// generated activity, cwd, the lifecycle state when it is news — `exited`, not
+/// status activity, cwd, the lifecycle state when it is news — `exited`, not
 /// the `alive` every live tab is — then the newest-first timeline tail) — the
-/// one list both surfaces render. Authored and generated prose are labeled so
-/// transient model output can never masquerade as durable session metadata.
+/// one list both surfaces render. Authored and observed prose are labeled so
+/// a transient status line can never masquerade as durable session metadata.
 /// Returns `(identity_lines, timeline_lines)` so the two consumers can place
 /// their own separators between the groups.
 fn header_lines(input: &SessionChromeInput) -> (Vec<String>, Vec<String>) {
@@ -598,7 +600,7 @@ fn event_words(kind: &str) -> &str {
 }
 
 /// Compose the hover TOOLTIP for one terminal tab, or `None` when the session
-/// carries NOTHING beyond its bare label (no authored description, generated
+/// carries NOTHING beyond its bare label (no authored description, status
 /// activity, icon, cwd, exited state or connection) — the tab then keeps its
 /// no-tooltip behavior instead of a tooltip that merely repeats the chip text.
 /// Shape: the identity lines, then the per-connection lines (design §4: the
@@ -898,7 +900,7 @@ mod tests {
     }
 
     /// The tooltip renders identity lines in the pinned order (icon+title,
-    /// durable description, generated activity, ~-abbreviated cwd) — one exact
+    /// durable description, status activity, ~-abbreviated cwd) — one exact
     /// byte shape, so surfaces never drift apart silently. `alive` is every live
     /// tab's state, so it is no line; the timeline tail is the menu's.
     #[test]
@@ -938,11 +940,11 @@ mod tests {
         assert_eq!(compose_tooltip(&bare), None);
     }
 
-    /// Generated activity is transient and therefore never overwrites durable
+    /// The activity line is transient and therefore never overwrites durable
     /// `meta set description` identity. With both present they remain distinct;
     /// without authored metadata, activity alone supplies the descriptive line.
     #[test]
-    fn authored_description_and_generated_activity_remain_distinct() {
+    fn authored_description_and_status_activity_remain_distinct() {
         let both = full_input();
         let tip = compose_tooltip(&both).expect("full metadata composes");
         assert!(

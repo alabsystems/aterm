@@ -1,17 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 for `NativeUpdateRosterFreshness` (round eight of the update audit,
-//! #503): no lane swaps a stage whose roster authorization was last confirmed a
-//! window or more ago, and a check confirms only what the roster it read still
-//! trusts — so a revocation published a window before a swap is never missed.
+//! Tier-0 for `NativeUpdateRosterFreshness`: no lane swaps a stage whose roster authorization was
+//! last confirmed a window or more ago, and a check confirms only what the roster it read still
+//! trusts, so a revocation published a window before a swap is never missed.
 
-use aterm_spec::{derive::native_update_roster_freshness_model, interp, verify};
-
-#[test]
-fn roster_freshness_proves_and_catches() {
-    verify::prove_and_catch_scalar(&native_update_roster_freshness_model(), "roster freshness");
-}
+use aterm_spec::{derive::native_update_roster_freshness_model, interp};
 
 /// Each mutant with the invariant it was written for.
 const MUTANTS: [(&str, &str); 2] = [
@@ -28,8 +22,8 @@ fn only(mutant: &str) -> aterm_spec::derive::Model {
     model
 }
 
-/// Every mutant ALONE breaks the invariant, and with no mutant live the
-/// `Buggy = 1` model is clean, so each catch is the mutant's.
+/// Each mutant alone breaks its invariant, and with no mutant live the `Buggy = 1` model is
+/// clean, so each catch is the mutant's.
 #[test]
 fn each_mutant_alone_breaks_the_invariant_it_was_written_for() {
     for (mutant, invariant) in MUTANTS {
@@ -44,11 +38,8 @@ fn each_mutant_alone_breaks_the_invariant_it_was_written_for() {
     assert!(interp::bmc(&only("")).is_ok());
 }
 
-/// The finding's night, walked: staged and confirmed at 0, the app quit, the
-/// owner revokes the signer at tick 1, and the next launch comes a window after
-/// the confirmation. Its swap is not enabled; the check that runs right after it
-/// retires the stage. A stage the roster still trusts is confirmed by that check
-/// and swapped.
+/// Staged and confirmed at 0, the signer revoked at tick 1, the next launch a window after the
+/// confirmation: its swap is not enabled, and the check that runs next retires the stage.
 #[test]
 fn a_stale_stage_waits_for_the_check_which_retires_or_confirms_it() {
     let model = native_update_roster_freshness_model();
@@ -65,7 +56,7 @@ fn a_stale_stage_waits_for_the_check_which_retires_or_confirms_it() {
     assert_eq!(state["staged"], 0, "the revoking roster retires it");
     assert!(!model.action_enabled("Swap", &state));
 
-    // The same night with no revocation: the check confirms, the swap goes on.
+    // With no revocation the check confirms and the swap goes on.
     trusted.insert("revoked", 0);
     trusted.insert("rev_at", 0);
     assert!(!model.action_enabled("Swap", &trusted));

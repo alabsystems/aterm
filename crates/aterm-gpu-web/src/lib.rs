@@ -4,23 +4,49 @@
 // `aterm-gpu-web` — the GPU rendering substrate for the Electron renderer.
 //
 // Sibling of `aterm-wasm`: the same engine front-end (`aterm-core`), but frames
-// are drawn by `aterm-gpu` on wgpu's WebGL2 backend straight into a `<canvas>`
-// surface, with no CPU readback on the present path. WebGPU is refused.
+// are drawn by `aterm-gpu` on WebGL2 straight into a `<canvas>` surface, with
+// no CPU readback on the present path. WebGPU is refused.
 //
 // Init is async: a browser cannot block its main thread, so adapter and device
 // acquisition is awaited (`wasm_bindgen_futures`); the surface comes from the
-// `HtmlCanvasElement` via `SurfaceTarget::Canvas`. `render` draws the grid via
+// `HtmlCanvasElement` via `aterm_gpu::web::CanvasTarget::Canvas`. `render` draws the grid via
 // `present_input`; `render_offscreen` plus `rgba`/`width`/`height` read the
 // framebuffer back so an e2e harness can pixel-compare GPU against CPU.
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+// The terminal type the binding modules shared by aterm-wasm and
+// aterm-gpu-web extend (aterm-gpu-web mounts them by `#[path]`).
+use crate::AtermGpuTerminal as WebTerminal;
+
+// Expands a shared module's `bind!` — its exported impl — onto this crate's
+// terminal under `#[wasm_bindgen]` (aterm-wasm passes aterm-wasm-abi's
+// `export`). wasm-bindgen names the JS class after the impl's type, a bare
+// identifier, so the name is brought into the shared module here.
+macro_rules! web_terminal_impl {
+    ($bind:ident) => {
+        use crate::AtermGpuTerminal;
+        #[cfg(target_arch = "wasm32")]
+        use wasm_bindgen::prelude::wasm_bindgen;
+        $bind!(AtermGpuTerminal, wasm_bindgen);
+    };
+}
+
+#[path = "../../aterm-wasm/src/effects_api.rs"]
 mod effects_api;
+#[path = "../../aterm-wasm/src/facade_api.rs"]
+mod facade_api;
+mod host;
+#[path = "../../aterm-wasm/src/messages_api.rs"]
 mod messages_api;
+#[path = "../../aterm-wasm/src/notifications_api.rs"]
 mod notifications_api;
+#[path = "../../aterm-wasm/src/predict_api.rs"]
 mod predict_api;
+#[path = "../../aterm-wasm/src/scroll_input_api.rs"]
 mod scroll_input_api;
+#[path = "../../aterm-wasm/src/scrollback_tiers_api.rs"]
 mod scrollback_tiers_api;
 
 use aterm_core::grid::{PendingScrollbackReflow, ReflowStep};
@@ -142,9 +168,6 @@ pub struct AtermGpuTerminal {
     // Host-injected symbol fallback face, re-applied by `init`. Interned Arc.
     // None until `set_symbol_font`.
     symbol_font: Option<std::sync::Arc<Vec<u8>>>,
-    // Live line-height multiplier (the host's terminalLineHeight), re-applied to the
-    // fresh GPU CPU face at `init`. `1.0` until the host calls `set_line_height`.
-    line_height: f32,
     // Host-selected text shaping (ligatures + OpenType `font_features`), applied
     // to the CPU and live GPU faces and re-applied by `init` so a setting chosen
     // before init survives the face rebuild.
@@ -210,9 +233,8 @@ pub struct AtermGpuTerminal {
     // Host half of the frame-gate key: bumped by every wasm-layer mutator of
     // renderer-held or presentation state that the engine's damage epoch cannot
     // see. `open_frame` reads it, so a mutator that forgets to bump serves a
-    // stale frame. Over-bumping costs one frame. Parity is pinned by
-    // `every_visual_mutator_bumps_the_host_visual_generation` and
-    // aterm-effects' `web_binding_parity` test.
+    // stale frame. Over-bumping costs one frame. Pinned by
+    // `every_visual_mutator_bumps_the_host_visual_generation`.
     host_visual_gen: u64,
     // Gate key of the last frame built and presented. `None` means the canvas
     // cannot be assumed to hold any frame of ours: after construction, `init`,
@@ -324,10 +346,9 @@ impl AtermGpuTerminal {
         if let Some(bytes) = self.symbol_font.as_deref() {
             cpu.set_symbol_fallback_bytes(bytes)?;
         }
-        // Re-apply a line-height set before init (the fresh face is built at 1.0).
-        if (self.line_height - 1.0).abs() > 0.001 {
-            cpu.set_line_height(self.line_height);
-        }
+        // Read normalized settings from the live CPU face, including rejected
+        // requests that left the last valid setting in place.
+        cpu.set_line_height(self.cpu.line_height());
         // Re-apply the host's text shaping (ligatures + font_features): the fresh face
         // above starts at TextShapingConfig::default(), so a setting chosen before init
         // would otherwise be lost — same retention contract as the fallback/emoji faces.
@@ -339,6 +360,11 @@ impl AtermGpuTerminal {
         // defaults to opaque) — same retention contract as min-contrast above.
         cpu.set_background_opacity(self.cpu.background_opacity());
         cpu.set_cursor_opacity(self.cpu.cursor_opacity());
+        cpu.set_cursor_blink_phase(self.cpu.cursor_blink_phase());
+        cpu.set_cursor_style_override(self.cpu.cursor_style_override());
+        cpu.set_selection_fg(self.cpu.selection_fg());
+        cpu.set_selection_inactive(self.cpu.selection_inactive());
+        cpu.set_selection_inactive_bg(self.cpu.selection_inactive_bg());
         // Re-apply window-chrome set before init (set_chrome; the fresh face
         // defaults to the exact-fit frame) — init's frame_size then sizes the
         // swapchain to the padded frame. Same retention contract as above.
@@ -566,7 +592,7 @@ impl AtermGpuTerminal {
         selection: u32,
     ) -> Result<AtermGpuTerminal, String> {
         #[cfg(target_arch = "wasm32")]
-        console_error_panic_hook::set_once();
+        aterm_wasm_abi::panic_hook::set_once(host::CONSOLE);
         // The wasm artifact is its own root, the binary of the web terminal: it
         // stamps its version here (XTVERSION reads it), and only on wasm32, so
         // the native compile of this library carries no build fact.
@@ -582,7 +608,7 @@ impl AtermGpuTerminal {
             selection,
         };
         // Build the CPU face now (cheap, GPU-independent) so cell metrics are
-        // available before WebGPU init and the host can size the canvas.
+        // available before WebGL init and the host can size the canvas.
         let mut cpu = Renderer::from_bytes(font_bytes, px, theme)?;
         // No filesystem on the web: a real miss surfaces via
         // `take_missing_font_classes` (E1 lazy fonts), never system discovery.
@@ -620,7 +646,6 @@ impl AtermGpuTerminal {
             emoji_font: None,
             bold_font: None,
             symbol_font: None,
-            line_height: 1.0,
             text_shaping: aterm_render::TextShapingConfig::default(),
             frame_scratch: RenderInput::empty(),
             #[cfg(test)]
@@ -646,21 +671,6 @@ impl AtermGpuTerminal {
             blink_phase_shadow: None,
             hollow_shadow: None,
         })
-    }
-
-    /// Feed raw PTY output bytes into the engine.
-    pub fn process(&mut self, bytes: &[u8]) {
-        self.term.process(bytes);
-        self.pump_reflow_on_output();
-    }
-
-    /// Feed PTY output as a JS string. wasm-bindgen encodes it (UTF-8, via
-    /// `encodeInto`) straight into wasm memory, so the host avoids a separate
-    /// JS-side `TextEncoder.encode` allocation + copy on the hot output path.
-    /// Byte-identical to `process(new TextEncoder().encode(s))`.
-    pub fn process_str(&mut self, s: &str) {
-        self.term.process(s.as_bytes());
-        self.pump_reflow_on_output();
     }
 
     /// Inject a broad-coverage (CJK + symbols) fallback face from font bytes, so
@@ -753,22 +763,6 @@ impl AtermGpuTerminal {
     // ── registered-font (handle) variants ───────────────────────────────────
     // Take a `register_font` handle and store the shared Arc directly, so panes
     // injecting the same OS faces copy nothing across the JS/wasm boundary.
-
-    /// [`AtermGpuTerminal::new`] from a registered PRIMARY font handle.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_registered(
-        rows: u16,
-        cols: u16,
-        font_handle: u32,
-        px: f32,
-        fg: u32,
-        bg: u32,
-        cursor: u32,
-        selection: u32,
-    ) -> Result<AtermGpuTerminal, String> {
-        let bytes = registered_font(font_handle)?;
-        Self::new(rows, cols, &bytes, px, fg, bg, cursor, selection)
-    }
 
     /// [`AtermGpuTerminal::set_fallback_font`] from a registered handle.
     pub fn set_fallback_font_registered(&mut self, handle: u32) -> Result<(), String> {
@@ -865,7 +859,6 @@ impl AtermGpuTerminal {
             gpu.renderer.set_line_height(scale);
             gpu.win.invalidate_present();
         }
-        self.line_height = scale;
     }
 
     /// Programming ligatures on/off (`=>`, `!=`, `===` …), like the native
@@ -913,33 +906,8 @@ impl AtermGpuTerminal {
     pub fn set_palette_color(&mut self, index: u8, r: u8, g: u8, b: u8) {
         self.note_host_visual_change(); // WF-1 gate
         self.term.set_palette_color_components(index, r, g, b);
-        // Slots 4 and 6 are the hues a near-grey cursor's band meter borrows.
+        // The band borrows slots 1, 3, 4 and 6 (its error, warn and meter hues).
         self.band.set_palette_color(index, [r, g, b]);
-    }
-
-    /// Authorize OSC 52 clipboard writes so the engine queues OSC 52 app-events
-    /// for the host to drain. Otherwise the engine drops PTY-origin OSC 52 sets.
-    pub fn authorize_clipboard_write(&mut self) {
-        self.term.authorize_clipboard_access(ClipboardAccess::Write);
-    }
-
-    /// Revoke OSC 52 clipboard *write* authorization (user toggled the setting
-    /// off), returning the engine to its fail-closed default.
-    pub fn revoke_clipboard_write(&mut self) {
-        self.term.revoke_clipboard_access(ClipboardAccess::Write);
-    }
-
-    /// Add an extra OSC 8 URI scheme to the engine's safe allowlist (same as
-    /// aterm-wasm). Returns `false` when refused (malformed, never-allow, or
-    /// the bounded set is full), `true` when live.
-    pub fn authorize_hyperlink_scheme(&mut self, scheme: &str) -> bool {
-        self.term.authorize_hyperlink_scheme(scheme)
-    }
-
-    /// Remove a host-minted extra scheme (case-insensitive), restoring the
-    /// engine's default allowlist posture for it (parity with aterm-wasm).
-    pub fn revoke_hyperlink_scheme(&mut self, scheme: &str) {
-        self.term.revoke_hyperlink_scheme(scheme);
     }
 
     /// Set the cursor blink phase on the live GPU renderer and the CPU face.
@@ -975,110 +943,6 @@ impl AtermGpuTerminal {
         }
     }
 
-    /// Drain the engine's pending query replies (DA1/DA2/DSR/CPR/DECRQM/OSC color/
-    /// window-size, …) so the host can forward them to the PTY — the renderer is the
-    /// authoritative responder. Call after each `process`.
-    pub fn take_response(&mut self) -> Option<Vec<u8>> {
-        self.term.take_response()
-    }
-
-    /// Drain pending OSC app-events as a JSON array of `[code, payload]` pairs
-    /// (`[[7,"/home"],[52,"copied"]]`); `None` when empty. Decoded payloads
-    /// (OSC 52 clipboard / OSC 7 cwd / OSC 133 mark), distinct from PTY replies.
-    pub fn take_osc_events(&mut self) -> Option<String> {
-        if !self.term.has_osc_events() {
-            return None;
-        }
-        let mut pairs = Vec::new();
-        while let Some((code, payload)) = self.term.take_osc_event() {
-            pairs.push(format!("[{code},{}]", json_string(&payload)));
-        }
-        Some(format!("[{}]", pairs.join(",")))
-    }
-
-    /// Display-relative cursor column (0-based).
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn cursor_x(&self) -> u16 {
-        self.term.grid().cursor().col
-    }
-
-    /// Display-relative cursor row (0-based, top of viewport).
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn cursor_y(&self) -> u16 {
-        self.term.grid().cursor().row
-    }
-
-    /// The live application cursor colour (OSC 12) as `0x00RRGGBB`, or
-    /// `undefined` after OSC 21 `cursor=` selected foreground-following (and in
-    /// an unconfigured core). OSC 112 restores the host baseline. Read per
-    /// frame so glow/trail colours follow app changes.
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn cursor_color(&self) -> Option<u32> {
-        self.term
-            .cursor_color()
-            .map(|c| (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b))
-    }
-
-    /// Absolute row index of the live/last line (xterm `buffer.active.baseY`):
-    /// `oldest_absolute_row() + scrollback_lines()`. `usize` → plain JS number.
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn base_y(&self) -> usize {
-        self.term.grid().base_y()
-    }
-
-    /// Absolute row index of the TOP visible line for the current viewport
-    /// (`base_y - display_offset`); the search/link origin.
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn display_origin_absolute(&self) -> usize {
-        self.term.grid().display_origin_absolute()
-    }
-
-    /// Soft-wrap flag for a visible `row`: `true` if it continues the previous
-    /// row (autowrap), `None` when out of range.
-    pub fn row_is_wrapped(&self, row: u16) -> Option<bool> {
-        self.term.grid().row_is_wrapped(row)
-    }
-
-    /// Logical length of a visible `row` (last non-empty cell + 1, 0 if blank);
-    /// `None` when out of range.
-    pub fn row_len(&self, row: u16) -> Option<u16> {
-        self.term.grid().row_len(row)
-    }
-
-    /// Grapheme text at display cell `row`/`col` (display_offset-aware, like
-    /// `row_text`): base char plus cluster and combining marks. Empty for a
-    /// blank cell, a wide-continuation spacer, or out-of-range coords. The
-    /// live-frame reader is `get_line_text`.
-    pub fn cell_text(&self, row: u16, col: u16) -> String {
-        self.with_display_row_cell(row, col, |(text, _)| text.clone())
-            .unwrap_or_default()
-    }
-
-    /// Whether the DISPLAY cell at `row`/`col` is a wide (double-width)
-    /// character; `None` when out of range. Resolved through the same
-    /// display-offset-aware row view as `cell_text` so a host's per-cell walk
-    /// sees one coherent row.
-    pub fn cell_is_wide(&self, row: u16, col: u16) -> Option<bool> {
-        self.with_display_row_cell(row, col, |(_, wide)| *wide)
-    }
-
-    /// Drain the edge-triggered BEL flag: `true` if a BEL fired since the last
-    /// call, then clears it (poll-based flash/ring without the bell callback).
-    pub fn drain_bell(&mut self) -> bool {
-        self.term.drain_bell()
-    }
-
-    /// Advance Kitty graphics animations to now; a due frame is shown on the
-    /// next `render`. Returns milliseconds until the next frame is due, or
-    /// `undefined` while nothing plays on screen.
-    pub fn advance_kitty_animations(&mut self) -> Option<f64> {
-        let now = aterm_time::Instant::now();
-        self.term
-            .advance_kitty_animations(now)
-            .next_frame_at
-            .map(|at| at.saturating_duration_since(now).as_secs_f64() * 1000.0)
-    }
-
     /// Drain the missing-font class bits (1 = text/mono fallback, 2 = colour
     /// emoji) accumulated since the last call. Misses land on the pre-init
     /// metrics face and on the GPU renderer's inner CPU face, so both are
@@ -1103,27 +967,6 @@ impl AtermGpuTerminal {
         self.term.set_default_background(Rgb { r, g, b });
     }
 
-    /// Tell the engine the real device-pixel cell size so CSI 14t/16t reports are
-    /// accurate (the engine has no canvas otherwise).
-    pub fn set_cell_pixel_size(&mut self, width: u16, height: u16) {
-        self.term.set_cell_pixel_size(width, height);
-    }
-
-    /// Set the scrollback line limit (`0` = unlimited, bounded only by byte
-    /// budgets). The limit is one total across the hot ring, staged lines and
-    /// the tiered store. Targets the primary grid (through an alt screen too;
-    /// the alt buffer keeps zero scrollback) and re-clamps the scroll position.
-    /// Default is `DEFAULT_LINE_LIMIT`.
-    pub fn set_scrollback_limit(&mut self, lines: u32) {
-        self.note_host_visual_change(); // WF-1 gate
-        let limit = if lines == 0 {
-            None
-        } else {
-            Some(lines as usize)
-        };
-        self.term.set_scrollback_line_limit(limit);
-    }
-
     /// Replace the default fg/bg/cursor/selection theme (0x00RRGGBB) on the GPU
     /// renderer and the CPU face without a device or face rebuild.
     pub fn set_theme(&mut self, fg: u32, bg: u32, cursor: u32, selection: u32) {
@@ -1134,7 +977,7 @@ impl AtermGpuTerminal {
         self.theme_fg = fg & 0x00FF_FFFF;
         self.theme_bg = bg & 0x00FF_FFFF;
         self.effects
-            .set_matrix_rain_theme(self.theme_bg, self.theme_fg);
+            .set_matrix_rain_theme(self.theme_bg, self.theme_fg, self.theme_cursor);
         // The pet's contrast sample belongs to the old theme; drop it while the
         // pet's behaviour, position and breed carry on.
         self.effects.invalidate_companion_colors();
@@ -1235,55 +1078,6 @@ impl AtermGpuTerminal {
         self.cpu.head() as u16
     }
 
-    // ── spill band: the cross-pane window-space effects export ──────────────
-    // Same host contract as aterm-wasm. Spill is CPU integer math over the
-    // emission streams both engines feed, so the bytes are engine-independent.
-
-    /// Monotone revision of the spill-band content; advances only when the
-    /// exported bytes changed, so an unchanged value lets the host skip its
-    /// blit.
-    pub fn spill_rev(&self) -> u32 {
-        self.spill.rev()
-    }
-
-    /// Number of dirty rects from the LAST `render`/`render_offscreen` (0 on
-    /// a no-change frame). Read with [`spill_rects_ptr`](Self::spill_rects_ptr).
-    pub fn spill_rect_count(&self) -> u32 {
-        (self.spill.rects().len() / 4) as u32
-    }
-
-    /// Byte offset (in wasm linear memory) of the packed dirty-rect array:
-    /// `spill_rect_count()` rects of 4 `i32`s (`x, y, w, h`, frame-absolute
-    /// device px). Consume synchronously after a render; never cache the view.
-    pub fn spill_rects_ptr(&self) -> usize {
-        self.spill.rects().as_ptr() as usize
-    }
-
-    /// Byte offset (in wasm linear memory) of the straight-alpha RGBA spill
-    /// buffer: four packed row-major strips — **top** `(0, 0, frameW,
-    /// pad+head)`, **bottom** `(0, frameH−pad, frameW, pad)`, **left** `(0,
-    /// pad+head, pad, gridH)`, **right** `(frameW−pad, pad+head, pad, gridH)`
-    /// with `gridH = frameH − 2·pad − head`. The pointer is stable across
-    /// frames and moves only when chrome or grid size changes; memory growth
-    /// still detaches JS views, so rebuild the view per read.
-    pub fn spill_ptr(&self) -> usize {
-        self.spill.rgba().as_ptr() as usize
-    }
-
-    /// Byte length of the spill buffer (`0` at 0/0 chrome — the identity law:
-    /// no band, no bytes, no per-frame cost).
-    pub fn spill_len(&self) -> usize {
-        self.spill.rgba().len()
-    }
-
-    /// Include `HaloMode::Over` veils (light-theme smoke/steam) in the spill
-    /// band (default `true`). `false` limits spill to additive light and fire
-    /// ink. Applies from the next render.
-    pub fn set_spill_include_veils(&mut self, on: bool) {
-        self.note_host_visual_change(); // WF-1 gate
-        self.spill.set_include_veils(on);
-    }
-
     /// Cursor-fill opacity (0..=1, like Ghostty's `cursor-opacity`; `1.0` is
     /// the default opaque fill with block cut-out). Below 1.0 the glyph shows
     /// through. Set on both faces; forces a full present.
@@ -1372,70 +1166,6 @@ impl AtermGpuTerminal {
         self.size_swapchain();
     }
 
-    /// Advance a deferred width-change scrollback rewrap (stashed by
-    /// [`Self::resize`]) by one step of at most [`Self::pump_reflow_budget`]
-    /// history lines, re-attaching the history when the job completes. Returns
-    /// `true` while work remains (schedule another pump), `false` once nothing
-    /// is pending (re-attach marks full damage, so the next render repaints).
-    ///
-    /// Cost: O(budget × cols) per call; a logical line is never split, so a
-    /// longer wrapped run is rewrapped whole. Any pump schedule yields the same
-    /// history as a one-shot rewrap.
-    ///
-    /// SAFETY: hosts that never pump still converge: `render`/`render_offscreen` pump
-    /// one step per frame after `REFLOW_PUMP_GRACE_RENDERS`, `process` pumps
-    /// one step per call past `REFLOW_BACKLOG_MAX_LINES`, and teardown drops
-    /// the job with the engine.
-    pub fn pump_reflow(&mut self) -> bool {
-        let Some(pending) = self.pending_reflow.take() else {
-            return false;
-        };
-        self.reflow_grace = 0;
-        match pending.reflow_step(self.reflow_budget) {
-            ReflowStep::InProgress(job) => {
-                self.pending_reflow = Some(job);
-                true
-            }
-            ReflowStep::Done(reflowed) => {
-                // A width change that landed while stepping hands back a
-                // re-detached job at the settled width; keep pumping it.
-                match self.term.finish_resize_offload(reflowed) {
-                    Some(follow) => {
-                        self.pending_reflow = Some(follow);
-                        true
-                    }
-                    None => false,
-                }
-            }
-        }
-    }
-
-    /// Tune the per-pump rewrap budget (input history lines per
-    /// [`Self::pump_reflow`] step); `0` restores `REFLOW_STEP_BUDGET_LINES`.
-    /// Raise it to finish in fewer tasks, lower it for tighter latency.
-    pub fn pump_reflow_budget(&mut self, max_lines: u32) {
-        self.reflow_budget = if max_lines == 0 {
-            REFLOW_STEP_BUDGET_LINES
-        } else {
-            max_lines as usize
-        };
-    }
-
-    /// True while a deferred scrollback rewrap is stashed: deep history is
-    /// detached (only the ring is visible/searchable). Keep scheduling
-    /// [`Self::pump_reflow`] while set.
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn reflow_pending(&self) -> bool {
-        self.pending_reflow.is_some()
-    }
-
-    /// `true` when the last `render` call was elided by the frame gate (the
-    /// canvas kept its previous frame). A test witness; hosts should use
-    /// [`needs_frame`](Self::needs_frame), which answers before the call.
-    pub fn last_render_skipped(&self) -> bool {
-        self.last_render_gated
-    }
-
     /// Whether the next `render` would draw: the exported frame gate, so a JS
     /// host can skip the wasm call and its own rAF work on a settled pane.
     ///
@@ -1513,716 +1243,6 @@ impl AtermGpuTerminal {
             }
             None => String::new(),
         }
-    }
-
-    // ---------------------------------------------------------------------
-    // Engine-state surface, matching aterm-wasm's `AtermTerminal`: the host's
-    // input handlers (scroll/selection/search/mouse/link/cursor/focus) use the
-    // same engine that draws, so bytes are parsed once per pane.
-    // ---------------------------------------------------------------------
-
-    /// Scroll the viewport through scrollback: positive `delta` reveals older
-    /// lines, negative reveals newer. The host redraws afterwards.
-    pub fn scroll_lines(&mut self, delta: i32) {
-        // Whole-row navigation lands row-aligned: drop any banked sub-row
-        // residual (the scroll_input_api reset-on-snap contract).
-        self.scroll_input.reset();
-        self.term.scroll_display(delta);
-    }
-
-    /// Snap the viewport to the live bottom (latest output).
-    pub fn scroll_to_bottom(&mut self) {
-        self.scroll_input.reset();
-        self.term.scroll_to_bottom();
-    }
-
-    /// Snap the viewport to the oldest retained scrollback line.
-    pub fn scroll_to_top(&mut self) {
-        self.scroll_input.reset();
-        self.term.scroll_to_top();
-    }
-
-    /// Lines the viewport is scrolled up from the live bottom (0 = at bottom).
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn display_offset(&self) -> usize {
-        self.term.grid().display_offset()
-    }
-
-    /// True when the alternate screen is active (TUIs own their own scrolling),
-    /// so the host should let wheel events pass through to the app.
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn is_alt_screen(&self) -> bool {
-        self.term.is_alternate_screen()
-    }
-
-    /// Serialize the terminal to a replayable ANSI string (replaces xterm's
-    /// SerializeAddon) via `aterm_core`'s `Terminal::serialize_ansi`, the body
-    /// the CPU `AtermTerminal::serialize` shares.
-    /// `scrollback_rows`: None = all history, Some(n) = last n, Some(0) =
-    /// viewport only.
-    pub fn serialize(&self, scrollback_rows: Option<u32>) -> String {
-        self.term.serialize_ansi(self.rows, scrollback_rows)
-    }
-
-    /// Scrollback HISTORY only (main buffer), via the shared
-    /// `Terminal::serialize_scrollback_ansi`.
-    pub fn serialize_scrollback(&self, max_rows: Option<u32>) -> String {
-        self.term.serialize_scrollback_ansi(max_rows)
-    }
-
-    /// The last completed OSC-133 block's output as JSON ("Copy Last Command
-    /// Output"), matching the CPU binding:
-    ///   `{"status":"ok","text":"…","exitCode":0}` — output read in full
-    ///     (`exitCode` is `null` when the block closed without OSC 133 D);
-    ///   `{"status":"evicted"}` — the block's rows scrolled past the
-    ///     scrollback cap;
-    ///   `undefined` — nothing to copy: no shell integration, no finished block
-    ///     (including a snapshot-rehydrated pane), or no output phase reached.
-    pub fn last_command_output(&self) -> Option<String> {
-        let block = self.term.last_completed_block()?;
-        match self.term.block_output_text(block) {
-            BlockText::Text(text) => {
-                let exit = block
-                    .exit_code
-                    .map_or_else(|| "null".to_owned(), |c| c.to_string());
-                Some(format!(
-                    "{{\"status\":\"ok\",\"text\":{},\"exitCode\":{exit}}}",
-                    json_string(&text)
-                ))
-            }
-            BlockText::Evicted => Some("{\"status\":\"evicted\"}".to_owned()),
-            BlockText::NotAvailable => None,
-        }
-    }
-
-    /// The window title (OSC 0/2), or `None` when unset (mirrors the CPU binding).
-    pub fn title(&self) -> Option<String> {
-        let title = self.term.title();
-        if title.is_empty() {
-            None
-        } else {
-            Some(title.to_string())
-        }
-    }
-
-    /// Whether bracketed-paste mode (DECSET 2004) is active. For display only;
-    /// route pastes through [`AtermGpuTerminal::format_paste`].
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn bracketed_paste_mode(&self) -> bool {
-        self.term.modes().bracketed_paste()
-    }
-
-    /// The paste encoder (the engine's `Terminal::format_paste`, as used by the
-    /// native app). Give it raw clipboard text; send the result to the PTY.
-    ///
-    /// It strips smuggled control bytes (ESC, the C1 block, C0 signal bytes),
-    /// folds line breaks to CR, and only then adds the `ESC[200~ … ESC[201~`
-    /// guards when bracketed paste is on. That order is the security property:
-    /// a pasted `ESC[201~` (or 8-bit `0x9B 2 0 1 ~`) is inert before the closing
-    /// guard is appended, so it cannot end its own bracket. A host that wraps
-    /// raw text itself has that hole.
-    pub fn format_paste(&self, text: &str) -> Vec<u8> {
-        self.term.format_paste(text)
-    }
-
-    /// True when DEC private mode 1007 (alternate scroll) is set: on the
-    /// alternate screen with mouse tracking off, the host converts wheel ticks
-    /// into arrow keys so TUIs without mouse support still scroll.
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn is_alternate_scroll(&self) -> bool {
-        self.term.modes().alternate_scroll()
-    }
-
-    /// True when DECCKM (application cursor keys) is set: the host encodes
-    /// arrows/Home/End as SS3 instead of CSI for full-screen apps.
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn is_app_cursor_mode(&self) -> bool {
-        self.term.modes().application_cursor_keys()
-    }
-
-    /// True when a TUI has enabled mouse tracking (DECSET 9/1000/1002/1003).
-    /// The host then encodes mouse events to the PTY instead of running
-    /// selection/scroll/link (unless Shift overrides).
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn is_mouse_tracking(&self) -> bool {
-        self.term.mouse_tracking_enabled()
-    }
-
-    /// True when the active mouse mode reports MOTION (1002 drag, 1003 any).
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn mouse_wants_motion(&self) -> bool {
-        matches!(
-            self.term.mouse_mode(),
-            MouseMode::ButtonEvent | MouseMode::AnyEvent
-        )
-    }
-
-    /// True for AnyEvent (1003): report motion even with NO button pressed.
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn mouse_wants_any_motion(&self) -> bool {
-        matches!(self.term.mouse_mode(), MouseMode::AnyEvent)
-    }
-
-    /// True when DECSET 1004 (focus reporting) is active: the host sends CSI I
-    /// on focus-in and CSI O on focus-out so apps track terminal focus.
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn is_focus_event_mode(&self) -> bool {
-        self.term.focus_reporting_enabled()
-    }
-
-    /// True when DEC mode 2031 (color-scheme update notifications) is set: the
-    /// app wants `CSI ? 997 ; n` on OS light/dark theme changes.
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn is_color_scheme_updates_mode(&self) -> bool {
-        self.term.report_color_scheme_enabled()
-    }
-
-    /// Active DECSCUSR cursor style as the discriminant of `aterm_core`'s
-    /// `CursorStyle`, for host introspection and tests.
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn cursor_style(&self) -> u8 {
-        self.term.cursor_style() as u8
-    }
-
-    /// Set the host's default cursor style (used before any DECSCUSR and after
-    /// RIS/DECSTR). `n` per DECSCUSR: 1=blinking block, 2=steady block,
-    /// 3=blinking underline, 4=steady underline, 5=blinking bar, 6=steady bar;
-    /// out of range is ignored. Does not override an app's live DECSCUSR.
-    pub fn set_default_cursor_style(&mut self, n: u8) {
-        self.note_host_visual_change(); // WF-1 gate
-        if let Some(style) = CursorStyle::from_param(u16::from(n)) {
-            self.term.set_default_cursor_style(style);
-        }
-    }
-
-    /// Push the host OS colour scheme (`dark`). When it changes and the app
-    /// enabled DEC mode 2031, the engine queues `CSI ? 997 ; Ps n`; drain it
-    /// via `take_response`. No-op when unchanged.
-    pub fn set_color_scheme(&mut self, dark: bool) {
-        self.note_host_visual_change(); // WF-1 gate
-        let scheme = if dark {
-            aterm_types::Appearance::Dark
-        } else {
-            aterm_types::Appearance::Light
-        };
-        self.term.set_color_scheme(scheme);
-    }
-
-    /// Encode a mouse-button PRESS at 0-based cell `col`/`row` for the active
-    /// mouse mode+encoding (`None` when tracking is off). See aterm-wasm.
-    pub fn encode_mouse_press(&self, col: u16, row: u16, button: u8, mods: u8) -> Option<Vec<u8>> {
-        self.term.encode_mouse_press(button, col, row, mods)
-    }
-
-    /// Encode a mouse-button RELEASE; `None` in X10 press-only mode.
-    pub fn encode_mouse_release(
-        &self,
-        col: u16,
-        row: u16,
-        button: u8,
-        mods: u8,
-    ) -> Option<Vec<u8>> {
-        self.term.encode_mouse_release(button, col, row, mods)
-    }
-
-    /// Encode mouse MOTION at `col`/`row`; `button` is the held button (3=none).
-    pub fn encode_mouse_motion(&self, col: u16, row: u16, button: u8, mods: u8) -> Option<Vec<u8>> {
-        self.term.encode_mouse_motion(button, col, row, mods)
-    }
-
-    /// Encode a mouse wheel tick at `col`/`row` (`up` = wheel-up); `None` in
-    /// X10. Vertical only, as in aterm-wasm.
-    pub fn encode_mouse_wheel(&self, col: u16, row: u16, up: bool, mods: u8) -> Option<Vec<u8>> {
-        let dir = if up {
-            aterm_types::mouse::WheelDir::Up
-        } else {
-            aterm_types::mouse::WheelDir::Down
-        };
-        self.term.encode_mouse_wheel(dir, col, row, mods)
-    }
-
-    /// Encode a keyboard event through the engine's full encoder (legacy,
-    /// modifyOtherKeys, Kitty) using the live `Terminal::keyboard_mode()`.
-    /// `key` is a DOM `KeyboardEvent.key`; `mods` is the `Modifiers` bitfield
-    /// (SHIFT=1, ALT=2, CTRL=4, SUPER=8); `event_type` is 0=Press, 1=Repeat,
-    /// 2=Release; `base_layout_key` is the US-QWERTY char for Kitty
-    /// `REPORT_ALTERNATE_KEYS`. `None` when the event encodes to nothing.
-    pub fn encode_key(
-        &self,
-        key: &str,
-        mods: u8,
-        event_type: u8,
-        base_layout_key: Option<char>,
-    ) -> Option<Vec<u8>> {
-        aterm_types::keyboard::encode_dom_key(
-            key,
-            mods,
-            event_type,
-            base_layout_key,
-            self.term.keyboard_mode(),
-        )
-    }
-
-    /// Enable/disable the Kitty keyboard protocol (default on). Disabled, the
-    /// engine acts as if unsupported: no `CSI ? u` reply, push/set/pop ignored,
-    /// no kitty bits in `keyboard_mode`. For hosts whose platform consumes kitty
-    /// sequences itself (Windows ConPTY). Survives `init`.
-    pub fn set_kitty_keyboard_enabled(&mut self, enabled: bool) {
-        self.term.set_kitty_keyboard_enabled(enabled);
-    }
-
-    /// Declare that the PTY behind this terminal is a Windows ConPTY (default
-    /// off). Only then does conhost's `CSI ? 9001 h` take effect, so key
-    /// encoding sends the win32-input-mode records conhost asked for
-    /// (Shift/Ctrl+Enter). Anywhere else that request is program output and is
-    /// ignored. Survives `init`.
-    pub fn set_win32_input_enabled(&mut self, enabled: bool) {
-        self.term.set_win32_input_enabled(enabled);
-    }
-
-    /// The live `Terminal::keyboard_mode()` bits, zero-extended from `u16`, for
-    /// worker-hosted engines: the host mirrors them to the main thread and
-    /// feeds them to [`encode_key_with_mode`].
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn keyboard_mode_bits(&self) -> u32 {
-        u32::from(self.term.keyboard_mode().bits())
-    }
-
-    /// Convert a display-relative row (0 = top of viewport) to the
-    /// terminal-relative row the selection model stores (`display_row -
-    /// display_offset`, negative for scrollback), so highlight and copied text
-    /// stay correct while scrolled.
-    fn display_row_to_terminal(&self, display_row: i32) -> i32 {
-        display_row - self.term.grid().display_offset() as i32
-    }
-
-    /// Begin a character selection at display `row`/`col` (clears any prior one).
-    pub fn selection_start(&mut self, row: i32, col: u16) {
-        self.note_host_visual_change(); // WF-1 gate
-        let row = self.display_row_to_terminal(row);
-        self.term.text_selection_mut().start_selection(
-            row,
-            col,
-            SelectionSide::Left,
-            SelectionType::Simple,
-        );
-    }
-
-    /// Select the word/URL at display `row`/`col` (double-click) and return its
-    /// text: a Semantic selection over the word's inclusive cell span, falling
-    /// back to the clicked cell on whitespace. The selection stays active.
-    ///
-    /// Works on the physical row: a word straddling a soft wrap yields only its
-    /// clicked-row fragment, unlike the desktop GUI's logical-line
-    /// `aterm_control::selection::word_span`.
-    pub fn selection_word(&mut self, row: i32, col: u16) -> Option<String> {
-        self.note_host_visual_change(); // WF-1 gate
-                                        // smart_word_at is display-offset-aware (takes the DISPLAY row); the
-                                        // selection anchor must be terminal-relative.
-        let (start, last) = match self
-            .term
-            .smart_word_at(row as usize, col as usize, &self.smart)
-        {
-            Some((s, e)) => (s as u16, e.saturating_sub(1).max(s) as u16),
-            None => (col, col),
-        };
-        let term_row = self.display_row_to_terminal(row);
-        let sel = self.term.text_selection_mut();
-        sel.start_selection(term_row, col, SelectionSide::Left, SelectionType::Semantic);
-        sel.expand_semantic(start, last);
-        sel.complete_selection();
-        self.term.selection_to_string()
-    }
-
-    /// Select the physical row at display `row` (triple-click) and return its
-    /// text. `col` is accepted for a uniform API but unused. Unlike the
-    /// desktop GUI's logical-line `select_line`, a soft-wrapped line is
-    /// truncated at the window width.
-    pub fn selection_line(&mut self, row: i32, col: u16) -> Option<String> {
-        self.note_host_visual_change(); // WF-1 gate
-        let _ = col;
-        let row = self.display_row_to_terminal(row);
-        let max_col = (self.cols as u16).saturating_sub(1);
-        let sel = self.term.text_selection_mut();
-        sel.start_selection(row, 0, SelectionSide::Left, SelectionType::Lines);
-        sel.expand_lines(max_col);
-        sel.complete_selection();
-        self.term.selection_to_string()
-    }
-
-    /// Move the selection endpoint to `row`/`col` (during a drag).
-    ///
-    /// Bumps the frame gate only when the resolved selection actually changes,
-    /// since hosts call this at pointer cadence. The comparison uses the
-    /// engine's `TextSelection` before and after, not the caller's arguments,
-    /// which would mis-handle auto-scroll, stale shadows across drags, and
-    /// anchors moved by content scroll.
-    pub fn selection_extend(&mut self, row: i32, col: u16) {
-        let row = self.display_row_to_terminal(row);
-        let before = self.term.text_selection().clone();
-        self.term
-            .text_selection_mut()
-            .update_selection(row, col, SelectionSide::Right);
-        if *self.term.text_selection() != before {
-            self.note_host_visual_change();
-        }
-    }
-
-    /// Finalize the selection (mouse released).
-    pub fn selection_finish(&mut self) {
-        self.note_host_visual_change(); // WF-1 gate
-        self.term.text_selection_mut().complete_selection();
-    }
-
-    /// Drop the current selection so the highlight clears on the next render.
-    pub fn selection_clear(&mut self) {
-        self.note_host_visual_change(); // WF-1 gate
-        self.term.text_selection_mut().clear();
-    }
-
-    /// Override the characters that break a double-click word (xterm.js
-    /// `wordSeparators`): a word is a maximal run of non-separators.
-    /// `undefined` restores the default (alphanumeric + `_`). Smart-selection
-    /// rules still take precedence for `selection_word` and `link_at`.
-    pub fn set_word_separators(&mut self, separators: Option<String>) {
-        self.smart.set_word_separators(separators.as_deref());
-    }
-
-    /// The selected text, if any (`None` when the selection is empty).
-    pub fn selection_text(&self) -> Option<String> {
-        self.term.selection_to_string()
-    }
-
-    /// Current selection bounds in DISPLAY viewport cell coords (0 = top visible
-    /// row), side-adjusted to match `selection_text` and the painted highlight.
-    /// `None` when there is no selection OR it lies fully outside the viewport.
-    pub fn selection_range(&self) -> Option<SelectionRange> {
-        selection_range_for(&self.term, self.rows, self.cols)
-    }
-
-    /// Detect a link under display `row`/`col`. Prefers an OSC-8 hyperlink, then
-    /// falls back to smart-selection rules (url/file_path). `None` for plain
-    /// words. `kind`: 0=osc8, 1=url, 2=file_path, 3=other. See aterm-wasm.
-    pub fn link_at(&self, row: u16, col: u16) -> Option<LinkHit> {
-        // OSC-8 lookups are NOT display_offset-aware, so only consult
-        // hyperlink_at when the viewport isn't scrolled.
-        if self.term.grid().display_offset() == 0 {
-            if let Some(url) = self.term.hyperlink_at(row, col) {
-                let url = url.to_string();
-                let (s, e) = self.osc8_span(row, col);
-                return Some(LinkHit {
-                    url,
-                    start_col: s,
-                    end_col: e,
-                    kind: 0,
-                });
-            }
-        }
-
-        // Smart-selection fallback: display_offset-aware, so it works on any
-        // scrollback row, and the word's text is read from the cells its
-        // columns name, not sliced out of the row's text by columns.
-        let (matched, sc, ec) =
-            self.term
-                .smart_word_text_at(row as usize, col as usize, &self.smart)?;
-        let kind = classify(&matched);
-        if kind == 3 {
-            return None;
-        }
-        Some(LinkHit {
-            url: matched,
-            start_col: sc as u16,
-            end_col: ec as u16,
-            kind,
-        })
-    }
-
-    /// Scroll-correct text of a display `row` (display_offset-aware), for a TS
-    /// fallback that re-runs link matching in JS.
-    pub fn row_text(&self, row: u16) -> Option<String> {
-        self.term.display_row_text(row as usize)
-    }
-
-    /// Batch export of `count` display rows from `first_row` (same coords as
-    /// [`AtermGpuTerminal::row_text`]) in one boundary crossing: a JSON array
-    /// of `{text, wrapped, len, widths?}` records in row order. `widths` is a
-    /// per-column digit string (`'2'` wide lead, `'1'` otherwise), omitted for
-    /// all-narrow rows. `undefined` when a row is outside the live grid (e.g.
-    /// resize skew); the host then falls back to the per-row path.
-    pub fn row_range_json(&self, first_row: u32, count: u32) -> Option<String> {
-        let rows = u32::try_from(self.rows).unwrap_or(u32::MAX);
-        let cols = self.cols;
-        let end = first_row.checked_add(count)?;
-        // Any row past the live grid ⇒ range unavailable this frame.
-        if end > rows {
-            return None;
-        }
-        let mut out = String::from("[");
-        for y in first_row..end {
-            if y != first_row {
-                out.push(',');
-            }
-            let row_u16 = u16::try_from(y).ok()?;
-            // Text matches the per-row `row_text` fallback exactly
-            // (display_row_text), so a path switch never spuriously re-dirties.
-            let text = self.term.display_row_text(y as usize).unwrap_or_default();
-            let wrapped = self.term.grid().row_is_wrapped(row_u16).unwrap_or(false);
-            let len = self
-                .term
-                .grid()
-                .row_len(row_u16)
-                .map_or(self.cols, usize::from);
-            // Per-column wide map from one row view (the continuation spacer
-            // reports narrow, matching `cell_is_wide`). Reading `is_wide()` off
-            // the view avoids allocating a String per column; an out-of-grid
-            // row yields `Empty`, whose `cell()` is `None` (all-narrow).
-            let view = self.term.grid().visible_row_view(row_u16);
-            let mut widths = String::with_capacity(cols);
-            let mut any_wide = false;
-            for col in 0..cols {
-                let wide = u16::try_from(col)
-                    .ok()
-                    .and_then(|c| view.cell(c))
-                    .is_some_and(|c| c.is_wide());
-                if wide {
-                    widths.push('2');
-                    any_wide = true;
-                } else {
-                    widths.push('1');
-                }
-            }
-            out.push_str("{\"text\":");
-            out.push_str(&json_string(&text));
-            out.push_str(",\"wrapped\":");
-            out.push_str(if wrapped { "true" } else { "false" });
-            out.push_str(",\"len\":");
-            out.push_str(&len.to_string());
-            if any_wide {
-                out.push_str(",\"widths\":");
-                out.push_str(&json_string(&widths));
-            }
-            out.push('}');
-        }
-        out.push(']');
-        Some(out)
-    }
-
-    /// Search the full retained buffer for `query`, returning matches as a flat
-    /// `[abs_line, start_col, len]` triplet array; empty query or regex error
-    /// gives an empty array. `is_regex` compiles `query` as a regex. Same
-    /// coordinate contract as aterm-wasm.
-    pub fn search(&mut self, query: &str, case_sensitive: bool, is_regex: bool) -> Vec<u32> {
-        if query.is_empty() {
-            return Vec::new();
-        }
-        let Ok(results) =
-            self.term
-                .indexed_search()
-                .search_results_opts(query, case_sensitive, is_regex)
-        else {
-            return Vec::new();
-        };
-        let mut out = Vec::with_capacity(results.matches.len() * 3);
-        for m in &results.matches {
-            out.push(u32::try_from(m.line).unwrap_or(u32::MAX));
-            out.push(u32::try_from(m.start_col).unwrap_or(u32::MAX));
-            out.push(u32::try_from(m.len()).unwrap_or(u32::MAX));
-        }
-        out
-    }
-
-    /// Metadata for a [`AtermGpuTerminal::search`] query, carrying the
-    /// engine's `incomplete` signal that `search` drops. Re-runs `query` on
-    /// the cached index (no rebuild on unchanged content); empty query or
-    /// invalid regex reports `incomplete == false`, `match_count == 0`.
-    pub fn search_meta(&mut self, query: &str, case_sensitive: bool, is_regex: bool) -> SearchMeta {
-        if query.is_empty() {
-            return SearchMeta {
-                incomplete: false,
-                match_count: 0,
-            };
-        }
-        let Ok(results) =
-            self.term
-                .indexed_search()
-                .search_results_opts(query, case_sensitive, is_regex)
-        else {
-            return SearchMeta {
-                incomplete: false,
-                match_count: 0,
-            };
-        };
-        SearchMeta {
-            incomplete: results.incomplete,
-            match_count: u32::try_from(results.matches.len()).unwrap_or(u32::MAX),
-        }
-    }
-
-    /// Snippet-carrying superset of [`AtermGpuTerminal::search_meta`]: returns
-    /// `{matches:[{absRow,col,len,snippet}], total, incomplete}`. `matches` is
-    /// capped to `max_matches` (0 = uncapped), `total` counts before the cap,
-    /// `incomplete` is the engine's eviction/match-cap signal, and `snippet` is
-    /// the match line's text. Empty query or invalid regex ⇒
-    /// `{matches:[],total:0,incomplete:false}`.
-    ///
-    /// Reads an already-built index ([`Terminal::search_summary_results`]): a
-    /// completed [`AtermGpuTerminal::search_budgeted`] scan's index when it
-    /// matches, else the reused one-shot index (rebuilt only on a content-key
-    /// miss). Only the capped rows pay a snippet read.
-    pub fn search_summary(
-        &mut self,
-        query: &str,
-        case_sensitive: bool,
-        is_regex: bool,
-        max_matches: u32,
-    ) -> Option<String> {
-        let empty = || Some("{\"matches\":[],\"total\":0,\"incomplete\":false}".to_owned());
-        if query.is_empty() {
-            return empty();
-        }
-        let (matches, total, incomplete) = {
-            let Ok(results) = self
-                .term
-                .search_summary_results(query, case_sensitive, is_regex)
-            else {
-                return empty();
-            };
-            let total = results.matches.len();
-            let cap = if max_matches == 0 {
-                total
-            } else {
-                (max_matches as usize).min(total)
-            };
-            // Copy the capped (line, start_col, len) triplets out so the &self
-            // index borrow ends before the &self snippet reads below.
-            let matches: Vec<(u64, usize, usize)> = results.matches[..cap]
-                .iter()
-                .map(|m| (m.line as u64, m.start_col, m.len()))
-                .collect();
-            (matches, total, results.incomplete)
-        };
-        let mut out = String::from("{\"matches\":[");
-        for (i, (abs, col, len)) in matches.iter().enumerate() {
-            if i != 0 {
-                out.push(',');
-            }
-            let snippet = self.term.abs_row_text(*abs).unwrap_or_default();
-            out.push_str("{\"absRow\":");
-            out.push_str(&abs.to_string());
-            out.push_str(",\"col\":");
-            out.push_str(&col.to_string());
-            out.push_str(",\"len\":");
-            out.push_str(&len.to_string());
-            out.push_str(",\"snippet\":");
-            out.push_str(&json_string(&snippet));
-            out.push('}');
-        }
-        out.push_str("],\"total\":");
-        out.push_str(&total.to_string());
-        out.push_str(",\"incomplete\":");
-        out.push_str(if incomplete { "true" } else { "false" });
-        out.push('}');
-        Some(out)
-    }
-
-    /// Absolute row of display row 0 at the live bottom. A match at absolute
-    /// `line` is at display row `line - origin + display_offset`.
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
-    pub fn search_display_origin(&self) -> u32 {
-        let grid = self.term.grid();
-        let origin = grid
-            .oldest_absolute_row()
-            .saturating_add(grid.scrollback_lines() as u64);
-        u32::try_from(origin).unwrap_or(u32::MAX)
-    }
-
-    /// Scroll the viewport so the match at absolute `line` is visible (top row),
-    /// clamped to the retained scrollback. Host redraws after.
-    pub fn scroll_search_line_into_view(&mut self, line: u32) {
-        let grid = self.term.grid();
-        let origin = grid
-            .oldest_absolute_row()
-            .saturating_add(grid.scrollback_lines() as u64);
-        let scrollback = grid.scrollback_lines();
-        let current = grid.display_offset();
-        let want = origin.saturating_sub(u64::from(line));
-        let want = (want as usize).min(scrollback);
-        let delta = want as i64 - current as i64;
-        if let Ok(delta) = i32::try_from(delta) {
-            self.term.scroll_display(delta);
-        }
-    }
-
-    /// Budgeted, resumable variant of [`AtermGpuTerminal::search`] (same
-    /// cursor/staleness contract as aterm-wasm's `search_budgeted`). Runs at
-    /// most `row_budget` rows per call (zero is clamped to one); the returned
-    /// cursor resumes. A stale cursor, new pattern or changed content restarts.
-    /// Empty query or invalid regex returns an empty `complete` result (an
-    /// empty query also drops in-flight state). Backlog-drain turns may deliver
-    /// deltas without advancing `rows_fed`.
-    pub fn search_budgeted(
-        &mut self,
-        query: &str,
-        case_sensitive: bool,
-        is_regex: bool,
-        resume_cursor: Option<u64>,
-        row_budget: u32,
-    ) -> BudgetedSearchResult {
-        let empty = || BudgetedSearchResult {
-            matches: Vec::new(),
-            complete: true,
-            cursor: None,
-            search_id: None,
-            reset: true,
-            incomplete_index: false,
-            lowest_retained_line: 0,
-            rows_fed: 0,
-            total_rows: 0,
-        };
-        if query.is_empty() {
-            self.term.cancel_budgeted_search();
-            return empty();
-        }
-        let Ok(step) = self.term.search_budgeted(
-            query,
-            case_sensitive,
-            is_regex,
-            resume_cursor,
-            row_budget as usize,
-        ) else {
-            return empty();
-        };
-        let mut matches = Vec::with_capacity(step.results.matches.len() * 3);
-        for m in &step.results.matches {
-            matches.push(u32::try_from(m.line).unwrap_or(u32::MAX));
-            matches.push(u32::try_from(m.start_col).unwrap_or(u32::MAX));
-            matches.push(u32::try_from(m.len()).unwrap_or(u32::MAX));
-        }
-        BudgetedSearchResult {
-            matches,
-            complete: step.complete,
-            cursor: step.cursor,
-            search_id: Some(step.search_id),
-            reset: step.reset,
-            incomplete_index: step.results.incomplete,
-            lowest_retained_line: u32::try_from(step.results.lowest_retained_line)
-                .unwrap_or(u32::MAX),
-            rows_fed: u32::try_from(step.rows_fed).unwrap_or(u32::MAX),
-            total_rows: u32::try_from(step.total_rows).unwrap_or(u32::MAX),
-        }
-    }
-
-    /// Drop any in-flight [`AtermGpuTerminal::search_budgeted`] state (frees
-    /// the partial index; outstanding cursors go stale and restart if resumed).
-    pub fn search_budgeted_cancel(&mut self) {
-        self.term.cancel_budgeted_search();
-    }
-
-    /// Release the search index's heap: drop the cached full-content index and
-    /// any in-flight budgeted search so an idle pane returns the memory. The
-    /// next search rebuilds, with identical results.
-    pub fn search_index_release(&mut self) {
-        self.term.release_search_index();
     }
 }
 
@@ -2459,46 +1479,6 @@ impl SelectionRange {
     }
 }
 
-/// Project the engine's selection (terminal-relative rows) into display
-/// viewport coords, clamping partially scrolled selections to `[0, rows)`.
-/// Uses the same `project_range` + side adjustment as the renderer and
-/// `selection_text`. `None` when there is no selection or it is off-screen.
-fn selection_range_for(term: &Terminal, rows: usize, cols: usize) -> Option<SelectionRange> {
-    let last_col = (cols as u16).saturating_sub(1);
-    let proj = term.text_selection().project_range(last_col)?;
-    let offset = term.grid().display_offset() as i32;
-    let rows_i = rows as i32;
-
-    // terminal_row -> display_row = terminal_row + display_offset.
-    let start_disp = proj.start_row + offset;
-    let end_disp = proj.end_row + offset;
-
-    // Fully outside the viewport (both ends above the top or below the bottom).
-    if end_disp < 0 || start_disp >= rows_i {
-        return None;
-    }
-
-    // Clamp to the viewport: a row scrolled off the top enters at col 0 of the
-    // top row; one past the bottom exits at the last col of the bottom row.
-    let (start_y, start_x) = if start_disp < 0 {
-        (0u16, 0u16)
-    } else {
-        (start_disp as u16, proj.start_col)
-    };
-    let (end_y, end_x) = if end_disp >= rows_i {
-        ((rows_i - 1) as u16, last_col)
-    } else {
-        (end_disp as u16, proj.end_col)
-    };
-
-    Some(SelectionRange {
-        start_x,
-        start_y,
-        end_x,
-        end_y,
-    })
-}
-
 /// JSON-escape `s` and wrap it in double quotes for `take_osc_events` /
 /// `take_notifications`. Mirrors the aterm-wasm crate.
 pub(crate) fn json_string(s: &str) -> String {
@@ -2545,23 +1525,6 @@ fn classify(s: &str) -> u8 {
 // Async WebGL init + present, wasm32 only. Native callers drive aterm-gpu
 // directly via `GpuRenderer::new` and a window surface.
 // ---------------------------------------------------------------------------
-/// An empty `RawDisplayHandle::Web` provider. wgpu requires the instance to
-/// carry a display handle before `create_surface()`; the WebGL backend reads
-/// the canvas from the window handle and ignores this one.
-#[cfg(target_arch = "wasm32")]
-#[derive(Debug)]
-struct WebDisplay;
-
-#[cfg(target_arch = "wasm32")]
-impl wgpu::rwh::HasDisplayHandle for WebDisplay {
-    fn display_handle(&self) -> Result<wgpu::rwh::DisplayHandle<'_>, wgpu::rwh::HandleError> {
-        let raw = wgpu::rwh::RawDisplayHandle::Web(wgpu::rwh::WebDisplayHandle::new());
-        // SAFETY: the Web display handle is an empty marker (no borrowed data),
-        // so a 'static borrow is sound — there is nothing for it to outlive.
-        Ok(unsafe { wgpu::rwh::DisplayHandle::borrow_raw(raw) })
-    }
-}
-
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 impl AtermGpuTerminal {
@@ -2570,65 +1533,47 @@ impl AtermGpuTerminal {
     /// The browser counterpart of aterm-gpu's `GpuRenderer::new` +
     /// `create_window_surface`, with every blocking step awaited and the
     /// surface created before the adapter (WebGL enumerates its adapter
-    /// against the canvas): GL-backend `wgpu::Instance`, `create_surface`,
-    /// `GpuContext::from_instance_with_surface`, `GpuRenderer::from_parts`,
-    /// then `configure_window_surface`.
+    /// against the canvas): `GpuContext::for_canvas`,
+    /// `GpuRenderer::from_parts`, then `configure_canvas_surface`.
     ///
     /// Returns `Err` (a JS string) if WebGL is unavailable or any step fails, so
     /// the host can fall back to the CPU `aterm-wasm` path.
-    pub async fn init(&mut self, canvas: web_sys::HtmlCanvasElement) -> Result<(), String> {
-        self.init_with_target(wgpu::SurfaceTarget::Canvas(canvas))
+    pub async fn init(&mut self, canvas: aterm_gpu::web::HtmlCanvasElement) -> Result<(), String> {
+        self.init_with_target(aterm_gpu::web::CanvasTarget::Canvas(canvas))
             .await
     }
 
     /// Worker variant: create the WebGL2 surface on a transferred
     /// `OffscreenCanvas`, so rendering and present run off the main thread.
     /// Otherwise identical to `init`.
-    pub async fn init_offscreen(&mut self, canvas: web_sys::OffscreenCanvas) -> Result<(), String> {
-        self.init_with_target(wgpu::SurfaceTarget::OffscreenCanvas(canvas))
+    pub async fn init_offscreen(
+        &mut self,
+        canvas: aterm_gpu::web::OffscreenCanvas,
+    ) -> Result<(), String> {
+        self.init_with_target(aterm_gpu::web::CanvasTarget::Offscreen(canvas))
             .await
     }
 
-    /// Shared GPU bring-up for `init` and `init_offscreen`: WebGL instance and
-    /// surface from `target`, then adapter/device/renderer and swapchain
-    /// config. Not `pub` because `SurfaceTarget` is not a JS type.
+    /// Shared GPU bring-up for `init` and `init_offscreen`: context and
+    /// pending canvas surface from `target`, then the renderer and swapchain
+    /// config. Not `pub` because `CanvasTarget` is not a JS type.
     async fn init_with_target(
         &mut self,
-        target: wgpu::SurfaceTarget<'static>,
+        target: aterm_gpu::web::CanvasTarget,
     ) -> Result<(), String> {
-        // The WebGL2 backend (the only one compiled into the wasm build).
-        // `create_surface()` requires the instance to carry some display handle;
-        // WebGL ignores it, so an empty `RawDisplayHandle::Web` marker satisfies
-        // the check.
-        let instance = wgpu::Instance::new(
-            wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::GL,
-                ..wgpu::InstanceDescriptor::new_without_display_handle()
-            }
-            .with_display_handle(Box::new(WebDisplay)),
-        );
-
         // WebGL can only acquire an adapter from a surface (the GL context lives
-        // on the canvas), so create the surface first.
-        let surface_raw = instance
-            .create_surface(target)
-            .map_err(|e| format!("create canvas surface failed: {e}"))?;
-
-        // Adapter + device, awaited, with the canvas surface as the
-        // compatibility target.
-        let ctx = GpuContext::from_instance_with_surface(instance, Some(&surface_raw))
-            .await
-            .map_err(|e| format!("WebGL adapter/device init failed: {e}"))?;
+        // on the canvas), so aterm-gpu creates the surface first and hands it
+        // back unconfigured. Its errors name the failed step.
+        let (ctx, canvas_surface) = GpuContext::for_canvas(target).await?;
 
         // Assemble the portable GPU renderer on the acquired context, on the
-        // face the host configured — this builds every wgpu pipeline.
+        // face the host configured — this builds every pipeline.
         let renderer = GpuRenderer::from_parts(ctx, self.gpu_face()?, None, self.theme)?;
 
-        // Configure the canvas swapchain (non-sRGB, sized to the grid) via
-        // aterm-gpu's `configure_window_surface`.
+        // Configure the canvas swapchain (non-sRGB, sized to the grid).
         let (w, h) = renderer.frame_size(self.surface_rows(), self.cols);
         let surface = renderer
-            .configure_window_surface(surface_raw, w as u32, h as u32)
+            .configure_canvas_surface(canvas_surface, w as u32, h as u32)
             .map_err(|e| format!("configure canvas surface failed: {e}"))?;
 
         self.gpu = Some(GpuState {
@@ -2814,7 +1759,6 @@ impl AtermGpuTerminal {
             emoji_font: None,
             bold_font: None,
             symbol_font: None,
-            line_height: 1.0,
             text_shaping: aterm_render::TextShapingConfig::default(),
             frame_scratch: RenderInput::empty(),
             #[cfg(test)]
@@ -2901,10 +1845,41 @@ mod tests {
         t.set_px(21.0);
         t.set_line_height(1.25);
         t.set_chrome(4, 2);
+        // An unusable request keeps the last valid CPU geometry. Rebuilding
+        // must retain that geometry too, rather than replay the rejected input.
+        t.set_line_height(f32::INFINITY);
         let face = t.gpu_face().expect("the bundled face");
         assert_eq!(face.px(), 21.0);
         assert_eq!(face.cell_size(), t.cpu.cell_size());
         assert_eq!((face.pad(), face.head()), (t.cpu.pad(), t.cpu.head()));
+
+        t.process(b"selected text\r\n\x1b[1 q");
+        t.selection_start(0, 0);
+        t.selection_extend(0, 8);
+        t.selection_finish();
+        t.set_selection_fg(Some(0x00ff_8040));
+        t.set_selection_inactive_bg(Some(0x0012_3456));
+        for (inactive, hollow, blink) in [
+            (false, false, false),
+            (false, true, true),
+            (true, false, true),
+        ] {
+            t.set_selection_inactive(inactive);
+            t.set_cursor_hollow(hollow);
+            t.set_cursor_blink_phase(blink);
+            let mut face = t.gpu_face().expect("the bundled face");
+            let input = t.term.cell_frame(t.rows, t.cols);
+            let expected = t.cpu.render_input(&input);
+            let actual = face.render_input(&input);
+            assert_eq!(
+                (actual.width, actual.height),
+                (expected.width, expected.height)
+            );
+            assert_eq!(
+                actual.pixels, expected.pixels,
+                "init must retain inactive={inactive}, hollow={hollow}, blink={blink}"
+            );
+        }
     }
 
     #[test]

@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Settings ▸ Messages page's model proves itself without a host (design
-//! ruling 382): a [`Desk`] answers the seam — its clock, its log folder, a
-//! staged build, the files that are there, the upgrades that stand and take
-//! a word, and the sentence count a key names — and the builder runs over a
-//! real [`MessageCenter`]. Moved here from the host with the model: the
-//! calendar's `a_stamp_from_tomorrow_is_todays` (from `native_settings`), the
-//! cut-off mark's controls and the span words (from `messages_host`'s
-//! projection tests, which keep driving the host's facts through `App`).
+//! The Settings ▸ Messages page's model without a host: a [`Desk`] answers the seam and
+//! the builder runs over a real [`MessageCenter`].
 
 use crate::center::MessageCenter;
 use crate::log::{LogLine, LogRecord, MessageLog};
@@ -38,7 +32,7 @@ struct Desk {
     takes: Vec<(&'static str, &'static str, UpgradeWord)>,
     /// The tabs whose upgrade stands at all.
     standing: Vec<&'static str>,
-    /// A host that performs no navigation (the web's, ruling 389).
+    /// A host that performs no navigation (the web's).
     no_navigation: bool,
 }
 
@@ -120,12 +114,10 @@ fn upgrade(tab: &str, to: &str, word: UpgradeWord) -> Intent {
     }
 }
 
-/// THE PROJECTION (design §4.2), built by the engine over a real center:
-/// every record newest first in the wire's own state words, the live row's
-/// CURRENT words (a restatement is never logged), the band row each live row
-/// is on, tag counts in the chips' order with a tag this build does not
-/// know after them in first-seen order, and the host's facts — its clock,
-/// its log folder, saved, its offset — passed through as it answered them.
+/// The projection over a real center: every record newest first in the wire's state
+/// words, a live row's current words (a restatement is never logged), the band row each
+/// live row is on, tag counts in the chips' order with an unknown tag after them, and the
+/// host's facts passed through.
 #[test]
 fn the_projection_is_newest_first_in_the_chips_order_with_the_hosts_facts() {
     let now = Instant::now();
@@ -298,10 +290,8 @@ fn the_projection_is_newest_first_in_the_chips_order_with_the_hosts_facts() {
     assert!(MessagesState::empty().saved && MessagesState::empty().entries.is_empty());
 }
 
-/// `Install now` is offered while its row is up and pressable only while the
-/// HOST says that build is still the staged one; a decision is pressable
-/// while live and not offered once answered (ruling 265); the sentence count
-/// is the host's (ruling 314).
+/// `Install now` is pressable only while the host says that build is still staged; an
+/// answered decision is not offered again; the sentence count is the host's.
 #[test]
 fn install_now_follows_the_hosts_staged_build_and_the_sentence_is_the_hosts() {
     let now = Instant::now();
@@ -380,12 +370,9 @@ fn install_now_follows_the_hosts_staged_build_and_the_sentence_is_the_hosts() {
     assert_eq!(ans.sentences, 1);
 }
 
-/// A WORD FOR A SESSION THAT IS GONE is not offered (ruling 315): on a
-/// retired record, an upgrade word whose tab the host no longer has is
-/// dropped; one whose upgrade still stands but no longer takes the word is
-/// offered disabled; one it takes is pressable. An agent's one row's word
-/// stays while ANY tab it named stands, and is pressable while any takes it.
-/// A LIVE row keeps every word, gone or not.
+/// On a retired record an upgrade word whose tab the host no longer has is dropped; one
+/// whose upgrade stands but no longer takes the word is offered disabled. An agent's one
+/// row's word stays while any tab it named stands. A live row keeps every word.
 #[test]
 fn a_word_for_a_session_that_is_gone_is_not_offered() {
     let now = Instant::now();
@@ -457,9 +444,8 @@ fn a_word_for_a_session_that_is_gone_is_not_offered() {
     );
     assert!(words_of(&page, tab).is_empty());
     assert_eq!(words_of(&page, group), [(0, true)]);
-    // s-1 stands but moved on: its words stay, disabled; one it takes is
-    // pressable. The group word stays (s-1 stands), disabled: no tab takes
-    // Skip.
+    // s-1 stands but moved on: its words stay, disabled, but for one it takes. The group
+    // word stays (s-1 stands), disabled: no tab takes Skip.
     let page = MessagesState::of(
         &c,
         &Desk {
@@ -472,14 +458,10 @@ fn a_word_for_a_session_that_is_gone_is_not_offered() {
     assert_eq!(words_of(&page, group), [(0, false)]);
 }
 
-/// A NAVIGATION IS PRESSABLE WHERE THE HOST PERFORMS ONE (ruling 389): its
-/// moment never passes, so on a host that performs navigations — the macOS
-/// one, from any record — every `Manual`, `Open aterm.toml`, System Settings
-/// pane and `New window` is pressable, live or retired; on a host that
-/// performs none (the web's) not one is, while every other intent keeps its
-/// own fact: `Open log` follows the file, a live ask's `Not now` stays
-/// pressable. The page's lines say the same (`actionable=`). NEGATIVE
-/// CONTROL: the performing host's page, where the same capsules read `1`.
+/// A navigation's moment never passes: on a host that performs navigations every one is
+/// pressable, live or retired; on one that performs none (the web's) not one is, while
+/// every other intent keeps its own fact (`Open log` follows the file, a live ask's `Not
+/// now` stays pressable). The lines say the same (`actionable=`).
 #[test]
 fn a_navigation_is_pressable_only_where_the_host_performs_one() {
     let now = Instant::now();
@@ -579,16 +561,10 @@ fn a_navigation_is_pressable_only_where_the_host_performs_one() {
     );
 }
 
-/// A SCRIPT'S TAG NEVER READS AS ONE OF ATERM'S CHIPS (ruling 390): chips
-/// merge by their words, so a script's `updates`, capitalized, would have
-/// counted, filtered and been spoken as aterm's own Updates — the lane the
-/// wire refuses a script (ruling 171). Every aterm chip's words spelled as a
-/// script's tag read as the script wrote them, a chip of their own; every
-/// other script tag keeps its capitals (`search` → `Search`, `ci` → `CI`).
-/// Over a real center: a script's `updates` error and aterm's own `update`
-/// record are two chips, the Updates filter admits aterm's alone, and the
-/// script's row is spoken as `updates`. NEGATIVE CONTROL: aterm's own pairs
-/// still share a chip.
+/// Chips merge by their words, so a script tag spelled as an aterm chip's words (`updates`)
+/// reads as the script wrote it, a chip of its own; other script tags are capitalized
+/// (`search` → `Search`, `ci` → `CI`). Over a real center, the Updates filter admits
+/// aterm's `update` record alone. Control: aterm's own pairs still share a chip.
 #[test]
 fn a_scripts_tag_never_reads_as_one_of_aterms_chips() {
     for (script, own) in [
@@ -668,12 +644,9 @@ fn a_scripts_tag_never_reads_as_one_of_aterms_chips() {
     );
 }
 
-/// THE MARK OF WORK CUT OFF (ruling 317, day eight E5), the engine's half of
-/// `messages_host::tests::a_row_open_at_quit_is_recorded_as_cut_off_and_a_dead_processes_as_open`
-/// (whose controls on the mark moved here with it): a record replayed open
-/// from a process that died without an ending says aterm stopped and wears
-/// its severity's mark, not the working `↻`; a row THIS process retired for
-/// going silent still blames its reporter; a row cut off by a quit says so.
+/// A record replayed open from a process that died without an ending says aterm stopped
+/// and wears its severity's mark, not the working `↻`; a row this process retired for
+/// going silent blames its reporter; a row cut off by a quit says so.
 #[test]
 fn a_replayed_open_record_is_cut_off_and_a_silent_one_blames_its_reporter() {
     let dead = LogRecord::from_posted(
@@ -736,9 +709,8 @@ fn a_replayed_open_record_is_cut_off_and_a_silent_one_blames_its_reporter() {
     );
 }
 
-/// Every state in PLAIN words (design ruling 66): what the row is doing,
-/// and once it has left how long it stood — never the wire's word, never
-/// `cleared` over a failure, `took` only for delivered work.
+/// Every state in plain words: what the row is doing and, once it has left, how long it
+/// stood; never `cleared` over a failure, `took` only for delivered work.
 #[test]
 fn every_state_is_said_in_plain_words() {
     let base = entry_at(1, NOW - 120_000);
@@ -826,9 +798,8 @@ fn every_state_is_said_in_plain_words() {
     }
 }
 
-/// Every vocabulary word has a chip position, in the chips' own words; a
-/// script's tags read like the chips beside them (ruling 265); a span in
-/// words. The span words moved here from the host's projection test.
+/// Every vocabulary word has a chip position, in the chips' own words; a script's tags
+/// read like the chips beside them; a span in words.
 #[test]
 fn tags_chips_cover_the_vocabulary() {
     for tag in tags::ALL {
@@ -849,11 +820,9 @@ fn tags_chips_cover_the_vocabulary() {
     assert_eq!(span_words(200_000_000), "2 d");
 }
 
-/// The filters match a tag by the CHIP it shows under (ruling 262): one
-/// Agents chip for `fabric` and `harness`, one ALab tools chip for
-/// `toolchain` and `packages`, and Problems is warnings and errors together
-/// (ruling 264); the count line says the whole of what they admit; an
-/// entry's spoken name is its severity, chip and age in words.
+/// The filters match a tag by the chip it shows under, Problems is warnings and errors
+/// together, the count line says the whole of what they admit, and an entry's spoken name
+/// is its severity, chip and age in words.
 #[test]
 fn the_filter_matches_by_chip_and_the_count_line_says_what_it_admits() {
     let fabric = MessageView {
@@ -902,12 +871,8 @@ fn the_filter_matches_by_chip_and_the_count_line_says_what_it_admits() {
     );
 }
 
-/// A STAMP FROM TOMORROW IS TODAY'S (ruling 281): a writer whose clock
-/// runs ahead stamps a record past the reader's midnight. It heads no
-/// list of today alone (ruling 277: a list all of today carries none),
-/// and in a headed list it opens no section of its own — before 281 it
-/// did, and read `Today` above today's own `Today`. NEGATIVE CONTROL: a
-/// past entry still heads the list, into two sections.
+/// A stamp past the reader's midnight (a writer whose clock runs ahead) is today's: a list
+/// of it and today carries no header, and in a headed list it is in today's section.
 #[test]
 fn a_stamp_from_tomorrow_is_todays() {
     const DAY: u64 = 86_400_000;
@@ -937,14 +902,9 @@ fn a_stamp_from_tomorrow_is_todays() {
     );
 }
 
-/// AN OLD OPEN EXCEPTION KEEPS ITS OWN DAY: it is listed first whatever its
-/// age, and the log under it starts again from today — before, a running
-/// minimum filed every newer record under the exception's day, with no
-/// `Today` header anywhere. A log record from the exception's day files
-/// under that day again, below `Today`: the open run and the log each give
-/// a day one header, so `Yesterday` can appear twice. NEGATIVE CONTROL: the
-/// same rows with no open exception keep the plain running minimum (one
-/// header a day).
+/// An old open exception is listed first under its own day, and the log under it starts
+/// again from today, so a day can head both the open run and the log. Control: with no
+/// open exception the sections are a running minimum (one header a day).
 #[test]
 fn an_old_open_exception_keeps_its_own_day_header() {
     const DAY: u64 = 86_400_000;
@@ -1000,9 +960,9 @@ fn an_old_open_exception_keeps_its_own_day_header() {
     );
 }
 
-/// Under the day headers a row older than today says its local time; today's
-/// rows, and every row of an unheaded list, keep their relative words
-/// (ruling 273); the clock reads the host's offset.
+/// Under the day headers a row older than today says its local time; today's rows, and
+/// every row of an unheaded list, keep their relative words; the clock reads the host's
+/// offset.
 #[test]
 fn a_headed_list_says_the_local_time_of_a_past_row() {
     const DAY: u64 = 86_400_000;
@@ -1135,9 +1095,8 @@ fn page_field<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> 
         .map(|(_, v)| v.as_str())
 }
 
-/// The `page` line's chrome keys (ruling 396), byte for byte, after every
-/// older key: for a page whose tag filter admits `all` entries, `problems`
-/// of them warnings or errors, with no tag filter down.
+/// The `page` line's chrome keys, byte for byte, for a page whose tag filter admits `all`
+/// entries, `problems` of them warnings or errors, with no tag filter down.
 fn page_chrome(all: usize, problems: usize) -> String {
     format!(
         "\theading=Messages\tsubtitle=What aterm reported, newest first.\tall_words=All \u{00b7} {all}\tproblems_words=Problems \u{00b7} {problems}\tall_tags=All tags\tall_tags_on=1\ttag_menu=Tag: All\ttag_menu_name=Filter by tag: All\tcopy_all_button=Copy All\tcopy_all_name=Copy the shown messages\tempty=Nothing yet.\ttechnical_caption=Technical details\tcopy_button=Copy"
@@ -1211,15 +1170,10 @@ fn page_lines_fixture() -> (MessageCenter, Desk) {
     (c, desk)
 }
 
-/// THE PAGE AS LINES (ruling 387), byte for byte: one grammar a web page
-/// renders without wording anything itself — the head with the counts and
-/// the count line, the chips in their order (`toolchain` and `packages`
-/// ONE chip), a day header before each section of a headed list, and each
-/// entry newest first with its lead, meta, chip, severity, state and spoken
-/// words, its sentence and technical lines (a diagram technical whole, an
-/// upgrade row's two-line sentence), and its offered capsules — every value
-/// through the log codec's escaping (the title's backslash is `\\`, the
-/// lines joined by US are `\u`).
+/// The page as lines, byte for byte: one grammar a web page renders without wording
+/// anything itself (head, chips in order with `toolchain` and `packages` one chip, day
+/// headers, entries newest first with their offered capsules), every value through the
+/// log codec's escaping.
 #[test]
 fn the_page_as_lines_says_every_word_in_one_grammar() {
     let (c, desk) = page_lines_fixture();
@@ -1281,8 +1235,8 @@ fn the_page_as_lines_says_every_word_in_one_grammar() {
         page_field(&fields, "state_words"),
         Some(&*wait.state_words())
     );
-    // Copy's text reads back byte for byte, its line breaks the escaping's
-    // (ruling 396), and the meta line is the one an expanded entry paints.
+    // Copy's text reads back byte for byte, and the meta line is the one an expanded
+    // entry paints.
     assert_eq!(page_field(&fields, "copy"), Some(&*wait.copy_text()));
     assert_eq!(page_field(&fields, "meta"), Some(&*wait.meta_words(NOW, 0)));
     assert_eq!(
@@ -1300,13 +1254,10 @@ fn the_page_as_lines_says_every_word_in_one_grammar() {
     );
 }
 
-/// THE LINES FOLLOW THE FILTER (ruling 387): the tag filter selects a chip
-/// by its words (a deep link to `packages` lights the ALab tools chip keyed
-/// `toolchain`) and the severity counts follow it; Problems counts every chip
-/// by its warnings and errors and admits only those; the count line says
-/// what the filters admit; a list the filter leaves all of today carries no
-/// header. The host's facts: the not-saved note and the log folder appear
-/// only while they are true. An empty log is its head alone, with no count.
+/// The lines follow the filter: a tag selects a chip by its words (a deep link to
+/// `packages` lights the chip keyed `toolchain`) and the counts follow it; Problems admits
+/// warnings and errors only; a list of today alone carries no header. The not-saved note
+/// and the log folder appear only while true; an empty log is its head alone.
 #[test]
 fn the_page_lines_follow_the_filter_and_the_hosts_facts() {
     let (c, desk) = page_lines_fixture();
@@ -1329,8 +1280,8 @@ fn the_page_lines_follow_the_filter_and_the_hosts_facts() {
         "the chip lights by its words"
     );
     assert!(alab[1].contains("\ton=0\t") && alab[3].contains("\ton=0\t"));
-    // The chrome follows the filter (ruling 396): the segments' words over
-    // the chip's counts, `All tags` up, the pop-up naming the chip.
+    // The chrome follows the filter: the segments' words over the chip's counts, `All
+    // tags` up, the pop-up naming the chip.
     assert_eq!(page_field(&head, "all_words"), Some("All \u{00b7} 2"));
     assert_eq!(
         page_field(&head, "problems_words"),
@@ -1437,8 +1388,7 @@ fn the_page_lines_follow_the_filter_and_the_hosts_facts() {
         "{}",
         lines[0]
     );
-    // No host has the log: `Open log` offered, not pressable (the negative
-    // control of the desk's file).
+    // A host without the log file: `Open log` offered, not pressable.
     assert!(
         lines.contains(
             &"action\tid=3\tindex=0\tlabel=Open log\tactionable=0\tbutton=Open log\tprimary=0"
@@ -1462,12 +1412,9 @@ fn the_page_lines_follow_the_filter_and_the_hosts_facts() {
     );
 }
 
-/// ANY WORD SURVIVES THE LINES (ruling 387): a title, tag, detail line or
-/// label carrying the grammar's own separators — TAB, LF, CR, US and the
-/// escape's backslash — reads back whole, field for field, and never splits
-/// a line or a field (a host hands the page words it did not post: a
-/// restored log, another build's line). Every line of a kind has its keys
-/// in the one fixed order.
+/// A word carrying the grammar's own separators (TAB, LF, CR, US, the escape's backslash)
+/// reads back whole and never splits a line or a field: a host hands the page words it did
+/// not post. Every line of a kind has its keys in the one fixed order.
 #[test]
 fn any_word_survives_the_page_lines() {
     let hostile = "a\tb\nc\rd\u{1f}e\\f \\t";
@@ -1570,10 +1517,8 @@ fn any_word_survives_the_page_lines() {
     let (_, e) = &read[2];
     assert_eq!(page_field(e, "title"), Some(hostile));
     assert_eq!(page_field(e, "tag"), Some(hostile));
-    // COPY'S TEXT READS BACK BYTE FOR BYTE (ruling 396): its title and tag
-    // carry TAB, LF, CR, US and a backslash, a detail line a literal `\n`,
-    // and its own line breaks ride the escaping's `\n` — one value, never a
-    // US-joined list.
+    // Copy's text reads back byte for byte: one value whose line breaks ride the
+    // escaping's `\n`, never a US-joined list.
     let copy = entry.copy_text();
     assert!(
         ['\t', '\n', '\r', '\u{1f}', '\\']
@@ -1583,8 +1528,8 @@ fn any_word_survives_the_page_lines() {
     );
     assert_eq!(page_field(e, "copy"), Some(copy.as_str()));
     assert_eq!(page_field(e, "meta"), Some(&*entry.meta_words(NOW, 0)));
-    // NEGATIVE CONTROL: the list fields' US join would have lost the
-    // title's US (`join_us` drops one inside a line).
+    // Control: a US-joined list would have lost the title's US (`join_us` drops one
+    // inside a line).
     let as_list: Vec<String> = copy.split('\n').map(str::to_string).collect();
     assert_ne!(
         crate::log::split_us(&crate::log::join_us(&as_list)).join("\n"),
@@ -1617,21 +1562,15 @@ fn any_word_survives_the_page_lines() {
         Some(&*format!("Tag: {}", tag_words(hostile)))
     );
     assert_eq!(page_field(&head, "all_tags_on"), Some("0"));
-    // NEGATIVE CONTROL: the same field unescaped would split the line.
+    // Control: the same field unescaped would split the line.
     assert!(format!("title={hostile}").split('\t').count() > 1);
 }
 
-/// THE PAGE'S CHROME WORDS (ruling 395), byte for byte: the words the macOS
-/// page paints and names its controls by, the engine's so a page on any
-/// host says the same page — the heading, the subtitle, the empty log's
-/// line, the first tag chip, Copy and Copy All, the technical caption; the
-/// severity segments over their counts; a chip's name and count; the tag
-/// pop-up's painted and spoken words (the chip's words, never the tag, and a
-/// script's colliding tag as the script wrote it, ruling 390); a
-/// destination's footer button `Open …` and every other intent's own label;
-/// the meta line, with the posts folded in only past one; and Copy All's
-/// text — the host's build information verbatim, then each shown entry's
-/// Copy text after two line breaks (ruling 397).
+/// The page's chrome words are the engine's, byte for byte, so a page on any host says the
+/// same page: the fixed words, the severity segments, a chip, the tag pop-up (the chip's
+/// words, never the tag), a destination's `Open …` button, the meta line (`×N` only past
+/// one) and Copy All's text (the build information verbatim, then each shown entry's Copy
+/// text after two line breaks).
 #[test]
 fn the_pages_chrome_words_are_the_engines() {
     use crate::page::{
@@ -1705,6 +1644,12 @@ fn the_pages_chrome_words_are_the_engines() {
         ),
         (
             Intent::OpenSettings {
+                route: "/security".into(),
+            },
+            "Open Security",
+        ),
+        (
+            Intent::OpenSettings {
                 route: "/privacy".into(),
             },
             "Open Settings",
@@ -1771,11 +1716,9 @@ fn the_pages_chrome_words_are_the_engines() {
     );
 }
 
-/// THE PAGE PUTS AN OPEN EXCEPTION AWAY (owner rule 2026-09-28: one batched item
-/// "that I can dismiss"): every open entry carries a view-time `Dismiss` after its
-/// own capsules, the first of two or more also `Dismiss all`; the indices are past
-/// any authored capsule, and a filed entry, a live row and a plain record carry
-/// neither.
+/// Every open entry carries a view-time `Dismiss` after its own capsules, the first of two
+/// or more also `Dismiss all`; the indices are past any authored capsule, and a filed
+/// entry or a plain record carries neither.
 #[test]
 fn an_open_exception_offers_dismiss_and_the_first_of_several_dismiss_all() {
     use crate::exceptions::{Entry, Family};
@@ -1850,12 +1793,9 @@ fn an_open_exception_offers_dismiss_and_the_first_of_several_dismiss_all() {
     );
 }
 
-/// THE DIGEST STANDS FIRST on the page, in its CURRENT words (owner rule
-/// 2026-09-28; review 2026-09-29 issue 12): an open exception is placed above
-/// every other record whatever its age, reads the entry's words (a
-/// restatement is never logged, so the record still holds the first ones),
-/// offers its buttons, and moves the projection's revision without moving the
-/// band's.
+/// An open exception stands above every other record whatever its age, reads the entry's
+/// current words (a restatement is never logged), offers its buttons, and moves the
+/// projection's revision.
 #[test]
 fn an_open_exception_stands_first_in_its_current_words() {
     use crate::exceptions::{Entry, Family};
@@ -1883,7 +1823,7 @@ fn an_open_exception_stands_first_in_its_current_words() {
         now,
     );
     assert_eq!(s.posted, 1);
-    // A NEWER plain record: the exception still stands above it.
+    // A newer plain record: the exception still stands above it.
     c.post(
         Message::new(tags::UPDATE, Severity::Info, "Checked for updates").hold(Hold::LogOnly),
         stamp(NOW + 1_000),
@@ -1898,8 +1838,8 @@ fn an_open_exception_stands_first_in_its_current_words() {
         "an open exception's buttons are offered"
     );
     assert!(before.entries[1..].iter().all(|e| e.state != "review"));
-    // A restatement changes the entry's words, never the record's: the page
-    // must read the entry's, and the projection's revision moves.
+    // A restatement changes the entry's words, never the record's: the page reads the
+    // entry's, and the projection's revision moves.
     let s = c.sync_digest(
         &prefix,
         vec![entry("Claude in tab 1 is still behind")],
@@ -1912,14 +1852,11 @@ fn an_open_exception_stands_first_in_its_current_words() {
     assert!(after.revision > before.revision);
 }
 
-/// THE PAGE'S PRIMARY IS THE ENGINE'S (ruling 407; the rule of rulings 265, 401
-/// and 403, which the macOS page applied itself until then): the first offered
-/// intent while a press can perform it — a pressable first decline keeps it —
-/// else, past a dead first, the first LATER pressable intent that is no decline,
-/// else none. Every case of ruling 403 is pinned, with the controls that tell the
-/// rule from its near misses: plain "first pressable" would promote `Skip
-/// version` past a dead `Upgrade now` (case b), and "first non-decline" would
-/// take the Primary from a pressable first `Not now` (case d).
+/// The page's Primary: the first offered intent while a press can perform it (a pressable
+/// first decline keeps it), else the first later pressable intent that is no decline,
+/// else none. The controls tell the rule from its near misses: "first pressable" would
+/// promote `Skip version` past a dead `Upgrade now` (b), and "first non-decline" would take
+/// the Primary from a pressable first `Not now` (d).
 #[test]
 fn the_primary_is_the_first_pressable_and_never_a_promoted_decline() {
     use crate::page::primary_index;
@@ -1940,9 +1877,8 @@ fn the_primary_is_the_first_pressable_and_never_a_promoted_decline() {
         ]),
         Some(0)
     );
-    // (b) A dead first hands the Primary to the first LATER pressable intent
-    // that is no decline: `Skip version` is passed over, `Software Update`
-    // leads.
+    // (b) A dead first hands the Primary to the first later pressable intent that is no
+    // decline: `Skip version` is passed over.
     assert_eq!(
         primary_index(&[
             act(0, "Upgrade now", false, false),
@@ -1960,7 +1896,7 @@ fn the_primary_is_the_first_pressable_and_never_a_promoted_decline() {
         ]),
         Some(2)
     );
-    // A dead first DECLINE hands it on the same way.
+    // A dead first decline hands it on the same way.
     assert_eq!(
         primary_index(&[
             act(0, "Not now", false, true),
@@ -1984,8 +1920,7 @@ fn the_primary_is_the_first_pressable_and_never_a_promoted_decline() {
         ]),
         None
     );
-    // (d) A first decline that is pressable keeps it (the reporter's order
-    // leads, ruling 265).
+    // (d) A first decline that is pressable keeps it: the reporter's order leads.
     assert_eq!(
         primary_index(&[
             act(0, "Not now", true, true),
@@ -2004,15 +1939,10 @@ fn the_primary_is_the_first_pressable_and_never_a_promoted_decline() {
     assert_eq!(primary_index(&[]), None);
 }
 
-/// THE LINES CARRY THE PRIMARY (ruling 407): each `action` line ends
-/// `primary=`, `1` on the entry's Primary alone ([`crate::page::primary_index`]),
-/// `0` on every other — so a page drawing the lines could lead with the one the
-/// native footer does without re-deriving the rule (none does yet: no site
-/// renders the page, and the web hosts press nothing on a record, ruling 389)
-/// — and the key is appended after
-/// every older one (`button=` stays where it was). Across entries: a dead
-/// first hands it to a later navigation; only declines left, none leads; a
-/// pressable first decline keeps it.
+/// Each `action` line ends `primary=`, `1` on the entry's Primary alone
+/// ([`crate::page::primary_index`]), after every older key. Across entries: a dead first
+/// hands it to a later navigation; only declines left, none leads; a pressable first
+/// decline keeps it.
 #[test]
 fn the_action_lines_carry_the_primary_after_every_older_key() {
     let act = |index: u8, label: &'static str, still_actionable: bool, declines: bool| {
@@ -2096,16 +2026,10 @@ fn the_action_lines_carry_the_primary_after_every_older_key() {
     }
 }
 
-/// `primary=` MARKS A POSITION IN THE OFFERED INTENTS, NOT AN `ActionIndex`
-/// (ruling 408). [`crate::page::primary_index`] answers a
-/// position in `entry.actions`, while each line's `index=` keeps the intent's
-/// own `ActionIndex`: an intent whose moment passed is not offered (ruling
-/// 265: `Not now` on an answered ask), so the offered indices can start past
-/// 0 and skip. Every other pin offers `index=` equal to the position, where a
-/// mark by `index=` reads the same. Here they differ: (A) the first offered
-/// intent, `index=1`, leads, where a mark by `index=` would mark none; (B) past a
-/// dead `index=1`, the pressable `index=2` leads, where a mark by `index=`
-/// would put the Primary on the dead button (day ten's D2 again).
+/// `primary=` marks a position in the offered intents, not an `ActionIndex`: an intent
+/// whose moment passed is not offered, so the offered indices can start past 0 and skip.
+/// Here they differ: the first offered intent (`index=1`) leads, and past a dead
+/// `index=1` the pressable `index=2` does.
 #[test]
 fn the_primary_line_marks_a_position_in_the_offered_intents_not_an_action_index() {
     let act = |index: u8, label: &'static str, still_actionable: bool| MessageActionView {

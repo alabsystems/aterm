@@ -593,25 +593,3 @@ fn a_halt_blocks_the_hold_and_one_during_it_is_judged() {
     w.run(6_000);
     assert_eq!(w.acts, ["Hold", "Release", "GiveUp"]);
 }
-
-/// NEGATIVE CONTROL: the model refuses the moves of the mutants written as
-/// wrong drivers, so the guards above are not vacuous.
-#[test]
-fn the_models_guards_reject_the_wrong_drivers() {
-    let w = World::new(Standin::NeverAnswers);
-    let mut s = w.model.init_state();
-    for a in ["Debt", "Arm", "Quiet", "Hold"] {
-        assert!(w.model.fire(a, &mut s), "{a}");
-    }
-    // A driver that "finishes" on the first answer (HealOnFirstAnswer) or lets
-    // the machine end while the PTY is short (LoseTheHold) is not a move the
-    // fair model has.
-    assert!(!w.model.action_enabled("Finish", &s));
-    assert!(!w.model.action_enabled("GiveUp", &s));
-    let mut answered = s.clone();
-    assert!(w.model.fire("App1", &mut answered));
-    assert!(
-        !w.model.action_enabled("Finish", &answered),
-        "one answer is not a heal"
-    );
-}

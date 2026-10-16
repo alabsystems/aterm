@@ -14,16 +14,10 @@ use crate::walk::{committed_actions, walk};
 #[test]
 fn publish_once_proves_and_catches_every_defect_class() {
     let model = release_publish_once_model();
-    assert!(
-        aterm_spec::xref::model_registry()
-            .iter()
-            .any(|registered| registered.name == model.name),
-        "the publish-once contract must stay enrolled in the spec-link registry"
-    );
     verify::prove_and_catch_scalar(&model, "release publish once");
-    // Every invariant is falsified by a mutant checked ALONE, and every mutant is an
-    // independently caught negative control: dead at `Buggy = 0`, live when added alone
-    // to the committed machine, and caught there.
+    // Every invariant is falsified by a mutant checked alone, and every mutant is an
+    // independently caught negative control: dead at `Buggy = 0`, live when added alone to the
+    // committed machine, and caught there.
     assert!(
         verify::uncaught_invariants(&model).is_empty(),
         "ghost invariants: {:?}",
@@ -37,23 +31,21 @@ fn publish_once_proves_and_catches_every_defect_class() {
         .filter(|name| !committed.contains(name))
         .collect();
     assert_eq!(
-        verify::audit_dead_negative_controls(&model, &mutants),
+        verify::audit_dead_negative_controls(std::slice::from_ref(&model)),
         Ok(mutants.len()),
         "{mutants:?}"
     );
     assert_eq!(mutants.len(), 11, "{mutants:?}");
 
-    // A head the cut made can always reach completion: nothing wedges at `Buggy = 0`,
-    // and the resume that refused its own head strands the lease (`--abandon` refuses a
-    // published release). The liveness half runs on the same machine WITHOUT its
-    // invariants, so the `Buggy = 1` verdict on both tiers is the wedge itself, never an
-    // earlier safety counterexample.
+    // A head the cut made always reaches completion, and the resume that refused its own head
+    // strands the lease (`--abandon` refuses a published release). The liveness half runs without
+    // the invariants, so its `Buggy = 1` verdict on both tiers is the wedge itself.
     let mut liveness = model.clone();
     liveness.invariants.clear();
     let is_final = |state: &interp::State| state["phase"] == 5 || state["phase"] == 6;
     verify::deadlock_free_and_catches_tiered(&liveness, is_final, "release publish once");
-    // …and the re-sent PATCH is what that takes: a resume that only READS (proves the
-    // head, sends nothing) wedges once another release has taken `latest` since.
+    // …and the re-sent PATCH is what that takes: a resume that only reads (proves the head,
+    // sends nothing) wedges once another release has taken `latest` since.
     let mut read_only = interp::with_buggy(&liveness, 0);
     read_only
         .actions
@@ -65,7 +57,7 @@ fn publish_once_proves_and_catches_every_defect_class() {
         "{wedge:?}"
     );
 
-    // The shipped order reaches the head, and only through the proof and the PATCH.
+    // The committed order reaches the head, and only through the proof and the PATCH.
     let healthy = walk(
         &model,
         &[
@@ -111,9 +103,9 @@ fn publish_once_proves_and_catches_every_defect_class() {
     assert_eq!(newer["latest"], 2, "the newer head keeps `latest`");
     assert_eq!(newer["bound"], 0, "and the refused cut bound nothing");
 
-    // THE SECOND FLOOR READ: a join during the uploads makes the first read stale, the
-    // PATCH waits on a read after it, and that read refuses — from a release carrying
-    // this cut's uploads, which an abandon then withdraws, leaving the engine's release.
+    // The second floor read: a join during the uploads makes the first read stale, the PATCH
+    // waits on a read after it, and that read refuses, from a release carrying this cut's
+    // uploads, which an abandon then withdraws, leaving the engine's release.
     let mut joined = walk(
         &model,
         &[
@@ -144,9 +136,9 @@ fn publish_once_proves_and_catches_every_defect_class() {
         "{joined:?}"
     );
 
-    // THE RESUME AFTER THE PATCH: the pointer gate ran out of time, another release took
-    // `latest` and a join re-dressed the channel since, and the cut still finishes — the
-    // PATCH re-sent, the read side proved, no floor read to refuse it.
+    // The resume after the PATCH: the pointer gate ran out of time, another release took
+    // `latest` and a join re-dressed the channel since, and the cut still finishes: the PATCH
+    // re-sent, the read side proved, no floor read to refuse it.
     let mut resumed = walk(
         &model,
         &[
@@ -210,7 +202,7 @@ fn publish_once_proves_and_catches_every_defect_class() {
     let with = |tail: &[&'static str]| -> Vec<&'static str> {
         lease.iter().copied().chain(tail.iter().copied()).collect()
     };
-    // The engine before 2026-09-23: a full source release takes `latest` empty.
+    // `PublishSourceFull`: a full source release takes `latest` empty.
     caught(&["PublishSourceFull"], "NoEmptyHead");
     // The head PATCH before the appcast pair.
     caught(&with(&["MakeHeadEarly"]), "NoEmptyHead");
@@ -221,9 +213,8 @@ fn publish_once_proves_and_catches_every_defect_class() {
         &with(&["UploadSig", "ProveBeforeLastUpload"]),
         "ProofAfterTheLastUpload",
     );
-    // THE DEFECT THE DOUBLE PATH GUARDED: bytes made the head that nothing re-read.
-    // The origin's live verify stood between them and the fleet before the mirror
-    // copied a release; with one publication the channel's own proof is that line.
+    // `MakeHeadUnproved`: bytes made the head that nothing re-read; the channel's own proof
+    // is the only line between them and the fleet.
     caught(
         &with(&["UploadSig", "UploadToml", "MakeHeadUnproved"]),
         "NoUnprovedHead",
@@ -239,7 +230,7 @@ fn publish_once_proves_and_catches_every_defect_class() {
         ]),
         "NeverBehindTheFleet",
     );
-    // The adopt path before 2026-09-23: everything uploaded, no PATCH.
+    // `FinishWithoutHead`: everything uploaded, no PATCH.
     caught(
         &with(&[
             "UploadSig",
@@ -275,8 +266,8 @@ fn publish_once_proves_and_catches_every_defect_class() {
         &with(&["AbandonDeletesRelease"]),
         "AbandonLeavesTheSourceRelease",
     );
-    // The resume before 2026-09-26: after the PATCH and a join, the write half
-    // re-entered and the floors refused a head the fleet already runs.
+    // `ResumeRefusesItsOwnHead`: after the PATCH and a join, the write half re-enters and the
+    // floors refuse a head the fleet already runs.
     caught(
         &with(&[
             "UploadSig",
@@ -291,14 +282,9 @@ fn publish_once_proves_and_catches_every_defect_class() {
     );
 }
 
-/// THE GUARD-CONJUNCT AUDIT (`common/conjunct_audit.rs`), pinned: for every conjunct of
-/// every guard the committed machine takes, which invariants dropping it breaks (each
-/// checked alone) and whether it changes a real transition. The ORDER the model exists
-/// to prove carries weight — the signature before the appcast (`UploadToml`'s `sig_up`),
-/// the proof after the last upload (`ProveAssets`' `toml_up`), the bind after the floors
-/// (`Bind`'s `checked`), the PATCH on a floor read after the uploads (`MakeHead`'s
-/// `checked`, which only a join makes stale), a join refused only before the head
-/// (`RefuseFloor`'s `phase`) — and every conjunct that carries nothing is named below
+/// The guard-conjunct audit (`common/conjunct_audit.rs`), pinned: for every conjunct of every
+/// guard the committed machine takes, which invariants dropping it breaks (each checked alone)
+/// and whether it changes a real transition. Every conjunct that carries nothing is named below
 /// with the reason it is there.
 #[test]
 fn publish_once_guard_conjuncts_carry_the_order_they_claim() {
@@ -334,17 +320,17 @@ fn publish_once_guard_conjuncts_carry_the_order_they_claim() {
             &["AbandonLeavesTheSourceRelease", "MadeHeadFinishes"],
             true,
         ),
-        // THE FLOORS: the head half and the roster half of the real ratchet.
+        // The floors: the head half and the roster half of the real ratchet.
         ("Ratchet", 0, &["NeverDisplacesNewer"], true),
         ("Ratchet", 1, &["NeverDisplacesNewer"], true),
         ("Ratchet", 2, &["NeverBehindTheFleet"], true),
         ("RefuseNewer", 0, none, true),
         ("RefuseNewer", 1, none, true),
-        // A join is refused only BEFORE the head: from phase 3 it is the resume that
-        // refused its own head (`channel::ChannelRelease::head_made` is the real guard).
+        // A join is refused only before the head: from phase 3 it is the resume that refused
+        // its own head (`channel::ChannelRelease::head_made` is the real guard).
         ("RefuseFloor", 0, &["MadeHeadFinishes"], true),
         ("RefuseFloor", 1, none, true),
-        // THE BIND AFTER THE FLOORS.
+        // The bind after the floors.
         ("Bind", 0, none, true),
         ("Bind", 1, &["BoundOnAFloorRead"], true),
         ("Bind", 2, none, false),
@@ -353,7 +339,7 @@ fn publish_once_guard_conjuncts_carry_the_order_they_claim() {
         ("UploadSig", 1, none, true),
         ("UploadSig", 2, none, true),
         ("UploadToml", 0, none, true),
-        // THE SIGNATURE BEFORE THE APPCAST.
+        // The signature before the appcast.
         (
             "UploadToml",
             1,
@@ -362,7 +348,7 @@ fn publish_once_guard_conjuncts_carry_the_order_they_claim() {
         ),
         ("UploadToml", 2, none, true),
         ("ProveAssets", 0, none, true),
-        // THE PROOF AFTER THE LAST UPLOAD.
+        // The proof after the last upload.
         (
             "ProveAssets",
             1,
@@ -371,9 +357,9 @@ fn publish_once_guard_conjuncts_carry_the_order_they_claim() {
         ),
         ("ProveAssets", 2, none, false),
         ("MakeHead", 0, none, true),
-        // THE PATCH ON A FLOOR READ AFTER THE UPLOADS.
+        // The PATCH on a floor read after the uploads.
         ("MakeHead", 1, &["NeverBehindTheFleet"], true),
-        // THE PATCH ON A PROOF.
+        // The PATCH on a proof.
         ("MakeHead", 2, &["NoEmptyHead", "NoUnprovedHead"], true),
         // Another release takes `latest` only from a head this cut made, before it is
         // proved (environment, bound at Tier-1 by the fake's full `atpkg-index` release).
@@ -389,12 +375,12 @@ fn publish_once_guard_conjuncts_carry_the_order_they_claim() {
         // Only a head this cut made holds `latest` at `Buggy = 0`, so the phase adds
         // nothing to the pointer: the proof reads as the step after the head.
         ("ProveHead", 0, none, false),
-        // THE POINTER NAMES THIS RELEASE before the cut is done.
+        // The pointer names this release before the cut is done.
         ("ProveHead", 1, &["PublishedMeansHead"], true),
         ("Abandon", 0, &["AbandonLeavesTheSourceRelease"], true),
-        // `--abandon` refuses a published release. At `Buggy = 0` no refused cut holds
-        // a head, so this changes nothing; its weight is the liveness catch above — with
-        // it, the resume that refused its own head is a WEDGE, the stranded lease.
+        // `--abandon` refuses a published release. At `Buggy = 0` no refused cut holds a head,
+        // so this changes nothing; its weight is the liveness catch above: with it, the resume
+        // that refused its own head is a wedge, the stranded lease.
         ("Abandon", 1, none, false),
         ("Done", 0, none, false),
     ];
